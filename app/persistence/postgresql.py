@@ -11,7 +11,10 @@ from app.persistence.interface import Document, PersistenceTransaction, Predicat
 from app.repositories.postgresql import PostgreSQLStore
 
 
-MIGRATION = Path(__file__).resolve().parents[2] / "migrations" / "001_postgresql_persistence.sql"
+MIGRATIONS = [
+    Path(__file__).resolve().parents[2] / "migrations" / "001_postgresql_persistence.sql",
+    Path(__file__).resolve().parents[2] / "migrations" / "002_model_configuration_v2.sql",
+]
 
 
 class _PostgreSQLTransactionBackend(TransactionBackend):
@@ -126,7 +129,7 @@ class _PostgreSQLTransactionBackend(TransactionBackend):
 
     def get_secret(self, organization_id: str, item_id: str) -> Document:
         row = self.connection.execute(
-            "SELECT data FROM provider_secrets WHERE organization_id = %s AND provider_config_id = %s",
+            "SELECT data FROM provider_secrets WHERE organization_id = %s AND provider_connection_id = %s",
             (organization_id, item_id),
         ).fetchone()
         return dict(row["data"]) if row else {}
@@ -134,9 +137,9 @@ class _PostgreSQLTransactionBackend(TransactionBackend):
     def replace_secret(self, organization_id: str, item_id: str, secret: Document) -> None:
         self.connection.execute(
             """
-            INSERT INTO provider_secrets(provider_config_id, organization_id, data, updated_at)
+            INSERT INTO provider_secrets(provider_connection_id, organization_id, data, updated_at)
             VALUES (%s, %s, %s, now())
-            ON CONFLICT(organization_id, provider_config_id) DO UPDATE
+            ON CONFLICT(organization_id, provider_connection_id) DO UPDATE
             SET data = excluded.data, updated_at = excluded.updated_at
             """,
             (item_id, organization_id, Jsonb(secret)),
@@ -164,9 +167,9 @@ class PostgreSQLPersistence:
         return psycopg.connect(self.store.dsn, row_factory=dict_row)
 
     def _ensure_schema(self) -> None:
-        sql = MIGRATION.read_text(encoding="utf-8")
         with self._connect() as connection:
-            connection.execute(sql)
+            for migration in MIGRATIONS:
+                connection.execute(migration.read_text(encoding="utf-8"))
 
     @contextmanager
     def transaction(self, organization_id: str) -> Iterator[PersistenceTransaction]:

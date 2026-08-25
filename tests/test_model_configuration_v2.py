@@ -1,0 +1,221 @@
+import json
+import sqlite3
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app.core.errors import ApiError
+from app.main import create_app
+from app.migrations.model_configuration_v2 import migrate_documents, migrate_sqlite
+from app.model_gateway.forms import validate_form_values
+from app.model_gateway.gateway import ModelGateway
+from app.model_gateway.registry import get_provider_manifest
+from app.model_gateway.schemas import ChatJSONResponse, ProviderMeta, Usage
+from app.repositories.provider import reset_store_for_tests
+from app.services.model_admin import ModelAdminService
+
+
+def client() -> TestClient:
+    reset_store_for_tests()
+    return TestClient(create_app())
+
+
+def test_manifest_exposes_backend_owned_connection_and_model_forms() -> None:
+    manifest = get_provider_manifest("openai_compatible")
+
+    assert {field["name"] for field in manifest["credential_form"]["fields"]} == {"api_key"}
+    assert {field["name"] for field in manifest["connection_form"]["fields"]} >= {"base_url"}
+    assert set(manifest["model_types"]) >= {"llm", "embedding", "tts"}
+    assert {field["name"] for field in manifest["model_types"]["tts"]["configuration_form"]["fields"]} >= {
+        "default_voice"
+    }
+
+
+def test_dynamic_form_validation_rejects_unknown_and_invalid_values() -> None:
+    schema = {
+        "fields": [
+            {"name": "mode", "control": "select", "required": True, "options": [{"label": "A", "value": "a"}]},
+            {"name": "rate", "control": "number", "min": 0.5, "max": 2},
+        ]
+    }
+
+    with pytest.raises(ApiError, match="unknown fields"):
+        validate_form_values(schema, {"mode": "a", "vendor_typo": True}, path="settings")
+    with pytest.raises(ApiError, match="allowed option"):
+        validate_form_values(schema, {"mode": "b"}, path="settings")
+    with pytest.raises(ApiError, match="exceeds"):
+        validate_form_values(schema, {"mode": "a", "rate": 3}, path="settings")
+
+
+def test_connection_model_and_route_are_separate_resources() -> None:
+    api = client()
+    connection = api.post(
+        "/api/v1/admin/model-provider-connections",
+        json={"provider_id": "mock", "display_name": "Local provider"},
+    )
+    assert connection.status_code == 200, connection.text
+
+    catalog = api.get(
+        "/api/v1/admin/model-provider-connections/%s/model-catalog" % connection.json()["id"]
+    )
+    assert catalog.status_code == 200
+    assert set(catalog.json()["model_types"]) >= {"llm", "embedding", "tts"}
+
+    model = api.post(
+        "/api/v1/admin/model-configurations",
+        json={
+            "provider_connection_id": connection.json()["id"],
+            "model_type": "llm",
+            "provider_model_id": "mock-json",
+            "display_name": "Evaluation JSON",
+            "default_parameters": {"temperature": 0.25, "max_output_tokens": 800},
+        },
+    )
+    assert model.status_code == 200, model.text
+    assert model.json()["provider_connection_id"] == connection.json()["id"]
+    assert model.json()["status"] == "ready"
+
+    route = api.post(
+        "/api/v1/admin/model-routes",
+        json={
+            "capability": "llm.chat_json",
+            "purpose": "answer_evaluation",
+            "primary": {"model_configuration_id": model.json()["id"], "timeout_s": 5},
+        },
+    )
+    assert route.status_code == 200, route.text
+    assert route.json()["primary"] == {
+        "model_configuration_id": model.json()["id"],
+        "timeout_s": 5.0,
+        "pricing": {},
+    }
+    assert "provider_config_id" not in str(route.json())
+
+
+@pytest.mark.anyio
+async def test_untested_model_can_run_probe_and_receives_saved_defaults() -> None:
+    store = reset_store_for_tests()
+    service = ModelAdminService(store)
+    connection = service.create_provider_connection(
+        {
+            "provider_id": "openai_compatible",
+            "display_name": "Probe gateway",
+            "connection_config": {"base_url": "https://models.example.com/v1"},
+            "credentials": {"api_key": "test-key"},
+        }
+    )
+    model = service.create_model_configuration(
+        {
+            "provider_connection_id": connection["id"],
+            "model_type": "llm",
+            "provider_model_id": "chat-model",
+            "display_name": "Probe model",
+            "settings": {"structured_output_mode": "json_object"},
+            "default_parameters": {"temperature": 0.7, "max_output_tokens": 321},
+        }
+    )
+    seen = {}
+
+    class Adapter:
+        provider_id = "openai_compatible"
+
+        async def invoke(self, capability, request, context):
+            seen["temperature"] = request.temperature
+            seen["max_output_tokens"] = request.max_output_tokens
+            seen["connection_config"] = context.connection_config
+            seen["model_settings"] = context.model_settings
+            return ChatJSONResponse(
+                data={},
+                usage=Usage(),
+                provider=ProviderMeta(provider_id="openai_compatible", model=context.model, request_id="probe", latency_ms=1),
+            )
+
+    service.gateway = ModelGateway(store, provider_clients={"openai_compatible": Adapter()})
+    result = await service.test_model_configuration(model["id"])
+
+    assert result["provider"]["model"] == "chat-model"
+    assert seen == {
+        "temperature": 0.7,
+        "max_output_tokens": 321,
+        "connection_config": {"base_url": "https://models.example.com/v1", "use_environment_proxy": False},
+        "model_settings": {"structured_output_mode": "json_object"},
+    }
+    assert service.list_model_configurations()[0]["status"] == "ready"
+
+
+def test_legacy_documents_migrate_without_dual_route_representation() -> None:
+    legacy = {
+        "id": "mpc_legacy",
+        "organization_id": "org_default",
+        "provider_id": "openai_compatible",
+        "display_name": "Legacy gateway",
+        "enabled": True,
+        "config": {"base_url": "https://models.example.com/v1", "structured_output_mode": "json_object"},
+        "credential_ref": "secret://model-providers/mpc_legacy",
+        "version": 3,
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-02T00:00:00Z",
+    }
+    old_route = {
+        "id": "route_legacy",
+        "organization_id": "org_default",
+        "capability": "llm.chat_json",
+        "purpose": "answer_evaluation",
+        "primary": {"provider_config_id": "mpc_legacy", "model": "chat-model", "timeout_s": 12},
+        "fallbacks": [],
+        "policy": {},
+        "enabled": True,
+    }
+
+    connections, models, routes = migrate_documents([legacy], [old_route])
+
+    assert connections[0]["connection_config"] == {
+        "base_url": "https://models.example.com/v1",
+        "use_environment_proxy": False,
+    }
+    assert models[0]["settings"] == {"structured_output_mode": "json_object"}
+    assert routes[0]["primary"]["model_configuration_id"] == models[0]["id"]
+    assert "provider_config_id" not in routes[0]["primary"]
+    assert "model" not in routes[0]["primary"]
+
+
+def test_sqlite_migration_supports_dry_run_then_one_way_upgrade(tmp_path) -> None:
+    path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE documents(collection TEXT, id TEXT, data TEXT, updated_at TEXT, PRIMARY KEY(collection, id))")
+        connection.execute("CREATE TABLE provider_secrets(provider_config_id TEXT PRIMARY KEY, data TEXT, updated_at TEXT)")
+        legacy = {
+            "id": "mpc_mock", "organization_id": "org_default", "provider_id": "mock",
+            "display_name": "Legacy mock", "enabled": True, "config": {}, "version": 1,
+            "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+        }
+        route = {
+            "id": "route_old", "organization_id": "org_default", "capability": "llm.chat_json",
+            "purpose": "answer_evaluation", "primary": {"provider_config_id": "mpc_mock", "model": "mock-json"},
+            "fallbacks": [], "policy": {}, "enabled": True,
+        }
+        connection.execute("INSERT INTO documents VALUES (?, ?, ?, ?)", ("provider_configs", legacy["id"], json.dumps(legacy), legacy["updated_at"]))
+        connection.execute("INSERT INTO documents VALUES (?, ?, ?, ?)", ("model_routes", route["id"], json.dumps(route), legacy["updated_at"]))
+
+    assert migrate_sqlite(str(path), dry_run=True)["model_configurations"] == 1
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT count(*) FROM documents WHERE collection = 'provider_configs'").fetchone()[0] == 1
+
+    migrate_sqlite(str(path))
+    with sqlite3.connect(path) as connection:
+        collections = {row[0] for row in connection.execute("SELECT DISTINCT collection FROM documents")}
+        secret_columns = {row[1] for row in connection.execute("PRAGMA table_info(provider_secrets)")}
+    assert "provider_configs" not in collections
+    assert {"provider_connections", "model_configurations", "model_routes"}.issubset(collections)
+    assert "provider_connection_id" in secret_columns
+
+
+def test_admin_console_uses_schema_renderer_and_no_legacy_endpoint() -> None:
+    script = Path("app/web/app.js").read_text(encoding="utf-8")
+
+    assert "schemaForm" in script
+    assert "connection_form" in script
+    assert "model_types" in script
+    assert "model-provider-configs" not in script
+    assert "provider_config_id" not in script

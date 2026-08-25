@@ -28,7 +28,8 @@ DOCUMENT_COLLECTIONS = (
     "answers",
     "evaluations",
     "reports",
-    "provider_configs",
+    "provider_connections",
+    "model_configurations",
     "model_routes",
     "model_circuit_states",
 )

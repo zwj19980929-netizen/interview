@@ -182,16 +182,25 @@ class ProviderContext(BaseModel):
     organization_id: str
     invocation_id: str
     route_id: str
-    provider_config_id: str
+    provider_connection_id: str
+    model_configuration_id: str
+    model_type: str
     capability: str
     purpose: str
     model: str
     timeout_s: float
     attempt: int
     fallback_index: int
-    config: Dict[str, Any] = Field(default_factory=dict)
+    connection_config: Dict[str, Any] = Field(default_factory=dict)
+    model_settings: Dict[str, Any] = Field(default_factory=dict)
+    default_parameters: Dict[str, Any] = Field(default_factory=dict)
     credentials: Dict[str, Any] = Field(default_factory=dict)
     metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def config(self) -> Dict[str, Any]:
+        """Resolved provider options for existing adapters; model settings win on collision."""
+        return {**self.connection_config, **self.model_settings}
 
 
 InvocationRequest = Union[

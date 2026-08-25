@@ -52,31 +52,31 @@ def test_web_console_and_static_assets() -> None:
     assert avatar.headers["content-type"] == "image/png"
 
 
-def test_provider_config_updates_require_current_version() -> None:
+def test_provider_connection_updates_require_current_version() -> None:
     api = client()
     created = api.post(
-        "/api/v1/admin/model-provider-configs",
+        "/api/v1/admin/model-provider-connections",
         json={
             "provider_id": "mock",
             "display_name": "Versioned mock",
-            "credentials": {"api_key": "never-return-this"},
+            "credentials": {},
         },
     )
     assert created.status_code == 200, created.text
-    config = created.json()
-    assert config["version"] == 1
-    assert "credentials" not in config
+    connection = created.json()
+    assert connection["version"] == 1
+    assert "credentials" not in connection
 
     updated = api.patch(
-        "/api/v1/admin/model-provider-configs/%s" % config["id"],
-        json={"expected_version": config["version"], "display_name": "Updated mock"},
+        "/api/v1/admin/model-provider-connections/%s" % connection["id"],
+        json={"expected_version": connection["version"], "display_name": "Updated mock"},
     )
     assert updated.status_code == 200, updated.text
     assert updated.json()["version"] == 2
 
     stale = api.patch(
-        "/api/v1/admin/model-provider-configs/%s" % config["id"],
-        json={"expected_version": config["version"], "enabled": False},
+        "/api/v1/admin/model-provider-connections/%s" % connection["id"],
+        json={"expected_version": connection["version"], "enabled": False},
     )
     assert stale.status_code == 409
     assert stale.json()["error"]["code"] == "PERSISTENCE_CONFLICT"
@@ -85,67 +85,46 @@ def test_provider_config_updates_require_current_version() -> None:
 def test_provider_manifest_and_route_invariants_are_enforced_on_write() -> None:
     api = client()
 
-    missing_config = api.post(
-        "/api/v1/admin/model-provider-configs",
-        json={
-            "provider_id": "openai_compatible",
-            "display_name": "Invalid OpenAI",
-            "config": {},
-            "credentials": {"api_key": "test-key"},
-        },
+    unknown_field = api.post(
+        "/api/v1/admin/model-provider-connections",
+        json={"provider_id": "mock", "display_name": "Invalid", "connection_config": {"base_url": "nope"}},
     )
-    assert missing_config.status_code == 400
-    assert missing_config.json()["error"]["code"] == "MODEL_PROVIDER_CONFIG_INVALID"
-    assert missing_config.json()["error"]["details"]["fields"] == ["base_url"]
-
-    missing_secret = api.post(
-        "/api/v1/admin/model-provider-configs",
-        json={
-            "provider_id": "openai_compatible",
-            "display_name": "Invalid credentials",
-            "config": {"base_url": "https://models.example.com/v1"},
-            "credentials": {},
-        },
-    )
-    assert missing_secret.status_code == 400
-    assert missing_secret.json()["error"]["details"]["fields"] == ["api_key"]
+    assert unknown_field.status_code == 400
+    assert unknown_field.json()["error"]["code"] == "MODEL_CONFIGURATION_INVALID"
 
     configured = api.post(
-        "/api/v1/admin/model-provider-configs",
-        json={
-            "provider_id": "openai_compatible",
-            "display_name": "Configured OpenAI",
-            "config": {"base_url": "https://models.example.com/v1"},
-            "credentials": {"api_key": "test-key"},
-        },
+        "/api/v1/admin/model-provider-connections",
+        json={"provider_id": "mock", "display_name": "Configured mock", "credentials": {}},
     )
     assert configured.status_code == 200, configured.text
+    model = api.post(
+        "/api/v1/admin/model-configurations",
+        json={
+            "provider_connection_id": configured.json()["id"],
+            "model_type": "llm",
+            "provider_model_id": "mock-json",
+            "display_name": "Scoring model",
+        },
+    )
+    assert model.status_code == 200, model.text
 
     incompatible_route = api.post(
         "/api/v1/admin/model-routes",
         json={
             "capability": "avatar.speak",
             "purpose": "interview_question_delivery",
-            "primary": {
-                "provider_config_id": configured.json()["id"],
-                "model": "chat-model",
-                "timeout_s": 10,
-            },
+            "primary": {"model_configuration_id": model.json()["id"], "timeout_s": 10},
         },
     )
     assert incompatible_route.status_code == 409
-    assert incompatible_route.json()["error"]["code"] == "MODEL_PROVIDER_CAPABILITY_MISSING"
+    assert incompatible_route.json()["error"]["code"] == "MODEL_CAPABILITY_MISMATCH"
 
     invalid_policy = api.post(
         "/api/v1/admin/model-routes",
         json={
             "capability": "llm.chat_json",
             "purpose": "answer_evaluation",
-            "primary": {
-                "provider_config_id": configured.json()["id"],
-                "model": "chat-model",
-                "timeout_s": 10,
-            },
+            "primary": {"model_configuration_id": model.json()["id"], "timeout_s": 10},
             "policy": {"max_retries": 1},
         },
     )
@@ -154,11 +133,7 @@ def test_provider_manifest_and_route_invariants_are_enforced_on_write() -> None:
     route_payload = {
         "capability": "llm.chat_json",
         "purpose": "answer_evaluation",
-        "primary": {
-            "provider_config_id": configured.json()["id"],
-            "model": "chat-model",
-            "timeout_s": 10,
-        },
+        "primary": {"model_configuration_id": model.json()["id"], "timeout_s": 10},
         "policy": {"retry_count": 1},
     }
     created_route = api.post("/api/v1/admin/model-routes", json=route_payload)
@@ -171,92 +146,105 @@ def test_provider_manifest_and_route_invariants_are_enforced_on_write() -> None:
 def test_provider_defaults_and_predefined_model_catalog_are_enforced() -> None:
     api = client()
     configured = api.post(
-        "/api/v1/admin/model-provider-configs",
+        "/api/v1/admin/model-provider-connections",
         json={
             "provider_id": "deepseek",
             "display_name": "DeepSeek production",
-            "config": {},
+            "connection_config": {},
             "credentials": {"api_key": "test-key"},
         },
     )
     assert configured.status_code == 200, configured.text
-    assert configured.json()["config"]["base_url"] == "https://api.deepseek.com"
-    assert configured.json()["config"]["test_model"] == "deepseek-chat"
+    assert configured.json()["connection_config"]["base_url"] == "https://api.deepseek.com"
+    catalog = api.get(
+        "/api/v1/admin/model-provider-connections/%s/model-catalog" % configured.json()["id"]
+    )
+    assert catalog.status_code == 200
+    assert {item["model_id"] for item in catalog.json()["models"]} >= {"deepseek-chat"}
 
-    invalid_route = api.post(
-        "/api/v1/admin/model-routes",
+    invalid_model = api.post(
+        "/api/v1/admin/model-configurations",
         json={
-            "capability": "llm.chat_json",
-            "purpose": "answer_evaluation",
-            "primary": {
-                "provider_config_id": configured.json()["id"],
-                "model": "not-a-deepseek-model",
-                "timeout_s": 10,
-            },
+            "provider_connection_id": configured.json()["id"],
+            "model_type": "llm",
+            "provider_model_id": "not-a-deepseek-model",
+            "display_name": "Invalid model",
         },
     )
-    assert invalid_route.status_code == 409
-    assert invalid_route.json()["error"]["code"] == "MODEL_PROVIDER_MODEL_UNAVAILABLE"
+    assert invalid_model.status_code == 409
+    assert invalid_model.json()["error"]["code"] == "MODEL_PROVIDER_MODEL_UNAVAILABLE"
 
-    valid_route = api.post(
-        "/api/v1/admin/model-routes",
+    valid_model = api.post(
+        "/api/v1/admin/model-configurations",
         json={
-            "capability": "llm.chat_json",
-            "purpose": "answer_evaluation",
-            "primary": {
-                "provider_config_id": configured.json()["id"],
-                "model": "deepseek-chat",
-                "timeout_s": 10,
-            },
+            "provider_connection_id": configured.json()["id"],
+            "model_type": "llm",
+            "provider_model_id": "deepseek-chat",
+            "display_name": "DeepSeek Chat",
         },
     )
-    assert valid_route.status_code == 200, valid_route.text
+    assert valid_model.status_code == 200, valid_model.text
+    assert valid_model.json()["status"] == "untested"
 
 
-def test_provider_test_selects_capability_specific_predefined_model() -> None:
+def test_model_configuration_enforces_type_specific_predefined_models() -> None:
     api = client()
     configured = api.post(
-        "/api/v1/admin/model-provider-configs",
+        "/api/v1/admin/model-provider-connections",
         json={
             "provider_id": "zhipuai",
             "display_name": "Zhipu multi-capability",
-            "config": {},
+            "connection_config": {},
             "credentials": {"api_key": "test-key"},
         },
     )
     assert configured.status_code == 200, configured.text
-    item = configured.json()
-    assert item["config"]["test_models"] == {
-        "llm.chat_json": "glm-5.2",
-        "llm.chat_text": "glm-5.2",
-        "tts.synthesize": "glm-tts",
-    }
 
     wrong_model = api.post(
-        "/api/v1/admin/model-provider-configs/%s/test" % item["id"],
-        json={"capability": "tts.synthesize", "model": "glm-5.2"},
+        "/api/v1/admin/model-configurations",
+        json={
+            "provider_connection_id": configured.json()["id"],
+            "model_type": "tts",
+            "provider_model_id": "glm-5.2",
+            "display_name": "Wrong TTS",
+        },
     )
     assert wrong_model.status_code == 409
     assert wrong_model.json()["error"]["code"] == "MODEL_PROVIDER_MODEL_UNAVAILABLE"
 
-    unsupported_probe = api.post(
-        "/api/v1/admin/model-provider-configs/%s/test" % item["id"],
-        json={"capability": "stt.streaming", "model": "glm-tts"},
+    tts = api.post(
+        "/api/v1/admin/model-configurations",
+        json={
+            "provider_connection_id": configured.json()["id"],
+            "model_type": "tts",
+            "provider_model_id": "glm-tts",
+            "display_name": "GLM TTS",
+        },
     )
-    assert unsupported_probe.status_code == 409
-    assert unsupported_probe.json()["error"]["code"] == "MODEL_CAPABILITY_NOT_IMPLEMENTED"
+    assert tts.status_code == 200, tts.text
+    assert tts.json()["supported_capabilities"] == ["tts.synthesize"]
 
 
-def test_provider_test_keeps_empty_body_compatibility() -> None:
+def test_mock_model_configuration_can_be_tested() -> None:
     api = client()
     configured = api.post(
-        "/api/v1/admin/model-provider-configs",
+        "/api/v1/admin/model-provider-connections",
         json={"provider_id": "mock", "display_name": "Mock connection test"},
     )
     assert configured.status_code == 200, configured.text
+    model = api.post(
+        "/api/v1/admin/model-configurations",
+        json={
+            "provider_connection_id": configured.json()["id"],
+            "model_type": "llm",
+            "provider_model_id": "mock-json",
+            "display_name": "Mock JSON",
+        },
+    )
+    assert model.status_code == 200, model.text
 
     tested = api.post(
-        "/api/v1/admin/model-provider-configs/%s/test" % configured.json()["id"]
+        "/api/v1/admin/model-configurations/%s/test" % model.json()["id"], json={}
     )
     assert tested.status_code == 200, tested.text
     assert tested.json()["provider"]["provider_id"] == "mock"

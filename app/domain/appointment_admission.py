@@ -136,12 +136,24 @@ class AppointmentAdmission:
         route = route or next((item for item in routes if item.get("purpose") == "default"), None)
         if route is None:
             return False
-        provider_config = transaction.provider_configs.get((route.get("primary") or {}).get("provider_config_id"))
-        if provider_config is None or not provider_config.get("enabled", True):
-            return False
-        manifest = get_provider_manifest(provider_config.get("provider_id", ""))
+        model_configuration = transaction.model_configurations.get(
+            (route.get("primary") or {}).get("model_configuration_id")
+        )
         if (
-            provider_config.get("provider_id") == "mock"
+            model_configuration is None
+            or not model_configuration.get("enabled", True)
+            or model_configuration.get("status") != "ready"
+            or capability not in model_configuration.get("supported_capabilities", [])
+        ):
+            return False
+        provider_connection = transaction.provider_connections.get(
+            model_configuration.get("provider_connection_id")
+        )
+        if provider_connection is None or not provider_connection.get("enabled", True):
+            return False
+        manifest = get_provider_manifest(model_configuration.get("provider_id", ""))
+        if (
+            model_configuration.get("provider_id") == "mock"
             or not manifest.get("implemented", False)
             or capability not in manifest.get("capabilities", [])
         ):

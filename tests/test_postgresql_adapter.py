@@ -2,12 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from app.persistence.postgresql import MIGRATION
+from app.persistence.postgresql import MIGRATIONS
 from app.repositories.provider import _create_store
 
 
 def test_postgresql_migration_contains_required_constraints_and_tenant_rls() -> None:
-    sql = Path(MIGRATION).read_text(encoding="utf-8")
+    sql = "\n".join(Path(path).read_text(encoding="utf-8") for path in MIGRATIONS)
     required_fragments = (
         "UNIQUE (organization_id, idempotency_key)",
         "uq_interview_appointment_session",
@@ -15,7 +15,7 @@ def test_postgresql_migration_contains_required_constraints_and_tenant_rls() -> 
         "ENABLE ROW LEVEL SECURITY",
         "FORCE ROW LEVEL SECURITY",
         "current_setting('app.organization_id', true)",
-        "PRIMARY KEY (organization_id, provider_config_id)",
+        "PRIMARY KEY (organization_id, provider_connection_id)",
     )
     for fragment in required_fragments:
         assert fragment in sql

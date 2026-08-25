@@ -159,3 +159,17 @@
   - 最终全量：`99 passed in 3.01s`；Python 编译、前端语法和 `git diff --check` 均通过。
   - 恢复检查：先复制为 `/private/tmp/interviewer-reset-20260825.sqlite3`，SQLite `.recover` 仍只得到 reset 后数据；`tmutil listlocalsnapshots /` 没有可用用户数据快照。
 - 未完成事项或恢复说明：误删前的 Provider secret、其它 Provider 配置/路由和可能存在的开发业务记录无法从 SQLite 或本地快照恢复，不能伪造。已按可确认信息将 `mpc_11b4d940e3134074` 恢复为 disabled 智谱配置，Base URL、LLM/TTS 按能力模型和 `tongtong` 音色已补回；管理员需在“模型服务 → 编辑”重新输入 API Key、启用并重建需要的 route。两个 `/private/tmp/interviewer-*-20260825.sqlite3` 恢复副本保留，未删除。
+
+## 2026-08-25 · MODEL-CONFIG-V2-001
+
+- 目标：把模型服务配置重构为“厂商连接 → 模型配置 → 能力路由”，由 Provider 插件声明厂商与模型类型特有的后端表单 schema，并由前端通用渲染；路由只引用已验证的模型配置，删除 `provider_config_id + model` 双字段执行表示。
+- 关联问题：`MODEL-CONFIG-V2-001`；当前 `ModelProviderConfig` 混合账号凭据、连接参数和模型参数，具体模型不是独立资源，前端硬编码厂商字段。
+- 状态：`closed`（仓库实现与旧运行时边界删除完成；真实厂商健康仍为 `environment_pending`）。
+- 实际修改文件：`app/model_gateway/{capabilities,forms,gateway,registry,schemas}.py`、`app/services/model_admin.py`、`app/api/routes.py`、`app/schemas/api.py`、`app/domain/appointment_admission.py`、Persistence/repository 的 Memory/SQLite/PostgreSQL 实现、五个已实现 Provider manifest、`app/web/app.js`、`app/migrations/model_configuration_v2.py`、`migrations/001_postgresql_persistence.sql`、`migrations/002_model_configuration_v2.sql`、相关既有测试与 `tests/test_model_configuration_v2.py`；同步 `CONTEXT.md`、ADR 及架构/API/领域/Provider/数据库/问题/进度/路线图文档。
+- 验证命令与结果：
+  - `PYTHONPYCACHEPREFIX=/private/tmp/interviewer-pyc .venv/bin/python -m compileall -q app`：通过。
+  - `node --check app/web/app.js`：通过；所有 Provider manifest 通过 JSON 解析和 registry 加载，模型类型覆盖符合能力声明。
+  - `.venv/bin/pytest -q`：`106 passed in 3.63s`。
+  - `git diff --check`：通过。
+  - `.venv/bin/python -m app.migrations.model_configuration_v2 data/interviewer.sqlite3 --dry-run`：输出 `2` 个 ProviderConnection、`2` 个 ModelConfiguration、`0` 个 ModelRoute；dry-run 未修改开发数据库。
+- 未完成事项或恢复说明：未执行开发 SQLite 的实际单向迁移，部署升级前需先复核 dry-run，再去掉 `--dry-run` 执行；真实供应商 API Key、模型授权、费用/延迟及音质仍需逐个 ModelConfiguration 联调，不能由离线测试标记生产健康。

@@ -70,8 +70,8 @@
 建议任务：
 
 - 建立 Model Invocation deep module：单一 `invoke` interface、provider manifest entrypoint、能力枚举、mock adapter。
-- 实现 `ModelProviderConfig`、`ModelRoute`、`ModelInvocationLog`。
-- 实现 provider catalog、供应商配置、路由配置和测试调用 API。
+- 实现 `ProviderConnection`、`ModelConfiguration`、`ModelRoute`、`ModelInvocationLog`。
+- 实现 provider catalog、动态表单、厂商连接、分类模型配置、路由配置和模型测试 API。
 - 实现可执行的 `mock`、`openai_compatible`、`deepseek`、`zhipuai` 和 `dashscope` provider adapter；共享 OpenAI-compatible runtime 吸收 HTTP/鉴权/错误/结构化输出，manifest 驱动默认配置和模型目录。
 - 定义 `llm.chat_json`、`llm.chat_text` 的统一请求/响应；`embedding.text` 只作为可选实验能力。
 
@@ -294,6 +294,7 @@
 - 13C：`stt.streaming` schema/open_stream/WebSocket、唯一 final、断流 batch 修复、OpenAI-compatible/智谱 GLM-TTS/DashScope TTS、非 mock 私有复制和生产 readiness TTL 完成；外部凭据/区域/音质验收为 `environment_pending`，真实 STT/数字人仍需选型。
 - 13D：PostgreSQL/RLS migration、RBAC、HTTP/敏感访问审计、联系人/凭证加密、到期数据 dry-run/显式清理、Outbox 指数退避/dead-letter/指标/重放、共享断路器、Redis bus 和心跳监控完成。
 - 13E：报告导出、复核签名媒体、实际下载审计和抽题公平性 API 完成；邮件/短信、WebRTC、视频数字人和真实金标评估需要外部通道、厂商与业务样本。
+- 13F：模型配置完成 ProviderConnection/ModelConfiguration/ModelRoute 分层，插件后端动态表单、模型健康探针、单向数据迁移和旧接口删除均完成；真实厂商联调保持 `environment_pending`。
 
 仓库验收：
 

@@ -28,7 +28,8 @@ DOCUMENT_COLLECTIONS = [
     "answers",
     "evaluations",
     "reports",
-    "provider_configs",
+    "provider_connections",
+    "model_configurations",
     "model_routes",
     "model_circuit_states",
 ]
@@ -50,20 +51,21 @@ class SQLiteStore(InMemoryStore):
         super().__init__()
         self._suspend_persistence = False
         self._load_from_db()
-        if not self.provider_configs:
-            self.provider_configs = self._default_provider_configs()
-            self.save_many("provider_configs", list(self.provider_configs.values()))
+        if not self.provider_connections:
+            self.provider_connections = self._default_provider_connections()
+            self.save_many("provider_connections", list(self.provider_connections.values()))
 
-    def _default_provider_configs(self) -> Dict[str, Dict[str, Any]]:
+    def _default_provider_connections(self) -> Dict[str, Dict[str, Any]]:
         now = utc_now()
         return {
-            "mpc_mock": {
-                "id": "mpc_mock",
+            "provider_conn_mock": {
+                "id": "provider_conn_mock",
                 "organization_id": "org_default",
                 "provider_id": "mock",
                 "display_name": "Mock Provider",
                 "enabled": True,
-                "config": {},
+                "connection_config": {},
+                "credential_status": "valid",
                 "credential_ref": "secret://mock",
                 "version": 1,
                 "created_at": now,
@@ -101,7 +103,7 @@ class SQLiteStore(InMemoryStore):
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS provider_secrets (
-                    provider_config_id TEXT PRIMARY KEY,
+                    provider_connection_id TEXT PRIMARY KEY,
                     data TEXT NOT NULL,
                     updated_at TEXT
                 )
@@ -141,8 +143,8 @@ class SQLiteStore(InMemoryStore):
                 getattr(self, collection)[row["id"]] = json.loads(row["data"])
             for row in connection.execute("SELECT data FROM model_invocations ORDER BY created_at ASC"):
                 self.model_invocations.append(json.loads(row["data"]))
-            for row in connection.execute("SELECT provider_config_id, data FROM provider_secrets"):
-                self.provider_secrets[row["provider_config_id"]] = json.loads(row["data"])
+            for row in connection.execute("SELECT provider_connection_id, data FROM provider_secrets"):
+                self.provider_secrets[row["provider_connection_id"]] = json.loads(row["data"])
             for row in connection.execute("SELECT id, data FROM outbox_work_items ORDER BY created_at, id"):
                 self.outbox_work_items[row["id"]] = json.loads(row["data"])
 
@@ -155,7 +157,7 @@ class SQLiteStore(InMemoryStore):
             connection.execute("DELETE FROM model_invocations")
             connection.execute("DELETE FROM provider_secrets")
             connection.execute("DELETE FROM outbox_work_items")
-        self.save_many("provider_configs", list(self.provider_configs.values()))
+        self.save_many("provider_connections", list(self.provider_connections.values()))
 
     def save_item(self, collection: str, item_id: str, item: Dict[str, Any]) -> None:
         if getattr(self, "_suspend_persistence", False):
@@ -195,18 +197,18 @@ class SQLiteStore(InMemoryStore):
                 (item["id"], json.dumps(item, ensure_ascii=False), item.get("created_at")),
             )
 
-    def save_provider_secret(self, config_id: str, credentials: Dict[str, Any]) -> None:
-        self.provider_secrets[config_id] = credentials
+    def save_provider_secret(self, connection_id: str, credentials: Dict[str, Any]) -> None:
+        self.provider_secrets[connection_id] = credentials
         if getattr(self, "_suspend_persistence", False):
             return
         with self._connect() as connection:
             connection.execute(
                 """
-                INSERT OR REPLACE INTO provider_secrets(provider_config_id, data, updated_at)
+                INSERT OR REPLACE INTO provider_secrets(provider_connection_id, data, updated_at)
                 VALUES (?, ?, ?)
                 """,
-                (config_id, json.dumps(credentials, ensure_ascii=False), utc_now()),
+                (connection_id, json.dumps(credentials, ensure_ascii=False), utc_now()),
             )
 
-    def get_provider_secret(self, config_id: str) -> Dict[str, Any]:
-        return self.provider_secrets.get(config_id, {})
+    def get_provider_secret(self, connection_id: str) -> Dict[str, Any]:
+        return self.provider_secrets.get(connection_id, {})

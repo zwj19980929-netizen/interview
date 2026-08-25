@@ -138,7 +138,7 @@ class _SQLiteTransactionBackend(TransactionBackend):
 
     def get_secret(self, organization_id: str, item_id: str) -> Document:
         row = self.connection.execute(
-            "SELECT data FROM provider_secrets WHERE provider_config_id = ?",
+            "SELECT data FROM provider_secrets WHERE provider_connection_id = ?",
             (item_id,),
         ).fetchone()
         return json.loads(row["data"]) if row else {}
@@ -146,9 +146,9 @@ class _SQLiteTransactionBackend(TransactionBackend):
     def replace_secret(self, organization_id: str, item_id: str, secret: Document) -> None:
         self.connection.execute(
             """
-            INSERT INTO provider_secrets(provider_config_id, data, updated_at)
+            INSERT INTO provider_secrets(provider_connection_id, data, updated_at)
             VALUES (?, ?, datetime('now'))
-            ON CONFLICT(provider_config_id)
+            ON CONFLICT(provider_connection_id)
             DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at
             """,
             (item_id, json.dumps(secret, ensure_ascii=False)),

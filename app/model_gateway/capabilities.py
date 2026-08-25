@@ -7,6 +7,13 @@ TTS_SYNTHESIZE = "tts.synthesize"
 AVATAR_SPEAK = "avatar.speak"
 MODERATION_TEXT = "moderation.text"
 
+MODEL_TYPE_LLM = "llm"
+MODEL_TYPE_EMBEDDING = "embedding"
+MODEL_TYPE_STT = "stt"
+MODEL_TYPE_TTS = "tts"
+MODEL_TYPE_AVATAR = "avatar"
+MODEL_TYPE_MODERATION = "moderation"
+
 ALL_CAPABILITIES = {
     LLM_CHAT_JSON,
     LLM_CHAT_TEXT,
@@ -18,3 +25,17 @@ ALL_CAPABILITIES = {
     MODERATION_TEXT,
 }
 
+MODEL_TYPE_CAPABILITIES = {
+    MODEL_TYPE_LLM: {LLM_CHAT_JSON, LLM_CHAT_TEXT},
+    MODEL_TYPE_EMBEDDING: {EMBEDDING_TEXT},
+    MODEL_TYPE_STT: {STT_STREAMING, STT_BATCH},
+    MODEL_TYPE_TTS: {TTS_SYNTHESIZE},
+    MODEL_TYPE_AVATAR: {AVATAR_SPEAK},
+    MODEL_TYPE_MODERATION: {MODERATION_TEXT},
+}
+
+CAPABILITY_MODEL_TYPES = {
+    capability: model_type
+    for model_type, capabilities in MODEL_TYPE_CAPABILITIES.items()
+    for capability in capabilities
+}

@@ -30,20 +30,22 @@ class InMemoryStore:
         self.reports: Dict[str, Dict[str, Any]] = {}
         self.outbox_work_items: Dict[str, Dict[str, Any]] = {}
         self.provider_secrets: Dict[str, Dict[str, Any]] = {}
-        self.provider_configs: Dict[str, Dict[str, Any]] = {
-            "mpc_mock": {
-                "id": "mpc_mock",
+        self.provider_connections: Dict[str, Dict[str, Any]] = {
+            "provider_conn_mock": {
+                "id": "provider_conn_mock",
                 "organization_id": "org_default",
                 "provider_id": "mock",
                 "display_name": "Mock Provider",
                 "enabled": True,
-                "config": {},
+                "connection_config": {},
+                "credential_status": "valid",
                 "credential_ref": "secret://mock",
                 "version": 1,
                 "created_at": utc_now(),
                 "updated_at": utc_now(),
             }
         }
+        self.model_configurations: Dict[str, Dict[str, Any]] = {}
         self.model_routes: Dict[str, Dict[str, Any]] = {}
         self.model_circuit_states: Dict[str, Dict[str, Any]] = {}
         self.model_invocations: List[Dict[str, Any]] = []
@@ -58,11 +60,11 @@ class InMemoryStore:
     def save_many(self, collection: str, items: List[Dict[str, Any]]) -> None:
         return None
 
-    def save_provider_secret(self, config_id: str, credentials: Dict[str, Any]) -> None:
-        self.provider_secrets[config_id] = credentials
+    def save_provider_secret(self, connection_id: str, credentials: Dict[str, Any]) -> None:
+        self.provider_secrets[connection_id] = credentials
 
-    def get_provider_secret(self, config_id: str) -> Dict[str, Any]:
-        return self.provider_secrets.get(config_id, {})
+    def get_provider_secret(self, connection_id: str) -> Dict[str, Any]:
+        return self.provider_secrets.get(connection_id, {})
 
     def add_model_invocation(self, item: Dict[str, Any]) -> None:
         self.model_invocations.append(item)

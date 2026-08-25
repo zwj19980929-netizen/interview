@@ -11,7 +11,8 @@ const state = {
   plans: [],
   interviews: [],
   catalog: [],
-  providerConfigs: [],
+  providerConnections: [],
+  modelConfigurations: [],
   routes: [],
   questionResults: null,
   selectedInterview: null,
@@ -168,12 +169,13 @@ async function loadRouteData() {
 }
 
 async function loadWorkspace() {
-  const [roles, plans, interviews, catalog, providerConfigs, routes, positions, candidates, appointments] = await Promise.all([
+  const [roles, plans, interviews, catalog, providerConnections, modelConfigurations, routes, positions, candidates, appointments] = await Promise.all([
     api(`${API}/role-requirements`),
     api(`${API}/interview-plans`),
     api(`${API}/interviews`),
     api(`${API}/admin/model-providers/catalog`),
-    api(`${API}/admin/model-provider-configs`),
+    api(`${API}/admin/model-provider-connections`),
+    api(`${API}/admin/model-configurations`),
     api(`${API}/admin/model-routes`),
     api(`${API}/job-positions`),
     api(`${API}/candidate-profiles`),
@@ -183,7 +185,8 @@ async function loadWorkspace() {
   state.plans = newestFirst(plans.items);
   state.interviews = newestFirst(interviews.items);
   state.catalog = catalog.items;
-  state.providerConfigs = newestFirst(providerConfigs.items);
+  state.providerConnections = newestFirst(providerConnections.items);
+  state.modelConfigurations = newestFirst(modelConfigurations.items);
   state.routes = newestFirst(routes.items);
   state.positions = newestFirst(positions.items);
   state.candidates = newestFirst(candidates.items);
@@ -213,7 +216,8 @@ async function refreshCollection(name) {
     roles: `${API}/role-requirements`,
     plans: `${API}/interview-plans`,
     interviews: `${API}/interviews`,
-    providerConfigs: `${API}/admin/model-provider-configs`,
+    providerConnections: `${API}/admin/model-provider-connections`,
+    modelConfigurations: `${API}/admin/model-configurations`,
     routes: `${API}/admin/model-routes`,
   };
   const data = await api(endpoints[name]);
@@ -710,12 +714,14 @@ function renderCandidateCompletion(interview) {
 }
 
 function renderModels() {
+  const readyModels = state.modelConfigurations.filter((item) => item.enabled && item.status === "ready");
   return `
     <section class="page-header">
-      <div><h1>模型服务</h1><p>Provider 插件、组织配置与能力路由</p></div>
+      <div><h1>模型服务</h1><p>先连接模型厂商，再按模型类型配置具体模型</p></div>
       <div class="page-actions">
-        <button class="button button-secondary" type="button" data-action="create-route" ${state.providerConfigs.length ? "" : "disabled"}><i data-lucide="route" aria-hidden="true"></i>添加路由</button>
-        <button class="button button-primary" type="button" data-action="create-provider"><i data-lucide="plug-zap" aria-hidden="true"></i>添加配置</button>
+        <button class="button button-secondary" type="button" data-action="create-route" ${readyModels.length ? "" : "disabled"}><i data-lucide="route" aria-hidden="true"></i>添加路由</button>
+        <button class="button button-secondary" type="button" data-action="create-model" ${state.providerConnections.length ? "" : "disabled"}><i data-lucide="brain-circuit" aria-hidden="true"></i>添加模型</button>
+        <button class="button button-primary" type="button" data-action="create-provider"><i data-lucide="plug-zap" aria-hidden="true"></i>添加厂商连接</button>
       </div>
     </section>
 
@@ -725,8 +731,13 @@ function renderModels() {
     </section>
 
     <section class="section-block">
-      <div class="section-title-row"><div><h2>组织配置</h2><p>凭证仅显示引用地址</p></div></div>
-      ${state.providerConfigs.length ? providerConfigTable() : emptyState("plug", "暂无 Provider 配置", "当前组织没有模型配置")}
+      <div class="section-title-row"><div><h2>厂商连接</h2><p>API Key 只写入密钥库，页面仅显示凭证状态</p></div></div>
+      ${state.providerConnections.length ? providerConnectionTable() : emptyState("plug", "暂无厂商连接", "先连接一个已安装的 Provider 插件")}
+    </section>
+
+    <section class="section-block">
+      <div class="section-title-row"><div><h2>模型配置</h2><p>LLM、Embedding、TTS 等模型分别配置</p></div></div>
+      ${state.modelConfigurations.length ? modelConfigurationTable() : emptyState("brain-circuit", "暂无模型配置", "在厂商连接下添加一个具体模型")}
     </section>
 
     <section class="section-block">
@@ -829,14 +840,19 @@ function providerCard(provider) {
   return `<article class="provider-card"><div class="provider-card-head"><div><h3>${escapeHtml(provider.display_name)}</h3><span class="mono">${escapeHtml(provider.provider_id)}</span></div><span class="status-badge ${provider.implemented ? "" : "status-draft"}">${provider.implemented ? "可调用" : "待实现"}</span></div><p>${escapeHtml(descriptions[provider.provider_id] || "Provider 插件清单已安装，真实调用尚未接入。")}<span class="muted">${escapeHtml(modelSummary)}</span></p><div class="provider-capabilities">${(provider.capabilities || []).slice(0, 4).map(tag).join("")}${provider.capabilities.length > 4 ? `<span class="tag">+${provider.capabilities.length - 4}</span>` : ""}</div></article>`;
 }
 
-function providerConfigTable() {
-  return `<div class="data-table-wrap"><table class="data-table"><thead><tr><th>配置名称</th><th>Provider</th><th>状态</th><th>凭证引用</th><th class="text-right">操作</th></tr></thead><tbody>${state.providerConfigs.map((config) => `<tr><td><span class="cell-title">${escapeHtml(config.display_name)}</span><span class="cell-subtitle">${formatDate(config.updated_at)}</span></td><td class="mono">${escapeHtml(config.provider_id)}</td><td><span class="status-badge ${config.enabled ? "" : "status-draft"}">${config.enabled ? "已启用" : "已停用"}</span></td><td class="mono">${escapeHtml(config.credential_ref || "-")}</td><td><div class="table-actions"><button class="button button-secondary button-small" type="button" data-action="edit-provider" data-id="${escapeHtml(config.id)}"><i data-lucide="settings-2" aria-hidden="true"></i>编辑</button><button class="button button-secondary button-small" type="button" data-action="test-provider" data-id="${escapeHtml(config.id)}"><i data-lucide="flask-conical" aria-hidden="true"></i>测试</button></div></td></tr>`).join("")}</tbody></table></div>`;
+function providerConnectionTable() {
+  return `<div class="data-table-wrap"><table class="data-table"><thead><tr><th>连接名称</th><th>Provider</th><th>状态</th><th>凭证</th><th class="text-right">操作</th></tr></thead><tbody>${state.providerConnections.map((connection) => `<tr><td><span class="cell-title">${escapeHtml(connection.display_name)}</span><span class="cell-subtitle">${formatDate(connection.updated_at)}</span></td><td class="mono">${escapeHtml(connection.provider_id)}</td><td><span class="status-badge ${connection.enabled ? "" : "status-draft"}">${connection.enabled ? "已启用" : "已停用"}</span></td><td>${escapeHtml(connection.credential_status || "missing")}</td><td><div class="table-actions"><button class="button button-secondary button-small" type="button" data-action="edit-provider" data-id="${escapeHtml(connection.id)}"><i data-lucide="settings-2" aria-hidden="true"></i>编辑</button><button class="button button-secondary button-small" type="button" data-action="validate-provider" data-id="${escapeHtml(connection.id)}"><i data-lucide="shield-check" aria-hidden="true"></i>校验</button></div></td></tr>`).join("")}</tbody></table></div>`;
+}
+
+function modelConfigurationTable() {
+  return `<div class="data-table-wrap"><table class="data-table"><thead><tr><th>模型名称</th><th>类型</th><th>厂商模型 ID</th><th>状态</th><th class="text-right">操作</th></tr></thead><tbody>${state.modelConfigurations.map((model) => `<tr><td><span class="cell-title">${escapeHtml(model.display_name)}</span><span class="cell-subtitle">${escapeHtml(model.provider_connection_id)}</span></td><td>${escapeHtml(model.model_type)}</td><td class="mono">${escapeHtml(model.provider_model_id)}</td><td><span class="status-badge status-${escapeHtml(model.status)}">${statusLabel(model.status)}</span></td><td><div class="table-actions"><button class="button button-secondary button-small" type="button" data-action="edit-model" data-id="${escapeHtml(model.id)}"><i data-lucide="settings-2" aria-hidden="true"></i>编辑</button><button class="button button-secondary button-small" type="button" data-action="test-model" data-id="${escapeHtml(model.id)}"><i data-lucide="flask-conical" aria-hidden="true"></i>测试</button></div></td></tr>`).join("")}</tbody></table></div>`;
 }
 
 function routeTable() {
   return `<div class="data-table-wrap"><table class="data-table"><thead><tr><th>用途</th><th>能力</th><th>主配置</th><th>模型</th><th class="text-right">操作</th></tr></thead><tbody>${state.routes.map((route) => {
-    const config = state.providerConfigs.find((item) => item.id === route.primary?.provider_config_id);
-    return `<tr><td><span class="cell-title">${escapeHtml(route.purpose)}</span></td><td class="mono">${escapeHtml(route.capability)}</td><td>${escapeHtml(config?.display_name || route.primary?.provider_config_id || "-")}</td><td class="mono">${escapeHtml(route.primary?.model || "默认模型")}</td><td><div class="table-actions"><button class="button button-secondary button-small" type="button" data-action="test-route" data-id="${escapeHtml(route.id)}"><i data-lucide="flask-conical" aria-hidden="true"></i>测试</button></div></td></tr>`;
+    const model = state.modelConfigurations.find((item) => item.id === route.primary?.model_configuration_id);
+    const connection = state.providerConnections.find((item) => item.id === model?.provider_connection_id);
+    return `<tr><td><span class="cell-title">${escapeHtml(route.purpose)}</span></td><td class="mono">${escapeHtml(route.capability)}</td><td>${escapeHtml(connection?.display_name || "-")}</td><td class="mono">${escapeHtml(model?.display_name || route.primary?.model_configuration_id || "-")}</td><td><div class="table-actions"><button class="button button-secondary button-small" type="button" data-action="test-route" data-id="${escapeHtml(route.id)}"><i data-lucide="flask-conical" aria-hidden="true"></i>测试</button></div></td></tr>`;
   }).join("")}</tbody></table></div>`;
 }
 
@@ -916,8 +932,10 @@ async function handleContentAction(event) {
     "approve-plan": () => approvePlan(id, button),
     "create-interview": openAppointmentModal,
     "create-provider": openProviderModal,
+    "create-model": () => openModelModal(),
     "create-route": openRouteModal,
     "edit-provider": () => openProviderEditModal(id),
+    "edit-model": () => openModelModal(id),
     "go-questions": () => navigate("questions"),
     "go-interviews": () => navigate("interviews"),
     "clear-search": () => { state.questionResults = null; render(); },
@@ -929,7 +947,8 @@ async function handleContentAction(event) {
     "cancel-interview": () => controlInterview(id, "cancel", "interviewer cancelled", button),
     "complete-interview": () => completeInterview(id, button),
     "refresh-interviews": refreshInterviews,
-    "test-provider": () => openProviderTestModal(id),
+    "validate-provider": () => validateProviderConnection(id, button),
+    "test-model": () => testModelConfiguration(id, button),
     "test-route": () => testRoute(id, button),
     "candidate-enable-media": enableCandidateMedia,
     "candidate-toggle-audio": toggleCandidateAudio,
@@ -1815,180 +1834,145 @@ async function refreshInterviews() {
   }
 }
 
+function schemaFields(schema) {
+  return schema?.fields || [];
+}
+
+function schemaForm(schema, values = {}, prefix = "schema") {
+  return schemaFields(schema).map((item) => {
+    const name = `${prefix}__${item.name}`;
+    const raw = values[item.name] ?? item.default ?? "";
+    const required = item.required && !(item.control === "secret" && values.__configured) ? "required" : "";
+    let control;
+    if (item.control === "select") {
+      control = `<select class="form-select" name="${escapeHtml(name)}" ${required}>${(item.options || []).map((option) => `<option value="${escapeHtml(option.value)}" ${String(raw) === String(option.value) ? "selected" : ""}>${escapeHtml(option.label)}</option>`).join("")}</select>`;
+    } else if (item.control === "switch") {
+      control = `<select class="form-select" name="${escapeHtml(name)}"><option value="false" ${raw ? "" : "selected"}>否</option><option value="true" ${raw ? "selected" : ""}>是</option></select>`;
+    } else if (item.control === "textarea" || item.control === "key_value") {
+      const value = item.control === "key_value" && typeof raw === "object" ? JSON.stringify(raw, null, 2) : raw;
+      control = `<textarea class="form-input" name="${escapeHtml(name)}" ${required} placeholder="${item.control === "key_value" ? "JSON 对象" : escapeHtml(item.placeholder || "")}">${escapeHtml(value)}</textarea>`;
+    } else {
+      const type = item.control === "secret" ? "password" : item.control === "number" ? "number" : "text";
+      control = `<input class="form-input" name="${escapeHtml(name)}" type="${type}" value="${item.control === "secret" ? "" : escapeHtml(raw)}" ${required} ${item.min !== undefined ? `min="${item.min}"` : ""} ${item.max !== undefined ? `max="${item.max}"` : ""} placeholder="${escapeHtml(item.control === "secret" && values.__configured ? "留空则保留现有密钥" : item.placeholder || "")}" />`;
+    }
+    return field(item.label, control, false, item.help || "");
+  }).join("");
+}
+
+function readSchemaForm(form, schema, prefix, { omitBlankSecrets = false } = {}) {
+  const data = new FormData(form);
+  const result = {};
+  for (const item of schemaFields(schema)) {
+    const raw = data.get(`${prefix}__${item.name}`);
+    if (item.control === "secret" && omitBlankSecrets && !raw) continue;
+    if (raw === "" && !item.required) continue;
+    if (item.control === "number") result[item.name] = Number(raw);
+    else if (item.control === "switch") result[item.name] = raw === "true";
+    else if (item.control === "tags") result[item.name] = String(raw || "").split(",").map((value) => value.trim()).filter(Boolean);
+    else if (item.control === "key_value") result[item.name] = raw ? JSON.parse(raw) : {};
+    else result[item.name] = raw;
+  }
+  return result;
+}
+
 function openProviderModal() {
   const implemented = state.catalog.filter((item) => item.implemented);
-  const initialDefaults = implemented[0]?.defaults || {};
-  openModal("添加 Provider 配置", `
+  if (!implemented.length) return;
+  const renderForm = (provider) => `
     <form id="provider-create-form"><div class="form-grid">
-      ${field("Provider", `<select class="form-select" name="provider_id">${implemented.map((item) => `<option value="${escapeHtml(item.provider_id)}">${escapeHtml(item.display_name)}</option>`).join("")}</select>`)}
-      ${field("配置名称", `<input class="form-input" name="display_name" value="开发模型" required />`)}
-      ${field("Base URL", `<input class="form-input" name="base_url" value="${escapeHtml(initialDefaults.base_url || "")}" placeholder="由 Provider manifest 提供默认值" />`, true)}
-      ${field("TTS Endpoint", `<input class="form-input" name="tts_endpoint" value="${escapeHtml(initialDefaults.tts_endpoint || "")}" placeholder="可选；DashScope 非标准地域或专属空间使用" />`, true)}
-      ${field("默认音色", `<input class="form-input" name="default_voice" value="${escapeHtml(initialDefaults.default_voice || "")}" placeholder="如 alloy、Cherry、longanyang" />`)}
-      ${field("使用环境代理", `<select class="form-select" name="use_environment_proxy"><option value="false">否（推荐）</option><option value="true">是</option></select>`, false, "仅显式启用时读取 HTTP_PROXY/ALL_PROXY。")}
-      ${field("API Key", `<input class="form-input" name="api_key" type="password" autocomplete="new-password" />`)}
-      ${field("能力测试", `<span class="field-hint">保存后点击“测试”，分别选择 LLM、Embedding 或 TTS 及对应模型。</span>`, true)}
-    </div></form>`, {
-      submitLabel: "保存配置",
-      submitIcon: "save",
-      onSubmit: createProvider,
-      formId: "provider-create-form",
-    });
-  const form = modalRoot.querySelector("#provider-create-form");
-  form?.elements.provider_id?.addEventListener("change", () => applyProviderManifestDefaults(form));
+      ${field("Provider", `<select class="form-select" name="provider_id">${implemented.map((item) => `<option value="${escapeHtml(item.provider_id)}" ${item.provider_id === provider.provider_id ? "selected" : ""}>${escapeHtml(item.display_name)}</option>`).join("")}</select>`)}
+      ${field("连接名称", `<input class="form-input" name="display_name" value="${escapeHtml(provider.display_name)}" required />`)}
+      ${schemaForm(provider.connection_form, {}, "connection")}
+      ${schemaForm(provider.credential_form, {}, "credential")}
+    </div></form>`;
+  const show = (provider) => {
+    openModal("添加厂商连接", renderForm(provider), { submitLabel: "保存连接", submitIcon: "save", onSubmit: (form, submit) => createProviderConnection(provider, form, submit), formId: "provider-create-form" });
+    modalRoot.querySelector('[name="provider_id"]')?.addEventListener("change", (event) => show(implemented.find((item) => item.provider_id === event.target.value)));
+  };
+  show(implemented[0]);
 }
 
-function applyProviderManifestDefaults(form) {
-  const provider = state.catalog.find((item) => item.provider_id === form.elements.provider_id.value);
-  const defaults = provider?.defaults || {};
-  for (const fieldName of ["base_url", "tts_endpoint", "default_voice"]) {
-    if (form.elements[fieldName]) form.elements[fieldName].value = defaults[fieldName] || "";
-  }
-  if (form.elements.use_environment_proxy) {
-    form.elements.use_environment_proxy.value = String(Boolean(defaults.use_environment_proxy));
-  }
-}
-
-async function createProvider(form, submit) {
+async function createProviderConnection(provider, form, submit) {
   const data = new FormData(form);
-  const config = {};
-  if (data.get("base_url")) config.base_url = data.get("base_url");
-  if (data.get("tts_endpoint")) config.tts_endpoint = data.get("tts_endpoint");
-  if (data.get("default_voice")) config.default_voice = data.get("default_voice");
-  config.use_environment_proxy = data.get("use_environment_proxy") === "true";
   setBusy(submit, true, "保存中");
-  const item = await api(`${API}/admin/model-provider-configs`, {
-    method: "POST",
-    body: {
-      provider_id: data.get("provider_id"),
-      display_name: data.get("display_name"),
-      enabled: true,
-      config,
-      credentials: data.get("api_key") ? { api_key: data.get("api_key") } : {},
-    },
-  });
-  await refreshCollection("providerConfigs");
-  closeModal();
-  render();
-  toast("配置已保存", item.display_name);
+  const item = await api(`${API}/admin/model-provider-connections`, { method: "POST", body: { provider_id: provider.provider_id, display_name: data.get("display_name"), enabled: true, connection_config: readSchemaForm(form, provider.connection_form, "connection"), credentials: readSchemaForm(form, provider.credential_form, "credential") } });
+  await refreshCollection("providerConnections");
+  closeModal(); render(); toast("厂商连接已保存", item.display_name);
 }
 
 function openProviderEditModal(id) {
-  const config = state.providerConfigs.find((item) => item.id === id);
-  if (!config) return;
-  const provider = state.catalog.find((item) => item.provider_id === config.provider_id);
-  const values = config.config || {};
-  openModal("编辑 Provider 配置", `
-    <form id="provider-edit-form"><div class="form-grid">
-      ${field("Provider", `<input class="form-input" value="${escapeHtml(provider?.display_name || config.provider_id)}" disabled />`)}
-      ${field("状态", `<select class="form-select" name="enabled"><option value="true" ${config.enabled ? "selected" : ""}>已启用</option><option value="false" ${config.enabled ? "" : "selected"}>已停用</option></select>`)}
-      ${field("配置名称", `<input class="form-input" name="display_name" value="${escapeHtml(config.display_name)}" required />`, true)}
-      ${field("Base URL", `<input class="form-input" name="base_url" value="${escapeHtml(values.base_url || "")}" required />`, true)}
-      ${field("TTS Endpoint", `<input class="form-input" name="tts_endpoint" value="${escapeHtml(values.tts_endpoint || "")}" placeholder="可选" />`, true)}
-      ${field("默认音色", `<input class="form-input" name="default_voice" value="${escapeHtml(values.default_voice || "")}" placeholder="如 tongtong、Cherry、alloy" />`)}
-      ${field("使用环境代理", `<select class="form-select" name="use_environment_proxy"><option value="false" ${values.use_environment_proxy ? "" : "selected"}>否（推荐）</option><option value="true" ${values.use_environment_proxy ? "selected" : ""}>是</option></select>`, false, "启用 SOCKS 代理时运行环境必须安装对应 transport。")}
-      ${field("替换 API Key", `<input class="form-input" name="api_key" type="password" autocomplete="new-password" placeholder="留空则保留现有密钥" />`, true)}
-    </div></form>`, {
-      submitLabel: "保存修改",
-      submitIcon: "save",
-      onSubmit: (form, submit) => updateProvider(config, form, submit),
-      formId: "provider-edit-form",
-    });
+  const connection = state.providerConnections.find((item) => item.id === id);
+  const provider = state.catalog.find((item) => item.provider_id === connection?.provider_id);
+  if (!connection || !provider) return;
+  openModal("编辑厂商连接", `<form id="provider-edit-form"><div class="form-grid">${field("Provider", `<input class="form-input" value="${escapeHtml(provider.display_name)}" disabled />`)}${field("连接名称", `<input class="form-input" name="display_name" value="${escapeHtml(connection.display_name)}" required />`)}${field("状态", `<select class="form-select" name="enabled"><option value="true" ${connection.enabled ? "selected" : ""}>已启用</option><option value="false" ${connection.enabled ? "" : "selected"}>已停用</option></select>`)}${schemaForm(provider.connection_form, connection.connection_config, "connection")}${schemaForm(provider.credential_form, { __configured: true }, "credential")}</div></form>`, { submitLabel: "保存修改", onSubmit: (form, submit) => updateProviderConnection(connection, provider, form, submit), formId: "provider-edit-form" });
 }
 
-async function updateProvider(current, form, submit) {
+async function updateProviderConnection(current, provider, form, submit) {
   const data = new FormData(form);
-  const config = { ...(current.config || {}) };
-  config.base_url = String(data.get("base_url") || "").trim();
-  config.use_environment_proxy = data.get("use_environment_proxy") === "true";
-  for (const fieldName of ["tts_endpoint", "default_voice"]) {
-    const value = String(data.get(fieldName) || "").trim();
-    if (value) config[fieldName] = value;
-    else delete config[fieldName];
-  }
-  const body = {
-    expected_version: current.version,
-    display_name: data.get("display_name"),
-    enabled: data.get("enabled") === "true",
-    config,
-  };
-  if (data.get("api_key")) body.credentials = { api_key: data.get("api_key") };
+  const credentials = readSchemaForm(form, provider.credential_form, "credential", { omitBlankSecrets: true });
+  const body = { expected_version: current.version, display_name: data.get("display_name"), enabled: data.get("enabled") === "true", connection_config: readSchemaForm(form, provider.connection_form, "connection") };
+  if (Object.keys(credentials).length) body.credentials = credentials;
   setBusy(submit, true, "保存中");
-  const item = await api(`${API}/admin/model-provider-configs/${encodeURIComponent(current.id)}`, {
-    method: "PATCH",
-    body,
-  });
-  await refreshCollection("providerConfigs");
-  closeModal();
-  render();
-  toast("配置已更新", item.display_name);
+  const item = await api(`${API}/admin/model-provider-connections/${encodeURIComponent(current.id)}`, { method: "PATCH", body });
+  await refreshCollection("providerConnections"); closeModal(); render(); toast("厂商连接已更新", item.display_name);
 }
 
-function openProviderTestModal(id) {
-  const config = state.providerConfigs.find((item) => item.id === id);
-  const provider = state.catalog.find((item) => item.provider_id === config?.provider_id);
-  if (!config || !provider) return;
-  const supported = ["llm.chat_json", "llm.chat_text", "embedding.text", "tts.synthesize", "stt.batch", "avatar.speak"];
-  const capabilities = (provider.capabilities || []).filter((item) => supported.includes(item));
-  if (!capabilities.length) {
-    toast("暂时无法测试", "该 Provider 没有统一连接测试协议", "error");
-    return;
+async function validateProviderConnection(id, button) {
+  setBusy(button, true, "校验中");
+  try { const item = await api(`${API}/admin/model-provider-connections/${encodeURIComponent(id)}/validate`, { method: "POST" }); await refreshCollection("providerConnections"); render(); toast("连接字段有效", item.last_validation?.message || item.credential_status); }
+  catch (error) { toast("连接校验失败", error.message, "error"); }
+  finally { setBusy(button, false); }
+}
+
+async function openModelModal(id = null) {
+  const current = state.modelConfigurations.find((item) => item.id === id);
+  const connections = state.providerConnections.filter((item) => item.enabled);
+  if (!connections.length) return;
+  const initialConnection = current ? connections.find((item) => item.id === current.provider_connection_id) : connections[0];
+  const catalog = await api(`${API}/admin/model-provider-connections/${encodeURIComponent(initialConnection.id)}/model-catalog`);
+  showModelModal(current, connections, initialConnection, catalog);
+}
+
+function showModelModal(current, connections, connection, catalog, desiredModelId = null, desiredModelType = null) {
+  const modelType = current?.model_type || desiredModelType || Object.keys(catalog.model_types || {})[0];
+  const typeDefinition = catalog.model_types[modelType];
+  const models = (catalog.models || []).filter((item) => item.model_type === modelType);
+  const selected = models.find((item) => item.model_id === (current?.provider_model_id || desiredModelId)) || models.find((item) => item.default) || models[0];
+  const predefined = typeDefinition.selection_mode === "predefined";
+  const modelControl = predefined
+    ? `<select class="form-select" name="provider_model_id">${models.map((item) => `<option value="${escapeHtml(item.model_id)}" ${item.model_id === selected?.model_id ? "selected" : ""}>${escapeHtml(item.label || item.model_id)}</option>`).join("")}</select>`
+    : `<input class="form-input" name="provider_model_id" value="${escapeHtml(current?.provider_model_id || selected?.model_id || "")}" required />`;
+  const configurationForm = selected?.configuration_form || typeDefinition.configuration_form || { fields: [] };
+  const parameterForm = catalog.parameter_forms?.[modelType] || { fields: [] };
+  openModal(current ? "编辑模型配置" : "添加模型配置", `<form id="model-config-form"><div class="form-grid">${field("厂商连接", `<select class="form-select" name="provider_connection_id" ${current ? "disabled" : ""}>${connections.map((item) => `<option value="${escapeHtml(item.id)}" ${item.id === connection.id ? "selected" : ""}>${escapeHtml(item.display_name)}</option>`).join("")}</select>`)}${field("模型类型", `<select class="form-select" name="model_type" ${current ? "disabled" : ""}>${Object.entries(catalog.model_types || {}).map(([key, value]) => `<option value="${escapeHtml(key)}" ${key === modelType ? "selected" : ""}>${escapeHtml(value.label || key)}</option>`).join("")}</select>`)}${field("厂商模型 ID", modelControl)}${field("显示名称", `<input class="form-input" name="display_name" value="${escapeHtml(current?.display_name || selected?.label || "")}" required />`)}${field("状态", `<select class="form-select" name="enabled"><option value="true" ${current?.enabled === false ? "" : "selected"}>已启用</option><option value="false" ${current?.enabled === false ? "selected" : ""}>已停用</option></select>`)}${schemaForm(configurationForm, current?.settings || {}, "settings")}${schemaForm(parameterForm, current?.default_parameters || {}, "parameters")}</div></form>`, { submitLabel: current ? "保存修改" : "保存模型", onSubmit: (form, submit) => saveModelConfiguration(current, configurationForm, parameterForm, form, submit), formId: "model-config-form" });
+  const form = modalRoot.querySelector("#model-config-form");
+  if (!current) {
+    form.elements.provider_connection_id.addEventListener("change", async (event) => { const next = connections.find((item) => item.id === event.target.value); showModelModal(null, connections, next, await api(`${API}/admin/model-provider-connections/${encodeURIComponent(next.id)}/model-catalog`)); });
+    form.elements.model_type.addEventListener("change", (event) => showModelModal(null, connections, connection, catalog, null, event.target.value));
+    if (predefined) form.elements.provider_model_id.addEventListener("change", (event) => showModelModal(null, connections, connection, catalog, event.target.value, modelType));
   }
-  const capability = capabilities[0];
-  const models = providerModelsForCapability(provider, capability);
-  const model = providerTestModel(config, provider, capability);
-  openModal("测试 Provider 能力", `
-    <form id="provider-test-form"><div class="form-grid">
-      ${field("Provider", `<input class="form-input" value="${escapeHtml(config.display_name)}" disabled />`)}
-      ${field("能力", `<select class="form-select" name="capability">${capabilities.map((item) => `<option value="${escapeHtml(item)}">${escapeHtml(item)}</option>`).join("")}</select>`)}
-      ${field("模型 ID", `<input class="form-input" name="model" list="provider-test-model-options" value="${escapeHtml(model || "")}" required /><datalist id="provider-test-model-options">${models.map((item) => `<option value="${escapeHtml(item.model_id)}">${escapeHtml(item.label || item.model_id)}</option>`).join("")}</datalist>`, true, "模型必须属于所选能力；例如 GLM LLM 用 glm-5.2，TTS 用 glm-tts。")}
-    </div></form>`, {
-      submitLabel: "开始测试",
-      submitIcon: "flask-conical",
-      onSubmit: (form, submit) => testProvider(config.id, form, submit),
-      formId: "provider-test-form",
-      small: true,
-    });
-  const form = modalRoot.querySelector("#provider-test-form");
-  form?.elements.capability?.addEventListener("change", () => applyProviderTestModelCatalog(config, provider, form));
 }
 
-function providerTestModel(config, provider, capability) {
-  const configured = config.config || {};
-  if (configured.test_models?.[capability]) return configured.test_models[capability];
-  const models = providerModelsForCapability(provider, capability);
-  if (configured.test_model && (!(provider.models || []).length || models.some((item) => item.model_id === configured.test_model))) {
-    return configured.test_model;
-  }
-  return preferredProviderModel(models)?.model_id || "";
-}
-
-function applyProviderTestModelCatalog(config, provider, form) {
-  const capability = form.elements.capability.value;
-  const models = providerModelsForCapability(provider, capability);
-  form.elements.model.value = providerTestModel(config, provider, capability);
-  const options = modalRoot.querySelector("#provider-test-model-options");
-  if (options) options.innerHTML = models.map((item) => `<option value="${escapeHtml(item.model_id)}">${escapeHtml(item.label || item.model_id)}</option>`).join("");
+async function saveModelConfiguration(current, configurationForm, parameterForm, form, submit) {
+  const data = new FormData(form);
+  const body = { display_name: data.get("display_name"), enabled: data.get("enabled") === "true", settings: readSchemaForm(form, configurationForm, "settings"), default_parameters: readSchemaForm(form, parameterForm, "parameters") };
+  let item;
+  setBusy(submit, true, "保存中");
+  if (current) item = await api(`${API}/admin/model-configurations/${encodeURIComponent(current.id)}`, { method: "PATCH", body: { ...body, expected_version: current.version } });
+  else item = await api(`${API}/admin/model-configurations`, { method: "POST", body: { ...body, provider_connection_id: data.get("provider_connection_id"), model_type: data.get("model_type"), provider_model_id: data.get("provider_model_id") } });
+  await refreshCollection("modelConfigurations"); closeModal(); render(); toast("模型配置已保存", item.display_name);
 }
 
 function openRouteModal() {
-  if (!state.providerConfigs.length) return;
-  const targets = state.providerConfigs.filter((config) => config.enabled).flatMap((config) => {
-    const provider = state.catalog.find((item) => item.provider_id === config.provider_id && item.implemented);
-    return (provider?.capabilities || []).map((capability) => ({ config, capability }));
-  });
+  const targets = state.modelConfigurations.filter((model) => model.enabled && model.status === "ready").flatMap((model) => (model.supported_capabilities || []).map((capability) => ({ model, capability })));
   if (!targets.length) {
     toast("暂时无法创建", "没有已启用且可调用的 Provider 配置", "error");
     return;
   }
-  const initialProvider = state.catalog.find((item) => item.provider_id === targets[0].config.provider_id);
-  const initialModels = providerModelsForCapability(initialProvider, targets[0].capability);
-  const initialModel = preferredProviderModel(initialModels);
   openModal("添加能力路由", `
     <form id="route-create-form"><div class="form-grid">
       ${field("调用用途", `<input class="form-input" name="purpose" value="answer_evaluation" required />`)}
-      ${field("Provider 与能力", `<select class="form-select" name="target">${targets.map(({ config, capability }) => `<option value="${escapeHtml(`${config.id}::${capability}`)}">${escapeHtml(config.display_name)} · ${escapeHtml(capability)}</option>`).join("")}</select>`, true)}
-      ${field("模型 ID", `<input class="form-input" name="model" list="route-model-options" value="${escapeHtml(initialModel?.model_id || "")}" placeholder="从 Provider 模型目录选择" required /><datalist id="route-model-options">${initialModels.map((item) => `<option value="${escapeHtml(item.model_id)}">${escapeHtml(item.label || item.model_id)}</option>`).join("")}</datalist>`)}
+      ${field("模型与能力", `<select class="form-select" name="target">${targets.map(({ model, capability }) => `<option value="${escapeHtml(`${model.id}::${capability}`)}">${escapeHtml(model.display_name)} · ${escapeHtml(capability)}</option>`).join("")}</select>`, true)}
       ${field("超时（秒）", `<input class="form-input" name="timeout_s" type="number" min="1" max="300" value="30" required />`)}
       ${field("重试次数", `<input class="form-input" name="retry_count" type="number" min="0" max="3" value="1" required />`)}
     </div></form>`, {
@@ -1998,36 +1982,12 @@ function openRouteModal() {
       formId: "route-create-form",
       small: true,
     });
-  const form = modalRoot.querySelector("#route-create-form");
-  form?.elements.target?.addEventListener("change", () => applyRouteModelCatalog(form));
-}
-
-function providerModelsForCapability(provider, capability) {
-  return (provider?.models || []).filter((item) => (item.capabilities || []).includes(capability));
-}
-
-function preferredProviderModel(models) {
-  return models.find((item) => item.default) || models[0] || null;
-}
-
-function applyRouteModelCatalog(form) {
-  const [providerConfigId, capability] = String(form.elements.target.value || "").split("::", 2);
-  const config = state.providerConfigs.find((item) => item.id === providerConfigId);
-  const provider = state.catalog.find((item) => item.provider_id === config?.provider_id);
-  const models = providerModelsForCapability(provider, capability);
-  const preferred = preferredProviderModel(models);
-  form.elements.model.value = preferred?.model_id || "";
-  form.elements.model.placeholder = provider?.model_selection === "predefined"
-    ? "请选择目录中的模型"
-    : "可选择目录模型或填写自定义模型 ID";
-  const options = modalRoot.querySelector("#route-model-options");
-  if (options) options.innerHTML = models.map((item) => `<option value="${escapeHtml(item.model_id)}">${escapeHtml(item.label || item.model_id)}</option>`).join("");
 }
 
 async function createRoute(form, submit) {
   const data = new FormData(form);
-  const [providerConfigId, capability] = String(data.get("target") || "").split("::", 2);
-  if (!providerConfigId || !capability) throw new Error("请选择有效的 Provider 与能力");
+  const [modelConfigurationId, capability] = String(data.get("target") || "").split("::", 2);
+  if (!modelConfigurationId || !capability) throw new Error("请选择有效的模型与能力");
   setBusy(submit, true, "保存中");
   const route = await api(`${API}/admin/model-routes`, {
     method: "POST",
@@ -2035,8 +1995,7 @@ async function createRoute(form, submit) {
       capability,
       purpose: data.get("purpose"),
       primary: {
-        provider_config_id: providerConfigId,
-        model: data.get("model"),
+        model_configuration_id: modelConfigurationId,
         timeout_s: Number(data.get("timeout_s")),
       },
       fallbacks: [],
@@ -2050,23 +2009,15 @@ async function createRoute(form, submit) {
   toast("路由已保存", `${route.purpose} · ${route.capability}`);
 }
 
-async function testProvider(id, form, submit) {
-  const data = new FormData(form);
-  setBusy(submit, true, "测试中");
+async function testModelConfiguration(id, button) {
+  setBusy(button, true, "测试中");
   try {
-    const result = await api(`${API}/admin/model-provider-configs/${encodeURIComponent(id)}/test`, {
-      method: "POST",
-      body: {
-        capability: data.get("capability"),
-        model: data.get("model"),
-      },
-    });
-    closeModal();
-    toast("Provider 可用", `${result.provider?.provider_id || "provider"} · ${result.latency_ms || result.provider?.latency_ms || 0} ms`);
+    const result = await api(`${API}/admin/model-configurations/${encodeURIComponent(id)}/test`, { method: "POST", body: {} });
+    await refreshCollection("modelConfigurations"); render(); toast("模型可用", `${result.provider?.model || "model"} · ${result.latency_ms || result.provider?.latency_ms || 0} ms`);
   } catch (error) {
-    toast("Provider 测试失败", error.message, "error");
+    toast("模型测试失败", error.message, "error");
   } finally {
-    setBusy(submit, false);
+    setBusy(button, false);
   }
 }
 

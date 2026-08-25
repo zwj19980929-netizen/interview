@@ -1,4 +1,5 @@
 {
+  "schema_version": "2",
   "provider_id": "deepseek",
   "display_name": "DeepSeek",
   "version": "1.0.0",
@@ -6,8 +7,28 @@
   "model_selection": "predefined",
   "defaults": {
     "base_url": "https://api.deepseek.com",
-    "test_model": "deepseek-chat",
     "use_environment_proxy": false
+  },
+  "connection_form": {
+    "schema_version": "2",
+    "fields": [
+      {"name": "base_url", "label": "Base URL", "control": "text", "required": true, "default": "https://api.deepseek.com"},
+      {"name": "use_environment_proxy", "label": "使用环境代理", "control": "switch", "required": false, "default": false}
+    ]
+  },
+  "credential_form": {
+    "schema_version": "2",
+    "fields": [
+      {"name": "api_key", "label": "API Key", "control": "secret", "required": true, "write_only": true}
+    ]
+  },
+  "model_types": {
+    "llm": {
+      "label": "大语言模型",
+      "selection_mode": "predefined",
+      "capabilities": ["llm.chat_json", "llm.chat_text"],
+      "configuration_form": {"fields": []}
+    }
   },
   "config_schema": {
     "type": "object",

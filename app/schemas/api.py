@@ -237,34 +237,58 @@ class AvatarSpeakCommand(BaseModel):
     voice: str = "default"
 
 
-class ProviderConfigCreate(BaseModel):
+class ProviderConnectionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     provider_id: str
     display_name: str
     enabled: bool = True
-    config: Dict[str, Any] = Field(default_factory=dict)
+    connection_config: Dict[str, Any] = Field(default_factory=dict)
     credentials: Dict[str, Any] = Field(default_factory=dict)
 
 
-class ProviderConfigPatch(BaseModel):
+class ProviderConnectionPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     expected_version: int
     display_name: Optional[str] = None
     enabled: Optional[bool] = None
-    config: Optional[Dict[str, Any]] = None
+    connection_config: Optional[Dict[str, Any]] = None
     credentials: Optional[Dict[str, Any]] = None
 
 
-class ProviderConfigTest(BaseModel):
+class ModelConfigurationCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider_connection_id: str = Field(min_length=1)
+    model_type: str = Field(min_length=1)
+    provider_model_id: str = Field(min_length=1)
+    display_name: str = Field(min_length=1)
+    settings: Dict[str, Any] = Field(default_factory=dict)
+    default_parameters: Dict[str, Any] = Field(default_factory=dict)
+    enabled: bool = True
+
+
+class ModelConfigurationPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int
+    display_name: Optional[str] = None
+    settings: Optional[Dict[str, Any]] = None
+    default_parameters: Optional[Dict[str, Any]] = None
+    enabled: Optional[bool] = None
+
+
+class ModelConfigurationTest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     capability: Optional[str] = Field(default=None, min_length=1)
-    model: Optional[str] = Field(default=None, min_length=1)
 
 
 class ModelRouteTarget(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    provider_config_id: str = Field(min_length=1)
-    model: str = Field(min_length=1)
+    model_configuration_id: str = Field(min_length=1)
     timeout_s: float = Field(default=20, gt=0, le=300)
     pricing: Dict[str, float] = Field(default_factory=dict)
 

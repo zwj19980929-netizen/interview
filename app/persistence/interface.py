@@ -281,14 +281,14 @@ class ProviderSecretRepository:
         self._organization_id = organization_id
         self._vault = ProviderSecretVault()
 
-    def get(self, provider_config_id: str) -> Document:
-        sealed = self._backend.get_secret(self._organization_id, provider_config_id)
+    def get(self, provider_connection_id: str) -> Document:
+        sealed = self._backend.get_secret(self._organization_id, provider_connection_id)
         return deepcopy(self._vault.open(sealed))
 
-    def replace(self, provider_config_id: str, credentials: Document) -> None:
+    def replace(self, provider_connection_id: str, credentials: Document) -> None:
         self._backend.replace_secret(
             self._organization_id,
-            provider_config_id,
+            provider_connection_id,
             self._vault.seal(deepcopy(credentials)),
         )
 
@@ -364,8 +364,11 @@ class PersistenceTransaction:
         self.interview_sessions = VersionedDocumentRepository(
             backend, organization_id, collection="interviews", entity_name="InterviewSession"
         )
-        self.provider_configs = VersionedDocumentRepository(
-            backend, organization_id, collection="provider_configs", entity_name="ModelProviderConfig"
+        self.provider_connections = VersionedDocumentRepository(
+            backend, organization_id, collection="provider_connections", entity_name="ProviderConnection"
+        )
+        self.model_configurations = VersionedDocumentRepository(
+            backend, organization_id, collection="model_configurations", entity_name="ModelConfiguration"
         )
         self.model_routes = VersionedDocumentRepository(
             backend, organization_id, collection="model_routes", entity_name="ModelRoute"

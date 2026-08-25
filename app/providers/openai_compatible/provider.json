@@ -1,30 +1,53 @@
 {
+  "schema_version": "2",
   "provider_id": "openai_compatible",
   "display_name": "OpenAI Compatible",
-  "version": "0.2.0",
+  "version": "2.0.0",
   "capabilities": ["llm.chat_json", "llm.chat_text", "embedding.text", "tts.synthesize"],
   "model_selection": "customizable",
-  "defaults": {},
-  "config_schema": {
-    "type": "object",
-    "required": ["base_url"],
-    "properties": {
-      "base_url": {"type": "string"},
-      "organization": {"type": "string"},
-      "test_model": {"type": "string"},
-      "test_models": {"type": "object"},
-      "use_environment_proxy": {"type": "boolean"},
-      "structured_output_mode": {"type": "string"},
-      "default_voice": {"type": "string"},
-      "voice_map": {"type": "object"},
-      "tts_instructions": {"type": "string"}
-    }
+  "defaults": {"use_environment_proxy": false},
+  "connection_form": {
+    "schema_version": "2",
+    "fields": [
+      {"name": "base_url", "label": "Base URL", "control": "text", "required": true, "placeholder": "https://api.example.com/v1"},
+      {"name": "organization", "label": "Organization", "control": "text", "required": false},
+      {"name": "use_environment_proxy", "label": "使用环境代理", "control": "switch", "required": false, "default": false, "help": "仅显式启用时读取 HTTP_PROXY/ALL_PROXY。"}
+    ]
   },
-  "credential_schema": {
-    "type": "object",
-    "required": ["api_key"],
-    "properties": {
-      "api_key": {"type": "string", "secret": true}
+  "credential_form": {
+    "schema_version": "2",
+    "fields": [
+      {"name": "api_key", "label": "API Key", "control": "secret", "required": true, "write_only": true}
+    ]
+  },
+  "model_types": {
+    "llm": {
+      "label": "大语言模型",
+      "selection_mode": "customizable",
+      "capabilities": ["llm.chat_json", "llm.chat_text"],
+      "configuration_form": {"fields": [
+        {"name": "structured_output_mode", "label": "结构化输出模式", "control": "select", "required": false, "default": "json_schema", "options": [
+          {"label": "JSON Schema", "value": "json_schema"}, {"label": "JSON Object", "value": "json_object"}, {"label": "Prompt 约束", "value": "prompt"}
+        ]}
+      ]}
+    },
+    "embedding": {
+      "label": "Embedding",
+      "selection_mode": "customizable",
+      "capabilities": ["embedding.text"],
+      "configuration_form": {"fields": [
+        {"name": "dimensions", "label": "期望向量维度", "control": "number", "required": false, "min": 1}
+      ]}
+    },
+    "tts": {
+      "label": "语音合成",
+      "selection_mode": "customizable",
+      "capabilities": ["tts.synthesize"],
+      "configuration_form": {"fields": [
+        {"name": "default_voice", "label": "默认音色", "control": "text", "required": true, "default": "alloy"},
+        {"name": "voice_map", "label": "音色映射", "control": "key_value", "required": false},
+        {"name": "tts_instructions", "label": "合成指令", "control": "textarea", "required": false}
+      ]}
     }
   },
   "models": [],

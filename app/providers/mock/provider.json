@@ -1,31 +1,28 @@
 {
+  "schema_version": "2",
   "provider_id": "mock",
   "display_name": "Mock Provider",
-  "version": "1.0.0",
-  "capabilities": [
-    "avatar.speak",
-    "embedding.text",
-    "llm.chat_json",
-    "llm.chat_text",
-    "stt.streaming",
-    "stt.batch",
-    "tts.synthesize"
-  ],
-  "config_schema": {
-    "type": "object",
-    "properties": {}
-  },
-  "credential_schema": {
-    "type": "object",
-    "properties": {}
+  "version": "2.0.0",
+  "capabilities": ["avatar.speak", "embedding.text", "llm.chat_json", "llm.chat_text", "stt.streaming", "stt.batch", "tts.synthesize"],
+  "model_selection": "predefined",
+  "defaults": {},
+  "connection_form": {"schema_version": "2", "fields": []},
+  "credential_form": {"schema_version": "2", "fields": []},
+  "model_types": {
+    "llm": {"label": "大语言模型", "selection_mode": "predefined", "capabilities": ["llm.chat_json", "llm.chat_text"], "configuration_form": {"fields": []}},
+    "embedding": {"label": "Embedding", "selection_mode": "predefined", "capabilities": ["embedding.text"], "configuration_form": {"fields": []}},
+    "stt": {"label": "语音识别", "selection_mode": "predefined", "capabilities": ["stt.streaming", "stt.batch"], "configuration_form": {"fields": []}},
+    "tts": {"label": "语音合成", "selection_mode": "predefined", "capabilities": ["tts.synthesize"], "configuration_form": {"fields": []}},
+    "avatar": {"label": "数字人", "selection_mode": "predefined", "capabilities": ["avatar.speak"], "configuration_form": {"fields": []}}
   },
   "models": [
-    {"model_id": "mock-json", "capabilities": ["llm.chat_json"]},
-    {"model_id": "mock-text", "capabilities": ["llm.chat_text"]},
-    {"model_id": "mock-embedding", "capabilities": ["embedding.text"], "embedding_dimensions": 16},
-    {"model_id": "mock-avatar", "capabilities": ["avatar.speak"]},
-    {"model_id": "mock-stt", "capabilities": ["stt.streaming", "stt.batch"]},
-    {"model_id": "mock-tts", "capabilities": ["tts.synthesize"]}
+    {"model_id": "mock-json", "label": "Mock JSON", "model_type": "llm", "capabilities": ["llm.chat_json"], "default": true},
+    {"model_id": "mock-text", "label": "Mock Text", "model_type": "llm", "capabilities": ["llm.chat_text"], "default": true},
+    {"model_id": "mock-embedding", "label": "Mock Embedding", "model_type": "embedding", "capabilities": ["embedding.text"], "default": true, "properties": {"dimensions": 16}},
+    {"model_id": "mock-avatar", "label": "Mock Avatar", "model_type": "avatar", "capabilities": ["avatar.speak"], "default": true},
+    {"model_id": "mock-stt", "label": "Mock STT", "model_type": "stt", "capabilities": ["stt.streaming", "stt.batch"], "default": true},
+    {"model_id": "mock-tts", "label": "Mock TTS", "model_type": "tts", "capabilities": ["tts.synthesize"], "default": true}
   ],
-  "entrypoint": "app.providers.mock.provider:MockProvider"
+  "entrypoint": "app.providers.mock.provider:MockProvider",
+  "implemented": true
 }

@@ -136,33 +136,19 @@ app/
   "display_name": "OpenAI Compatible",
   "version": "1.0.0",
   "capabilities": ["llm.chat_json", "embedding.text", "tts.synthesize"],
-  "model_selection": "customizable",
-  "defaults": {
-    "base_url": "https://models.example.com/v1",
-    "test_models": {
-      "llm.chat_json": "chat-model-default",
-      "tts.synthesize": "speech-model-default"
-    }
-  },
-  "config_schema": {
-    "type": "object",
-    "required": ["base_url"],
-    "properties": {
-      "base_url": {"type": "string"},
-      "organization": {"type": "string"}
-    }
-  },
-  "credential_schema": {
-    "type": "object",
-    "required": ["api_key"],
-    "properties": {
-      "api_key": {"type": "string", "secret": true}
-    }
+  "schema_version": "2",
+  "connection_form": {"fields": [{"name": "base_url", "label": "Base URL", "control": "text", "required": true}]},
+  "credential_form": {"fields": [{"name": "api_key", "label": "API Key", "control": "secret", "required": true, "write_only": true}]},
+  "model_types": {
+    "llm": {"selection_mode": "customizable", "capabilities": ["llm.chat_json"], "configuration_form": {"fields": [{"name": "structured_output_mode", "control": "select", "options": [{"label": "JSON Object", "value": "json_object"}]}]}},
+    "embedding": {"selection_mode": "customizable", "capabilities": ["embedding.text"], "configuration_form": {"fields": []}},
+    "tts": {"selection_mode": "customizable", "capabilities": ["tts.synthesize"], "configuration_form": {"fields": [{"name": "default_voice", "control": "text", "required": true}]}}
   },
   "models": [
     {
       "model_id": "chat-model-default",
       "label": "Default Chat Model",
+      "model_type": "llm",
       "capabilities": ["llm.chat_json"],
       "default": true,
       "context_window": 128000,
@@ -170,6 +156,7 @@ app/
     },
     {
       "model_id": "embedding-model-default",
+      "model_type": "embedding",
       "capabilities": ["embedding.text"],
       "embedding_dimensions": 3072
     }
@@ -182,12 +169,12 @@ Manifest 规则：
 
 - `provider_id` 全局唯一，只允许小写字母、数字和下划线。
 - `capabilities` 必须来自系统能力枚举。
-- `credential_schema` 中标记 `secret: true` 的字段不得明文写入普通日志或 API 响应。
-- `defaults` 只保存非秘密配置默认值；创建 Provider 配置时先与用户配置合并再执行 `config_schema` 校验，凭证不得放入 defaults。多能力 Provider 使用 `test_models[capability]`，不能让单一 `test_model` 同时代表 LLM、Embedding 和 TTS；旧字段只作为能力匹配时的兼容读取。
-- `model_selection` 只允许 `predefined` 或 `customizable`。`predefined` 要求 route 模型存在于 `models` 且声明目标能力；`customizable` 的 `models` 是后台候选目录，仍允许管理员填写目录外模型。
-- `models` 条目必须提供唯一非空 `model_id` 和非空 `capabilities`，且能力是 provider 能力的子集；每项能力至多有一个 `default=true` 模型。`models` 可以为空，但此时 `model_selection` 必须为 `customizable`。
+- `credential_form` 的秘密字段必须 `write_only`，不得明文写入普通日志或 API 响应。
+- `connection_form` 只声明连接级字段；模型、音色、维度和结构化输出策略放在对应 `model_types[].configuration_form`。
+- 每个模型类型独立声明 `predefined/customizable`；`predefined` 要求 ModelConfiguration 的模型存在于该类型目录，`customizable` 允许目录外模型 ID。
+- `models` 条目必须提供 `model_id/model_type/capabilities`，能力必须属于对应模型类型；每项能力至多有一个默认模型。
 - `entrypoint` 指向实现通用 Provider adapter interface 的类；`implemented=true` 时必须可在运行时加载。
-- `config_schema` 与 `credential_schema` 在创建和更新配置时执行，不能只用于页面展示。
+- 所有表单 schema 在创建和更新时由服务端执行严格校验，不能只用于页面展示；v1 JSON schema 只用于加载尚未升级的未实现插件 manifest。
 - `capabilities` 只声明当前 adapter 和统一 schema 真正可执行的能力；未来能力可保留在 `implemented=false` 的占位 manifest 中。
 
 ## Provider 接口
@@ -202,14 +189,18 @@ class ProviderContext:
     organization_id: str
     invocation_id: str
     route_id: str
-    provider_config_id: str
+    provider_connection_id: str
+    model_configuration_id: str
+    model_type: str
     capability: str
     purpose: str
     model: str
     timeout_s: float
     attempt: int
     fallback_index: int
-    config: dict
+    connection_config: dict
+    model_settings: dict
+    default_parameters: dict
     credentials: dict
     metadata: dict
 
@@ -454,30 +445,50 @@ Model Invocation 校验 content type、最大大小、非空音频和 duration�
 
 ## 配置模型
 
-### Provider 配置
+### Provider 插件声明与连接
 
-`ModelProviderConfig` 保存某个组织可用的供应商配置。
+`ProviderPluginDefinition` 的 `provider.json` 由后端插件拥有，使用 `connection_form`、`credential_form`、`model_types[].configuration_form` 描述动态表单。字段控件限定为 `text/secret/number/select/switch/textarea/tags/key_value`；服务端负责默认值、必填、类型、范围、选项、可见条件和未知字段校验，前端只负责通用渲染。
+
+`ProviderConnection` 保存某个组织到厂商或兼容网关的连接。连接级参数和凭证不能混入具体模型配置。
 
 ```json
 {
-  "id": "mpc_01J...",
+  "id": "provider_conn_01J...",
   "organization_id": "org_01J...",
   "provider_id": "openai_compatible",
   "display_name": "公司统一模型网关",
   "enabled": true,
-  "config": {
+  "connection_config": {
     "base_url": "https://models.example.com/v1"
   },
-  "credential_ref": "secret://model-providers/mpc_01J",
+  "credential_ref": "secret://model-providers/provider_conn_01J",
   "created_at": "2026-07-01T18:30:00Z"
+}
+```
+
+### 模型配置
+
+`ModelConfiguration` 绑定一个连接并代表一个可调用的具体模型。`settings` 只包含插件声明的厂商专属字段；`default_parameters` 只包含网关统一字段，调用请求显式值优先于默认值。
+
+```json
+{
+  "id": "model_cfg_01J...",
+  "provider_connection_id": "provider_conn_01J...",
+  "model_type": "llm",
+  "provider_model_id": "chat-model-default",
+  "display_name": "面试评分模型",
+  "settings": {"structured_output_mode": "json_object"},
+  "default_parameters": {"temperature": 0.2},
+  "supported_capabilities": ["llm.chat_json"],
+  "status": "ready"
 }
 ```
 
 ### 模型路由
 
-`ModelRoute` 决定某个能力、场景默认走哪个 provider 和模型。
+`ModelRoute` 决定某个能力、场景默认走哪个 ModelConfiguration。
 
-同一组织内 `(capability, purpose)` 是应用层唯一键；重复创建返回 `409 MODEL_ROUTE_CONFLICT`。创建请求使用强类型 target/policy schema，未知字段返回 `422`，避免把 `max_retries` 等拼写错误静默保存。target 只接受 `provider_config_id`、`model`、`timeout_s`、`pricing`；policy 只接受 `retry_count`、`retry_backoff_ms`、`fallback_on`、`max_cost_usd_per_call`、`circuit_failure_threshold`、`circuit_recovery_seconds` 和 `readiness_ttl_seconds`。
+同一组织内 `(capability, purpose)` 是应用层唯一键；重复创建返回 `409 MODEL_ROUTE_CONFLICT`。创建请求使用强类型 target/policy schema，未知字段返回 `422`。target 只接受 `model_configuration_id`、`timeout_s`、`pricing`；policy 只接受 `retry_count`、`retry_backoff_ms`、`fallback_on`、`max_cost_usd_per_call`、`circuit_failure_threshold`、`circuit_recovery_seconds` 和 `readiness_ttl_seconds`。
 
 本业务至少使用以下精确 purpose，不能用一个 `default` 路由混合不同敏感数据：
 
@@ -500,19 +511,16 @@ Model Invocation 校验 content type、最大大小、非空音频和 duration�
   "capability": "llm.chat_json",
   "purpose": "answer_evaluation",
   "primary": {
-    "provider_config_id": "mpc_01J...",
-    "model": "chat-model-default",
+    "model_configuration_id": "model_cfg_01J...",
     "timeout_s": 20
   },
   "fallbacks": [
     {
-      "provider_config_id": "mpc_02J...",
-      "model": "fallback-chat-model",
+      "model_configuration_id": "model_cfg_02J...",
       "timeout_s": 25
     },
     {
-      "provider_config_id": "mpc_mock",
-      "model": "mock-json",
+      "model_configuration_id": "model_cfg_mock_llm",
       "timeout_s": 2
     }
   ],
@@ -554,17 +562,16 @@ readiness 是带检查时间和有效期的事实，不是永久布尔值；超�
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/api/v1/admin/model-providers/catalog` | 查看系统已安装 provider 插件和能力 |
-| `POST` | `/api/v1/admin/model-provider-configs` | 新增组织级供应商配置 |
-| `GET` | `/api/v1/admin/model-provider-configs` | 列出供应商配置，凭证字段脱敏 |
-| `PATCH` | `/api/v1/admin/model-provider-configs/{id}` | 启用、停用或修改配置 |
-| `POST` | `/api/v1/admin/model-provider-configs/{id}/test` | 使用可选 `capability + model` 测试连接和能力调用 |
+| `POST/GET/PATCH` | `/api/v1/admin/model-provider-connections` | 管理组织级厂商连接，凭证字段脱敏 |
+| `POST` | `/api/v1/admin/model-provider-connections/{id}/validate` | 本地校验连接和凭证完整性 |
+| `GET` | `/api/v1/admin/model-provider-connections/{id}/model-catalog` | 获取模型类型、目录和动态表单 |
+| `POST/GET/PATCH` | `/api/v1/admin/model-configurations` | 管理具体模型配置 |
+| `POST` | `/api/v1/admin/model-configurations/{id}/test` | 对具体模型执行能力探针 |
 | `POST` | `/api/v1/admin/model-routes` | 配置能力路由 |
 | `GET` | `/api/v1/admin/model-routes` | 查看路由 |
 | `POST` | `/api/v1/admin/model-routes/{id}/test` | 测试路由和 fallback |
 
-`PATCH /model-provider-configs/{id}` 必须携带 `expected_version`。配置文档和凭证引用使用同一租户事务更新；并发版本不匹配时拒绝写入，不能以最后写入覆盖。
-
-Provider test 的请求 body 可省略；管理 UI 应显式选择能力并从 manifest 当前能力的模型目录选择 model。服务端依次解析请求 model、`config.test_models[capability]`、能力匹配的旧 `config.test_model` 和 manifest 默认模型；`predefined` Provider 必须再次执行模型/能力校验。配置编辑 UI 只在用户输入新密钥时发送 `credentials`，空密码不能清除现有密钥。
+两个 `PATCH` 都必须携带 `expected_version`。连接文档和凭证引用使用同一租户事务更新；并发版本不匹配时拒绝写入。连接编辑时空密码不能清除现有密钥。模型测试只使用 ModelConfiguration 已保存的模型标识与参数，不允许客户端在测试时临时替换模型。
 
 新增供应商插件后，`catalog` 必须能读出 manifest，不需要改业务服务。
 
@@ -580,7 +587,8 @@ Provider test 的请求 body 可省略；管理 UI 应显式选择能力并从 m
 | `capability` | 能力 |
 | `purpose` | 场景 |
 | `route_id` | 路由 ID |
-| `provider_config_id` | 使用的配置 |
+| `provider_connection_id` | 使用的连接 |
+| `model_configuration_id` | 使用的模型配置 |
 | `provider_id` | provider 类型 |
 | `model` | 模型名 |
 | `status` | `success`、`failed`、`fallback_success` |

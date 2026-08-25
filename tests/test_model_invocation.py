@@ -61,34 +61,44 @@ class SlowAdapter:
 
 def configured_store() -> InMemoryStore:
     store = InMemoryStore()
-    store.provider_configs["mpc_primary"] = {
-        "id": "mpc_primary",
+    store.provider_connections["provider_conn_primary"] = {
+        "id": "provider_conn_primary",
         "organization_id": "org_default",
         "provider_id": "openai_compatible",
         "display_name": "Primary",
         "enabled": True,
-        "config": {
-            "pricing": {
-                "input_per_million_tokens": 1.0,
-                "output_per_million_tokens": 2.0,
-            }
-        },
-        "credential_ref": "secret://model-providers/mpc_primary",
+        "connection_config": {},
+        "credential_ref": "secret://provider-connections/provider_conn_primary",
+        "credential_status": "valid",
         "created_at": "2026-08-24T00:00:00Z",
         "updated_at": "2026-08-24T00:00:00Z",
     }
-    store.provider_configs["mpc_fallback"] = {
-        "id": "mpc_fallback",
+    store.provider_connections["provider_conn_fallback"] = {
+        "id": "provider_conn_fallback",
         "organization_id": "org_default",
         "provider_id": "mock",
         "display_name": "Fallback",
         "enabled": True,
-        "config": {},
-        "credential_ref": "secret://model-providers/mpc_fallback",
+        "connection_config": {},
+        "credential_ref": "secret://provider-connections/provider_conn_fallback",
+        "credential_status": "valid",
         "created_at": "2026-08-24T00:00:00Z",
         "updated_at": "2026-08-24T00:00:00Z",
     }
-    store.save_provider_secret("mpc_primary", {"api_key": "never-logged"})
+    store.model_configurations["model_cfg_primary"] = {
+        "id": "model_cfg_primary", "organization_id": "org_default", "provider_connection_id": "provider_conn_primary",
+        "provider_id": "openai_compatible", "model_type": "llm", "provider_model_id": "scripted-model",
+        "display_name": "Primary model", "supported_capabilities": [cap.LLM_CHAT_JSON], "enabled": True,
+        "status": "ready", "settings": {"pricing": {"input_per_million_tokens": 1.0, "output_per_million_tokens": 2.0}},
+        "default_parameters": {},
+    }
+    store.model_configurations["model_cfg_fallback"] = {
+        "id": "model_cfg_fallback", "organization_id": "org_default", "provider_connection_id": "provider_conn_fallback",
+        "provider_id": "mock", "model_type": "llm", "provider_model_id": "mock-json",
+        "display_name": "Fallback model", "supported_capabilities": [cap.LLM_CHAT_JSON], "enabled": True,
+        "status": "ready", "settings": {}, "default_parameters": {},
+    }
+    store.save_provider_secret("provider_conn_primary", {"api_key": "never-logged"})
     return store
 
 
@@ -115,14 +125,12 @@ def route(*, retry_count=0, timeout_s=1.0, fallback=True, policy=None):
         "capability": cap.LLM_CHAT_JSON,
         "purpose": "answer_evaluation",
         "primary": {
-            "provider_config_id": "mpc_primary",
-            "model": "scripted-model",
+            "model_configuration_id": "model_cfg_primary",
             "timeout_s": timeout_s,
         },
         "fallbacks": [
             {
-                "provider_config_id": "mpc_fallback",
-                "model": "mock-json",
+                "model_configuration_id": "model_cfg_fallback",
                 "timeout_s": 1,
             }
         ] if fallback else [],
@@ -172,7 +180,7 @@ async def test_schema_invalid_primary_falls_back_through_same_pipeline() -> None
     assert result.provider.provider_id == "mock"
     assert [item["status"] for item in store.model_invocations] == ["failed", "fallback_success"]
     assert store.model_invocations[0]["error_code"] == "provider_schema_invalid"
-    assert store.model_invocations[1]["provider_config_id"] == "mpc_fallback"
+    assert store.model_invocations[1]["model_configuration_id"] == "model_cfg_fallback"
 
 
 @pytest.mark.anyio
@@ -255,7 +263,7 @@ async def test_production_requires_an_explicit_model_route(monkeypatch) -> None:
         "organization_id": "org_default",
         "capability": cap.LLM_CHAT_JSON,
         "purpose": "default",
-        "primary": {"provider_config_id": "mpc_mock", "model": "mock-json", "timeout_s": 1},
+        "primary": {"model_configuration_id": "model_cfg_mock_llm_chat_json", "timeout_s": 1},
         "fallbacks": [],
         "policy": {},
         "enabled": True,

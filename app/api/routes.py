@@ -23,11 +23,13 @@ from app.schemas.api import (
     KnowledgeBaseCreate,
     KnowledgeBaseImport,
     KnowledgeBaseRebuild,
+    ModelConfigurationCreate,
+    ModelConfigurationPatch,
+    ModelConfigurationTest,
     ModelRouteCreate,
     OutboxReplay,
-    ProviderConfigCreate,
-    ProviderConfigPatch,
-    ProviderConfigTest,
+    ProviderConnectionCreate,
+    ProviderConnectionPatch,
     QuestionCreate,
     QuestionPatch,
     QuestionSearchRequest,
@@ -160,29 +162,54 @@ async def model_provider_catalog() -> Dict[str, Any]:
     return {"items": services()["model_admin"].catalog()}
 
 
-@router.post("/api/v1/admin/model-provider-configs")
-async def create_model_provider_config(payload: ProviderConfigCreate) -> Dict[str, Any]:
-    return services()["model_admin"].create_provider_config(payload.model_dump())
+@router.post("/api/v1/admin/model-provider-connections")
+async def create_model_provider_connection(payload: ProviderConnectionCreate) -> Dict[str, Any]:
+    return services()["model_admin"].create_provider_connection(payload.model_dump())
 
 
-@router.get("/api/v1/admin/model-provider-configs")
-async def list_model_provider_configs() -> Dict[str, Any]:
-    return {"items": services()["model_admin"].list_provider_configs(), "next_cursor": None}
+@router.get("/api/v1/admin/model-provider-connections")
+async def list_model_provider_connections() -> Dict[str, Any]:
+    return {"items": services()["model_admin"].list_provider_connections(), "next_cursor": None}
 
 
-@router.patch("/api/v1/admin/model-provider-configs/{config_id}")
-async def patch_model_provider_config(config_id: str, payload: ProviderConfigPatch) -> Dict[str, Any]:
-    return services()["model_admin"].patch_provider_config(config_id, payload.model_dump(exclude_unset=True))
+@router.patch("/api/v1/admin/model-provider-connections/{connection_id}")
+async def patch_model_provider_connection(connection_id: str, payload: ProviderConnectionPatch) -> Dict[str, Any]:
+    return services()["model_admin"].patch_provider_connection(connection_id, payload.model_dump(exclude_unset=True))
 
 
-@router.post("/api/v1/admin/model-provider-configs/{config_id}/test")
-async def test_model_provider_config(
-    config_id: str,
-    payload: Optional[ProviderConfigTest] = None,
+@router.post("/api/v1/admin/model-provider-connections/{connection_id}/validate")
+async def validate_model_provider_connection(connection_id: str) -> Dict[str, Any]:
+    return services()["model_admin"].validate_provider_connection(connection_id)
+
+
+@router.get("/api/v1/admin/model-provider-connections/{connection_id}/model-catalog")
+async def model_catalog_for_connection(connection_id: str, model_type: Optional[str] = None) -> Dict[str, Any]:
+    return services()["model_admin"].model_catalog(connection_id, model_type)
+
+
+@router.post("/api/v1/admin/model-configurations")
+async def create_model_configuration(payload: ModelConfigurationCreate) -> Dict[str, Any]:
+    return services()["model_admin"].create_model_configuration(payload.model_dump())
+
+
+@router.get("/api/v1/admin/model-configurations")
+async def list_model_configurations() -> Dict[str, Any]:
+    return {"items": services()["model_admin"].list_model_configurations(), "next_cursor": None}
+
+
+@router.patch("/api/v1/admin/model-configurations/{configuration_id}")
+async def patch_model_configuration(configuration_id: str, payload: ModelConfigurationPatch) -> Dict[str, Any]:
+    return services()["model_admin"].patch_model_configuration(
+        configuration_id, payload.model_dump(exclude_unset=True)
+    )
+
+
+@router.post("/api/v1/admin/model-configurations/{configuration_id}/test")
+async def test_model_configuration(
+    configuration_id: str, payload: Optional[ModelConfigurationTest] = None
 ) -> Dict[str, Any]:
-    return await services()["model_admin"].test_provider_config(
-        config_id,
-        payload.model_dump(exclude_none=True) if payload else {},
+    return await services()["model_admin"].test_model_configuration(
+        configuration_id, payload.model_dump(exclude_none=True) if payload else {}
     )
 
 

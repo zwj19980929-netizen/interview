@@ -112,6 +112,22 @@ _Avoid_: HiringDecision、MutableReport、AutoReject
 一次为特定业务 purpose 和能力发起的逻辑模型调用；可以按同一 ModelRoute 产生多次 Provider 尝试，但只形成一个最终成功或统一失败。
 _Avoid_: ModelCall、ProviderRequest、SDKCall
 
+**ProviderPluginDefinition**:
+安装期的厂商插件声明，负责定义连接、凭证和各模型类型的动态表单，以及运行时 adapter；它不保存组织数据。
+_Avoid_: ProviderConfig、FrontendVendorForm、PluginInstance
+
+**ProviderConnection**:
+一个组织到模型厂商或兼容网关的连接，只保存 API Key 引用、Base URL、区域等连接级信息，不选择具体模型。
+_Avoid_: ModelProviderConfig、ModelCredential、ProviderModel
+
+**ModelConfiguration**:
+基于一个 ProviderConnection 配置的具体模型，拥有模型类型、厂商模型标识、厂商专属设置、统一默认参数、支持能力和健康状态。
+_Avoid_: ModelName、RouteTarget、ProviderConfig
+
+**ModelRoute**:
+组织在特定 capability 与 purpose 下对 ModelConfiguration 的主备选择及调用策略，不复制厂商连接或模型参数。
+_Avoid_: ProviderRoute、ModelAlias、DefaultModel
+
 **DurableWorkItem**:
 数据库作为真相来源的异步工作项，拥有幂等键、租约、退避、最大尝试、dead-letter 和人工重放事实。
 _Avoid_: BackgroundTask、FireAndForgetJob、QueueMessage

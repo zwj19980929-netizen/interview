@@ -195,24 +195,37 @@ async def test_model_gateway_routes_to_openai_compatible_provider() -> None:
         )
 
     store = InMemoryStore()
-    store.provider_configs["mpc_openai"] = {
-        "id": "mpc_openai",
+    store.provider_connections["provider_conn_openai"] = {
+        "id": "provider_conn_openai",
         "organization_id": "org_default",
         "provider_id": "openai_compatible",
         "display_name": "Test OpenAI Compatible",
         "enabled": True,
-        "config": {"base_url": "https://models.example.com/v1"},
-        "credential_ref": "secret://model-providers/mpc_openai",
+        "connection_config": {"base_url": "https://models.example.com/v1"},
+        "credential_ref": "secret://provider-connections/provider_conn_openai",
+        "credential_status": "valid",
         "created_at": "2026-07-01T00:00:00Z",
         "updated_at": "2026-07-01T00:00:00Z",
     }
-    store.save_provider_secret("mpc_openai", {"api_key": "test-key"})
+    store.model_configurations["model_cfg_chat"] = {
+        "id": "model_cfg_chat", "organization_id": "org_default", "provider_connection_id": "provider_conn_openai",
+        "provider_id": "openai_compatible", "model_type": "llm", "provider_model_id": "chat-model",
+        "display_name": "Chat", "supported_capabilities": [cap.LLM_CHAT_JSON, cap.LLM_CHAT_TEXT],
+        "settings": {}, "default_parameters": {}, "enabled": True, "status": "ready",
+    }
+    store.model_configurations["model_cfg_embedding"] = {
+        "id": "model_cfg_embedding", "organization_id": "org_default", "provider_connection_id": "provider_conn_openai",
+        "provider_id": "openai_compatible", "model_type": "embedding", "provider_model_id": "embedding-model",
+        "display_name": "Embedding", "supported_capabilities": [cap.EMBEDDING_TEXT],
+        "settings": {}, "default_parameters": {}, "enabled": True, "status": "ready",
+    }
+    store.save_provider_secret("provider_conn_openai", {"api_key": "test-key"})
     store.model_routes["route_chat"] = {
         "id": "route_chat",
         "organization_id": "org_default",
         "capability": cap.LLM_CHAT_JSON,
         "purpose": "provider_test",
-        "primary": {"provider_config_id": "mpc_openai", "model": "chat-model", "timeout_s": 5},
+        "primary": {"model_configuration_id": "model_cfg_chat", "timeout_s": 5},
         "fallbacks": [],
         "policy": {},
         "enabled": True,
@@ -222,7 +235,7 @@ async def test_model_gateway_routes_to_openai_compatible_provider() -> None:
         "organization_id": "org_default",
         "capability": cap.EMBEDDING_TEXT,
         "purpose": "question_indexing",
-        "primary": {"provider_config_id": "mpc_openai", "model": "embedding-model", "timeout_s": 5},
+        "primary": {"model_configuration_id": "model_cfg_embedding", "timeout_s": 5},
         "fallbacks": [],
         "policy": {},
         "enabled": True,

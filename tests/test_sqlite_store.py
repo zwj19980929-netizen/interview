@@ -49,12 +49,12 @@ def test_reset_store_for_tests_never_resets_development_sqlite(tmp_path) -> None
     db_path = tmp_path / "development.sqlite3"
     store = SQLiteStore(str(db_path))
     persisted = {
-        **store.provider_configs["mpc_mock"],
-        "id": "mpc_persisted",
+        **store.provider_connections["provider_conn_mock"],
+        "id": "provider_conn_persisted",
         "display_name": "Must survive test reset",
     }
-    store.provider_configs[persisted["id"]] = persisted
-    store.save_item("provider_configs", persisted["id"], persisted)
+    store.provider_connections[persisted["id"]] = persisted
+    store.save_item("provider_connections", persisted["id"], persisted)
     repository_provider._store = store
 
     test_store = repository_provider.reset_store_for_tests()
@@ -62,4 +62,4 @@ def test_reset_store_for_tests_never_resets_development_sqlite(tmp_path) -> None
     assert isinstance(test_store, InMemoryStore)
     assert not isinstance(test_store, SQLiteStore)
     reopened = SQLiteStore(str(db_path))
-    assert reopened.provider_configs[persisted["id"]]["display_name"] == "Must survive test reset"
+    assert reopened.provider_connections[persisted["id"]]["display_name"] == "Must survive test reset"

@@ -27,14 +27,16 @@ def context(capability: str, model: str, *, config=None) -> ProviderContext:
         organization_id="org_default",
         invocation_id="invocation_test",
         route_id="route_test",
-        provider_config_id="mpc_dashscope",
+        provider_connection_id="provider_conn_dashscope",
+        model_configuration_id="model_cfg_dashscope",
+        model_type="tts" if capability == cap.TTS_SYNTHESIZE else "llm",
         capability=capability,
         purpose="provider_test",
         model=model,
         timeout_s=5,
         attempt=1,
         fallback_index=0,
-        config=config or {"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1"},
+        connection_config=config or {"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1"},
         credentials={"api_key": "dashscope-key"},
     )
 

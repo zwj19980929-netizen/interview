@@ -1,4 +1,5 @@
 {
+  "schema_version": "2",
   "provider_id": "dashscope",
   "display_name": "阿里云百炼（千问 / Qwen）",
   "version": "0.2.0",
@@ -6,10 +7,33 @@
   "model_selection": "customizable",
   "defaults": {
     "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    "test_model": "qwen-plus",
-    "default_voice": "Cherry",
-    "force_https_assets": true,
     "use_environment_proxy": false
+  },
+  "connection_form": {
+    "schema_version": "2",
+    "fields": [
+      {"name": "base_url", "label": "Base URL", "control": "text", "required": true, "default": "https://dashscope.aliyuncs.com/compatible-mode/v1"},
+      {"name": "use_environment_proxy", "label": "使用环境代理", "control": "switch", "required": false, "default": false}
+    ]
+  },
+  "credential_form": {
+    "schema_version": "2",
+    "fields": [
+      {"name": "api_key", "label": "API Key", "control": "secret", "required": true, "write_only": true}
+    ]
+  },
+  "model_types": {
+    "llm": {"label": "大语言模型", "selection_mode": "customizable", "capabilities": ["llm.chat_json", "llm.chat_text"], "configuration_form": {"fields": []}},
+    "embedding": {"label": "Embedding", "selection_mode": "customizable", "capabilities": ["embedding.text"], "configuration_form": {"fields": [
+      {"name": "dimensions", "label": "期望向量维度", "control": "number", "required": false, "min": 1}
+    ]}},
+    "tts": {"label": "语音合成", "selection_mode": "customizable", "capabilities": ["tts.synthesize"], "configuration_form": {"fields": [
+      {"name": "tts_endpoint", "label": "TTS Endpoint", "control": "text", "required": false},
+      {"name": "default_voice", "label": "默认音色", "control": "text", "required": true, "default": "Cherry"},
+      {"name": "voice_map", "label": "音色映射", "control": "key_value", "required": false},
+      {"name": "sample_rate_hz", "label": "采样率", "control": "number", "required": false, "default": 24000, "min": 8000, "max": 48000},
+      {"name": "force_https_assets", "label": "仅接受 HTTPS 音频资产", "control": "switch", "required": false, "default": true}
+    ]}}
   },
   "config_schema": {
     "type": "object",

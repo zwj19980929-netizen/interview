@@ -188,7 +188,8 @@ answer_evaluations(..., answer_id text not null, revision integer not null, uniq
 interview_reports(..., interview_id text not null, revision integer not null, unique(interview_id, revision))
 interview_lifecycle_events(..., interview_id text not null, sequence integer not null, unique(interview_id, sequence))
 
-model_provider_configs(...)
+provider_connections(..., credential_ref text, version integer not null)
+model_configurations(..., provider_connection_id text not null, model_type text not null, provider_model_id text not null, settings jsonb, default_parameters jsonb, version integer not null)
 model_routes(...)
 model_invocation_logs(...)
 outbox_work_items(...)

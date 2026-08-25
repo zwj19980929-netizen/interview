@@ -10,7 +10,7 @@
 
 - `PYTHONPYCACHEPREFIX=/private/tmp/interviewer_pycache .venv/bin/python -m compileall -q app tests`：通过。
 - `node --check app/web/app.js`：通过。
-- `.venv/bin/python -m pytest -q`：`99 passed in 2.97s`。
+- `.venv/bin/python -m pytest -q`：`106 passed in 3.63s`。
 - `git diff --check`：通过。
 
 ## 里程碑对账
@@ -19,7 +19,7 @@
 | --- | --- | --- | --- |
 | 0 项目骨架 | ✅ verified | FastAPI、统一错误、健康检查、启动/worker 命令、自动化测试 | 生产观测平台由部署环境选择 |
 | 1 题库管理 | ✅ verified | CRUD/归档、JSON 批量 import、rebuild/build job、语音重建 | 批量 UI 仍以 API 为主 |
-| 2 模型网关 | ✅ verified | `chat_json/chat_text/embedding/STT/TTS/avatar` schema、invoke/open_stream、重试/fallback/超时/共享断路器、加密凭证；manifest defaults/模型目录/选择模式；OpenAI-compatible、DeepSeek、智谱与 DashScope/千问 adapter | 真实凭据、区域、模型授权和健康测试待联调；STT/数字人仍需选型 |
+| 2 模型网关 | ✅ closed（配置 v2） | `chat_json/chat_text/embedding/STT/TTS/avatar` schema、invoke/open_stream、重试/fallback/超时/共享断路器、加密凭证；ProviderConnection/ModelConfiguration/ModelRoute、后端动态表单与一次性迁移；OpenAI-compatible、DeepSeek、智谱与 DashScope/千问 adapter | 真实凭据、区域、模型授权和健康测试待联调；STT/数字人仍需选型 |
 | 3 结构化题库查询 | ✅ closed | Question Catalog、Memory/SQLite/PostgreSQL 下推实现、跨岗位拒绝；旧 QuestionService/向量 repository 已删除 | 真实 PostgreSQL 查询计划待环境验收 |
 | 4 岗位要求与计划 | ✅ closed | execution v2 canonical slots、显式一次性迁移、候选池冻结、覆盖/难度/去重、权重/时长守恒、审批不可变 | 部署旧数据时先运行迁移命令 |
 | 5 会话与实时事件 | ✅ verified | 生命周期、持久事件、WebSocket、Redis 跨实例 adapter、心跳超时恢复 | WebRTC 媒体仍为外部集成项 |
@@ -54,8 +54,8 @@
 ### 模型、语音与 readiness
 
 - `llm.chat_text` 已加入统一 schema；OpenAI-compatible 支持 Chat/Embedding/Speech TTS，DeepSeek/智谱 Chat 复用共享 runtime 并适配 JSON Object，智谱另实现官方 GLM-TTS，DashScope 支持 Qwen Chat/Embedding 以及 Qwen3-TTS/CosyVoice，均有离线 HTTP 合同测试。
-- Provider manifest 已驱动默认配置、predefined/customizable 模型选择与按能力模型候选；Provider test 接受 `capability + model`，管理 UI 支持配置编辑和按能力测试，智谱会把 `glm-5.2`/`glm-tts` 分别绑定 LLM/TTS。ModelRoute target/policy 使用强类型 API，未知字段返回 422、同组织重复 capability/purpose 返回冲突，predefined 目录外模型返回冲突；生产缺少精确 route 时返回 `provider_route_missing`，不再隐式使用 mock。
-- OpenAI-compatible 共享 transport 默认不继承环境代理，只有显式 `use_environment_proxy=true` 才读取代理变量；缺少 SOCKS transport 等初始化错误映射为 `provider_transport_unavailable`，不再泄漏原始 500。测试 helper 强制新建内存 store，`99` 项全量测试前后开发 SQLite 哈希保持一致。
+- 模型管理已拆分为 `ProviderConnection → ModelConfiguration → ModelRoute`：Provider manifest 声明连接/凭证及 `llm/embedding/tts/stt/avatar` 模型表单，管理 UI 通用渲染；模型测试更新健康事实，route target 只引用 ready 的模型配置。未知字段返回 422、同组织重复 capability/purpose 返回冲突、predefined 目录外模型返回冲突；生产缺少精确 route 时返回 `provider_route_missing`。
+- OpenAI-compatible 共享 transport 默认不继承环境代理，只有显式 `use_environment_proxy=true` 才读取代理变量；缺少 SOCKS transport 等初始化错误映射为 `provider_transport_unavailable`，不再泄漏原始 500。测试 helper 强制新建内存 store；当前全量 `106` 项测试不会触碰开发 SQLite。
 - `ModelGateway.open_stream()` 只在音频接受前允许 fallback；`ValidatedSTTStream` 校验 chunk/总量、事件序号和唯一 authoritative final。
 - `stt-stream` WebSocket 保存音频，stream final 直接提交评分，final 缺失/断流时使用 `stt.batch` 修复。
 - 非 mock TTS 结果必须从 data URI/受控 HTTP(S) 复制到 PrivateFileStorage 并形成 FileObject，才可标 `production_ready`。
@@ -94,4 +94,5 @@
 
 - 管理员直接创建/启动会话、客户端 REST/WebSocket 文本答案、计划运行时 `items`、旧全局题目创建/列表和 `QuestionService`/向量 repository/worker 分支均已物理删除，不再用 production 条件分支隐藏。
 - 旧计划只能在应用升级前通过 `python -m app.migrations.plan_execution_v2 --dry-run` 检查，再执行无 `--dry-run` 的显式一次性迁移；运行时不会懒迁移。
+- 旧模型配置只能在升级前通过 `python -m app.migrations.model_configuration_v2 data/interviewer.sqlite3 --dry-run` 检查，再执行同命令去掉 `--dry-run`；运行时不读取旧 collection 或 route target。
 - 当前仓库 SQLite 数据检查为 0 份 InterviewPlan，未产生数据改写。接口删除和迁移行为由 `tests/test_production_compatibility.py`、`tests/test_plan_assembly.py` 覆盖，`COMPAT-001` 已标 `closed`。

@@ -6,6 +6,12 @@ from typing import Any, Dict, List, Optional
 
 from app.model_gateway import capabilities as cap
 from app.model_gateway.errors import ProviderError
+from app.model_gateway.forms import (
+    FormSchemaError,
+    merge_form_schemas,
+    schema_from_json_object,
+    validate_form_schema,
+)
 
 
 PROVIDERS_DIR = Path(__file__).resolve().parents[1] / "providers"
@@ -29,13 +35,56 @@ def load_provider_manifest(path: Path) -> Dict[str, Any]:
         manifest = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ProviderManifestError("Invalid provider manifest JSON: %s" % path) from exc
+    manifest = _normalize_manifest(manifest)
+    _validate_manifest(manifest, path)
+    return manifest
+
+
+def _normalize_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
+    manifest = dict(manifest)
+    manifest.setdefault("schema_version", "1")
     manifest.setdefault("models", [])
     manifest.setdefault("model_selection", "customizable")
     manifest.setdefault("defaults", {})
-    manifest.setdefault("config_schema", {"type": "object", "properties": {}})
-    manifest.setdefault("credential_schema", {"type": "object", "properties": {}})
-    manifest.setdefault("implemented", manifest["provider_id"] == "mock")
-    _validate_manifest(manifest, path)
+    manifest.setdefault("implemented", manifest.get("provider_id") == "mock")
+    manifest.setdefault(
+        "connection_form",
+        schema_from_json_object(manifest.get("config_schema") or {"type": "object", "properties": {}}),
+    )
+    manifest.setdefault(
+        "credential_form",
+        schema_from_json_object(
+            manifest.get("credential_schema") or {"type": "object", "properties": {}},
+            secret=True,
+        ),
+    )
+    model_types = manifest.get("model_types")
+    if not isinstance(model_types, dict):
+        model_types = {}
+        for capability in manifest.get("capabilities", []):
+            model_type = cap.CAPABILITY_MODEL_TYPES.get(capability)
+            if not model_type:
+                continue
+            item = model_types.setdefault(
+                model_type,
+                {
+                    "label": _model_type_label(model_type),
+                    "selection_mode": manifest["model_selection"],
+                    "capabilities": [],
+                    "configuration_form": {"schema_version": "legacy", "fields": []},
+                },
+            )
+            item["capabilities"].append(capability)
+        manifest["model_types"] = model_types
+    normalized_models = []
+    for model in manifest["models"]:
+        item = dict(model)
+        item.setdefault("label", item.get("model_id", ""))
+        item.setdefault("model_type", _model_type_for_capabilities(item.get("capabilities", [])))
+        item.setdefault("configuration_form", {"schema_version": manifest["schema_version"], "fields": []})
+        item.setdefault("properties", {})
+        normalized_models.append(item)
+    manifest["models"] = normalized_models
     return manifest
 
 
@@ -66,8 +115,42 @@ def _validate_manifest(manifest: Dict[str, Any], path: Path) -> None:
     models = manifest.get("models")
     if not isinstance(models, list):
         raise ProviderManifestError("Provider manifest %s models must be a list." % path)
-    if model_selection == "predefined" and not models:
-        raise ProviderManifestError("Provider manifest %s predefined model catalog cannot be empty." % path)
+    try:
+        manifest["connection_form"] = validate_form_schema(
+            manifest["connection_form"], path="%s.connection_form" % provider_id
+        )
+        manifest["credential_form"] = validate_form_schema(
+            manifest["credential_form"], path="%s.credential_form" % provider_id
+        )
+    except FormSchemaError as exc:
+        raise ProviderManifestError("Provider manifest %s has an invalid form: %s" % (path, exc)) from exc
+
+    model_types = manifest.get("model_types")
+    if not isinstance(model_types, dict) or not model_types:
+        raise ProviderManifestError("Provider manifest %s must declare model_types." % path)
+    declared_capabilities = set()
+    for model_type, definition in model_types.items():
+        if model_type not in cap.MODEL_TYPE_CAPABILITIES or not isinstance(definition, dict):
+            raise ProviderManifestError("Provider manifest %s has invalid model type %s." % (path, model_type))
+        selection_mode = definition.get("selection_mode", model_selection)
+        if selection_mode not in {"predefined", "customizable"}:
+            raise ProviderManifestError("Provider manifest %s model type %s has invalid selection mode." % (path, model_type))
+        definition["selection_mode"] = selection_mode
+        type_capabilities = definition.get("capabilities")
+        if not isinstance(type_capabilities, list) or not type_capabilities:
+            raise ProviderManifestError("Provider manifest %s model type %s has no capabilities." % (path, model_type))
+        if set(type_capabilities).difference(cap.MODEL_TYPE_CAPABILITIES[model_type]):
+            raise ProviderManifestError("Provider manifest %s model type %s owns invalid capabilities." % (path, model_type))
+        declared_capabilities.update(type_capabilities)
+        try:
+            definition["configuration_form"] = validate_form_schema(
+                definition.get("configuration_form") or {"fields": []},
+                path="%s.model_types.%s.configuration_form" % (provider_id, model_type),
+            )
+        except FormSchemaError as exc:
+            raise ProviderManifestError("Provider manifest %s has an invalid model form: %s" % (path, exc)) from exc
+    if declared_capabilities != set(capabilities):
+        raise ProviderManifestError("Provider manifest %s model types do not cover provider capabilities." % path)
 
     seen_model_ids = set()
     default_capabilities = set()
@@ -89,6 +172,19 @@ def _validate_manifest(manifest: Dict[str, Any], path: Path) -> None:
                 "Provider manifest %s model %s declares capabilities not owned by provider: %s"
                 % (path, model_id, ", ".join(unsupported_model_caps))
             )
+        model_type = model.get("model_type")
+        if model_type not in model_types or set(model_capabilities).difference(model_types[model_type]["capabilities"]):
+            raise ProviderManifestError(
+                "Provider manifest %s model %s does not match model type %s."
+                % (path, model_id, model_type)
+            )
+        try:
+            model["configuration_form"] = validate_form_schema(
+                model.get("configuration_form") or {"fields": []},
+                path="%s.models.%s.configuration_form" % (provider_id, model_id),
+            )
+        except FormSchemaError as exc:
+            raise ProviderManifestError("Provider manifest %s has an invalid model form: %s" % (path, exc)) from exc
         if model.get("default") is True:
             duplicate_defaults = default_capabilities.intersection(model_capabilities)
             if duplicate_defaults:
@@ -97,6 +193,14 @@ def _validate_manifest(manifest: Dict[str, Any], path: Path) -> None:
                     % (path, ", ".join(sorted(duplicate_defaults)))
                 )
             default_capabilities.update(model_capabilities)
+
+    for model_type, definition in model_types.items():
+        if definition["selection_mode"] == "predefined" and not any(
+            model["model_type"] == model_type for model in models
+        ):
+            raise ProviderManifestError(
+                "Provider manifest %s predefined model type %s has no models." % (path, model_type)
+            )
 
 
 def load_provider_catalog(providers_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
@@ -122,6 +226,65 @@ def get_provider_manifest(provider_id: str) -> Dict[str, Any]:
             retryable=False,
         )
     return manifest
+
+
+def get_model_definition(provider_id: str, model_type: str, model_id: str) -> Dict[str, Any]:
+    manifest = get_provider_manifest(provider_id)
+    type_definition = manifest["model_types"].get(model_type)
+    if type_definition is None:
+        raise ProviderError(
+            "provider_model_type_missing",
+            "Provider %s does not support model type %s." % (provider_id, model_type),
+            retryable=False,
+        )
+    declared = next(
+        (
+            model
+            for model in manifest["models"]
+            if model["model_type"] == model_type and model["model_id"] == model_id
+        ),
+        None,
+    )
+    if declared is None and type_definition["selection_mode"] == "predefined":
+        raise ProviderError(
+            "provider_model_unavailable",
+            "Provider %s does not declare model %s for %s." % (provider_id, model_id, model_type),
+            retryable=False,
+        )
+    model = dict(
+        declared
+        or {
+            "model_id": model_id,
+            "label": model_id,
+            "model_type": model_type,
+            "capabilities": list(type_definition["capabilities"]),
+            "configuration_form": {"fields": []},
+            "properties": {},
+            "custom": True,
+        }
+    )
+    model["configuration_form"] = merge_form_schemas(
+        type_definition.get("configuration_form") or {"fields": []},
+        model.get("configuration_form") or {"fields": []},
+    )
+    return model
+
+
+def _model_type_for_capabilities(capabilities: List[str]) -> Optional[str]:
+    types = {cap.CAPABILITY_MODEL_TYPES.get(capability) for capability in capabilities}
+    types.discard(None)
+    return next(iter(types)) if len(types) == 1 else None
+
+
+def _model_type_label(model_type: str) -> str:
+    return {
+        cap.MODEL_TYPE_LLM: "大语言模型",
+        cap.MODEL_TYPE_EMBEDDING: "Embedding",
+        cap.MODEL_TYPE_STT: "语音识别",
+        cap.MODEL_TYPE_TTS: "语音合成",
+        cap.MODEL_TYPE_AVATAR: "数字人",
+        cap.MODEL_TYPE_MODERATION: "内容审核",
+    }.get(model_type, model_type)
 
 
 class ProviderRegistry:

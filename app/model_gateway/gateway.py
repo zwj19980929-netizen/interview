@@ -201,22 +201,27 @@ class ModelGateway:
         last_error: Optional[ProviderError] = None
 
         for fallback_index, target in enumerate(targets):
-            provider_config_id = str(target.get("provider_config_id") or "")
-            model = str(target.get("model") or self._default_mock_model(capability))
+            model_configuration_id = str(target.get("model_configuration_id") or "")
+            model = "unknown"
             timeout_s = max(0.01, float(target.get("timeout_s", 20)))
             provider_id = "unknown"
-            circuit_key = "%s:%s:%s" % (request.organization_id, provider_config_id, capability)
+            provider_connection_id = "unknown"
+            circuit_key = "%s:%s:%s" % (request.organization_id, model_configuration_id, capability)
 
             for attempt in range(1, retry_count + 2):
                 total_attempts += 1
                 started_at = perf_counter()
-                provider_config: Dict[str, Any] = {}
+                model_configuration: Dict[str, Any] = {}
                 try:
-                    provider_config, credentials = self._provider_connection(
+                    model_configuration, provider_connection, credentials = self._model_connection(
                         request.organization_id,
-                        provider_config_id,
+                        model_configuration_id,
+                        capability,
+                        allow_unready=resolved_route.get("id") == "model_configuration_test",
                     )
-                    provider_id = provider_config["provider_id"]
+                    provider_id = model_configuration["provider_id"]
+                    provider_connection_id = model_configuration["provider_connection_id"]
+                    model = model_configuration["provider_model_id"]
                     if self.circuits.is_open(
                         circuit_key,
                         threshold=circuit_threshold,
@@ -232,20 +237,24 @@ class ModelGateway:
                         organization_id=request.organization_id,
                         invocation_id=invocation_id,
                         route_id=str(resolved_route.get("id") or "route_inline"),
-                        provider_config_id=provider_config_id,
+                        provider_connection_id=provider_connection_id,
+                        model_configuration_id=model_configuration_id,
+                        model_type=model_configuration["model_type"],
                         capability=capability,
                         purpose=purpose,
                         model=model,
                         timeout_s=timeout_s,
                         attempt=attempt,
                         fallback_index=fallback_index,
-                        config=provider_config.get("config") or {},
+                        connection_config=provider_connection.get("connection_config") or {},
+                        model_settings=model_configuration.get("settings") or {},
+                        default_parameters=model_configuration.get("default_parameters") or {},
                         credentials=credentials,
                         metadata=request.metadata,
                     )
                     try:
                         response = await asyncio.wait_for(
-                            adapter.invoke(capability, request, context),
+                            adapter.invoke(capability, self._apply_model_defaults(request, context.default_parameters), context),
                             timeout=timeout_s,
                         )
                     except asyncio.TimeoutError as exc:
@@ -259,7 +268,7 @@ class ModelGateway:
                     response.provider.provider_id = provider_id
                     response.provider.model = model
                     response.provider.latency_ms = latency_ms
-                    estimated_cost = self._estimated_cost(response, provider_config, target)
+                    estimated_cost = self._estimated_cost(response, model_configuration, target)
                     max_cost = policy.get("max_cost_usd_per_call")
                     if max_cost is not None and estimated_cost > float(max_cost):
                         raise ProviderError(
@@ -273,7 +282,8 @@ class ModelGateway:
                         capability=capability,
                         purpose=purpose,
                         route=resolved_route,
-                        provider_config_id=provider_config_id,
+                        provider_connection_id=provider_connection_id,
+                        model_configuration_id=model_configuration_id,
                         provider_id=provider_id,
                         model=model,
                         status="fallback_success" if fallback_index else "success",
@@ -294,7 +304,8 @@ class ModelGateway:
                         capability=capability,
                         purpose=purpose,
                         route=resolved_route,
-                        provider_config_id=provider_config_id,
+                        provider_connection_id=provider_connection_id,
+                        model_configuration_id=model_configuration_id,
                         provider_id=provider_id,
                         model=model,
                         status="failed",
@@ -346,16 +357,22 @@ class ModelGateway:
         request_hash = self._request_hash(request)
         last_error: Optional[ProviderError] = None
         for fallback_index, target in enumerate(targets):
-            provider_config_id = str(target.get("provider_config_id") or "")
-            model = str(target.get("model") or self._default_mock_model(capability))
+            model_configuration_id = str(target.get("model_configuration_id") or "")
+            model = "unknown"
             timeout_s = max(0.01, float(target.get("timeout_s", 10)))
             provider_id = "unknown"
+            provider_connection_id = "unknown"
             started_at = perf_counter()
             try:
-                provider_config, credentials = self._provider_connection(
-                    request.organization_id, provider_config_id
+                model_configuration, provider_connection, credentials = self._model_connection(
+                    request.organization_id,
+                    model_configuration_id,
+                    capability,
+                    allow_unready=resolved_route.get("id") == "model_configuration_test",
                 )
-                provider_id = provider_config["provider_id"]
+                provider_id = model_configuration["provider_id"]
+                provider_connection_id = model_configuration["provider_connection_id"]
+                model = model_configuration["provider_model_id"]
                 adapter = self.providers.adapter(provider_id, capability)
                 open_stream = getattr(adapter, "open_stream", None)
                 if not callable(open_stream):
@@ -368,14 +385,18 @@ class ModelGateway:
                     organization_id=request.organization_id,
                     invocation_id=invocation_id,
                     route_id=str(resolved_route.get("id") or "route_inline"),
-                    provider_config_id=provider_config_id,
+                    provider_connection_id=provider_connection_id,
+                    model_configuration_id=model_configuration_id,
+                    model_type=model_configuration["model_type"],
                     capability=capability,
                     purpose=request.purpose,
                     model=model,
                     timeout_s=timeout_s,
                     attempt=1,
                     fallback_index=fallback_index,
-                    config=provider_config.get("config") or {},
+                    connection_config=provider_connection.get("connection_config") or {},
+                    model_settings=model_configuration.get("settings") or {},
+                    default_parameters=model_configuration.get("default_parameters") or {},
                     credentials=credentials,
                     metadata=request.metadata,
                 )
@@ -390,7 +411,8 @@ class ModelGateway:
                     capability=capability,
                     purpose=request.purpose,
                     route=resolved_route,
-                    provider_config_id=provider_config_id,
+                    provider_connection_id=provider_connection_id,
+                    model_configuration_id=model_configuration_id,
                     provider_id=provider_id,
                     model=model,
                     status="stream_opened" if not fallback_index else "stream_fallback_opened",
@@ -408,7 +430,8 @@ class ModelGateway:
                     capability=capability,
                     purpose=request.purpose,
                     route=resolved_route,
-                    provider_config_id=provider_config_id,
+                    provider_connection_id=provider_connection_id,
+                    model_configuration_id=model_configuration_id,
                     provider_id=provider_id,
                     model=model,
                     status="failed",
@@ -454,8 +477,7 @@ class ModelGateway:
             "capability": capability,
             "purpose": purpose,
             "primary": {
-                "provider_config_id": "mpc_mock",
-                "model": self._default_mock_model(capability),
+                "model_configuration_id": self._default_mock_model_configuration_id(capability),
                 "timeout_s": 2,
             },
             "fallbacks": [],
@@ -463,31 +485,69 @@ class ModelGateway:
             "enabled": True,
         }
 
-    def _provider_connection(self, organization_id: str, provider_config_id: str) -> tuple:
+    def _model_connection(
+        self,
+        organization_id: str,
+        model_configuration_id: str,
+        capability: str,
+        *,
+        allow_unready: bool = False,
+    ) -> tuple:
         with self.persistence.transaction(organization_id) as transaction:
-            config = transaction.provider_configs.get(provider_config_id)
-            credentials = transaction.provider_secrets.get(provider_config_id) if config else {}
-        if config is None and provider_config_id == "mpc_mock":
-            return {
-                "id": "mpc_mock",
+            model_configuration = transaction.model_configurations.get(model_configuration_id)
+            provider_connection = (
+                transaction.provider_connections.get(model_configuration["provider_connection_id"])
+                if model_configuration else None
+            )
+            credentials = transaction.provider_secrets.get(provider_connection["id"]) if provider_connection else {}
+        if model_configuration is None and model_configuration_id == self._default_mock_model_configuration_id(capability):
+            model_configuration = {
+                "id": model_configuration_id,
                 "organization_id": organization_id,
                 "provider_id": "mock",
+                "provider_connection_id": "provider_conn_mock",
+                "provider_model_id": self._default_mock_model(capability),
+                "model_type": cap.CAPABILITY_MODEL_TYPES[capability],
+                "supported_capabilities": [capability],
                 "enabled": True,
-                "config": {},
-            }, {}
-        if config is None:
+                "status": "ready",
+                "settings": {},
+                "default_parameters": {},
+            }
+            provider_connection = {
+                "id": "provider_conn_mock",
+                "provider_id": "mock",
+                "enabled": True,
+                "connection_config": {},
+            }
+            return model_configuration, provider_connection, {}
+        if model_configuration is None:
             raise ProviderError(
-                "provider_config_missing",
-                "Model provider config does not exist.",
+                "model_configuration_missing",
+                "Model configuration does not exist.",
                 retryable=False,
             )
-        if not config.get("enabled", True):
+        if not model_configuration.get("enabled", True) or (
+            model_configuration.get("status") != "ready" and not allow_unready
+        ):
             raise ProviderError(
-                "provider_config_disabled",
-                "Model provider config is disabled.",
+                "model_configuration_not_ready",
+                "Model configuration is disabled or has not passed validation.",
                 retryable=True,
             )
-        return config, credentials
+        if capability not in model_configuration.get("supported_capabilities", []):
+            raise ProviderError(
+                "provider_capability_missing",
+                "Model configuration does not support the requested capability.",
+                retryable=False,
+            )
+        if provider_connection is None or not provider_connection.get("enabled", True):
+            raise ProviderError(
+                "provider_connection_disabled",
+                "Provider connection is missing or disabled.",
+                retryable=True,
+            )
+        return model_configuration, provider_connection, credentials
 
     def _validate_request(self, capability: str, request: InvocationRequest) -> None:
         expected = {
@@ -616,10 +676,10 @@ class ModelGateway:
     def _estimated_cost(
         self,
         response: InvocationResponse,
-        provider_config: Dict[str, Any],
+        model_configuration: Dict[str, Any],
         target: Dict[str, Any],
     ) -> float:
-        pricing = target.get("pricing") or provider_config.get("config", {}).get("pricing") or {}
+        pricing = target.get("pricing") or model_configuration.get("settings", {}).get("pricing") or {}
         usage = getattr(response, "usage", None)
         if usage is None:
             return 0.0
@@ -635,7 +695,8 @@ class ModelGateway:
         capability: str,
         purpose: str,
         route: Dict[str, Any],
-        provider_config_id: str,
+        provider_connection_id: str,
+        model_configuration_id: str,
         provider_id: str,
         model: str,
         status: str,
@@ -655,7 +716,8 @@ class ModelGateway:
             "capability": capability,
             "purpose": purpose,
             "route_id": route.get("id"),
-            "provider_config_id": provider_config_id,
+            "provider_connection_id": provider_connection_id,
+            "model_configuration_id": model_configuration_id,
             "provider_id": provider_id,
             "model": model,
             "status": status,
@@ -698,3 +760,14 @@ class ModelGateway:
             cap.TTS_SYNTHESIZE: "mock-tts",
             cap.AVATAR_SPEAK: "mock-avatar",
         }.get(capability, "mock")
+
+    def _default_mock_model_configuration_id(self, capability: str) -> str:
+        return "model_cfg_mock_%s" % capability.replace(".", "_")
+
+    def _apply_model_defaults(self, request: InvocationRequest, defaults: Dict[str, Any]) -> InvocationRequest:
+        updates = {
+            key: value
+            for key, value in defaults.items()
+            if hasattr(request, key) and key not in request.model_fields_set
+        }
+        return request.model_copy(update=updates) if updates else request

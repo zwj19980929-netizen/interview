@@ -241,6 +241,7 @@ Report module 在生成开始时先物化唯一的 `current_evaluations` 集合�
 | `MODEL-PROVIDER-001` | P1 | `verified（仓库）` | 只有 OpenAI-compatible LLM/Embedding，没有真实 TTS adapter；DashScope manifest 声明能力但不可执行；路由 UI 漏掉 TTS 并把 `retry_count` 误写为 `max_retries` | OpenAI-compatible 增加 Speech TTS；DashScope 增加 Qwen Chat/Embedding、Qwen3-TTS/CosyVoice adapter；路由请求改为强类型、生产缺 route 失败关闭；HTTP 合同、registry、路由与私有资产哈希测试通过 | 真实账号、区域、API Key、模型授权和音质/延迟验收为 `environment_pending`；STT/视频仍未选择供应商 |
 | `MODEL-PROVIDER-002` | P1 | `verified（仓库）` | manifest 没有可执行模型目录/默认配置语义，路由只能手输模型；DeepSeek/智谱未成为独立插件，OpenAI-compatible 厂商容易复制 runtime | 增加 defaults、predefined/customizable 与模型目录校验；DeepSeek/智谱薄 adapter 复用共享 runtime；千问目录/UI 显式化；配置默认值、目录路由约束、厂商 HTTP 合同和全量回归通过 | 三家真实 API Key、区域/账号授权、模型可用性、延迟/费用与结构化输出稳定性为 `environment_pending` |
 | `MODEL-PROVIDER-003` | P1 | `verified（仓库）` | 智谱只声明 LLM，单一 `test_model` 会把 `glm-tts` 当成 LLM；配置 UI 无编辑/按能力测试，HTTPX 初始化时缺 SOCKS 依赖会裸抛 500 | 增加 GLM-TTS adapter/模型目录、`capability + model` 测试协议、配置编辑 UI、显式环境代理开关和结构化 transport 错误；厂商 HTTP 合同、API、UI 与全量回归通过 | 真实智谱凭据、模型授权、音色、音质/延迟/费用为 `environment_pending` |
+| `MODEL-CONFIG-V2-001` | P1 | `closed` | 厂商账号、API Key、具体模型和 route target 混在 `ModelProviderConfig`，前端硬编码厂商字段，多个模型会复制凭证和参数 | 拆分 ProviderConnection/ModelConfiguration/ModelRoute；v2 manifest 提供动态表单；route 只引用 ready model；旧 API、collection 和运行时 target 已删除；显式迁移与回归测试通过 | 真实厂商模型仍需逐个测试，健康状态为部署环境事实 |
 | `TEST-ISOLATION-001` | P0 | `verified` | `reset_store_for_tests()` 曾取得默认 SQLite 并执行 `reset()`，全量测试会删除本地开发数据 | helper 改为直接替换成全新 `InMemoryStore`；回归测试证明临时 SQLite 不被重置，99 项全量测试前后开发 DB SHA-256 不变 | 本轮误删前数据无法从 SQLite `.recover`/本地快照恢复；已恢复可确认的智谱非秘密配置，API Key 需管理员重填 |
 | `REALTIME-001` | P2 | `verified` | 多实例事件、断路器和心跳只在单进程 | 新增 Redis event bus adapter、DB-backed ModelCircuitState、持久心跳超时 monitor；共享断路器与超时测试通过 | Redis 双实例演练 `environment_pending`；WebRTC 需供应商选择 |
 | `FAIRNESS-001` | P2 | `verified` | 没有可比较的抽题难度/覆盖分布 | 新增按岗位题量、难度、技能覆盖的公平性投影、阈值告警和审计 API；测试通过 | 人工金标、WER、AI/人工一致性需业务样本 |
@@ -287,6 +288,14 @@ Report module 在生成开始时先物化唯一的 `current_evaluations` 集合�
 3. Provider test body 可选 `capability + model`；解析顺序为请求、`test_models[capability]`、能力匹配的旧 `test_model`、manifest 默认模型。`predefined` 模型/能力不匹配时调用前返回 `MODEL_PROVIDER_MODEL_UNAVAILABLE`。
 4. 管理页面新增编辑和按能力测试弹窗；编辑以 `expected_version` 提交，空 API Key 不发送 `credentials`，测试切换到 `tts.synthesize` 时模型自动切为 `glm-tts`。
 5. 共享 HTTP transport 默认 `trust_env=false`，只有显式配置环境代理才继承代理变量；transport 初始化失败映射为 `provider_transport_unavailable`。离线合同、API/UI 与全量 99 项测试已通过，真实账号联调保持 `environment_pending`。
+
+### MODEL-CONFIG-V2-001 修改步骤与模型配置边界
+
+1. `ProviderPluginDefinition` 通过 v2 manifest 声明连接、凭证、模型类型和厂商模型参数表单；服务端严格校验，前端使用同一组通用控件渲染。
+2. `ProviderConnection` 只保存 API Key 引用、Base URL、区域等连接级信息；`ModelConfiguration` 保存一个 `llm/embedding/tts/stt/avatar` 模型、专属 settings、统一 defaults、能力和健康事实。
+3. 模型测试允许 `untested/failed` 配置执行隔离探针，成功后置 ready；普通调用和 route 创建仍拒绝未就绪模型。
+4. ModelRoute target 只保存 `model_configuration_id/timeout_s/pricing`；网关在一次深模块调用内解析模型、连接、凭证和 adapter，并应用调用显式参数优先的模型默认值。
+5. `app.migrations.model_configuration_v2` 支持 SQLite dry-run/一次性迁移；旧 API、`provider_configs` collection 和 `provider_config_id + model` 运行时表示已删除，动态表单、迁移、API、网关和 UI 回归测试覆盖该边界。
 
 ### TEST-ISOLATION-001 修复与数据恢复记录
 

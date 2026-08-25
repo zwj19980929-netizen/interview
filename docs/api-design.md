@@ -514,17 +514,18 @@ class ModelGateway:
 
 业务调用按 `organization_id + capability + purpose` 解析 route。正式面试目标流程要求统一 schema 覆盖 `llm.chat_json`、`tts.synthesize`、`stt.streaming`、`stt.batch` 和需要的 `avatar.speak`；没有 schema、可执行 adapter 和通过健康测试的能力不能进入 active route。`embedding.text` 是可选的未来题库治理能力，不是题库 ready、计划批准、预约邀请、随机抽题或答案评分的前置条件；仓库不再持久化旧向量题库 projection。
 
-`POST /admin/model-routes` 使用强类型请求：`primary`/`fallbacks` 仅接受 `provider_config_id`、`model`、`timeout_s`、`pricing`；`policy` 仅接受 `retry_count`、`retry_backoff_ms`、`fallback_on`、`max_cost_usd_per_call`、`circuit_failure_threshold`、`circuit_recovery_seconds`、`readiness_ttl_seconds`。未知字段（例如旧前端误写的 `max_retries`）返回 `422`；同一组织重复创建相同 `capability + purpose` 返回 `409 MODEL_ROUTE_CONFLICT`。Provider manifest 的 `model_selection=predefined` 时，route 的 `model` 必须存在于该 provider 的模型目录且声明当前 capability，否则返回 `409 MODEL_PROVIDER_MODEL_UNAVAILABLE`；`customizable` 允许目录外模型名。生产环境找不到精确 route 时返回 `provider_route_missing`，只有 development/test 允许离线 mock fallback。
+模型管理分为三层：`ProviderConnection` 只保存组织级厂商连接、API Key 引用和区域等连接参数；`ModelConfiguration` 选择 `llm/embedding/tts/stt/avatar` 类型及厂商模型，并保存该模型的专属设置和统一默认参数；`ModelRoute` 只引用模型配置。插件 manifest 返回 `connection_form`、`credential_form` 与各模型类型的 `configuration_form`，前端使用通用控件渲染器，不内置任何厂商字段。
 
-Provider catalog 同时返回 `defaults`、`model_selection` 和 `models`；创建配置时服务端先合并 manifest 默认值再校验，管理员页面据此预填 Base URL，并按能力给出模型候选。当前可执行的真实 HTTP adapter 为 `openai_compatible`、`deepseek`、`zhipuai` 与 `dashscope`：通用 adapter 覆盖 Chat/Embedding/OpenAI Speech-compatible TTS，DeepSeek 复用其 Chat 运行时；智谱在同一薄 adapter 内复用 Chat runtime 并增加官方 `GLM-TTS /audio/speech` 合同；DashScope 覆盖 Qwen Chat/Embedding 以及 Qwen3-TTS/CosyVoice。管理员页面的能力列表从已启用且 `implemented=true` 的 manifest 动态派生，不把能力或模型写死在页面。
-
-`POST /api/v1/admin/model-provider-configs/{id}/test` 接受可选 JSON body `{"capability":"tts.synthesize","model":"glm-tts"}`。省略 body 时为兼容旧客户端选择该 Provider 第一个具有统一探针 schema 的能力；显式 capability 必须由 manifest 声明，`predefined` Provider 的 model 必须属于该能力。模型解析顺序为请求 model、配置中的 `test_models[capability]`、与能力相符的旧 `test_model`、manifest 默认模型；因此 LLM 的 `glm-5.2` 与 TTS 的 `glm-tts` 不再共用一个测试字段。`PATCH` 使用现有 `expected_version` 乐观并发，凭证字段留空时前端不发送 `credentials`，从而保留原密钥。
+`POST /admin/model-routes` 使用强类型请求：`primary`/`fallbacks` 仅接受 `model_configuration_id`、`timeout_s`、`pricing`；路由创建时校验模型配置已启用、状态为 `ready` 且支持目标 capability。`policy` 仅接受既有重试、熔断、成本和 readiness 字段。生产环境找不到精确 route 时返回 `provider_route_missing`，只有 development/test 允许离线 mock fallback。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/api/v1/admin/model-providers/catalog` | 已安装插件、能力和实现状态 |
-| `POST/GET/PATCH` | `/api/v1/admin/model-provider-configs` | 管理组织 provider 配置，凭证脱敏 |
-| `POST` | `/api/v1/admin/model-provider-configs/{id}/test` | 按 `capability + model` 测试连接和单项能力；body 可选 |
+| `POST/GET/PATCH` | `/api/v1/admin/model-provider-connections` | 管理厂商连接；凭证只写入、读取时仅返回状态 |
+| `POST` | `/api/v1/admin/model-provider-connections/{id}/validate` | 校验连接字段与凭证是否具备创建模型的条件，不产生付费模型调用 |
+| `GET` | `/api/v1/admin/model-provider-connections/{id}/model-catalog` | 返回该连接可配置的模型类型、模型目录和动态表单 schema |
+| `POST/GET/PATCH` | `/api/v1/admin/model-configurations` | 管理具体模型及其厂商参数、统一默认参数和启用状态 |
+| `POST` | `/api/v1/admin/model-configurations/{id}/test` | 以模型配置的统一能力探针进行真实调用并更新健康状态 |
 | `POST/GET` | `/api/v1/admin/model-routes` | 管理能力/purpose 路由 |
 | `POST` | `/api/v1/admin/model-routes/{id}/test` | 测试 schema、primary 和 fallback |
 | `GET` | `/api/v1/admin/work-items` | 查看状态计数、dead-letter 指标和工作项摘要 |

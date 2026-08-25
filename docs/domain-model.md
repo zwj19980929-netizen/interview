@@ -516,9 +516,11 @@ AI 生成内容默认为 `draft`，未经面试官批准不得进入正式计划
 
 生成报告时先从每个 `CandidateAnswer.current_evaluation_id` 物化唯一的 current evaluation 集合。`overall_score`、维度、证据、风险、`manual_review` 和 `evaluation_ids` 必须全部从该集合计算；历史评分 revision 只属于引用它的历史报告，不能影响新报告。
 
-### ModelProviderConfig、ModelRoute 与 ModelInvocationLog
+### ProviderConnection、ModelConfiguration、ModelRoute 与 ModelInvocationLog
 
-`ProviderManifest` 是安装期声明，不是租户聚合：它定义 provider 能力、非秘密 defaults、按 capability 的模型目录、`predefined/customizable` 选择模式和 runtime entrypoint。`ModelProviderConfig` 保存组织级 provider 配置与 `credential_ref`，创建时合并 manifest defaults 后校验；凭证不进入 defaults。多能力 Provider 的探针模型使用 `config.test_models[capability]`，旧 `test_model` 只在模型目录证明其属于当前能力时兼容读取，不能把 LLM 与 TTS 模型互换。配置更新携带 `expected_version`；未发送 `credentials` 表示保留现有密钥。`ModelRoute` 按 `organization_id + capability + purpose` 选择 primary、fallback、超时、重试和断路器策略；这一组合在组织内是应用层唯一键，重复创建必须冲突，不能让路由解析依赖列表顺序。route target 仅包含 `provider_config_id/model/timeout_s/pricing`，policy 仅包含 `retry_count/retry_backoff_ms/fallback_on/max_cost_usd_per_call/circuit_failure_threshold/circuit_recovery_seconds/readiness_ttl_seconds`，未知字段在 API 边界拒绝。`predefined` provider 的 route/测试模型必须在 manifest 中声明当前能力；`customizable` provider 可接受目录外模型。`ModelInvocationLog` 对每个 attempt 追加 provider、模型、延迟、成本、统一错误码和脱敏请求哈希。
+`ProviderPluginDefinition` 是安装期声明，不是租户聚合：它定义厂商连接表单、凭证表单、模型类型、模型目录、模型配置表单和 runtime entrypoint。`ProviderConnection` 保存组织级连接参数与 `credential_ref`，不选择具体模型；未发送 credentials 表示保留现有密钥。`ModelConfiguration` 属于一个 ProviderConnection，保存 `model_type`、`provider_model_id`、厂商专属 `settings`、统一 `default_parameters`、支持能力及健康状态。两者更新都携带 `expected_version`。
+
+`ModelRoute` 按 `organization_id + capability + purpose` 选择 primary、fallback、超时、重试和断路器策略；route target 仅包含 `model_configuration_id/timeout_s/pricing`，不再复制 provider 或模型名。创建路由时模型必须已启用、健康且支持目标 capability。`ModelInvocationLog` 对每个 attempt 追加连接 ID、模型配置 ID、provider、模型、延迟、成本、统一错误码和脱敏请求哈希。
 
 正式面试流程至少需要以下 purpose：
 
@@ -536,7 +538,7 @@ AI 生成内容默认为 `draft`，未经面试官批准不得进入正式计划
 
 ## 聚合版本与并发
 
-所有可变聚合根使用整数 `version` 做乐观并发，包括 `JobPosition`、`KnowledgeBase`、`Question`、`CandidateProfile`、`ResumeDocument`、`ResumeReview`、`ExperienceQuestion`、`RoleRequirement`、`InterviewPlan`、`InterviewAppointment`、`InterviewSession`、`ModelProviderConfig` 和 `ModelRoute`。
+所有可变聚合根使用整数 `version` 做乐观并发，包括 `JobPosition`、`KnowledgeBase`、`Question`、`CandidateProfile`、`ResumeDocument`、`ResumeReview`、`ExperienceQuestion`、`RoleRequirement`、`InterviewPlan`、`InterviewAppointment`、`InterviewSession`、`ProviderConnection`、`ModelConfiguration` 和 `ModelRoute`。
 
 - 新聚合从 `version=1` 开始；写入必须匹配组织、ID 和旧 version。
 - 陈旧写入返回明确冲突，调用方重新读取并重新执行领域判断，不能静默覆盖。

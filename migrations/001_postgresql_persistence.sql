@@ -67,11 +67,11 @@ CREATE INDEX IF NOT EXISTS idx_outbox_claim
     ON outbox_work_items (organization_id, status, updated_at);
 
 CREATE TABLE IF NOT EXISTS provider_secrets (
-    provider_config_id text NOT NULL,
+    provider_connection_id text NOT NULL,
     organization_id text NOT NULL,
     data jsonb NOT NULL,
     updated_at timestamptz NOT NULL DEFAULT now(),
-    PRIMARY KEY (organization_id, provider_config_id)
+    PRIMARY KEY (organization_id, provider_connection_id)
 );
 
 CREATE TABLE IF NOT EXISTS model_invocations (
