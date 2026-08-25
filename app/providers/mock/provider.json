@@ -1,0 +1,24 @@
+{
+  "provider_id": "mock",
+  "display_name": "Mock Provider",
+  "version": "1.0.0",
+  "capabilities": [
+    "avatar.speak",
+    "embedding.text",
+    "llm.chat_json"
+  ],
+  "config_schema": {
+    "type": "object",
+    "properties": {}
+  },
+  "credential_schema": {
+    "type": "object",
+    "properties": {}
+  },
+  "models": [
+    {"model_id": "mock-json", "capabilities": ["llm.chat_json"]},
+    {"model_id": "mock-embedding", "capabilities": ["embedding.text"], "embedding_dimensions": 16},
+    {"model_id": "mock-avatar", "capabilities": ["avatar.speak"]}
+  ],
+  "entrypoint": "app.providers.mock.provider:MockProvider"
+}

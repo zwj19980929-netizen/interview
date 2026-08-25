@@ -1,0 +1,23 @@
+{
+  "provider_id": "anthropic",
+  "display_name": "Anthropic",
+  "version": "0.1.0",
+  "capabilities": ["llm.chat_json", "llm.chat_text"],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "base_url": {"type": "string"}
+    }
+  },
+  "credential_schema": {
+    "type": "object",
+    "required": ["api_key"],
+    "properties": {
+      "api_key": {"type": "string", "secret": true}
+    }
+  },
+  "models": [],
+  "entrypoint": "app.providers.anthropic.provider:AnthropicProvider",
+  "implemented": false
+}
+

@@ -1,0 +1,2 @@
+"""Domain constants and enums."""
+

@@ -1,0 +1,20 @@
+[project]
+name = "interviewer"
+version = "0.1.0"
+description = "Real-time AI interviewer backend MVP"
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi>=0.128.0",
+    "httpx>=0.28.0",
+    "pydantic>=2.7.0",
+    "pytest>=8.0.0",
+    "uvicorn>=0.39.0",
+    "websockets>=14.0",
+]
+
+[project.scripts]
+interviewer-outbox-worker = "app.workers.outbox:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

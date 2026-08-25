@@ -1,0 +1,2 @@
+"""Gemini provider plugin placeholder."""
+

@@ -1,0 +1,31 @@
+{
+  "provider_id": "volcengine",
+  "display_name": "Volcengine",
+  "version": "0.1.0",
+  "capabilities": [
+    "llm.chat_json",
+    "llm.chat_text",
+    "embedding.text",
+    "stt.streaming",
+    "tts.synthesize",
+    "avatar.speak"
+  ],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "region": {"type": "string"},
+      "base_url": {"type": "string"}
+    }
+  },
+  "credential_schema": {
+    "type": "object",
+    "required": ["api_key"],
+    "properties": {
+      "api_key": {"type": "string", "secret": true}
+    }
+  },
+  "models": [],
+  "entrypoint": "app.providers.volcengine.provider:VolcengineProvider",
+  "implemented": false
+}
+

@@ -1,0 +1,24 @@
+{
+  "provider_id": "openai_compatible",
+  "display_name": "OpenAI Compatible",
+  "version": "0.1.0",
+  "capabilities": ["llm.chat_json", "embedding.text"],
+  "config_schema": {
+    "type": "object",
+    "required": ["base_url"],
+    "properties": {
+      "base_url": {"type": "string"},
+      "organization": {"type": "string"}
+    }
+  },
+  "credential_schema": {
+    "type": "object",
+    "required": ["api_key"],
+    "properties": {
+      "api_key": {"type": "string", "secret": true}
+    }
+  },
+  "models": [],
+  "entrypoint": "app.providers.openai_compatible.provider:OpenAICompatibleProvider",
+  "implemented": true
+}

@@ -1,0 +1,25 @@
+{
+  "provider_id": "azure_speech",
+  "display_name": "Azure Speech",
+  "version": "0.1.0",
+  "capabilities": ["stt.streaming", "stt.batch", "tts.synthesize"],
+  "config_schema": {
+    "type": "object",
+    "required": ["region"],
+    "properties": {
+      "region": {"type": "string"},
+      "endpoint": {"type": "string"}
+    }
+  },
+  "credential_schema": {
+    "type": "object",
+    "required": ["subscription_key"],
+    "properties": {
+      "subscription_key": {"type": "string", "secret": true}
+    }
+  },
+  "models": [],
+  "entrypoint": "app.providers.azure_speech.provider:AzureSpeechProvider",
+  "implemented": false
+}
+
