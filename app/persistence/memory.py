@@ -9,17 +9,28 @@ from app.repositories.memory import InMemoryStore
 
 DOCUMENT_COLLECTIONS = (
     "questions",
+    "job_positions",
+    "knowledge_bases",
+    "question_speech_assets",
     "role_requirements",
     "interview_plans",
+    "candidate_profiles",
+    "resume_documents",
+    "file_objects",
+    "audit_events",
+    "resume_reviews",
+    "experience_questions",
+    "interview_appointments",
+    "candidate_intakes",
     "candidates",
     "interviews",
     "turns",
     "answers",
     "evaluations",
     "reports",
-    "vector_documents",
     "provider_configs",
     "model_routes",
+    "model_circuit_states",
 )
 
 
@@ -49,6 +60,34 @@ class _MemoryTransactionBackend(TransactionBackend):
         for item_id in ids:
             self.documents[collection].pop(item_id, None)
 
+    def search_question_catalog(
+        self,
+        *,
+        organization_id: str,
+        job_position_id: str,
+        knowledge_base_ids: List[str],
+        skills: List[str],
+        difficulties: List[str],
+        question_types: List[str],
+    ) -> List[Document]:
+        allowed_knowledge_bases = set(knowledge_base_ids)
+        required_skills = set(skills)
+        allowed_difficulties = set(difficulties)
+        allowed_types = set(question_types)
+        return [
+            deepcopy(item)
+            for item in self.documents["questions"].values()
+            if item.get("organization_id") == organization_id
+            and item.get("job_position_id") == job_position_id
+            and item.get("knowledge_base_id") in allowed_knowledge_bases
+            and item.get("status") == "active"
+            and item.get("validation_status") == "valid"
+            and item.get("speech_status") == "ready"
+            and (not required_skills or required_skills.intersection(item.get("skills", [])))
+            and (not allowed_difficulties or item.get("difficulty") in allowed_difficulties)
+            and (not allowed_types or item.get("type") in allowed_types)
+        ]
+
     def get_work_item(self, item_id: str) -> Optional[Document]:
         return deepcopy(self.work_items.get(item_id))
 
@@ -61,10 +100,10 @@ class _MemoryTransactionBackend(TransactionBackend):
     def replace_work_item(self, item: Document) -> None:
         self.work_items[item["id"]] = deepcopy(item)
 
-    def get_secret(self, item_id: str) -> Document:
+    def get_secret(self, organization_id: str, item_id: str) -> Document:
         return deepcopy(self.secrets.get(item_id, {}))
 
-    def replace_secret(self, item_id: str, secret: Document) -> None:
+    def replace_secret(self, organization_id: str, item_id: str, secret: Document) -> None:
         self.secrets[item_id] = deepcopy(secret)
 
     def list_invocations(self) -> List[Document]:

@@ -1,18 +1,23 @@
 import asyncio
 
+from app.repositories import provider as repository_provider
+from app.repositories.memory import InMemoryStore
 from app.repositories.sqlite import SQLiteStore
-from app.services.questions import QuestionService
+from app.services.catalog import CatalogService
 
 
-def test_sqlite_store_persists_questions_and_vectors(tmp_path) -> None:
+def test_sqlite_store_persists_catalog_questions_and_speech_work(tmp_path) -> None:
     db_path = tmp_path / "interviewer.sqlite3"
     store = SQLiteStore(str(db_path))
-    service = QuestionService(store)
+    service = CatalogService(store)
+    position = service.create_position({"code": "backend", "name": "后端工程师"})
+    knowledge_base = service.create_knowledge_base(position["id"], {"name": "数据库题库"})
 
     question = asyncio.run(
         service.create_question(
+            knowledge_base["id"],
             {
-                "knowledge_base_id": "kb_backend",
+                "knowledge_base_id": knowledge_base["id"],
                 "title": "B+ 树索引",
                 "question_text": "B+ 树索引为什么适合范围查询？",
                 "standard_answer": "B+ 树叶子节点有序并通过链表连接，适合范围扫描。",
@@ -21,20 +26,40 @@ def test_sqlite_store_persists_questions_and_vectors(tmp_path) -> None:
                 "skills": ["database", "mysql"],
                 "type": "open_ended",
                 "role_families": ["backend_engineer"],
-                "rubric": {},
+                "rubric": {"semantic_correctness": 1.0},
             }
         )
     )
 
-    assert question["index_status"] == "indexed"
+    assert question["index_status"] == "not_required"
+    assert question["speech_status"] == "ready"
     assert question["version"] == 2
-    assert len(store.vector_documents) == 4
     assert list(store.outbox_work_items.values())[0]["status"] == "completed"
     assert store.model_invocations
 
     reopened = SQLiteStore(str(db_path))
     assert question["id"] in reopened.questions
     assert reopened.questions[question["id"]]["title"] == "B+ 树索引"
-    assert len(reopened.vector_documents) == 4
+    assert reopened.knowledge_bases[knowledge_base["id"]]["status"] == "ready"
     assert list(reopened.outbox_work_items.values())[0]["status"] == "completed"
     assert reopened.model_invocations
+
+
+def test_reset_store_for_tests_never_resets_development_sqlite(tmp_path) -> None:
+    db_path = tmp_path / "development.sqlite3"
+    store = SQLiteStore(str(db_path))
+    persisted = {
+        **store.provider_configs["mpc_mock"],
+        "id": "mpc_persisted",
+        "display_name": "Must survive test reset",
+    }
+    store.provider_configs[persisted["id"]] = persisted
+    store.save_item("provider_configs", persisted["id"], persisted)
+    repository_provider._store = store
+
+    test_store = repository_provider.reset_store_for_tests()
+
+    assert isinstance(test_store, InMemoryStore)
+    assert not isinstance(test_store, SQLiteStore)
+    reopened = SQLiteStore(str(db_path))
+    assert reopened.provider_configs[persisted["id"]]["display_name"] == "Must survive test reset"

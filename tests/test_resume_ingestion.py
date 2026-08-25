@@ -1,0 +1,239 @@
+import asyncio
+from io import BytesIO
+
+import pytest
+from fastapi.testclient import TestClient
+from pypdf import PdfWriter
+from pypdf.generic import DictionaryObject, NameObject, StreamObject
+
+from app.core.errors import ApiError
+from app.file_storage.aliyun_oss import AliyunOssFileAdapter
+from app.file_storage.local import LocalPrivateFileAdapter
+from app.file_storage.signing import FileAccessSigner
+from app.main import create_app
+from app.persistence.provider import persistence_for
+from app.repositories.provider import get_store, reset_store_for_tests
+from app.services.resume_ingestion import ResumeIngestionService, SafePdfDownloader
+from app.workers.outbox import OutboxWorker
+
+
+def _pdf(text: str = "Python backend resume") -> bytes:
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=612, height=792)
+    font = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Font"),
+            NameObject("/Subtype"): NameObject("/Type1"),
+            NameObject("/BaseFont"): NameObject("/Helvetica"),
+        }
+    )
+    page[NameObject("/Resources")] = DictionaryObject(
+        {NameObject("/Font"): DictionaryObject({NameObject("/F1"): writer._add_object(font)})}
+    )
+    stream = StreamObject()
+    stream.set_data(("BT /F1 12 Tf 72 720 Td (%s) Tj ET" % text).encode("ascii"))
+    page[NameObject("/Contents")] = writer._add_object(stream)
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
+def _candidate(api: TestClient) -> str:
+    response = api.post(
+        "/api/v1/candidate-profiles",
+        json={"name": "Candidate", "email": "candidate@example.com", "phone": "13800138000"},
+    )
+    assert response.status_code == 200, response.text
+    return response.json()["id"]
+
+
+def test_pdf_upload_worker_private_access_and_idempotency(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("INTERVIEWER_PRIVATE_FILE_ROOT", str(tmp_path / "private"))
+    monkeypatch.setenv("INTERVIEWER_FILE_QUARANTINE_ROOT", str(tmp_path / "quarantine"))
+    monkeypatch.setenv("INTERVIEWER_FILE_SIGNING_SECRET", "test-signing-secret-at-least-32-characters")
+    from app.file_storage.provider import reset_private_file_storage_for_tests
+
+    reset_private_file_storage_for_tests()
+    reset_store_for_tests()
+    api = TestClient(create_app())
+    candidate_id = _candidate(api)
+    content = _pdf()
+    upload = api.post(
+        f"/api/v1/candidate-profiles/{candidate_id}/resumes",
+        files={"file": ("candidate.pdf", content, "application/pdf")},
+        data={"display_name": "candidate.pdf"},
+        headers={"Idempotency-Key": "resume-upload-1"},
+    )
+    assert upload.status_code == 202, upload.text
+    duplicate = api.post(
+        f"/api/v1/candidate-profiles/{candidate_id}/resumes",
+        files={"file": ("candidate.pdf", content, "application/pdf")},
+        headers={"Idempotency-Key": "resume-upload-1"},
+    )
+    assert duplicate.json()["ingestion_job_id"] == upload.json()["ingestion_job_id"]
+
+    results = asyncio.run(OutboxWorker(get_store()).run_once())
+    assert any(item["kind"] == "resume.ingest" and item["status"] == "completed" for item in results)
+    job = api.get(f"/api/v1/file-ingestion-jobs/{upload.json()['ingestion_job_id']}")
+    assert job.status_code == 200
+    assert job.json()["resume_document"]["status"] == "ready"
+
+    resume_id = upload.json()["resume_document_id"]
+    detail = api.get(f"/api/v1/candidate-profiles/{candidate_id}/resumes/{resume_id}")
+    assert detail.json()["page_count"] == 1
+    assert detail.json()["file"]["scan_status"] == "clean"
+    assert "parsed_text" not in detail.json()
+    grant = api.post(
+        f"/api/v1/candidate-profiles/{candidate_id}/resumes/{resume_id}/content-url",
+        headers={"X-Actor-Id": "reviewer_1"},
+    )
+    download = api.get(grant.json()["url"])
+    assert download.status_code == 200
+    assert download.content == content
+    assert download.headers["cache-control"] == "private, no-store"
+    with persistence_for(get_store()).transaction("org_default") as transaction:
+        events = transaction.audit_events.list()
+        raw_resume = transaction.resume_documents.get(resume_id)
+        parsed_file = transaction.file_objects.get(raw_resume["parsed_text_file_object_id"])
+    assert any(item["action"] == "resume.file.access_granted" for item in events)
+    assert "parsed_text" not in raw_resume
+    assert parsed_file["purpose"] == "resume_parsed_text"
+    assert parsed_file["status"] == "ready"
+
+
+def test_pdf_upload_rejects_type_and_worker_fails_malware(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("INTERVIEWER_PRIVATE_FILE_ROOT", str(tmp_path / "private"))
+    monkeypatch.setenv("INTERVIEWER_FILE_QUARANTINE_ROOT", str(tmp_path / "quarantine"))
+    from app.file_storage.provider import reset_private_file_storage_for_tests
+
+    reset_private_file_storage_for_tests()
+    reset_store_for_tests()
+    api = TestClient(create_app())
+    candidate_id = _candidate(api)
+    invalid = api.post(
+        f"/api/v1/candidate-profiles/{candidate_id}/resumes",
+        files={"file": ("resume.pdf", b"not-a-pdf", "application/pdf")},
+    )
+    assert invalid.status_code == 415
+    assert invalid.json()["error"]["code"] == "PDF_SIGNATURE_INVALID"
+
+    infected = _pdf() + b"EICAR-STANDARD-ANTIVIRUS-TEST-FILE"
+    queued = api.post(
+        f"/api/v1/candidate-profiles/{candidate_id}/resumes",
+        files={"file": ("resume.pdf", infected, "application/pdf")},
+    )
+    assert queued.status_code == 202
+    results = asyncio.run(OutboxWorker(get_store()).run_once())
+    assert any(item["kind"] == "resume.ingest" and item["status"] == "failed" for item in results)
+    detail = api.get(
+        f"/api/v1/candidate-profiles/{candidate_id}/resumes/{queued.json()['resume_document_id']}"
+    )
+    assert detail.json()["status"] == "failed"
+    assert detail.json()["processing_error"]["code"] == "FILE_MALWARE_DETECTED"
+
+
+def test_safe_pdf_downloader_rejects_loopback() -> None:
+    with pytest.raises(ApiError) as captured:
+        asyncio.run(SafePdfDownloader().download("http://127.0.0.1/resume.pdf"))
+    assert captured.value.code == "PDF_URL_ADDRESS_FORBIDDEN"
+
+
+def test_local_private_file_storage_contract(tmp_path) -> None:
+    adapter = LocalPrivateFileAdapter(
+        tmp_path,
+        signer=FileAccessSigner("contract-signing-secret-at-least-32-characters"),
+    )
+    content = _pdf()
+    stored = adapter.store(
+        organization_id="org_a",
+        object_id="file_1",
+        content=content,
+        content_type="application/pdf",
+        checksum="sha256:test",
+    )
+    assert adapter.open(stored.object_key) == content
+    grant = adapter.issue_read_access(stored.object_key, expires_seconds=60)
+    assert adapter.signer.verify(grant)["object_key"] == stored.object_key
+    adapter.delete(stored.object_key)
+    with pytest.raises(FileNotFoundError):
+        adapter.open(stored.object_key)
+
+
+def test_url_import_uses_the_same_verified_private_pipeline(tmp_path) -> None:
+    class FixedDownloader:
+        async def download(self, source_url: str):
+            assert source_url == "https://public.example/resume.pdf"
+            return _pdf("URL imported Python resume"), source_url + "?temporary=redacted"
+
+    reset_store_for_tests()
+    api = TestClient(create_app())
+    candidate_id = _candidate(api)
+    service = ResumeIngestionService(
+        get_store(),
+        storage=LocalPrivateFileAdapter(
+            tmp_path / "private",
+            signer=FileAccessSigner("url-contract-signing-secret-at-least-32-chars"),
+        ),
+        downloader=FixedDownloader(),
+        quarantine_root=tmp_path / "quarantine",
+    )
+    queued = service.queue_url(
+        candidate_id,
+        source_url="https://public.example/resume.pdf",
+        file_name="resume.pdf",
+        idempotency_key="url-import-1",
+    )
+    completed = asyncio.run(service.process(queued["job"]["id"]))
+    assert completed["status"] == "ready"
+    assert completed["page_count"] == 1
+    with persistence_for(get_store()).transaction("org_default") as transaction:
+        file_object = transaction.file_objects.get(completed["file_object_id"])
+    assert file_object["scan_status"] == "clean"
+    assert file_object["source_reference"] == "https://public.example"
+    assert file_object["source_url_hash"].startswith("sha256:")
+    assert "temporary=redacted" not in str(get_store().outbox_work_items)
+
+
+def test_aliyun_oss_private_storage_contract() -> None:
+    class Download:
+        def __init__(self, content: bytes) -> None:
+            self.content = content
+
+        def read(self) -> bytes:
+            return self.content
+
+    class Bucket:
+        def __init__(self) -> None:
+            self.objects = {}
+            self.last_headers = {}
+
+        def put_object(self, key, content, headers):
+            self.objects[key] = content
+            self.last_headers = headers
+
+        def get_object(self, key):
+            return Download(self.objects[key])
+
+        def delete_object(self, key):
+            self.objects.pop(key, None)
+
+        def sign_url(self, method, key, expires, slash_safe):
+            assert method == "GET" and slash_safe is True and expires <= 900
+            return "https://oss.example/%s?signature=test" % key
+
+    bucket = Bucket()
+    adapter = AliyunOssFileAdapter(bucket=bucket, bucket_name="private-resumes")
+    content = _pdf()
+    stored = adapter.store(
+        organization_id="org_a",
+        object_id="file_oss_1",
+        content=content,
+        content_type="application/pdf",
+        checksum="sha256:abc",
+    )
+    assert adapter.open(stored.object_key) == content
+    assert bucket.last_headers["x-oss-server-side-encryption"] == "AES256"
+    assert bucket.last_headers["x-oss-meta-sha256"] == "abc"
+    assert adapter.issue_read_access(stored.object_key, expires_seconds=3600).startswith("https://oss.example/")
+    adapter.delete(stored.object_key)
+    assert stored.object_key not in bucket.objects

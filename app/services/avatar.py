@@ -20,6 +20,22 @@ class AvatarService:
         interview = context["interview"]
         turn = context["turn"]
         turn_id = turn["id"]
+        speech_asset_id = turn.get("question_snapshot", {}).get("speech_asset_id")
+        if speech_asset_id:
+            with self.persistence.transaction(interview.get("organization_id", "org_default")) as transaction:
+                asset = transaction.question_speech_assets.get(speech_asset_id)
+            if asset and asset.get("status") == "ready" and not asset["audio_uri"].startswith("mock-tts://"):
+                return {
+                    "speech_id": asset["id"],
+                    "status": "ready",
+                    "mode": "audio",
+                    "text": turn["question_spoken_text"],
+                    "stream_url": None,
+                    "audio_uri": asset["audio_uri"],
+                    "visemes": [],
+                    "speech_asset_id": asset["id"],
+                    "provider": asset["provider"],
+                }
 
         response = await self.gateway.invoke(
             cap.AVATAR_SPEAK,
@@ -32,4 +48,6 @@ class AvatarService:
                 metadata={"interview_id": interview_id, "turn_id": turn_id},
             )
         )
-        return response.model_dump()
+        result = response.model_dump()
+        result["speech_asset_id"] = speech_asset_id
+        return result

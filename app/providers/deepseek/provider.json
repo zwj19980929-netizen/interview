@@ -1,0 +1,55 @@
+{
+  "provider_id": "deepseek",
+  "display_name": "DeepSeek",
+  "version": "1.0.0",
+  "capabilities": ["llm.chat_json", "llm.chat_text"],
+  "model_selection": "predefined",
+  "defaults": {
+    "base_url": "https://api.deepseek.com",
+    "test_model": "deepseek-chat",
+    "use_environment_proxy": false
+  },
+  "config_schema": {
+    "type": "object",
+    "required": ["base_url"],
+    "properties": {
+      "base_url": {"type": "string"},
+      "test_model": {"type": "string"},
+      "test_models": {"type": "object"},
+      "use_environment_proxy": {"type": "boolean"},
+      "timeout_s": {"type": "integer"}
+    }
+  },
+  "credential_schema": {
+    "type": "object",
+    "required": ["api_key"],
+    "properties": {
+      "api_key": {"type": "string", "secret": true}
+    }
+  },
+  "models": [
+    {
+      "model_id": "deepseek-chat",
+      "label": "DeepSeek Chat",
+      "capabilities": ["llm.chat_json", "llm.chat_text"],
+      "default": true
+    },
+    {
+      "model_id": "deepseek-reasoner",
+      "label": "DeepSeek Reasoner",
+      "capabilities": ["llm.chat_json", "llm.chat_text"]
+    },
+    {
+      "model_id": "deepseek-v4-flash",
+      "label": "DeepSeek V4 Flash",
+      "capabilities": ["llm.chat_json", "llm.chat_text"]
+    },
+    {
+      "model_id": "deepseek-v4-pro",
+      "label": "DeepSeek V4 Pro",
+      "capabilities": ["llm.chat_json", "llm.chat_text"]
+    }
+  ],
+  "entrypoint": "app.providers.deepseek.provider:DeepSeekProvider",
+  "implemented": true
+}

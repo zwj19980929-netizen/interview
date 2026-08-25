@@ -1,6 +1,8 @@
 import asyncio
 import hashlib
 import json
+import os
+from datetime import datetime, timedelta, timezone
 from copy import deepcopy
 from dataclasses import dataclass
 from time import monotonic, perf_counter
@@ -16,14 +18,22 @@ from app.model_gateway.registry import ProviderRegistry
 from app.model_gateway.schemas import (
     AvatarSpeakRequest,
     AvatarSpeakResponse,
+    BatchSTTRequest,
+    BatchSTTResponse,
     ChatJSONRequest,
     ChatJSONResponse,
+    ChatTextRequest,
+    ChatTextResponse,
     InvocationRequest,
     InvocationResponse,
     ProviderContext,
+    TTSSynthesizeRequest,
+    TTSSynthesizeResponse,
     TextEmbeddingRequest,
     TextEmbeddingResponse,
+    StreamingSTTRequest,
 )
+from app.model_gateway.streaming import ValidatedSTTStream
 from app.persistence.interface import Persistence
 from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
@@ -68,6 +78,75 @@ class CircuitBreaker:
 _PROCESS_CIRCUITS = CircuitBreaker()
 
 
+class PersistentCircuitBreaker:
+    """Database-backed breaker state shared by every application instance."""
+
+    def __init__(self, persistence: Persistence, organization_id: str = "org_default") -> None:
+        self.persistence = persistence
+        self.organization_id = organization_id
+
+    def is_open(self, key: str, *, threshold: int, recovery_seconds: float) -> bool:
+        if threshold <= 0:
+            return False
+        item_id = self._id(key)
+        organization_id = self._organization_for(key)
+        with self.persistence.transaction(organization_id) as transaction:
+            state = transaction.model_circuit_states.get(item_id)
+            if state is None or int(state.get("failures", 0)) < threshold or not state.get("opened_at"):
+                return False
+            opened = datetime.fromisoformat(str(state["opened_at"]).replace("Z", "+00:00"))
+            if datetime.now(timezone.utc) - opened >= timedelta(seconds=max(0.0, recovery_seconds)):
+                state["failures"] = 0
+                state["opened_at"] = None
+                state["updated_at"] = utc_now()
+                transaction.model_circuit_states.update(state, expected_version=state["version"])
+                return False
+            return True
+
+    def record_failure(self, key: str, *, threshold: int) -> None:
+        if threshold <= 0:
+            return
+        item_id = self._id(key)
+        organization_id = self._organization_for(key)
+        with self.persistence.transaction(organization_id) as transaction:
+            state = transaction.model_circuit_states.get(item_id)
+            if state is None:
+                transaction.model_circuit_states.add(
+                    {
+                        "id": item_id,
+                        "organization_id": organization_id,
+                        "circuit_key_hash": item_id.removeprefix("circuit_"),
+                        "failures": 1,
+                        "opened_at": utc_now() if threshold <= 1 else None,
+                        "updated_at": utc_now(),
+                    }
+                )
+                return
+            state["failures"] = int(state.get("failures", 0)) + 1
+            if state["failures"] >= threshold and not state.get("opened_at"):
+                state["opened_at"] = utc_now()
+            state["updated_at"] = utc_now()
+            transaction.model_circuit_states.update(state, expected_version=state["version"])
+
+    def record_success(self, key: str) -> None:
+        item_id = self._id(key)
+        organization_id = self._organization_for(key)
+        with self.persistence.transaction(organization_id) as transaction:
+            state = transaction.model_circuit_states.get(item_id)
+            if state is None:
+                return
+            state["failures"] = 0
+            state["opened_at"] = None
+            state["updated_at"] = utc_now()
+            transaction.model_circuit_states.update(state, expected_version=state["version"])
+
+    def _id(self, key: str) -> str:
+        return "circuit_%s" % hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+    def _organization_for(self, key: str) -> str:
+        return key.split(":", 1)[0] or self.organization_id
+
+
 class ModelGateway:
     """Deep Model Invocation module behind one capability/request interface."""
 
@@ -82,7 +161,7 @@ class ModelGateway:
     ) -> None:
         self.persistence = persistence or persistence_for(store)
         self.providers = provider_registry or ProviderRegistry(provider_clients)
-        self.circuits = circuit_breaker or _PROCESS_CIRCUITS
+        self.circuits = circuit_breaker or PersistentCircuitBreaker(self.persistence)
 
     async def invoke(
         self,
@@ -249,6 +328,105 @@ class ModelGateway:
         self._annotate_error(error, invocation_id, resolved_route, total_attempts)
         raise error
 
+    async def open_stream(
+        self,
+        request: StreamingSTTRequest,
+        *,
+        route: Optional[Dict[str, Any]] = None,
+    ) -> ValidatedSTTStream:
+        """Open a streaming STT session; fallback is allowed only before audio is accepted."""
+        capability = cap.STT_STREAMING
+        resolved_route = deepcopy(route) if route is not None else self._resolve_route(
+            request.organization_id, capability, request.purpose
+        )
+        if resolved_route.get("capability") != capability:
+            raise ProviderError("provider_route_invalid", "STT stream route capability is invalid.", retryable=False)
+        targets = [resolved_route.get("primary") or {}] + list(resolved_route.get("fallbacks") or [])
+        invocation_id = new_id("model_invocation")
+        request_hash = self._request_hash(request)
+        last_error: Optional[ProviderError] = None
+        for fallback_index, target in enumerate(targets):
+            provider_config_id = str(target.get("provider_config_id") or "")
+            model = str(target.get("model") or self._default_mock_model(capability))
+            timeout_s = max(0.01, float(target.get("timeout_s", 10)))
+            provider_id = "unknown"
+            started_at = perf_counter()
+            try:
+                provider_config, credentials = self._provider_connection(
+                    request.organization_id, provider_config_id
+                )
+                provider_id = provider_config["provider_id"]
+                adapter = self.providers.adapter(provider_id, capability)
+                open_stream = getattr(adapter, "open_stream", None)
+                if not callable(open_stream):
+                    raise ProviderError(
+                        "provider_streaming_not_supported",
+                        "Provider adapter does not implement open_stream.",
+                        retryable=False,
+                    )
+                context = ProviderContext(
+                    organization_id=request.organization_id,
+                    invocation_id=invocation_id,
+                    route_id=str(resolved_route.get("id") or "route_inline"),
+                    provider_config_id=provider_config_id,
+                    capability=capability,
+                    purpose=request.purpose,
+                    model=model,
+                    timeout_s=timeout_s,
+                    attempt=1,
+                    fallback_index=fallback_index,
+                    config=provider_config.get("config") or {},
+                    credentials=credentials,
+                    metadata=request.metadata,
+                )
+                try:
+                    provider_stream = await asyncio.wait_for(open_stream(request, context), timeout=timeout_s)
+                except asyncio.TimeoutError as exc:
+                    raise ProviderError("provider_timeout", "Provider stream open timed out.", retryable=True) from exc
+                stream = ValidatedSTTStream(provider_stream, request)
+                self._log_invocation(
+                    invocation_id=invocation_id,
+                    organization_id=request.organization_id,
+                    capability=capability,
+                    purpose=request.purpose,
+                    route=resolved_route,
+                    provider_config_id=provider_config_id,
+                    provider_id=provider_id,
+                    model=model,
+                    status="stream_opened" if not fallback_index else "stream_fallback_opened",
+                    latency_ms=int((perf_counter() - started_at) * 1000),
+                    attempt=1,
+                    fallback_index=fallback_index,
+                    request_hash=request_hash,
+                )
+                return stream
+            except ProviderError as exc:
+                last_error = exc
+                self._log_invocation(
+                    invocation_id=invocation_id,
+                    organization_id=request.organization_id,
+                    capability=capability,
+                    purpose=request.purpose,
+                    route=resolved_route,
+                    provider_config_id=provider_config_id,
+                    provider_id=provider_id,
+                    model=model,
+                    status="failed",
+                    latency_ms=int((perf_counter() - started_at) * 1000),
+                    attempt=1,
+                    fallback_index=fallback_index,
+                    request_hash=request_hash,
+                    error_code=exc.code,
+                )
+                if not exc.retryable or fallback_index + 1 >= len(targets):
+                    self._annotate_error(exc, invocation_id, resolved_route, fallback_index + 1)
+                    raise
+        error = last_error or ProviderError(
+            "provider_route_invalid", "STT stream route has no target.", retryable=False
+        )
+        self._annotate_error(error, invocation_id, resolved_route, len(targets))
+        raise error
+
     def _resolve_route(self, organization_id: str, capability: str, purpose: str) -> Dict[str, Any]:
         with self.persistence.transaction(organization_id) as transaction:
             routes = transaction.model_routes.list()
@@ -259,8 +437,17 @@ class ModelGateway:
         ]
         exact = next((route for route in enabled if route.get("purpose") == purpose), None)
         default = next((route for route in enabled if route.get("purpose") == "default"), None)
-        if exact or default:
-            return deepcopy(exact or default)
+        runtime_env = os.getenv("INTERVIEWER_RUNTIME_ENV", "development").lower()
+        if exact:
+            return deepcopy(exact)
+        if default and runtime_env != "production":
+            return deepcopy(default)
+        if runtime_env == "production":
+            raise ProviderError(
+                "provider_route_missing",
+                "Production model invocation requires an explicit capability and purpose route.",
+                retryable=False,
+            )
         return {
             "id": "route_mock",
             "organization_id": organization_id,
@@ -305,7 +492,10 @@ class ModelGateway:
     def _validate_request(self, capability: str, request: InvocationRequest) -> None:
         expected = {
             cap.LLM_CHAT_JSON: ChatJSONRequest,
+            cap.LLM_CHAT_TEXT: ChatTextRequest,
             cap.EMBEDDING_TEXT: TextEmbeddingRequest,
+            cap.STT_BATCH: BatchSTTRequest,
+            cap.TTS_SYNTHESIZE: TTSSynthesizeRequest,
             cap.AVATAR_SPEAK: AvatarSpeakRequest,
         }.get(capability)
         if expected is None:
@@ -324,7 +514,10 @@ class ModelGateway:
     def _validate_response(self, capability: str, request: InvocationRequest, response: Any) -> None:
         expected = {
             cap.LLM_CHAT_JSON: ChatJSONResponse,
+            cap.LLM_CHAT_TEXT: ChatTextResponse,
             cap.EMBEDDING_TEXT: TextEmbeddingResponse,
+            cap.STT_BATCH: BatchSTTResponse,
+            cap.TTS_SYNTHESIZE: TTSSynthesizeResponse,
             cap.AVATAR_SPEAK: AvatarSpeakResponse,
         }[capability]
         if not isinstance(response, expected):
@@ -332,6 +525,9 @@ class ModelGateway:
         if isinstance(request, ChatJSONRequest) and isinstance(response, ChatJSONResponse):
             if request.json_schema:
                 self._validate_json_value(response.data, request.json_schema, path="$")
+        elif isinstance(request, ChatTextRequest) and isinstance(response, ChatTextResponse):
+            if not response.text.strip():
+                self._schema_error("Text response cannot be empty.")
         elif isinstance(request, TextEmbeddingRequest) and isinstance(response, TextEmbeddingResponse):
             if len(response.vectors) != len(request.texts):
                 self._schema_error("Embedding response count does not match request count.")
@@ -342,6 +538,12 @@ class ModelGateway:
         elif isinstance(request, AvatarSpeakRequest) and isinstance(response, AvatarSpeakResponse):
             if not response.text or response.mode not in {"browser_speech", "audio", "video", "webrtc"}:
                 self._schema_error("Avatar response is missing a supported delivery mode or spoken text.")
+        elif isinstance(request, BatchSTTRequest) and isinstance(response, BatchSTTResponse):
+            if not response.text.strip() or response.source not in {"server_streaming", "server_batch", "server_batch_repair"}:
+                self._schema_error("STT response is missing authoritative transcript text or source.")
+        elif isinstance(request, TTSSynthesizeRequest) and isinstance(response, TTSSynthesizeResponse):
+            if not response.audio_uri or not response.content_type.startswith("audio/"):
+                self._schema_error("TTS response is missing a supported audio asset.")
 
     def _validate_json_value(self, value: Any, schema: Dict[str, Any], *, path: str) -> None:
         if "enum" in schema and value not in schema["enum"]:
@@ -489,8 +691,10 @@ class ModelGateway:
     def _default_mock_model(self, capability: str) -> str:
         return {
             cap.LLM_CHAT_JSON: "mock-json",
+            cap.LLM_CHAT_TEXT: "mock-text",
             cap.EMBEDDING_TEXT: "mock-embedding",
             cap.STT_STREAMING: "mock-stt",
+            cap.STT_BATCH: "mock-stt",
             cap.TTS_SYNTHESIZE: "mock-tts",
             cap.AVATAR_SPEAK: "mock-avatar",
         }.get(capability, "mock")

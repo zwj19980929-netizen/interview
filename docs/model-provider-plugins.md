@@ -64,12 +64,14 @@ Provider adapter 负责把统一请求转换成厂商协议、注入厂商鉴权
 
 | provider_id | 能力 | 说明 |
 | --- | --- | --- |
-| `mock` | `llm.chat_json`、`embedding.text`、`avatar.speak` | 当前三个统一 schema 的本地测试 adapter |
-| `openai_compatible` | `llm.chat_json`、`embedding.text` | 兼容 OpenAI API 风格的模型服务，通过 `base_url` 配置切换 |
+| `mock` | `llm.chat_json`、`llm.chat_text`、`embedding.text`、`stt.streaming`、`stt.batch`、`tts.synthesize`、`avatar.speak` | 本地测试 adapter；语音结果明确不具备生产 readiness |
+| `openai_compatible` | `llm.chat_json`、`llm.chat_text`、`embedding.text`、`tts.synthesize` | 兼容 OpenAI Chat/Embedding/Speech API 风格的模型服务，通过 `base_url` 配置切换 |
+| `deepseek` | `llm.chat_json`、`llm.chat_text` | DeepSeek 官方 OpenAI-compatible Chat API；模型由 manifest 目录约束 |
+| `zhipuai` | `llm.chat_json`、`llm.chat_text`、`tts.synthesize` | 智谱 BigModel OpenAI-compatible Chat 与官方 GLM-TTS `/audio/speech`；模型由 manifest 按能力约束 |
 | `azure_openai` | `llm.chat_json`、`llm.chat_text`、`embedding.text` | 企业 Azure 部署场景 |
 | `anthropic` | `llm.chat_json`、`llm.chat_text` | 可作为评分和总结模型 |
 | `gemini` | `llm.chat_json`、`llm.chat_text`、`embedding.text` | 可作为通用 LLM 和 embedding |
-| `dashscope` | `llm.chat_json`、`llm.chat_text`、`embedding.text`、`stt.batch`、`tts.synthesize` | 国内模型和语音服务场景 |
+| `dashscope` | `llm.chat_json`、`llm.chat_text`、`embedding.text`、`tts.synthesize` | 阿里云百炼 Qwen LLM/Embedding 与 Qwen-TTS/CosyVoice HTTP 服务 |
 | `volcengine` | `llm.chat_json`、`llm.chat_text`、`embedding.text`、`stt.streaming`、`tts.synthesize`、`avatar.speak` | 国内模型、语音和数字人场景 |
 | `azure_speech` | `stt.streaming`、`stt.batch`、`tts.synthesize` | 语音识别和合成 |
 | `tencent_cloud_speech` | `stt.streaming`、`stt.batch`、`tts.synthesize` | 国内语音识别和合成 |
@@ -78,15 +80,19 @@ Provider adapter 负责把统一请求转换成厂商协议、注入厂商鉴权
 
 当前实现状态：
 
-- `provider.json` 同时驱动 catalog、管理员配置校验和运行时 adapter 加载；`entrypoint` 不再是展示字段。
+- `provider.json` 同时驱动 catalog、管理员配置校验、默认配置、模型选择和运行时 adapter 加载；`entrypoint` 不再是展示字段。该分层参考 Dify 的“声明式 Provider/Model schema + runtime adapter”思路，但仍保持本仓库单一 `ModelGateway` deep module，不引入第二套路由或插件管理器。
 - 业务 module 统一调用 `ModelGateway.invoke(capability, request)`，不再为 chat、embedding、avatar 复制路由与日志分支。
-- `mock` adapter 已实现 `llm.chat_json`、`embedding.text` 和 `avatar.speak`。
+- `mock` adapter 已实现 `llm.chat_json`、`llm.chat_text`、`embedding.text`、`stt.streaming`、`stt.batch`、`tts.synthesize` 和 `avatar.speak`。streaming adapter 产出有序 ready/partial/final/closed 事件；mock STT 只接受显式开发元数据，mock TTS 返回不可作为生产媒体的确定性 `mock-tts://` 资产。
 - `mock` provider 已实现 `avatar.speak` 的浏览器语音驱动响应，用于本地数字人演示；它不生成真人视频，也不应标记为生产数字人能力。
-- `openai_compatible` provider 已支持真实 HTTP 调用：`llm.chat_json` 和 `embedding.text`。
-- 当前还没有可执行的 `stt.streaming`、`stt.batch` 或 `tts.synthesize` 统一 adapter；浏览器 SpeechRecognition 和浏览器语音合成都只是本地演示兜底，不满足正式面试 readiness。
-- 路由的 retry、fallback_on、硬超时、进程内断路器、输出 schema 校验和成本上限已经在统一管线执行；每个 attempt 形成追加日志。
-- 其它 provider 目前只有 `implemented=false` 的 manifest 和配置 schema，可展示和保存配置，但不能创建活动路由，也不应视为已接入真实厂商 API。
-- 本地 SQLite 会把 provider credentials 存入 `provider_secrets` 表，仅用于开发测试；生产必须替换为密钥管理器或加密字段。
+- `openai_compatible` provider 已支持真实 HTTP 调用：`llm.chat_json`、`llm.chat_text`、`embedding.text` 和 `tts.synthesize`。TTS 使用 `/audio/speech`，支持 `wav/mp3/opus/aac/flac/pcm`，二进制响应会转为 data URI 后交给私有资产复制层校验和落盘。
+- `deepseek` 与 `zhipuai` provider 复用 `OpenAICompatibleProvider` 的 HTTP、Bearer 鉴权、用量解析、错误映射和响应归一化；两者的 `llm.chat_json` 使用厂商支持的 `json_object` 并在 system message 注入目标 JSON Schema，避免假定支持 OpenAI `json_schema` 扩展。智谱 adapter 另在 TTS seam 校验 `glm-tts`、官方 WAV/PCM 格式、1024 字符上限和默认音色 `tongtong`，再复用共享二进制响应归一化。
+- `dashscope` provider 已支持 OpenAI-compatible Qwen Chat/Embedding，并按模型路由 Qwen3-TTS 的 multimodal-generation HTTP 接口或 CosyVoice/Qwen-Audio 的 `SpeechSynthesizer` HTTP 接口。供应商返回的临时音频 URL 会强制升级为 HTTPS（可配置）并复制到 PrivateFileStorage；落盘文件的真实 SHA-256 是最终资产哈希。
+- `stt.streaming` 已有 `StreamingSTTRequest/Event`、`ModelGateway.open_stream()`、有序 chunk/final 校验、建立前 fallback、硬超时、断流 batch 修复和独立 WebSocket 端到端测试；`stt.batch` 与 `tts.synthesize` 也有统一 schema、网关校验和调用审计。浏览器 SpeechRecognition 只用于本地展示/开发输入，不满足正式面试 readiness。
+- 路由的 retry、fallback_on、硬超时、数据库共享断路器、输出 schema 校验和成本上限在统一管线执行；每个 attempt 形成追加日志。多实例进程通过 Persistence 共用 `ModelCircuitState`，不再依赖进程内全局状态。
+- 除 `mock`、`openai_compatible`、`deepseek`、`zhipuai` 和 `dashscope` 外，其它 provider 目前只有 `implemented=false` 的 manifest 和配置 schema，可展示和保存配置，但不能创建活动路由，也不应视为已接入真实厂商 API。
+- Provider credentials 通过 `ProviderSecretVault` 在 repository seam 使用 Fernet 密封；API 只返回 `credential_ref`。生产未配置 `INTERVIEWER_PROVIDER_SECRET_ENCRYPTION_KEY` 或遇到旧未密封值时失败关闭。
+
+仓库内 OpenAI-compatible/DashScope 的 LLM、Embedding、TTS HTTP 合同以及私有资产复制与 readiness 逻辑已验证；真实外部调用仍需要对应账号、区域、模型授权和 API Key 后才能标记健康。`azure_speech`、`tencent_cloud_speech`、`volcengine` 等 STT/数字人 manifest 仍为 `implemented=false`。基础视频继续通过稳定的 `avatar.speak -> TTS/文字` seam 降级，真人视频和口型同步留给后续供应商会话 adapter，不改变面试编排。
 
 ## 目录建议
 
@@ -102,6 +108,15 @@ app/
       provider.py
       provider.json
     openai_compatible/
+      provider.py
+      provider.json
+    deepseek/
+      provider.py
+      provider.json
+    zhipuai/
+      provider.py
+      provider.json
+    dashscope/
       provider.py
       provider.json
     azure_openai/
@@ -120,7 +135,15 @@ app/
   "provider_id": "openai_compatible",
   "display_name": "OpenAI Compatible",
   "version": "1.0.0",
-  "capabilities": ["llm.chat_json", "embedding.text"],
+  "capabilities": ["llm.chat_json", "embedding.text", "tts.synthesize"],
+  "model_selection": "customizable",
+  "defaults": {
+    "base_url": "https://models.example.com/v1",
+    "test_models": {
+      "llm.chat_json": "chat-model-default",
+      "tts.synthesize": "speech-model-default"
+    }
+  },
   "config_schema": {
     "type": "object",
     "required": ["base_url"],
@@ -139,7 +162,9 @@ app/
   "models": [
     {
       "model_id": "chat-model-default",
+      "label": "Default Chat Model",
       "capabilities": ["llm.chat_json"],
+      "default": true,
       "context_window": 128000,
       "supports_json_schema": true
     },
@@ -158,7 +183,9 @@ Manifest 规则：
 - `provider_id` 全局唯一，只允许小写字母、数字和下划线。
 - `capabilities` 必须来自系统能力枚举。
 - `credential_schema` 中标记 `secret: true` 的字段不得明文写入普通日志或 API 响应。
-- `models` 可以为空，允许管理员在后台手动填写模型名。
+- `defaults` 只保存非秘密配置默认值；创建 Provider 配置时先与用户配置合并再执行 `config_schema` 校验，凭证不得放入 defaults。多能力 Provider 使用 `test_models[capability]`，不能让单一 `test_model` 同时代表 LLM、Embedding 和 TTS；旧字段只作为能力匹配时的兼容读取。
+- `model_selection` 只允许 `predefined` 或 `customizable`。`predefined` 要求 route 模型存在于 `models` 且声明目标能力；`customizable` 的 `models` 是后台候选目录，仍允许管理员填写目录外模型。
+- `models` 条目必须提供唯一非空 `model_id` 和非空 `capabilities`，且能力是 provider 能力的子集；每项能力至多有一个 `default=true` 模型。`models` 可以为空，但此时 `model_selection` 必须为 `customizable`。
 - `entrypoint` 指向实现通用 Provider adapter interface 的类；`implemented=true` 时必须可在运行时加载。
 - `config_schema` 与 `credential_schema` 在创建和更新配置时执行，不能只用于页面展示。
 - `capabilities` 只声明当前 adapter 和统一 schema 真正可执行的能力；未来能力可保留在 `implemented=false` 的占位 manifest 中。
@@ -450,6 +477,8 @@ Model Invocation 校验 content type、最大大小、非空音频和 duration�
 
 `ModelRoute` 决定某个能力、场景默认走哪个 provider 和模型。
 
+同一组织内 `(capability, purpose)` 是应用层唯一键；重复创建返回 `409 MODEL_ROUTE_CONFLICT`。创建请求使用强类型 target/policy schema，未知字段返回 `422`，避免把 `max_retries` 等拼写错误静默保存。target 只接受 `provider_config_id`、`model`、`timeout_s`、`pricing`；policy 只接受 `retry_count`、`retry_backoff_ms`、`fallback_on`、`max_cost_usd_per_call`、`circuit_failure_threshold`、`circuit_recovery_seconds` 和 `readiness_ttl_seconds`。
+
 本业务至少使用以下精确 purpose，不能用一个 `default` 路由混合不同敏感数据：
 
 | capability | purpose | 数据边界 |
@@ -498,14 +527,13 @@ Model Invocation 校验 content type、最大大小、非空音频和 duration�
 路由匹配与执行顺序：
 
 1. 组织 + 能力 + purpose 精确匹配。
-2. 组织 + 能力默认路由。
-3. 本地开发未找到组织路由时可显式使用 mock 路由，保证离线闭环。
+2. 仅在 development/test 环境未找到组织路由时使用显式 mock fallback，保证离线闭环。
 
-生产部署必须显式配置组织路由并失败关闭，不能静默以 mock、浏览器 STT 或浏览器 TTS 参与真实邀请、面试或评分。
+生产部署必须显式配置组织、能力和 purpose 路由；缺失时返回 `provider_route_missing` 并失败关闭，不能静默以 mock、浏览器 STT 或浏览器 TTS 参与真实邀请、面试或评分。
 
 每个 route 依次执行 primary 与 fallbacks。每个 target 最多执行 `1 + retry_count` 次，当前 `retry_count` 限制为 0-3；每次都由管线施加硬 `timeout_s`。只有 `ProviderError.retryable=true` 且错误命中 `fallback_on`（未配置时为任意可重试错误）才进入下一个 target。`fallback_on` 同时接受完整错误码（如 `provider_timeout`）和去掉 `provider_` 前缀的别名（如 `timeout`）。鉴权、坏请求、能力缺失等非可重试错误立即失败。
 
-`circuit_failure_threshold` 次 target 失败后打开进程内断路器，`circuit_recovery_seconds` 后允许探测恢复。该状态当前不跨进程共享；多实例生产部署需要 Redis 或遥测驱动的共享断路器。`llm.chat_json` 在返回业务 module 前按请求携带的 JSON schema 校验；embedding 数量/维度和 avatar 模式也由同一管线校验。
+`circuit_failure_threshold` 次 target 失败后写入租户级 `ModelCircuitState`，`circuit_recovery_seconds` 后允许探测恢复；所有应用实例通过 Persistence 共享状态。`llm.chat_json` 在返回业务 module 前按请求携带的 JSON schema 校验；embedding 数量/维度、streaming STT 事件序号/唯一 final 和 avatar 模式也由同一管线校验。
 
 ### 正式面试 readiness
 
@@ -529,12 +557,14 @@ readiness 是带检查时间和有效期的事实，不是永久布尔值；超�
 | `POST` | `/api/v1/admin/model-provider-configs` | 新增组织级供应商配置 |
 | `GET` | `/api/v1/admin/model-provider-configs` | 列出供应商配置，凭证字段脱敏 |
 | `PATCH` | `/api/v1/admin/model-provider-configs/{id}` | 启用、停用或修改配置 |
-| `POST` | `/api/v1/admin/model-provider-configs/{id}/test` | 测试连接和能力调用 |
+| `POST` | `/api/v1/admin/model-provider-configs/{id}/test` | 使用可选 `capability + model` 测试连接和能力调用 |
 | `POST` | `/api/v1/admin/model-routes` | 配置能力路由 |
 | `GET` | `/api/v1/admin/model-routes` | 查看路由 |
 | `POST` | `/api/v1/admin/model-routes/{id}/test` | 测试路由和 fallback |
 
 `PATCH /model-provider-configs/{id}` 必须携带 `expected_version`。配置文档和凭证引用使用同一租户事务更新；并发版本不匹配时拒绝写入，不能以最后写入覆盖。
+
+Provider test 的请求 body 可省略；管理 UI 应显式选择能力并从 manifest 当前能力的模型目录选择 model。服务端依次解析请求 model、`config.test_models[capability]`、能力匹配的旧 `config.test_model` 和 manifest 默认模型；`predefined` Provider 必须再次执行模型/能力校验。配置编辑 UI 只在用户输入新密钥时发送 `credentials`，空密码不能清除现有密钥。
 
 新增供应商插件后，`catalog` 必须能读出 manifest，不需要改业务服务。
 
@@ -582,6 +612,7 @@ Provider 插件把厂商错误映射为统一错误码：
 | `provider_not_installed` / `provider_not_implemented` | manifest 或 runtime adapter 不可用 | 否 |
 | `provider_entrypoint_invalid` | manifest entrypoint 无法加载或不满足 interface | 否 |
 | `provider_config_missing` | route 引用不存在的配置 | 否 |
+| `provider_route_missing` | 生产环境未配置精确能力/purpose 路由 | 否 |
 | `provider_config_disabled` | route 引用已停用配置 | 是 |
 | `provider_circuit_open` | 断路器阻止调用该 target | 是 |
 | `provider_cost_limit_exceeded` | 返回用量超过单次成本上限 | 否 |
@@ -589,6 +620,7 @@ Provider 插件把厂商错误映射为统一错误码：
 | `provider_stream_open_failed` | 流在接受音频前无法建立 | 是，可重新开流 |
 | `provider_stream_interrupted` | 流在接受音频后中断 | 否，转 `stt.batch` 修复 |
 | `provider_audio_format_unsupported` | 音频编码、采样率或声道不支持 | 否 |
+| `provider_transport_unavailable` | HTTP transport 或显式代理依赖不可用 | 否 |
 | `provider_final_transcript_missing` | 输入结束后未得到 final | 否，转 `stt.batch` 修复 |
 
 ## 新增厂商流程
@@ -603,3 +635,15 @@ Provider 插件把厂商错误映射为统一错误码：
 8. 管理员新增配置并测试通过后配置路由；STT/TTS 还必须通过端到端 readiness 才可用于正式邀请。
 
 新增厂商不应修改评分、Question Selection 或面试编排 module。若必须修改业务 module，说明能力抽象不完整，应先扩展模型网关 schema。
+
+## 本轮实现依据
+
+- Dify `ProviderManager` 与官方模型插件仓库：借鉴 schema/runtime 分工，不复制其插件市场和租户配置编排层。
+  - <https://github.com/langgenius/dify/blob/main/api/core/provider_manager.py>
+  - <https://github.com/langgenius/dify-official-plugins>
+  - <https://github.com/langgenius/dify-official-plugins/blob/main/models/openai_api_compatible/provider/openai_api_compatible.yaml>
+- DeepSeek 官方 OpenAI-compatible API：<https://api-docs.deepseek.com/>
+- 智谱 BigModel OpenAI SDK 兼容说明：<https://docs.bigmodel.cn/cn/guide/develop/openai/introduction>
+- 阿里云百炼千问文本生成说明：<https://help.aliyun.com/zh/model-studio/text-generation>
+
+外部文档只决定 adapter 的厂商协议转换；领域能力、route、日志、隐私和 readiness 仍以本仓库统一 schema 为准。

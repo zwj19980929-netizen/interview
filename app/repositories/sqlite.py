@@ -9,17 +9,28 @@ from app.repositories.memory import InMemoryStore
 
 DOCUMENT_COLLECTIONS = [
     "questions",
+    "job_positions",
+    "knowledge_bases",
+    "question_speech_assets",
     "role_requirements",
     "interview_plans",
+    "candidate_profiles",
+    "resume_documents",
+    "file_objects",
+    "audit_events",
+    "resume_reviews",
+    "experience_questions",
+    "interview_appointments",
+    "candidate_intakes",
     "candidates",
     "interviews",
     "turns",
     "answers",
     "evaluations",
     "reports",
-    "vector_documents",
     "provider_configs",
     "model_routes",
+    "model_circuit_states",
 ]
 
 
@@ -27,9 +38,8 @@ class SQLiteStore(InMemoryStore):
     """SQLite-backed store for local development.
 
     The public shape intentionally matches InMemoryStore so services can move
-    toward repository boundaries without a large rewrite. PostgreSQL support
-    should implement the same methods and collections, with vector_documents
-    mapped to pgvector.
+    toward repository boundaries without a large rewrite. PostgreSQL uses the
+    same document and structured catalog interfaces.
     """
 
     def __init__(self, path: str) -> None:

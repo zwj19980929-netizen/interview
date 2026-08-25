@@ -5,7 +5,16 @@ from app.core.ids import new_id
 from app.core.time import utc_now
 from app.model_gateway import capabilities as cap
 from app.model_gateway.registry import get_provider_catalog, get_provider_manifest, provider_exists
-from app.model_gateway.schemas import AvatarSpeakRequest, ChatJSONRequest, ChatMessage, TextEmbeddingRequest
+from app.model_gateway.schemas import (
+    AvatarSpeakRequest,
+    BatchSTTRequest,
+    ChatJSONRequest,
+    ChatMessage,
+    ChatTextRequest,
+    TextEmbeddingRequest,
+    StreamingSTTRequest,
+    TTSSynthesizeRequest,
+)
 from app.model_gateway.gateway import ModelGateway
 from app.persistence.errors import ConcurrencyConflict
 from app.persistence.interface import Persistence
@@ -25,7 +34,8 @@ class ModelAdminService:
         if not provider_exists(payload["provider_id"]):
             raise ApiError("PROVIDER_NOT_FOUND", "Provider plugin is not installed.", status_code=404)
         manifest = get_provider_manifest(payload["provider_id"])
-        self._validate_manifest_document(payload.get("config", {}), manifest["config_schema"], "config")
+        config = self._with_manifest_defaults(manifest, payload.get("config", {}))
+        self._validate_manifest_document(config, manifest["config_schema"], "config")
         self._validate_manifest_document(
             payload.get("credentials", {}),
             manifest["credential_schema"],
@@ -39,7 +49,7 @@ class ModelAdminService:
             "provider_id": payload["provider_id"],
             "display_name": payload["display_name"],
             "enabled": payload.get("enabled", True),
-            "config": payload.get("config", {}),
+            "config": config,
             "credential_ref": "secret://model-providers/%s" % config_id,
             "created_at": now,
             "updated_at": now,
@@ -71,6 +81,7 @@ class ModelAdminService:
                 )
             manifest = get_provider_manifest(item["provider_id"])
             if payload.get("config") is not None:
+                payload["config"] = self._with_manifest_defaults(manifest, payload["config"])
                 self._validate_manifest_document(payload["config"], manifest["config_schema"], "config")
             if payload.get("credentials") is not None:
                 self._validate_manifest_document(
@@ -90,6 +101,7 @@ class ModelAdminService:
     async def test_provider_config(
         self,
         config_id: str,
+        probe: Optional[Dict[str, Any]] = None,
         organization_id: str = "org_default",
     ) -> Dict[str, Any]:
         with self.persistence.transaction(organization_id) as transaction:
@@ -97,8 +109,29 @@ class ModelAdminService:
         if not provider_config:
             raise ApiError("MODEL_PROVIDER_CONFIG_NOT_FOUND", "Model provider config does not exist.", status_code=404)
         manifest = get_provider_manifest(provider_config["provider_id"])
-        capability = next(
-            (item for item in (cap.LLM_CHAT_JSON, cap.EMBEDDING_TEXT, cap.AVATAR_SPEAK) if item in manifest["capabilities"]),
+        probe = probe or {}
+        probe_capabilities = (
+            cap.LLM_CHAT_JSON,
+            cap.LLM_CHAT_TEXT,
+            cap.EMBEDDING_TEXT,
+            cap.TTS_SYNTHESIZE,
+            cap.STT_BATCH,
+            cap.AVATAR_SPEAK,
+        )
+        requested_capability = probe.get("capability")
+        if requested_capability is not None and requested_capability not in probe_capabilities:
+            raise ApiError(
+                "MODEL_CAPABILITY_NOT_IMPLEMENTED",
+                "Capability has no unified local test schema.",
+                status_code=409,
+                details={"capability": requested_capability},
+            )
+        capability = requested_capability or next(
+            (
+                item
+                for item in probe_capabilities
+                if item in manifest["capabilities"]
+            ),
             None,
         )
         if capability is None:
@@ -107,11 +140,20 @@ class ModelAdminService:
                 "Provider has no capability with a unified local test schema.",
                 status_code=409,
             )
-        model = provider_config.get("config", {}).get("test_model") or {
+        model = self._test_model(
+            provider_config,
+            manifest,
+            capability,
+            requested_model=probe.get("model"),
+        ) or {
             cap.LLM_CHAT_JSON: "mock-json" if provider_config["provider_id"] == "mock" else "chat-model-default",
+            cap.LLM_CHAT_TEXT: "mock-text" if provider_config["provider_id"] == "mock" else "chat-model-default",
             cap.EMBEDDING_TEXT: "mock-embedding" if provider_config["provider_id"] == "mock" else "embedding-model-default",
+            cap.TTS_SYNTHESIZE: "mock-tts",
+            cap.STT_BATCH: "mock-stt",
             cap.AVATAR_SPEAK: "mock-avatar",
         }[capability]
+        self._require_provider_capability(provider_config, capability, model)
         request = self._probe_request(capability, organization_id, "provider_test")
         response = await self.gateway.invoke(
             capability,
@@ -153,15 +195,39 @@ class ModelAdminService:
             "updated_at": now,
         }
         with self.persistence.transaction(organization_id) as transaction:
+            duplicate = next(
+                (
+                    route
+                    for route in transaction.model_routes.list()
+                    if route.get("capability") == item["capability"]
+                    and route.get("purpose") == item["purpose"]
+                ),
+                None,
+            )
+            if duplicate is not None:
+                raise ApiError(
+                    "MODEL_ROUTE_CONFLICT",
+                    "A model route already exists for this capability and purpose.",
+                    status_code=409,
+                    details={"route_id": duplicate["id"]},
+                )
             primary_config = transaction.provider_configs.get(primary_config_id)
             if primary_config is None:
                 raise ApiError("MODEL_PROVIDER_CONFIG_NOT_FOUND", "Primary provider config does not exist.", status_code=404)
-            self._require_provider_capability(primary_config, payload["capability"])
+            self._require_provider_capability(
+                primary_config,
+                payload["capability"],
+                payload["primary"]["model"],
+            )
             for fallback in payload.get("fallbacks", []):
                 fallback_config = transaction.provider_configs.get(fallback.get("provider_config_id"))
                 if fallback_config is None:
                     raise ApiError("MODEL_PROVIDER_CONFIG_NOT_FOUND", "Fallback provider config does not exist.", status_code=404)
-                self._require_provider_capability(fallback_config, payload["capability"])
+                self._require_provider_capability(
+                    fallback_config,
+                    payload["capability"],
+                    fallback["model"],
+                )
             return transaction.model_routes.add(item)
 
     def list_routes(self, organization_id: str = "org_default") -> List[Dict[str, Any]]:
@@ -174,8 +240,36 @@ class ModelAdminService:
         if not route:
             raise ApiError("MODEL_ROUTE_NOT_FOUND", "Model route does not exist.", status_code=404)
         request = self._probe_request(route["capability"], organization_id, route["purpose"])
-        response = await self.gateway.invoke(route["capability"], request, route=route)
-        return response.model_dump()
+        try:
+            if route["capability"] == cap.STT_STREAMING:
+                stream = await self.gateway.open_stream(request, route=route)
+                events = list(stream.ready_events)
+                events.extend(await stream.send_audio(b"connection-test-audio"))
+                events.extend(await stream.finish())
+                result = {"stream_id": stream.stream_id, "events": [item.model_dump() for item in events]}
+            else:
+                response = await self.gateway.invoke(route["capability"], request, route=route)
+                result = response.model_dump()
+        except Exception as exc:
+            self._record_route_health(route_id, organization_id, status="failed", error=str(exc))
+            raise
+        self._record_route_health(route_id, organization_id, status="healthy", error=None)
+        return result
+
+    def _record_route_health(
+        self, route_id: str, organization_id: str, *, status: str, error: Optional[str]
+    ) -> None:
+        with self.persistence.transaction(organization_id) as transaction:
+            route = transaction.model_routes.get(route_id)
+            if route is None:
+                return
+            route["last_health"] = {
+                "status": status,
+                "checked_at": utc_now(),
+                "error": error[:500] if error else None,
+            }
+            route["updated_at"] = utc_now()
+            transaction.model_routes.update(route, expected_version=route["version"])
 
     def _probe_request(self, capability: str, organization_id: str, purpose: str) -> Any:
         if capability == cap.LLM_CHAT_JSON:
@@ -184,6 +278,12 @@ class ModelAdminService:
                 purpose=purpose,
                 messages=[ChatMessage(role="user", content="ping")],
                 metadata={},
+            )
+        if capability == cap.LLM_CHAT_TEXT:
+            return ChatTextRequest(
+                organization_id=organization_id,
+                purpose=purpose,
+                messages=[ChatMessage(role="user", content="ping")],
             )
         if capability == cap.EMBEDDING_TEXT:
             return TextEmbeddingRequest(
@@ -197,13 +297,39 @@ class ModelAdminService:
                 purpose=purpose,
                 text="连接测试",
             )
+        if capability == cap.TTS_SYNTHESIZE:
+            return TTSSynthesizeRequest(
+                organization_id=organization_id,
+                purpose=purpose,
+                text="连接测试",
+            )
+        if capability == cap.STT_BATCH:
+            return BatchSTTRequest(
+                organization_id=organization_id,
+                purpose=purpose,
+                audio_uri="mock-media://connection-test.webm",
+                metadata={"development_transcript": "连接测试"},
+            )
+        if capability == cap.STT_STREAMING:
+            return StreamingSTTRequest(
+                organization_id=organization_id,
+                interview_id="connection_test",
+                turn_id="connection_test_turn",
+                purpose=purpose,
+                metadata={"development_transcript": "连接测试", "confidence": 1.0},
+            )
         raise ApiError(
             "MODEL_CAPABILITY_NOT_IMPLEMENTED",
             "Capability has no unified local test schema.",
             status_code=409,
         )
 
-    def _require_provider_capability(self, provider_config: Dict[str, Any], capability: str) -> None:
+    def _require_provider_capability(
+        self,
+        provider_config: Dict[str, Any],
+        capability: str,
+        model: str,
+    ) -> None:
         manifest = get_provider_manifest(provider_config["provider_id"])
         if not manifest.get("implemented", manifest["provider_id"] == "mock"):
             raise ApiError(
@@ -217,6 +343,63 @@ class ModelAdminService:
                 "Configured provider does not declare the route capability.",
                 status_code=409,
             )
+        if manifest.get("model_selection") == "predefined":
+            declared = any(
+                item.get("model_id") == model and capability in item.get("capabilities", [])
+                for item in manifest.get("models", [])
+            )
+            if not declared:
+                raise ApiError(
+                    "MODEL_PROVIDER_MODEL_UNAVAILABLE",
+                    "Configured provider does not declare this model for the route capability.",
+                    status_code=409,
+                    details={
+                        "provider_id": manifest["provider_id"],
+                        "model": model,
+                        "capability": capability,
+                    },
+                )
+
+    def _with_manifest_defaults(self, manifest: Dict[str, Any], config: Any) -> Dict[str, Any]:
+        if not isinstance(config, dict):
+            return config
+        return {**(manifest.get("defaults") or {}), **config}
+
+    def _default_model(self, manifest: Dict[str, Any], capability: str) -> Optional[str]:
+        candidates = [
+            item
+            for item in manifest.get("models", [])
+            if capability in item.get("capabilities", [])
+        ]
+        selected = next((item for item in candidates if item.get("default") is True), None)
+        if selected is None and candidates:
+            selected = candidates[0]
+        return selected.get("model_id") if selected else None
+
+    def _test_model(
+        self,
+        provider_config: Dict[str, Any],
+        manifest: Dict[str, Any],
+        capability: str,
+        *,
+        requested_model: Optional[str],
+    ) -> Optional[str]:
+        if requested_model:
+            return str(requested_model)
+        config = provider_config.get("config") or {}
+        test_models = config.get("test_models") or {}
+        if isinstance(test_models, dict) and test_models.get(capability):
+            return str(test_models[capability])
+        legacy_model = str(config.get("test_model") or "").strip()
+        if legacy_model:
+            catalog = manifest.get("models") or []
+            if not catalog or any(
+                item.get("model_id") == legacy_model
+                and capability in item.get("capabilities", [])
+                for item in catalog
+            ):
+                return legacy_model
+        return self._default_model(manifest, capability)
 
     def _validate_manifest_document(self, value: Any, schema: Dict[str, Any], path: str) -> None:
         expected_type = schema.get("type")

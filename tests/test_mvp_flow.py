@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+from datetime import datetime, timedelta, timezone
 
 from app.main import create_app
 from app.repositories.provider import reset_store_for_tests
@@ -21,6 +22,9 @@ def test_healthz_and_model_catalog() -> None:
     provider_ids = {item["provider_id"] for item in catalog.json()["items"]}
     assert "mock" in provider_ids
     assert "openai_compatible" in provider_ids
+    assert "deepseek" in provider_ids
+    assert "zhipuai" in provider_ids
+    assert "dashscope" in provider_ids
 
 
 def test_web_console_and_static_assets() -> None:
@@ -132,14 +136,147 @@ def test_provider_manifest_and_route_invariants_are_enforced_on_write() -> None:
     assert incompatible_route.status_code == 409
     assert incompatible_route.json()["error"]["code"] == "MODEL_PROVIDER_CAPABILITY_MISSING"
 
+    invalid_policy = api.post(
+        "/api/v1/admin/model-routes",
+        json={
+            "capability": "llm.chat_json",
+            "purpose": "answer_evaluation",
+            "primary": {
+                "provider_config_id": configured.json()["id"],
+                "model": "chat-model",
+                "timeout_s": 10,
+            },
+            "policy": {"max_retries": 1},
+        },
+    )
+    assert invalid_policy.status_code == 422
+
+    route_payload = {
+        "capability": "llm.chat_json",
+        "purpose": "answer_evaluation",
+        "primary": {
+            "provider_config_id": configured.json()["id"],
+            "model": "chat-model",
+            "timeout_s": 10,
+        },
+        "policy": {"retry_count": 1},
+    }
+    created_route = api.post("/api/v1/admin/model-routes", json=route_payload)
+    assert created_route.status_code == 200, created_route.text
+    duplicate_route = api.post("/api/v1/admin/model-routes", json=route_payload)
+    assert duplicate_route.status_code == 409
+    assert duplicate_route.json()["error"]["code"] == "MODEL_ROUTE_CONFLICT"
+
+
+def test_provider_defaults_and_predefined_model_catalog_are_enforced() -> None:
+    api = client()
+    configured = api.post(
+        "/api/v1/admin/model-provider-configs",
+        json={
+            "provider_id": "deepseek",
+            "display_name": "DeepSeek production",
+            "config": {},
+            "credentials": {"api_key": "test-key"},
+        },
+    )
+    assert configured.status_code == 200, configured.text
+    assert configured.json()["config"]["base_url"] == "https://api.deepseek.com"
+    assert configured.json()["config"]["test_model"] == "deepseek-chat"
+
+    invalid_route = api.post(
+        "/api/v1/admin/model-routes",
+        json={
+            "capability": "llm.chat_json",
+            "purpose": "answer_evaluation",
+            "primary": {
+                "provider_config_id": configured.json()["id"],
+                "model": "not-a-deepseek-model",
+                "timeout_s": 10,
+            },
+        },
+    )
+    assert invalid_route.status_code == 409
+    assert invalid_route.json()["error"]["code"] == "MODEL_PROVIDER_MODEL_UNAVAILABLE"
+
+    valid_route = api.post(
+        "/api/v1/admin/model-routes",
+        json={
+            "capability": "llm.chat_json",
+            "purpose": "answer_evaluation",
+            "primary": {
+                "provider_config_id": configured.json()["id"],
+                "model": "deepseek-chat",
+                "timeout_s": 10,
+            },
+        },
+    )
+    assert valid_route.status_code == 200, valid_route.text
+
+
+def test_provider_test_selects_capability_specific_predefined_model() -> None:
+    api = client()
+    configured = api.post(
+        "/api/v1/admin/model-provider-configs",
+        json={
+            "provider_id": "zhipuai",
+            "display_name": "Zhipu multi-capability",
+            "config": {},
+            "credentials": {"api_key": "test-key"},
+        },
+    )
+    assert configured.status_code == 200, configured.text
+    item = configured.json()
+    assert item["config"]["test_models"] == {
+        "llm.chat_json": "glm-5.2",
+        "llm.chat_text": "glm-5.2",
+        "tts.synthesize": "glm-tts",
+    }
+
+    wrong_model = api.post(
+        "/api/v1/admin/model-provider-configs/%s/test" % item["id"],
+        json={"capability": "tts.synthesize", "model": "glm-5.2"},
+    )
+    assert wrong_model.status_code == 409
+    assert wrong_model.json()["error"]["code"] == "MODEL_PROVIDER_MODEL_UNAVAILABLE"
+
+    unsupported_probe = api.post(
+        "/api/v1/admin/model-provider-configs/%s/test" % item["id"],
+        json={"capability": "stt.streaming", "model": "glm-tts"},
+    )
+    assert unsupported_probe.status_code == 409
+    assert unsupported_probe.json()["error"]["code"] == "MODEL_CAPABILITY_NOT_IMPLEMENTED"
+
+
+def test_provider_test_keeps_empty_body_compatibility() -> None:
+    api = client()
+    configured = api.post(
+        "/api/v1/admin/model-provider-configs",
+        json={"provider_id": "mock", "display_name": "Mock connection test"},
+    )
+    assert configured.status_code == 200, configured.text
+
+    tested = api.post(
+        "/api/v1/admin/model-provider-configs/%s/test" % configured.json()["id"]
+    )
+    assert tested.status_code == 200, tested.text
+    assert tested.json()["provider"]["provider_id"] == "mock"
+
 
 def test_question_to_report_mvp_flow() -> None:
     api = client()
+    position = api.post(
+        "/api/v1/job-positions",
+        json={"code": "backend-senior", "name": "资深 Python 后端工程师"},
+    ).json()
+    knowledge_base = api.post(
+        "/api/v1/job-positions/%s/knowledge-bases" % position["id"],
+        json={"name": "后端题库"},
+    ).json()
 
     q1 = api.post(
-        "/api/v1/questions",
+        "/api/v1/knowledge-bases/%s/questions" % knowledge_base["id"],
         json={
-            "knowledge_base_id": "kb_backend",
+            "knowledge_base_id": knowledge_base["id"],
             "title": "Python GIL",
             "question_text": "请解释 Python GIL 对 CPU 密集型多线程程序的影响。",
             "standard_answer": "GIL 会限制同一进程内多个线程同时执行 Python 字节码，CPU 密集任务可考虑多进程。",
@@ -149,20 +286,22 @@ def test_question_to_report_mvp_flow() -> None:
             ],
             "difficulty": "senior",
             "skills": ["python", "concurrency"],
+            "rubric": {"semantic_correctness": 1.0},
         },
     )
     assert q1.status_code == 200, q1.text
 
     q2 = api.post(
-        "/api/v1/questions",
+        "/api/v1/knowledge-bases/%s/questions" % knowledge_base["id"],
         json={
-            "knowledge_base_id": "kb_backend",
+            "knowledge_base_id": knowledge_base["id"],
             "title": "Redis 缓存击穿",
             "question_text": "如何处理 Redis 缓存击穿？",
             "standard_answer": "可使用互斥锁、逻辑过期、热点 key 保护等方式。",
             "key_points": ["互斥锁", "逻辑过期", "热点 key 保护"],
             "difficulty": "mid",
             "skills": ["redis", "cache"],
+            "rubric": {"semantic_correctness": 1.0},
         },
     )
     assert q2.status_code == 200, q2.text
@@ -170,17 +309,18 @@ def test_question_to_report_mvp_flow() -> None:
     search = api.post(
         "/api/v1/questions/search",
         json={
+            "job_position_id": position["id"],
+            "knowledge_base_ids": [knowledge_base["id"]],
             "query": "资深 Python 后端，需要熟悉并发和 Redis",
-            "filters": {"skills": ["python", "redis"], "knowledge_base_ids": ["kb_backend"]},
+            "filters": {"skills": ["python", "redis"]},
             "limit": 2,
             "include_answer": True,
         },
     )
     assert search.status_code == 200, search.text
-    assert len(search.json()["items"]) == 2
 
     role = api.post(
-        "/api/v1/role-requirements",
+        "/api/v1/job-positions/%s/role-requirements" % position["id"],
         json={
             "title": "资深 Python 后端工程师",
             "description": "负责高并发 Python 服务、Redis 缓存和线上排障。",
@@ -196,19 +336,26 @@ def test_question_to_report_mvp_flow() -> None:
     roles = api.get("/api/v1/role-requirements")
     assert roles.status_code == 200
     assert [item["id"] for item in roles.json()["items"]] == [role_id]
+    candidate = api.post(
+        "/api/v1/candidate-profiles",
+        json={"name": "候选人 A", "email": "candidate@example.com", "phone": "13800138004"},
+    ).json()
 
     plan = api.post(
         "/api/v1/interview-plans/generate",
         json={
             "role_requirement_id": role_id,
-            "knowledge_base_ids": ["kb_backend"],
+            "job_position_id": position["id"],
+            "candidate_profile_id": candidate["id"],
+            "knowledge_base_ids": [knowledge_base["id"]],
             "question_count": 2,
             "strategy": {"allow_followups": True},
         },
     )
     assert plan.status_code == 200, plan.text
     plan_body = plan.json()
-    assert len(plan_body["items"]) == 2
+    assert len(plan_body["bank_slots"]) == 2
+    assert "items" not in plan_body
 
     plans = api.get("/api/v1/interview-plans")
     assert plans.status_code == 200
@@ -221,16 +368,44 @@ def test_question_to_report_mvp_flow() -> None:
     assert approved.status_code == 200, approved.text
     plan_body = approved.json()
 
-    interview = api.post(
-        "/api/v1/interviews",
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    appointment = api.post(
+        "/api/v1/interview-appointments",
         json={
             "plan_id": plan_body["id"],
-            "candidate": {"name": "候选人 A", "email": "candidate@example.com"},
-            "settings": {"allow_text_fallback": True},
+            "candidate_profile_id": candidate["id"],
+            "job_position_id": position["id"],
+            "scheduled_start_at": (now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+            "scheduled_end_at": (now + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+            "settings": {"record_audio": True},
         },
     )
-    assert interview.status_code == 200, interview.text
-    interview_id = interview.json()["id"]
+    assert appointment.status_code == 200, appointment.text
+    invitation = api.post(
+        f"/api/v1/interview-appointments/{appointment.json()['id']}/invite",
+        json={"expires_at": (now + timedelta(hours=1)).isoformat().replace("+00:00", "Z")},
+    )
+    assert invitation.status_code == 200, invitation.text
+    token = invitation.json()["invitation_token"]
+    notice = api.get(f"/api/v1/public/interview-invitations/{token}").json()["consent"]
+    intake = api.post(
+        f"/api/v1/public/interview-invitations/{token}/intake",
+        json={
+            "name": "候选人 A",
+            "email": "candidate@example.com",
+            "phone": "13800138004",
+            "consent": {"accepted": True, "version": notice["version"], "recording_accepted": True},
+        },
+    )
+    assert intake.status_code == 200, intake.text
+    readiness = api.post(
+        f"/api/v1/public/interview-invitations/{token}/readiness",
+        json={"browser_supported": True, "microphone_granted": True, "audio_content_type": "audio/webm"},
+    )
+    assert readiness.status_code == 200, readiness.text
+    started = api.post(f"/api/v1/public/interview-invitations/{token}/start")
+    assert started.status_code == 200, started.text
+    interview_id = started.json()["interview_id"]
 
     interviews = api.get("/api/v1/interviews")
     assert interviews.status_code == 200
@@ -238,8 +413,6 @@ def test_question_to_report_mvp_flow() -> None:
     assert len(interviews.json()["items"][0]["turns"]) == 2
     assert interviews.json()["items"][0]["plan_snapshot"]["source_plan_version"] == plan_body["version"]
 
-    started = api.post(f"/api/v1/interviews/{interview_id}/start")
-    assert started.status_code == 200, started.text
     current_turn_id = started.json()["current_turn_id"]
     assert current_turn_id
     active_turn = next(
@@ -249,10 +422,12 @@ def test_question_to_report_mvp_flow() -> None:
     )
 
     answer = api.post(
-        f"/api/v1/interviews/{interview_id}/answers",
+        f"/api/v1/interviews/{interview_id}/audio-answers",
         json={
             "turn_id": current_turn_id,
-            "final_transcript": active_turn["question_snapshot"]["standard_answer"],
+            "audio_uri": "private-test://mvp.webm",
+            "content_type": "audio/webm",
+            "development_transcript": active_turn["question_snapshot"]["standard_answer"],
             "duration_seconds": 20,
         },
     )
@@ -265,4 +440,11 @@ def test_question_to_report_mvp_flow() -> None:
 
     report = api.get(f"/api/v1/interviews/{interview_id}/report")
     assert report.status_code == 200, report.text
-    assert report.json()["recommendation"] in {"strong_advance", "advance", "hold", "reject"}
+    assert report.json()["job_fit_level"] in {
+        "strong_match",
+        "match",
+        "partial_match",
+        "insufficient_evidence",
+        "manual_review",
+    }
+    assert report.json()["human_decision_required"] is True

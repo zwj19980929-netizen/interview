@@ -1,16 +1,12 @@
-import asyncio
 from typing import Any, Dict, Tuple
 
 import pytest
 
-from app.model_gateway.errors import ProviderError
 from app.persistence.errors import ConcurrencyConflict
 from app.persistence.interface import Persistence, new_work_item
 from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
 from app.repositories.sqlite import SQLiteStore
-from app.services.questions import QuestionService
-from app.workers.outbox import OutboxWorker
 
 
 @pytest.fixture(params=["memory", "sqlite"])
@@ -100,7 +96,45 @@ def test_version_conflicts_are_explicit(persistence_bundle) -> None:
     assert current["version"] == 2
 
 
-def test_outbox_is_idempotent_and_commits_with_index_result(persistence_bundle) -> None:
+def test_question_catalog_search_is_filtered_inside_each_persistence_adapter(persistence_bundle) -> None:
+    _, persistence = persistence_bundle
+
+    def catalog_question(question_id: str, **overrides) -> Dict[str, Any]:
+        item = {
+            **question(question_id),
+            "job_position_id": "position_a",
+            "knowledge_base_id": "kb_a",
+            "validation_status": "valid",
+            "speech_status": "ready",
+            "skills": ["architecture"],
+        }
+        item.update(overrides)
+        return item
+
+    with persistence.transaction("org_a") as transaction:
+        transaction.questions.add(catalog_question("q_match"))
+        transaction.questions.add(catalog_question("q_inactive", status="archived"))
+        transaction.questions.add(catalog_question("q_invalid", validation_status="invalid"))
+        transaction.questions.add(catalog_question("q_speech_pending", speech_status="pending"))
+        transaction.questions.add(catalog_question("q_other_position", job_position_id="position_b"))
+        transaction.questions.add(catalog_question("q_other_kb", knowledge_base_id="kb_b"))
+        transaction.questions.add(catalog_question("q_other_skill", skills=["database"]))
+    with persistence.transaction("org_b") as transaction:
+        transaction.questions.add(catalog_question("q_other_tenant", organization_id="org_b"))
+
+    with persistence.transaction("org_a") as transaction:
+        matches = transaction.questions.search_catalog(
+            job_position_id="position_a",
+            knowledge_base_ids=["kb_a"],
+            skills=["architecture"],
+            difficulties=["mid"],
+            question_types=["open_ended"],
+        )
+
+    assert [item["id"] for item in matches] == ["q_match"]
+
+
+def test_outbox_is_idempotent_and_commits_with_aggregate_result(persistence_bundle) -> None:
     _, persistence = persistence_bundle
     queued = work()
     with persistence.transaction("org_a") as transaction:
@@ -114,31 +148,17 @@ def test_outbox_is_idempotent_and_commits_with_index_result(persistence_bundle) 
     assert running["status"] == "running"
     assert running["attempt_count"] == 1
 
-    vector = {
-        "id": "vec_contract",
-        "organization_id": "org_a",
-        "knowledge_base_id": "kb_contract",
-        "question_id": saved["id"],
-        "doc_type": "question_doc",
-        "text": saved["question_text"],
-        "vector": [1.0, 0.0],
-        "metadata": {},
-        "created_at": "2026-08-23T00:00:00Z",
-        "updated_at": "2026-08-23T00:00:00Z",
-    }
     with persistence.transaction("org_a") as transaction:
         current = transaction.questions.get(saved["id"])
         assert current is not None
-        current["index_status"] = "indexed"
+        current["speech_status"] = "ready"
         updated = transaction.questions.update(current, expected_version=current["version"])
-        transaction.vector_documents.replace_for_question(saved["id"], [vector])
         completed = transaction.outbox.complete(first["id"], lease_token=running["lease_token"])
 
     assert updated["version"] == 2
     assert completed["status"] == "completed"
     with persistence.transaction("org_a") as transaction:
-        assert transaction.questions.get(saved["id"])["index_status"] == "indexed"
-        assert transaction.vector_documents.list() == [vector]
+        assert transaction.questions.get(saved["id"])["speech_status"] == "ready"
         assert transaction.outbox.list("completed")[0]["id"] == first["id"]
 
 
@@ -184,65 +204,26 @@ def test_stale_worker_cannot_complete_reclaimed_work(persistence_bundle) -> None
     assert completed["status"] == "completed"
 
 
-class FailingEmbeddingGateway:
-    async def invoke(self, capability, request, *, route=None):
-        raise ProviderError("provider_timeout", "embedding timed out", retryable=True)
-
-
-def test_question_index_failure_is_durable(persistence_bundle) -> None:
-    store, persistence = persistence_bundle
-    service = QuestionService(store, gateway=FailingEmbeddingGateway(), persistence=persistence)
-
-    saved = asyncio.run(
-        service.create_question(
-            {
-                "knowledge_base_id": "kb_contract",
-                "title": "Failure recovery",
-                "question_text": "What happens after a provider timeout?",
-                "standard_answer": "The question remains saved and work remains retryable.",
-                "key_points": ["question remains saved"],
-                "difficulty": "mid",
-                "skills": ["reliability"],
-            },
-            organization_id="org_a",
-        )
+def test_outbox_dead_letter_and_manual_replay(persistence_bundle) -> None:
+    _, persistence = persistence_bundle
+    work = new_work_item(
+        organization_id="org_a",
+        kind="contract.dead-letter",
+        aggregate_id="aggregate_1",
+        idempotency_key="contract.dead-letter:1",
     )
-
-    assert saved["index_status"] == "failed"
-    assert saved["version"] == 2
+    work["max_attempts"] = 1
     with persistence.transaction("org_a") as transaction:
-        persisted = transaction.questions.get(saved["id"])
-        failed = transaction.outbox.list("failed")
-    assert persisted is not None
-    assert persisted["index_status"] == "failed"
-    assert len(failed) == 1
-    assert failed[0]["last_error"] == "embedding timed out"
-
-
-def test_outbox_worker_recovers_failed_question_index(persistence_bundle) -> None:
-    store, persistence = persistence_bundle
-    service = QuestionService(store, gateway=FailingEmbeddingGateway(), persistence=persistence)
-    saved = asyncio.run(
-        service.create_question(
-            {
-                "knowledge_base_id": "kb_contract",
-                "title": "Recoverable work",
-                "question_text": "Can a failed index job be retried?",
-                "standard_answer": "Yes, from durable outbox state.",
-                "key_points": ["durable outbox state"],
-                "difficulty": "mid",
-                "skills": ["reliability"],
-            },
-            organization_id="org_a",
+        saved = transaction.outbox.enqueue(work)
+        running = transaction.outbox.start(saved["id"])
+        failed = transaction.outbox.fail(
+            saved["id"], "terminal failure", lease_token=running["lease_token"]
         )
-    )
-    assert saved["index_status"] == "failed"
-
-    results = asyncio.run(OutboxWorker(store, persistence=persistence).run_once("org_a"))
-    assert results[0]["status"] == "completed"
+    assert failed["status"] == "dead_letter"
+    assert failed["dead_lettered_at"]
     with persistence.transaction("org_a") as transaction:
-        recovered = transaction.questions.get(saved["id"])
-        completed = transaction.outbox.list("completed")
-    assert recovered["index_status"] == "indexed"
-    assert recovered["version"] == 3
-    assert len(completed) == 1
+        replayed = transaction.outbox.replay(failed["id"], reason="operator fixed input", actor_id="admin_1")
+    assert replayed["status"] == "pending"
+    assert replayed["attempt_count"] == 0
+    assert replayed["replay_count"] == 1
+    assert replayed["last_replay"]["actor_id"] == "admin_1"

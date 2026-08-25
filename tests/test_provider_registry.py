@@ -12,6 +12,9 @@ from app.model_gateway.registry import (
 )
 from app.providers.mock.provider import MockProvider
 from app.providers.openai_compatible.provider import OpenAICompatibleProvider
+from app.providers.dashscope.provider import DashScopeProvider
+from app.providers.deepseek.provider import DeepSeekProvider
+from app.providers.zhipuai.provider import ZhipuAIProvider
 
 
 def test_provider_catalog_loads_provider_json_manifests() -> None:
@@ -20,6 +23,9 @@ def test_provider_catalog_loads_provider_json_manifests() -> None:
 
     assert "mock" in provider_ids
     assert "openai_compatible" in provider_ids
+    assert "deepseek" in provider_ids
+    assert "zhipuai" in provider_ids
+    assert "dashscope" in provider_ids
     assert "azure_speech" in provider_ids
     assert "tencent_cloud_speech" in provider_ids
     assert provider_exists("mock")
@@ -28,6 +34,8 @@ def test_provider_catalog_loads_provider_json_manifests() -> None:
     for provider in catalog:
         assert provider["capabilities"]
         assert set(provider["capabilities"]).issubset(cap.ALL_CAPABILITIES)
+        assert provider["model_selection"] in {"predefined", "customizable"}
+        assert isinstance(provider["defaults"], dict)
         assert "manifest_path" not in provider
 
 
@@ -57,3 +65,30 @@ def test_provider_registry_loads_runtime_adapters_from_manifest_entrypoints() ->
 
     assert isinstance(registry.adapter("mock", cap.LLM_CHAT_JSON), MockProvider)
     assert isinstance(registry.adapter("openai_compatible", cap.EMBEDDING_TEXT), OpenAICompatibleProvider)
+    assert isinstance(registry.adapter("dashscope", cap.TTS_SYNTHESIZE), DashScopeProvider)
+    assert isinstance(registry.adapter("deepseek", cap.LLM_CHAT_JSON), DeepSeekProvider)
+    assert isinstance(registry.adapter("zhipuai", cap.LLM_CHAT_TEXT), ZhipuAIProvider)
+    assert isinstance(registry.adapter("zhipuai", cap.TTS_SYNTHESIZE), ZhipuAIProvider)
+
+
+def test_provider_manifest_validation_rejects_empty_predefined_catalog(tmp_path) -> None:
+    provider_dir = tmp_path / "empty_catalog"
+    provider_dir.mkdir()
+    manifest_path = provider_dir / "provider.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "provider_id": "empty_catalog",
+                "display_name": "Empty Catalog",
+                "version": "0.1.0",
+                "capabilities": [cap.LLM_CHAT_TEXT],
+                "model_selection": "predefined",
+                "models": [],
+                "entrypoint": "app.providers.empty_catalog.provider:EmptyCatalogProvider",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ProviderManifestError):
+        load_provider_manifest(manifest_path)

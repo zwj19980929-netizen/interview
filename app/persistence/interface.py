@@ -1,9 +1,11 @@
 from contextlib import AbstractContextManager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+import os
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
 from app.core.ids import new_id
+from app.core.sensitive_data import ProviderSecretVault
 from app.core.time import utc_now
 from app.persistence.errors import ConcurrencyConflict, RecordAlreadyExists, RecordNotFound
 
@@ -23,6 +25,17 @@ class TransactionBackend(Protocol):
 
     def delete_documents(self, collection: str, predicate: Predicate) -> None: ...
 
+    def search_question_catalog(
+        self,
+        *,
+        organization_id: str,
+        job_position_id: str,
+        knowledge_base_ids: List[str],
+        skills: List[str],
+        difficulties: List[str],
+        question_types: List[str],
+    ) -> List[Document]: ...
+
     def get_work_item(self, item_id: str) -> Optional[Document]: ...
 
     def list_work_items(self) -> List[Document]: ...
@@ -31,9 +44,9 @@ class TransactionBackend(Protocol):
 
     def replace_work_item(self, item: Document) -> None: ...
 
-    def get_secret(self, item_id: str) -> Document: ...
+    def get_secret(self, organization_id: str, item_id: str) -> Document: ...
 
-    def replace_secret(self, item_id: str, secret: Document) -> None: ...
+    def replace_secret(self, organization_id: str, item_id: str, secret: Document) -> None: ...
 
     def list_invocations(self) -> List[Document]: ...
 
@@ -110,30 +123,30 @@ class QuestionRepository(VersionedDocumentRepository):
             entity_name="Question",
         )
 
-
-class VectorDocumentRepository:
-    def __init__(self, backend: TransactionBackend, organization_id: str) -> None:
-        self._backend = backend
-        self._organization_id = organization_id
-
-    def list(self) -> List[Document]:
-        return [
-            deepcopy(item)
-            for item in self._backend.list_documents("vector_documents")
-            if item.get("organization_id") == self._organization_id
-        ]
-
-    def replace_for_question(self, question_id: str, documents: List[Document]) -> None:
-        for item in documents:
-            if item.get("organization_id") != self._organization_id or item.get("question_id") != question_id:
-                raise ValueError("Vector document does not match the transaction tenant and question.")
-        self._backend.delete_documents(
-            "vector_documents",
-            lambda item: item.get("organization_id") == self._organization_id
-            and item.get("question_id") == question_id,
+    def search_catalog(
+        self,
+        *,
+        job_position_id: str,
+        knowledge_base_ids: List[str],
+        skills: List[str],
+        difficulties: List[str],
+        question_types: List[str],
+    ) -> List[Document]:
+        """Apply tenant and structured candidate filters at the repository seam."""
+        items = self._backend.search_question_catalog(
+            organization_id=self._organization_id,
+            job_position_id=job_position_id,
+            knowledge_base_ids=knowledge_base_ids,
+            skills=skills,
+            difficulties=difficulties,
+            question_types=question_types,
         )
-        for item in documents:
-            self._backend.insert_document("vector_documents", deepcopy(item))
+        result: List[Document] = []
+        for stored in items:
+            item = deepcopy(stored)
+            item.setdefault("version", 1)
+            result.append(item)
+        return result
 
 
 class OutboxRepository:
@@ -211,10 +224,34 @@ class OutboxRepository:
     def fail(self, item_id: str, error: str, *, lease_token: str) -> Document:
         item = self._required(item_id)
         self._require_lease(item, lease_token)
-        item["status"] = "failed"
+        max_attempts = max(1, int(item.get("max_attempts", 5)))
+        exhausted = int(item.get("attempt_count", 0)) >= max_attempts
+        item["status"] = "dead_letter" if exhausted else "failed"
         item["lease_token"] = None
         item["lease_expires_at"] = None
         item["last_error"] = error[:1000]
+        if exhausted:
+            item["dead_lettered_at"] = utc_now()
+        else:
+            base = max(0, int(item.get("retry_base_seconds", 0)))
+            delay = min(int(item.get("retry_max_seconds", 300)), base * (2 ** max(0, int(item["attempt_count"]) - 1)))
+            item["available_at"] = _utc_after(delay) if delay else utc_now()
+        item["updated_at"] = utc_now()
+        self._backend.replace_work_item(item)
+        return deepcopy(item)
+
+    def replay(self, item_id: str, *, reason: str, actor_id: str) -> Document:
+        item = self._required(item_id)
+        if item.get("status") not in {"failed", "dead_letter"}:
+            raise ConcurrencyConflict("Only failed or dead-letter work can be replayed: %s" % item_id)
+        item["status"] = "pending"
+        item["attempt_count"] = 0
+        item["available_at"] = utc_now()
+        item["lease_token"] = None
+        item["lease_expires_at"] = None
+        item["dead_lettered_at"] = None
+        item["replay_count"] = int(item.get("replay_count", 0)) + 1
+        item["last_replay"] = {"reason": reason, "actor_id": actor_id, "replayed_at": utc_now()}
         item["updated_at"] = utc_now()
         self._backend.replace_work_item(item)
         return deepcopy(item)
@@ -239,14 +276,21 @@ class OutboxRepository:
 
 
 class ProviderSecretRepository:
-    def __init__(self, backend: TransactionBackend) -> None:
+    def __init__(self, backend: TransactionBackend, organization_id: str) -> None:
         self._backend = backend
+        self._organization_id = organization_id
+        self._vault = ProviderSecretVault()
 
     def get(self, provider_config_id: str) -> Document:
-        return deepcopy(self._backend.get_secret(provider_config_id))
+        sealed = self._backend.get_secret(self._organization_id, provider_config_id)
+        return deepcopy(self._vault.open(sealed))
 
     def replace(self, provider_config_id: str, credentials: Document) -> None:
-        self._backend.replace_secret(provider_config_id, deepcopy(credentials))
+        self._backend.replace_secret(
+            self._organization_id,
+            provider_config_id,
+            self._vault.seal(deepcopy(credentials)),
+        )
 
 
 class ModelInvocationRepository:
@@ -271,12 +315,51 @@ class ModelInvocationRepository:
 
 class PersistenceTransaction:
     def __init__(self, backend: TransactionBackend, organization_id: str) -> None:
+        self.job_positions = VersionedDocumentRepository(
+            backend, organization_id, collection="job_positions", entity_name="JobPosition"
+        )
+        self.knowledge_bases = VersionedDocumentRepository(
+            backend, organization_id, collection="knowledge_bases", entity_name="KnowledgeBase"
+        )
         self.questions = QuestionRepository(backend, organization_id)
+        self.question_speech_assets = VersionedDocumentRepository(
+            backend,
+            organization_id,
+            collection="question_speech_assets",
+            entity_name="QuestionSpeechAsset",
+        )
         self.role_requirements = VersionedDocumentRepository(
             backend, organization_id, collection="role_requirements", entity_name="RoleRequirement"
         )
         self.interview_plans = VersionedDocumentRepository(
             backend, organization_id, collection="interview_plans", entity_name="InterviewPlan"
+        )
+        self.candidate_profiles = VersionedDocumentRepository(
+            backend, organization_id, collection="candidate_profiles", entity_name="CandidateProfile"
+        )
+        self.resume_documents = VersionedDocumentRepository(
+            backend, organization_id, collection="resume_documents", entity_name="ResumeDocument"
+        )
+        self.file_objects = VersionedDocumentRepository(
+            backend, organization_id, collection="file_objects", entity_name="FileObject"
+        )
+        self.audit_events = VersionedDocumentRepository(
+            backend, organization_id, collection="audit_events", entity_name="AuditEvent"
+        )
+        self.resume_reviews = VersionedDocumentRepository(
+            backend, organization_id, collection="resume_reviews", entity_name="ResumeReview"
+        )
+        self.experience_questions = VersionedDocumentRepository(
+            backend, organization_id, collection="experience_questions", entity_name="ExperienceQuestion"
+        )
+        self.interview_appointments = VersionedDocumentRepository(
+            backend,
+            organization_id,
+            collection="interview_appointments",
+            entity_name="InterviewAppointment",
+        )
+        self.candidate_intakes = VersionedDocumentRepository(
+            backend, organization_id, collection="candidate_intakes", entity_name="CandidateIntake"
         )
         self.interview_sessions = VersionedDocumentRepository(
             backend, organization_id, collection="interviews", entity_name="InterviewSession"
@@ -287,9 +370,11 @@ class PersistenceTransaction:
         self.model_routes = VersionedDocumentRepository(
             backend, organization_id, collection="model_routes", entity_name="ModelRoute"
         )
-        self.vector_documents = VectorDocumentRepository(backend, organization_id)
+        self.model_circuit_states = VersionedDocumentRepository(
+            backend, organization_id, collection="model_circuit_states", entity_name="ModelCircuitState"
+        )
         self.outbox = OutboxRepository(backend, organization_id)
-        self.provider_secrets = ProviderSecretRepository(backend)
+        self.provider_secrets = ProviderSecretRepository(backend, organization_id)
         self.model_invocations = ModelInvocationRepository(backend, organization_id)
 
 
@@ -306,6 +391,7 @@ def new_work_item(
     payload: Optional[Document] = None,
 ) -> Document:
     now = utc_now()
+    runtime = os.getenv("INTERVIEWER_RUNTIME_ENV", "development").lower()
     return {
         "id": new_id("work"),
         "organization_id": organization_id,
@@ -315,6 +401,14 @@ def new_work_item(
         "payload": deepcopy(payload or {}),
         "status": "pending",
         "attempt_count": 0,
+        "max_attempts": max(1, int(os.getenv("INTERVIEWER_OUTBOX_MAX_ATTEMPTS", "5"))),
+        "retry_base_seconds": max(
+            0,
+            int(os.getenv("INTERVIEWER_OUTBOX_RETRY_BASE_SECONDS", "2" if runtime == "production" else "0")),
+        ),
+        "retry_max_seconds": max(1, int(os.getenv("INTERVIEWER_OUTBOX_RETRY_MAX_SECONDS", "300"))),
+        "dead_lettered_at": None,
+        "replay_count": 0,
         "available_at": now,
         "lease_token": None,
         "lease_expires_at": None,

@@ -3,6 +3,7 @@ from typing import Optional
 
 from app.repositories.memory import InMemoryStore
 from app.repositories.sqlite import SQLiteStore
+from app.repositories.postgresql import PostgreSQLStore
 
 
 Store = InMemoryStore
@@ -17,6 +18,11 @@ def _create_store() -> InMemoryStore:
     if backend == "sqlite":
         path = os.getenv("INTERVIEWER_SQLITE_PATH", "data/interviewer.sqlite3")
         return SQLiteStore(path)
+    if backend in {"postgres", "postgresql"}:
+        dsn = os.getenv("INTERVIEWER_POSTGRES_DSN", "")
+        if not dsn:
+            raise RuntimeError("INTERVIEWER_POSTGRES_DSN is required for the PostgreSQL backend.")
+        return PostgreSQLStore(dsn)
     raise RuntimeError("Unsupported INTERVIEWER_DB_BACKEND: %s" % backend)
 
 
@@ -28,7 +34,6 @@ def get_store() -> InMemoryStore:
 
 
 def reset_store_for_tests() -> InMemoryStore:
-    store = get_store()
-    store.reset()
-    return store
-
+    global _store
+    _store = InMemoryStore()
+    return _store

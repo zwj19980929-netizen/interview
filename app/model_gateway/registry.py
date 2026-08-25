@@ -29,11 +29,13 @@ def load_provider_manifest(path: Path) -> Dict[str, Any]:
         manifest = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ProviderManifestError("Invalid provider manifest JSON: %s" % path) from exc
-    _validate_manifest(manifest, path)
     manifest.setdefault("models", [])
+    manifest.setdefault("model_selection", "customizable")
+    manifest.setdefault("defaults", {})
     manifest.setdefault("config_schema", {"type": "object", "properties": {}})
     manifest.setdefault("credential_schema", {"type": "object", "properties": {}})
     manifest.setdefault("implemented", manifest["provider_id"] == "mock")
+    _validate_manifest(manifest, path)
     return manifest
 
 
@@ -55,14 +57,46 @@ def _validate_manifest(manifest: Dict[str, Any], path: Path) -> None:
     if unsupported:
         raise ProviderManifestError("Provider manifest %s has unsupported capabilities: %s" % (path, ", ".join(unsupported)))
 
-    for model in manifest.get("models", []):
+    model_selection = manifest.get("model_selection")
+    if model_selection not in {"predefined", "customizable"}:
+        raise ProviderManifestError("Provider manifest %s has invalid model_selection." % path)
+    defaults = manifest.get("defaults")
+    if not isinstance(defaults, dict):
+        raise ProviderManifestError("Provider manifest %s defaults must be an object." % path)
+    models = manifest.get("models")
+    if not isinstance(models, list):
+        raise ProviderManifestError("Provider manifest %s models must be a list." % path)
+    if model_selection == "predefined" and not models:
+        raise ProviderManifestError("Provider manifest %s predefined model catalog cannot be empty." % path)
+
+    seen_model_ids = set()
+    default_capabilities = set()
+    for model in models:
+        if not isinstance(model, dict):
+            raise ProviderManifestError("Provider manifest %s model entries must be objects." % path)
+        model_id = model.get("model_id")
+        if not isinstance(model_id, str) or not model_id.strip():
+            raise ProviderManifestError("Provider manifest %s has a model without model_id." % path)
+        if model_id in seen_model_ids:
+            raise ProviderManifestError("Provider manifest %s has duplicate model %s." % (path, model_id))
+        seen_model_ids.add(model_id)
         model_capabilities = model.get("capabilities", [])
+        if not isinstance(model_capabilities, list) or not model_capabilities:
+            raise ProviderManifestError("Provider manifest %s model %s must declare capabilities." % (path, model_id))
         unsupported_model_caps = sorted(set(model_capabilities).difference(capabilities))
         if unsupported_model_caps:
             raise ProviderManifestError(
                 "Provider manifest %s model %s declares capabilities not owned by provider: %s"
-                % (path, model.get("model_id", "<unknown>"), ", ".join(unsupported_model_caps))
+                % (path, model_id, ", ".join(unsupported_model_caps))
             )
+        if model.get("default") is True:
+            duplicate_defaults = default_capabilities.intersection(model_capabilities)
+            if duplicate_defaults:
+                raise ProviderManifestError(
+                    "Provider manifest %s has multiple default models for: %s"
+                    % (path, ", ".join(sorted(duplicate_defaults)))
+                )
+            default_capabilities.update(model_capabilities)
 
 
 def load_provider_catalog(providers_dir: Optional[Path] = None) -> List[Dict[str, Any]]:

@@ -12,19 +12,29 @@ AI 协作者在写代码或改设计前，按顺序阅读：
 4. [检索与评分设计](docs/retrieval-and-evaluation.md)
 5. [模型供应商插件化设计](docs/model-provider-plugins.md)
 6. [数据库与向量存储设计](docs/database-and-vector-storage.md)
-7. [开发进度](docs/development-progress.md)
-8. [实施路线图](docs/implementation-roadmap.md)
+7. [统一领域语言](CONTEXT.md)
+8. [已知问题与修复设计](docs/known-issues-and-remediation.md)
+9. [开发进度](docs/development-progress.md)
+10. [实施路线图](docs/implementation-roadmap.md)
+11. [操作变更日志](docs/change-log.md)
 
 如果修改了接口、数据结构、检索策略、评分逻辑、模型供应商、模型路由或统一模型输入输出格式，必须同步更新对应文档。
 
+## 强制操作留痕
+
+- 任何会修改仓库内容的工作都必须作为一个工作项记录到 [操作变更日志](docs/change-log.md)：首次修改前登记 `in_progress`，结束时补充实际修改文件、验证命令、结果和未完成事项。
+- 工作项可以覆盖同一目标下的一组相关编辑，不要求逐条记录只读命令；但任何代码、测试、配置、数据库迁移或文档写入都不能脱离工作项。
+- 修复 [已知问题与修复设计](docs/known-issues-and-remediation.md) 中的问题时，必须同步更新问题状态、开发进度和实施路线图。没有代码、迁移与验收测试证据时不得标记 `verified`；兼容路径未删除时不得标记 `closed`。
+- 操作失败或任务中止也要保留记录，写明失败原因、已产生的副作用和恢复方式，不能删除日志条目掩盖历史。
+
 ## 当前阶段
 
-当前仓库仍处在设计和骨架阶段，根目录只有示例 `main.py` 和基础 `pyproject.toml`。后续实现应先建立清晰的后端模块边界，再接入具体的 LLM、语音识别、TTS 或数字人供应商。
+当前仓库已具备经过自动化验证的本地完整闭环：岗位题库批量构建、PDF/URL 简历安全摄取与私有存储、候选池/execution v2 计划、预约邀请页与明确同意、候选人 token 安全投影、流式/批量 STT 协议、评分、报告导出和企业复核；同时已有 PostgreSQL/RLS、Redis 跨实例事件、RBAC、字段/凭证加密、审计、签名媒体、Outbox dead-letter 与公平性评估实现。旧计划 `items`、管理员直建/直接 start、客户端文本答案和旧向量题库 interface 已删除。它仍不是“已通过生产环境验收”的版本：真实 PostgreSQL/Redis、阿里云 OSS、恶意文件扫描器及 STT/TTS/数字人供应商需要部署凭据和外部服务联调；生产 readiness 对这些能力失败关闭。继续实现时必须保留现有 deep module 边界和本页操作留痕规则。
 
 ## 关键原则
 
 - 保持供应商无关：LLM、Embedding、STT、TTS、数字人都通过模型网关和 provider 插件接入，不把业务逻辑写死到某一家服务。
-- 先做可闭环 MVP：题库管理、岗位要求、题目检索、面试计划、文本/音频回答、语义评分、报告生成要先跑通。
+- 保持闭环：题库管理、岗位要求、题目检索、面试计划、服务端语音回答、语义评分、报告生成必须持续可运行；客户端文本或浏览器 final 不能形成答案。
 - 实时链路要分层：WebSocket 负责状态和事件编排，音视频流优先用 WebRTC；MVP 可以先用 WebSocket 音频分片。
 - 评分必须可解释：每题分数要带命中的关键点、缺失点、证据片段和改进建议，不能只给一个黑盒分。
 - 人类最终决策：系统输出用于辅助面试官，不应自动做录用或淘汰决定。

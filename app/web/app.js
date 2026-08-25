@@ -3,6 +3,10 @@ const API = "/api/v1";
 const state = {
   view: "overview",
   questions: [],
+  positions: [],
+  knowledgeBases: [],
+  candidates: [],
+  appointments: [],
   roles: [],
   plans: [],
   interviews: [],
@@ -15,6 +19,8 @@ const state = {
   report: null,
   socket: null,
   candidateToken: null,
+  invitationToken: null,
+  publicInvitation: null,
   candidateMediaStream: null,
   candidateRecorder: null,
   candidateRecognition: null,
@@ -24,6 +30,7 @@ const state = {
   candidateRecording: false,
   candidateRecordingPending: false,
   candidateAudioUri: null,
+  candidateAudioMimeType: "audio/webm;codecs=opus",
   candidateTranscript: "",
   candidateInterimTranscript: "",
   candidateRecordingStartedAt: null,
@@ -37,17 +44,24 @@ const state = {
 const viewTitles = {
   overview: "总览",
   questions: "题库",
+  workflow: "招聘流程",
   plans: "面试计划",
   interviews: "面试会话",
   live: "实时面试",
   models: "模型服务",
   candidate: "候选人面试",
+  invite: "面试邀请",
 };
 
 const statusLabels = {
   active: "可用",
   indexed: "已索引",
   pending: "处理中",
+  processing: "安全处理中",
+  queued: "等待处理",
+  retry_scheduled: "等待重试",
+  dead_letter: "待人工重放",
+  failed: "处理失败",
   draft: "草稿",
   approved: "已确认",
   scheduled: "待开始",
@@ -67,6 +81,16 @@ const statusLabels = {
   hold: "暂缓决定",
   reject: "不建议推进",
   manual_review: "人工复核",
+  strong_match: "高度匹配",
+  match: "匹配",
+  partial_match: "部分匹配",
+  insufficient_evidence: "证据不足",
+  ready: "已就绪",
+  building: "构建中",
+  invited: "已邀请",
+  registered: "已登记",
+  consumed: "已使用",
+  transcribing: "服务端转写中",
 };
 
 const difficultyLabels = {
@@ -82,6 +106,10 @@ const recommendationLabels = {
   hold: "暂缓决定",
   reject: "不建议推进",
   manual_review: "人工复核",
+  strong_match: "高度匹配",
+  match: "匹配",
+  partial_match: "部分匹配",
+  insufficient_evidence: "证据不足",
 };
 
 const appContent = document.querySelector("#app-content");
@@ -125,6 +153,11 @@ function bindShell() {
 }
 
 async function loadRouteData() {
+  if (state.view === "invite") {
+    stopCandidateMedia();
+    await hydrateInvitationRoute();
+    return;
+  }
   if (state.view === "candidate") {
     await hydrateCandidateRoute();
     return;
@@ -135,27 +168,48 @@ async function loadRouteData() {
 }
 
 async function loadWorkspace() {
-  const [questions, roles, plans, interviews, catalog, providerConfigs, routes] = await Promise.all([
-    api(`${API}/questions`),
+  const [roles, plans, interviews, catalog, providerConfigs, routes, positions, candidates, appointments] = await Promise.all([
     api(`${API}/role-requirements`),
     api(`${API}/interview-plans`),
     api(`${API}/interviews`),
     api(`${API}/admin/model-providers/catalog`),
     api(`${API}/admin/model-provider-configs`),
     api(`${API}/admin/model-routes`),
+    api(`${API}/job-positions`),
+    api(`${API}/candidate-profiles`),
+    api(`${API}/interview-appointments`),
   ]);
-  state.questions = newestFirst(questions.items);
   state.roles = newestFirst(roles.items);
   state.plans = newestFirst(plans.items);
   state.interviews = newestFirst(interviews.items);
   state.catalog = catalog.items;
   state.providerConfigs = newestFirst(providerConfigs.items);
   state.routes = newestFirst(routes.items);
+  state.positions = newestFirst(positions.items);
+  state.candidates = newestFirst(candidates.items);
+  state.appointments = newestFirst(appointments.items);
+  const knowledgeBaseGroups = await Promise.all(
+    state.positions.map((item) => api(`${API}/job-positions/${encodeURIComponent(item.id)}/knowledge-bases`))
+  );
+  state.knowledgeBases = newestFirst(knowledgeBaseGroups.flatMap((item) => item.items || []));
+  const questionGroups = await Promise.all(
+    state.knowledgeBases.map((item) => api(`${API}/knowledge-bases/${encodeURIComponent(item.id)}/questions`))
+  );
+  state.questions = newestFirst(questionGroups.flatMap((item) => item.items || []));
 }
 
 async function refreshCollection(name) {
+  if (name === "questions") {
+    const groups = await Promise.all(
+      state.knowledgeBases.map((item) => api(`${API}/knowledge-bases/${encodeURIComponent(item.id)}/questions`))
+    );
+    state.questions = newestFirst(groups.flatMap((item) => item.items || []));
+    return;
+  }
   const endpoints = {
-    questions: `${API}/questions`,
+    positions: `${API}/job-positions`,
+    candidates: `${API}/candidate-profiles`,
+    appointments: `${API}/interview-appointments`,
     roles: `${API}/role-requirements`,
     plans: `${API}/interview-plans`,
     interviews: `${API}/interviews`,
@@ -180,8 +234,20 @@ function syncRouteFromHash() {
   } else if (view === "candidate" && id) {
     state.view = "candidate";
     state.selectedInterviewId = id;
-    state.candidateToken = new URLSearchParams(query).get("token");
-  } else if (["overview", "questions", "plans", "interviews", "models"].includes(view)) {
+    const suppliedToken = new URLSearchParams(query).get("token");
+    const storageKey = `candidate-session:${id}`;
+    if (suppliedToken) {
+      state.candidateToken = suppliedToken;
+      window.sessionStorage.setItem(storageKey, suppliedToken);
+      window.history.replaceState(null, "", `#candidate/${id}`);
+    } else {
+      state.candidateToken = window.sessionStorage.getItem(storageKey);
+    }
+  } else if (view === "invite" && id) {
+    state.view = "invite";
+    state.invitationToken = id;
+    state.selectedInterviewId = null;
+  } else if (["overview", "questions", "workflow", "plans", "interviews", "models"].includes(view)) {
     state.view = view;
     state.selectedInterviewId = null;
   } else {
@@ -190,19 +256,38 @@ function syncRouteFromHash() {
   }
 }
 
+async function hydrateInvitationRoute() {
+  disconnectSocket();
+  state.publicInvitation = null;
+  if (!state.invitationToken) return;
+  try {
+    state.publicInvitation = await api(`${API}/public/interview-invitations/${encodeURIComponent(state.invitationToken)}`);
+  } catch (error) {
+    toast("邀请链接不可用", error.message, "error");
+  }
+}
+
 async function hydrateCandidateRoute() {
   disconnectSocket();
   if (!state.selectedInterviewId) return;
   try {
-    state.selectedInterview = await api(`${API}/interviews/${encodeURIComponent(state.selectedInterviewId)}`);
+    state.selectedInterview = await candidateApi();
     state.report = null;
-    if (state.selectedInterview.status === "report_ready") {
-      state.report = await api(`${API}/interviews/${encodeURIComponent(state.selectedInterviewId)}/report`);
-    }
   } catch (error) {
     state.selectedInterview = null;
     toast("无法进入面试", error.message, "error");
   }
+}
+
+function candidateSessionApi(suffix = "") {
+  return `${API}/public/interviews/${encodeURIComponent(state.selectedInterviewId)}${suffix}`;
+}
+
+function candidateApi(suffix = "", options = {}) {
+  return api(candidateSessionApi(suffix), {
+    ...options,
+    headers: { ...(options.headers || {}), "X-Candidate-Session-Token": state.candidateToken || "" },
+  });
 }
 
 async function hydrateRoute() {
@@ -240,11 +325,13 @@ function render() {
   const renderers = {
     overview: renderOverview,
     questions: renderQuestions,
+    workflow: renderWorkflow,
     plans: renderPlans,
     interviews: renderInterviews,
     live: renderLiveInterview,
     models: renderModels,
     candidate: renderCandidateRoom,
+    invite: renderInvitation,
   };
   appContent.innerHTML = renderers[state.view]();
   bindViewEvents();
@@ -252,7 +339,7 @@ function render() {
 }
 
 function updateShell() {
-  document.body.classList.toggle("candidate-mode", state.view === "candidate");
+  document.body.classList.toggle("candidate-mode", ["candidate", "invite"].includes(state.view));
   document.querySelector("#topbar-title").textContent = viewTitles[state.view];
   document.querySelectorAll("[data-view]").forEach((button) => {
     const target = state.view === "live" ? "interviews" : state.view;
@@ -262,11 +349,13 @@ function updateShell() {
   const actions = {
     overview: ["新建题目", "plus"],
     questions: ["新建题目", "plus"],
+    workflow: ["新建岗位", "briefcase-business"],
     plans: ["新建岗位", "briefcase-business"],
-    interviews: ["创建面试", "calendar-plus"],
+    interviews: ["创建预约", "calendar-plus"],
     live: ["返回会话", "arrow-left"],
     models: ["添加配置", "plug-zap"],
     candidate: ["候选人面试", "video"],
+    invite: ["邀请登记", "shield-check"],
   };
   const [label, icon] = actions[state.view];
   quickAction.innerHTML = `<i data-lucide="${icon}" aria-hidden="true"></i><span>${label}</span>`;
@@ -290,7 +379,7 @@ function renderOverview() {
           <i data-lucide="briefcase-business" aria-hidden="true"></i>新建岗位
         </button>
         <button class="button button-primary" type="button" data-action="create-interview">
-          <i data-lucide="calendar-plus" aria-hidden="true"></i>创建面试
+          <i data-lucide="calendar-plus" aria-hidden="true"></i>创建预约
         </button>
       </div>
     </section>
@@ -333,9 +422,40 @@ function renderOverview() {
   `;
 }
 
+function renderWorkflow() {
+  const positionCards = state.positions.map((position) => {
+    const bases = state.knowledgeBases.filter((item) => item.job_position_id === position.id);
+    return `<article class="question-card"><div class="question-card-top"><div><span class="question-eyebrow">岗位 · ${escapeHtml(position.code)}</span><h3>${escapeHtml(position.name)}</h3></div><span class="status-badge status-${escapeHtml(position.status)}">${statusLabel(position.status)}</span></div><p class="question-copy">${escapeHtml(position.description || "尚未填写岗位说明")}</p><div class="tag-list">${bases.map((item) => `<span class="tag">${escapeHtml(item.name)} · ${statusLabel(item.status)}</span>`).join("") || '<span class="tag">尚无岗位题库</span>'}</div><div class="card-actions"><button class="button button-secondary button-small" type="button" data-action="create-knowledge-base" data-id="${escapeHtml(position.id)}"><i data-lucide="library-big" aria-hidden="true"></i>添加题库</button></div></article>`;
+  }).join("");
+  const candidateRows = state.candidates.map((candidate) => `<tr><td><span class="cell-title">${escapeHtml(candidate.name)}</span></td><td>${escapeHtml(candidate.email)}</td><td>${escapeHtml(candidate.phone)}</td><td><button class="button button-secondary button-small" type="button" data-action="upload-resume" data-id="${escapeHtml(candidate.id)}"><i data-lucide="file-up" aria-hidden="true"></i>上传简历</button></td></tr>`).join("");
+  const appointmentRows = state.appointments.map((item) => {
+    const position = state.positions.find((candidate) => candidate.id === item.job_position_id);
+    const candidate = state.candidates.find((value) => value.id === item.candidate_profile_id);
+    return `<tr><td><span class="cell-title">${escapeHtml(candidate?.name || item.candidate_profile_id)}</span></td><td>${escapeHtml(position?.name || item.job_position_id)}</td><td><span class="status-badge status-${escapeHtml(item.status)}">${statusLabel(item.status)}</span></td><td>${formatDate(item.scheduled_start_at)}</td></tr>`;
+  }).join("");
+  return `
+    <section class="page-header"><div><h1>岗位到复核的业务闭环</h1><p>岗位题库、简历证据、预约匹配、随机抽题、服务端 STT 与人工复核</p></div><div class="page-actions"><button class="button button-secondary" type="button" data-action="create-candidate-profile"><i data-lucide="user-plus"></i>录入候选人</button><button class="button button-primary" type="button" data-action="create-position"><i data-lucide="briefcase-business"></i>新建岗位</button></div></section>
+    <section class="workflow-band section-block">
+      ${workflowStep(1, "岗位", `${state.positions.length} 个岗位`)}
+      ${workflowStep(2, "岗位题库", `${state.knowledgeBases.length} 个题库`)}
+      ${workflowStep(3, "简历库", `${state.candidates.length} 位候选人`)}
+      ${workflowStep(4, "AI 审阅", "证据问题需人工批准")}
+      ${workflowStep(5, "计划与预约", `${state.appointments.length} 个预约`)}
+      ${workflowStep(6, "语音面试", "服务端转写后逐题评分")}
+      ${workflowStep(7, "企业复核", "人员作最终决定")}
+    </section>
+    <section class="panel"><div class="section-title-row"><div><h2>岗位与岗位题库</h2><p>题库只归属一个岗位；语音全部 ready 后才可进入计划</p></div></div>${positionCards ? `<div class="question-grid">${positionCards}</div>` : emptyState("briefcase-business", "尚无岗位", "先建立稳定岗位，再为岗位添加一个或多个题库")}</section>
+    <section class="panel"><div class="section-title-row"><div><h2>企业简历库</h2><p>候选人联系方式用于预约强匹配，AI 只提取岗位相关证据</p></div></div>${candidateRows ? `<div class="table-wrap"><table><thead><tr><th>候选人</th><th>邮箱</th><th>手机</th><th>操作</th></tr></thead><tbody>${candidateRows}</tbody></table></div>` : emptyState("users", "尚无候选人", "录入姓名、邮箱和手机号后上传简历")}</section>
+    <section class="panel"><div class="section-title-row"><div><h2>预约状态</h2><p>邀请 token 一次性使用；姓名加邮箱或手机号匹配后 self-start</p></div></div>${appointmentRows ? `<div class="table-wrap"><table><thead><tr><th>候选人</th><th>岗位</th><th>状态</th><th>预约时间</th></tr></thead><tbody>${appointmentRows}</tbody></table></div>` : emptyState("calendar-clock", "尚无预约", "批准候选人专属计划后创建预约")}</section>`;
+}
+
 function renderQuestions() {
   const items = state.questionResults === null ? state.questions : state.questionResults;
   const resultLabel = state.questionResults === null ? `${state.questions.length} 道题目` : `${items.length} 条搜索结果`;
+  const scopeOptions = state.knowledgeBases.map((knowledgeBase) => {
+    const position = state.positions.find((item) => item.id === knowledgeBase.job_position_id);
+    return `<option value="${escapeHtml(knowledgeBase.id)}">${escapeHtml(position?.name || "岗位")} · ${escapeHtml(knowledgeBase.name)}</option>`;
+  }).join("");
   return `
     <section class="page-header">
       <div><h1>题库</h1><p>标准答案、关键点与检索索引 · ${resultLabel}</p></div>
@@ -357,7 +477,11 @@ function renderQuestions() {
         <option value="senior">高级</option>
         <option value="expert">专家</option>
       </select>
-      <button class="button button-secondary" type="submit"><i data-lucide="search" aria-hidden="true"></i>检索</button>
+      <select class="form-select" name="knowledge_base_id" aria-label="岗位题库范围" required>
+        <option value="">选择岗位题库</option>
+        ${scopeOptions}
+      </select>
+      <button class="button button-secondary" type="submit" ${scopeOptions ? "" : "disabled"}><i data-lucide="search" aria-hidden="true"></i>检索</button>
     </form>
 
     ${items.length ? questionTable(items, state.questionResults !== null) : emptyState("search-x", state.questionResults === null ? "题库为空" : "没有匹配结果", state.questionResults === null ? "尚未创建面试题目" : "请调整检索条件")}
@@ -393,7 +517,7 @@ function renderInterviews() {
       <div><h1>面试会话</h1><p>候选人、轮次与报告状态 · ${state.interviews.length} 场面试</p></div>
       <div class="page-actions">
         <button class="button button-secondary" type="button" data-action="refresh-interviews"><i data-lucide="refresh-cw" aria-hidden="true"></i>刷新</button>
-        <button class="button button-primary" type="button" data-action="create-interview" ${state.plans.length ? "" : "disabled"}><i data-lucide="calendar-plus" aria-hidden="true"></i>创建面试</button>
+        <button class="button button-primary" type="button" data-action="create-interview" ${state.plans.length ? "" : "disabled"}><i data-lucide="calendar-plus" aria-hidden="true"></i>创建预约</button>
       </div>
     </section>
 
@@ -450,6 +574,40 @@ function renderLiveInterview() {
   `;
 }
 
+function renderInvitation() {
+  const invitation = state.publicInvitation;
+  if (!invitation) {
+    return `<div class="candidate-room">${emptyState("link-2-off", "邀请链接不可用", "链接可能已过期、已使用或被撤销，请联系面试官重新发送")}</div>`;
+  }
+  const consent = invitation.consent || {};
+  return `
+    <div class="candidate-room">
+      <header class="candidate-header">
+        <a class="candidate-brand" href="#invite/${escapeHtml(state.invitationToken || "")}" aria-label="Interviewer 面试邀请">
+          <span class="brand-mark"><i data-lucide="messages-square" aria-hidden="true"></i></span>
+          <span><strong>Interviewer</strong><small>候选人登记</small></span>
+        </a>
+        <div class="candidate-header-meta"><span class="status-badge status-${escapeHtml(invitation.status)}">${statusLabel(invitation.status)}</span></div>
+      </header>
+      <main style="width:min(760px, calc(100% - 32px)); margin:48px auto;">
+        <section class="panel" style="padding:28px;">
+          <div class="section-title-row"><div><span class="question-eyebrow">面试邀请</span><h1 style="margin:8px 0;">${escapeHtml(invitation.position_name)}</h1><p>${formatDate(invitation.scheduled_start_at)} 至 ${formatDate(invitation.scheduled_end_at)}</p></div></div>
+          <form id="invitation-intake-form">
+            <div class="form-grid">
+              ${field("姓名", `<input class="form-input" name="name" autocomplete="name" required />`, true)}
+              ${field("邮箱", `<input class="form-input" name="email" type="email" autocomplete="email" required />`)}
+              ${field("手机号", `<input class="form-input" name="phone" type="tel" autocomplete="tel" required />`)}
+            </div>
+            <div class="privacy-note" style="margin-top:20px;"><i data-lucide="shield-check" aria-hidden="true"></i><span>${escapeHtml(consent.privacy_notice || "身份信息仅用于本次面试登记与核验。")}</span></div>
+            <label style="display:flex; gap:10px; align-items:flex-start; margin-top:18px;"><input type="checkbox" name="privacy_accepted" required /><span>我已阅读并同意隐私说明（版本 ${escapeHtml(consent.version || "v1")}）</span></label>
+            ${consent.recording_required ? `<div class="privacy-note" style="margin-top:14px;"><i data-lucide="mic" aria-hidden="true"></i><span>${escapeHtml(consent.recording_notice || "面试需要录制答题音频。")}</span></div><label style="display:flex; gap:10px; align-items:flex-start; margin-top:14px;"><input type="checkbox" name="recording_accepted" required /><span>我同意录制答题音频并用于服务端转写、评分与授权复核</span></label>` : ""}
+            <button class="button button-primary" type="submit" style="margin-top:24px;"><i data-lucide="mic-2" aria-hidden="true"></i>核验身份、检查麦克风并进入面试</button>
+          </form>
+        </section>
+      </main>
+    </div>`;
+}
+
 function renderCandidateRoom() {
   const interview = state.selectedInterview;
   if (!interview) {
@@ -463,7 +621,7 @@ function renderCandidateRoom() {
   return `
     <div class="candidate-room">
       <header class="candidate-header">
-        <a class="candidate-brand" href="#candidate/${escapeHtml(interview.id)}?token=${escapeHtml(state.candidateToken || "")}" aria-label="Interviewer 候选人面试">
+        <a class="candidate-brand" href="#candidate/${escapeHtml(interview.id)}" aria-label="Interviewer 候选人面试">
           <span class="brand-mark"><i data-lucide="messages-square" aria-hidden="true"></i></span>
           <span><strong>Interviewer</strong><small>候选人面试</small></span>
         </a>
@@ -510,12 +668,7 @@ function renderCandidateRoom() {
             <span class="candidate-progress">${completedTurns}/${interview.turns.length}</span>
           </div>
 
-          ${interview.status === "scheduled" ? `
-            <div class="candidate-waiting-row">
-              <span><strong>面试尚未开始</strong><small>${mediaReady ? "设备检查已完成" : "请先完成设备检查"}</small></span>
-              <button class="button button-primary" type="button" data-action="candidate-start-session" ${mediaReady ? "" : "disabled"}><i data-lucide="play" aria-hidden="true"></i>进入面试</button>
-            </div>
-          ` : renderCandidateAnswerControls(currentTurn, mediaReady)}
+          ${renderCandidateAnswerControls(currentTurn, mediaReady)}
         </section>
       `}
     </div>
@@ -536,9 +689,9 @@ function renderCandidateAnswerControls(currentTurn, mediaReady) {
     <div class="candidate-transcript-wrap">
       <div class="transcript-toolbar">
         <span><i data-lucide="captions" aria-hidden="true"></i>实时转写</span>
-        <span id="recording-timer">${state.candidateRecording ? "录音中 00:00" : state.candidateAudioUri ? "录音已保存" : recognitionAvailable ? "浏览器语音识别可用" : "请使用文本补答"}</span>
+        <span id="recording-timer">${state.candidateRecording ? "录音中 00:00" : state.candidateAudioUri ? "录音已保存" : recognitionAvailable ? "浏览器可显示辅助转写" : "提交后由服务端转写"}</span>
       </div>
-      <textarea class="form-textarea candidate-transcript" id="candidate-transcript" placeholder="回答内容将在这里实时显示，也可以手动修正" ${mediaReady ? "" : "disabled"}>${transcript}</textarea>
+      <textarea class="form-textarea candidate-transcript" id="candidate-transcript" placeholder="浏览器支持时在这里显示辅助转写；最终答案以服务端 STT 为准" readonly>${transcript}</textarea>
       <div class="interim-transcript" id="candidate-interim-transcript">${escapeHtml(state.candidateInterimTranscript)}</div>
     </div>
     <div class="candidate-answer-actions">
@@ -546,7 +699,7 @@ function renderCandidateAnswerControls(currentTurn, mediaReady) {
         <button class="button button-record" type="button" data-action="candidate-record" ${mediaReady && !state.candidateRecording ? "" : "disabled"}><i data-lucide="circle" aria-hidden="true"></i>开始回答</button>
         <button class="button button-secondary" type="button" data-action="candidate-stop-recording" ${state.candidateRecording ? "" : "disabled"}><i data-lucide="square" aria-hidden="true"></i>结束录音</button>
       </div>
-      <button class="button button-primary" type="button" data-action="candidate-submit-answer" ${!state.candidateRecording && !state.candidateRecordingPending && state.candidateTranscript.trim() ? "" : "disabled"}><i data-lucide="send" aria-hidden="true"></i>提交本题</button>
+      <button class="button button-primary" type="button" data-action="candidate-submit-answer" ${!state.candidateRecording && !state.candidateRecordingPending && state.candidateAudioUri ? "" : "disabled"}><i data-lucide="send" aria-hidden="true"></i>提交录音</button>
     </div>
     ${state.candidateLastEvaluation ? `<div class="candidate-score-strip"><span><i data-lucide="circle-check" aria-hidden="true"></i>上一题已完成评分</span><strong>${state.candidateLastEvaluation.score} 分</strong></div>` : ""}
   `;
@@ -621,22 +774,27 @@ function roleList(items) {
   return `<div class="list-stack">${items.map((item) => `<div class="list-row"><span class="list-primary"><span class="list-icon"><i data-lucide="briefcase-business" aria-hidden="true"></i></span><span><strong>${escapeHtml(item.title)}</strong><small>${escapeHtml(difficultyLabels[item.seniority] || item.seniority)} · ${item.interview_duration_minutes} 分钟</small></span></span><span class="tag">${Object.keys(item.parsed_profile?.skill_weights || {}).length} 项技能</span></div>`).join("")}</div>`;
 }
 
+function planSlots(plan) {
+  return plan.bank_slots || [];
+}
+
 function planDetails(plan) {
   const role = state.roles.find((item) => item.id === plan.role_requirement_id);
+  const slots = planSlots(plan);
   const assembly = plan.assembly_summary || {};
   const coverage = (assembly.coverage || []).map((item) => `<span class="tag">${escapeHtml(item.dimension)} ${item.selected_count}/${item.target_count}</span>`).join("");
   const warnings = (assembly.warnings || []).map((item) => `<div class="plan-warning"><i data-lucide="triangle-alert" aria-hidden="true"></i><span>${escapeHtml(item)}</span></div>`).join("");
   return `<details class="plan-item">
     <summary>
-      <span class="plan-summary-title"><strong>${escapeHtml(role?.title || "面试计划")}</strong><small>${formatDate(plan.created_at)} · ${plan.items.length} 道题</small></span>
+      <span class="plan-summary-title"><strong>${escapeHtml(role?.title || "面试计划")}</strong><small>${formatDate(plan.created_at)} · ${slots.length} 道岗位题</small></span>
       <span class="muted">${plan.estimated_minutes} 分钟</span>
       <span class="status-badge status-${escapeHtml(plan.status)}">${statusLabel(plan.status)}</span>
       <i class="plan-chevron" data-lucide="chevron-right" aria-hidden="true"></i>
     </summary>
     <div class="plan-questions">
-      ${(coverage || warnings) ? `<div class="plan-assembly-summary"><div><strong>装配覆盖</strong><span class="muted">候选 ${assembly.candidate_count || 0} · 已选 ${assembly.selected_question_count || plan.items.length}/${assembly.requested_question_count || plan.items.length}</span></div>${coverage ? `<div class="plan-coverage">${coverage}</div>` : ""}${warnings}</div>` : ""}
-      ${plan.items.map((item) => {
-        const question = state.questions.find((candidate) => candidate.id === item.question_id);
+      ${(coverage || warnings) ? `<div class="plan-assembly-summary"><div><strong>装配覆盖</strong><span class="muted">候选 ${assembly.candidate_count || 0} · 已选 ${assembly.selected_question_count || slots.length}/${assembly.requested_question_count || slots.length}</span></div>${coverage ? `<div class="plan-coverage">${coverage}</div>` : ""}${warnings}</div>` : ""}
+      ${slots.map((item) => {
+        const question = state.questions.find((candidate) => candidate.id === item.display_question_id);
         return `<div class="plan-question"><span class="question-order">${item.order}</span><span><strong>${escapeHtml(question?.title || item.dimension || "题目")}</strong><span class="cell-subtitle">${escapeHtml(item.selection_reason || "已选入计划")}</span></span><span class="muted">${item.expected_minutes} 分钟</span></div>`;
       }).join("")}
       ${plan.status === "draft" ? `<div class="table-actions"><button class="button button-primary button-small" type="button" data-action="approve-plan" data-id="${escapeHtml(plan.id)}"><i data-lucide="badge-check" aria-hidden="true"></i>审批计划</button></div>` : ""}
@@ -654,8 +812,7 @@ function interviewRow(interview) {
     <span class="status-badge status-${escapeHtml(interview.status)}">${statusLabel(interview.status)}</span>
     <span class="muted">${formatDate(interview.created_at)}</span>
     <div class="table-actions">
-      <button class="icon-button" type="button" title="打开候选人房间" aria-label="打开候选人房间" data-action="open-candidate-room" data-id="${escapeHtml(interview.id)}"><i data-lucide="monitor-play" aria-hidden="true"></i></button>
-      ${interview.status === "scheduled" ? `<button class="button button-primary button-small" type="button" data-action="start-interview" data-id="${escapeHtml(interview.id)}"><i data-lucide="play" aria-hidden="true"></i>开始</button>` : `<button class="button button-secondary button-small" type="button" data-action="open-interview" data-id="${escapeHtml(interview.id)}"><i data-lucide="external-link" aria-hidden="true"></i>${interview.status === "report_ready" ? "报告" : "进入"}</button>`}
+      <button class="button button-secondary button-small" type="button" data-action="open-interview" data-id="${escapeHtml(interview.id)}"><i data-lucide="external-link" aria-hidden="true"></i>${interview.status === "report_ready" ? "报告" : "进入"}</button>
     </div>
   </article>`;
 }
@@ -664,12 +821,16 @@ function providerCard(provider) {
   const descriptions = {
     mock: "本地确定性模型，用于开发、检索和评分闭环。",
     openai_compatible: "兼容 Chat Completions 与 Embeddings 协议。",
+    deepseek: "DeepSeek 官方 Chat API，复用统一 OpenAI-compatible 运行时。",
+    zhipuai: "智谱 GLM Chat 与 GLM-TTS，支持 JSON Object 结构化输出和 WAV/PCM 语音。",
+    dashscope: "阿里云百炼千问 LLM、Embedding，以及 Qwen3-TTS / CosyVoice。",
   };
-  return `<article class="provider-card"><div class="provider-card-head"><div><h3>${escapeHtml(provider.display_name)}</h3><span class="mono">${escapeHtml(provider.provider_id)}</span></div><span class="status-badge ${provider.implemented ? "" : "status-draft"}">${provider.implemented ? "可调用" : "待实现"}</span></div><p>${escapeHtml(descriptions[provider.provider_id] || "Provider 插件清单已安装，真实调用尚未接入。")}</p><div class="provider-capabilities">${(provider.capabilities || []).slice(0, 4).map(tag).join("")}${provider.capabilities.length > 4 ? `<span class="tag">+${provider.capabilities.length - 4}</span>` : ""}</div></article>`;
+  const modelSummary = (provider.models || []).length ? ` · ${(provider.models || []).length} 个模型候选` : "";
+  return `<article class="provider-card"><div class="provider-card-head"><div><h3>${escapeHtml(provider.display_name)}</h3><span class="mono">${escapeHtml(provider.provider_id)}</span></div><span class="status-badge ${provider.implemented ? "" : "status-draft"}">${provider.implemented ? "可调用" : "待实现"}</span></div><p>${escapeHtml(descriptions[provider.provider_id] || "Provider 插件清单已安装，真实调用尚未接入。")}<span class="muted">${escapeHtml(modelSummary)}</span></p><div class="provider-capabilities">${(provider.capabilities || []).slice(0, 4).map(tag).join("")}${provider.capabilities.length > 4 ? `<span class="tag">+${provider.capabilities.length - 4}</span>` : ""}</div></article>`;
 }
 
 function providerConfigTable() {
-  return `<div class="data-table-wrap"><table class="data-table"><thead><tr><th>配置名称</th><th>Provider</th><th>状态</th><th>凭证引用</th><th class="text-right">操作</th></tr></thead><tbody>${state.providerConfigs.map((config) => `<tr><td><span class="cell-title">${escapeHtml(config.display_name)}</span><span class="cell-subtitle">${formatDate(config.updated_at)}</span></td><td class="mono">${escapeHtml(config.provider_id)}</td><td><span class="status-badge ${config.enabled ? "" : "status-draft"}">${config.enabled ? "已启用" : "已停用"}</span></td><td class="mono">${escapeHtml(config.credential_ref || "-")}</td><td><div class="table-actions"><button class="button button-secondary button-small" type="button" data-action="test-provider" data-id="${escapeHtml(config.id)}"><i data-lucide="flask-conical" aria-hidden="true"></i>测试</button></div></td></tr>`).join("")}</tbody></table></div>`;
+  return `<div class="data-table-wrap"><table class="data-table"><thead><tr><th>配置名称</th><th>Provider</th><th>状态</th><th>凭证引用</th><th class="text-right">操作</th></tr></thead><tbody>${state.providerConfigs.map((config) => `<tr><td><span class="cell-title">${escapeHtml(config.display_name)}</span><span class="cell-subtitle">${formatDate(config.updated_at)}</span></td><td class="mono">${escapeHtml(config.provider_id)}</td><td><span class="status-badge ${config.enabled ? "" : "status-draft"}">${config.enabled ? "已启用" : "已停用"}</span></td><td class="mono">${escapeHtml(config.credential_ref || "-")}</td><td><div class="table-actions"><button class="button button-secondary button-small" type="button" data-action="edit-provider" data-id="${escapeHtml(config.id)}"><i data-lucide="settings-2" aria-hidden="true"></i>编辑</button><button class="button button-secondary button-small" type="button" data-action="test-provider" data-id="${escapeHtml(config.id)}"><i data-lucide="flask-conical" aria-hidden="true"></i>测试</button></div></td></tr>`).join("")}</tbody></table></div>`;
 }
 
 function routeTable() {
@@ -680,9 +841,6 @@ function routeTable() {
 }
 
 function renderQuestionPanel(interview, currentTurn, canAnswer, canComplete) {
-  if (interview.status === "scheduled") {
-    return `<span class="question-eyebrow">面试待开始</span><h2>会话已创建，候选人资料和题目计划已就绪。</h2><button class="button button-primary" type="button" data-action="start-interview" data-id="${escapeHtml(interview.id)}"><i data-lucide="play" aria-hidden="true"></i>开始面试</button>`;
-  }
   if (interview.status === "report_ready" && state.report) {
     return `<span class="question-eyebrow">面试报告</span><h2>${recommendationLabels[state.report.recommendation] || "报告已生成"}</h2><div class="score-value">${state.report.overall_score}<small> / 100</small></div><p class="evaluation-copy">${escapeHtml(state.report.strengths?.[0] || state.report.risks?.[0] || "评分数据已汇总。")}</p>`;
   }
@@ -698,7 +856,7 @@ function renderQuestionPanel(interview, currentTurn, canAnswer, canComplete) {
   if (!currentTurn) {
     return `<span class="question-eyebrow">会话结束</span><h2>当前没有待回答题目。</h2>`;
   }
-  return `<span class="question-eyebrow">第 ${currentTurn.order} 题</span><h2>${escapeHtml(currentTurn.question_spoken_text)}</h2><form id="answer-form"><textarea class="form-textarea answer-box" name="final_transcript" placeholder="候选人实时转写或人工记录" required ${canAnswer ? "" : "disabled"}>${escapeHtml(state.liveTranscript)}</textarea><div class="session-action-row"><small>实时转写 · 文本兜底</small><div class="table-actions"><button class="button button-secondary" type="button" data-action="skip-interview-turn" data-id="${escapeHtml(interview.id)}" ${canAnswer ? "" : "disabled"}><i data-lucide="skip-forward" aria-hidden="true"></i>跳过本题</button><button class="button button-primary" type="submit" ${canAnswer ? "" : "disabled"}><i data-lucide="send" aria-hidden="true"></i>提交回答</button></div></div></form>`;
+  return `<span class="question-eyebrow">第 ${currentTurn.order} 题</span><h2>${escapeHtml(currentTurn.question_spoken_text)}</h2><div class="evaluation-copy">候选人回答必须从候选人房间录音，并由服务端 STT 形成权威转写。面试官可查看实时状态或跳过本题，不能代填最终答案。</div><div class="session-action-row"><small>服务端语音闭环</small><div class="table-actions"><button class="button button-secondary" type="button" data-action="skip-interview-turn" data-id="${escapeHtml(interview.id)}" ${canAnswer ? "" : "disabled"}><i data-lucide="skip-forward" aria-hidden="true"></i>跳过本题</button></div></div>`;
 }
 
 function renderEvaluation(evaluation) {
@@ -734,16 +892,8 @@ function tag(value) {
 function bindViewEvents() {
   const searchForm = document.querySelector("#question-search-form");
   if (searchForm) searchForm.addEventListener("submit", searchQuestions);
-  const answerForm = document.querySelector("#answer-form");
-  if (answerForm) answerForm.addEventListener("submit", submitAnswer);
-  const candidateTranscript = document.querySelector("#candidate-transcript");
-  if (candidateTranscript) {
-    candidateTranscript.addEventListener("input", (event) => {
-      state.candidateTranscript = event.target.value;
-      const submit = document.querySelector('[data-action="candidate-submit-answer"]');
-      if (submit) submit.disabled = state.candidateRecording || !state.candidateTranscript.trim();
-    });
-  }
+  const invitationForm = document.querySelector("#invitation-intake-form");
+  if (invitationForm) invitationForm.addEventListener("submit", submitInvitation);
   const audioDevice = document.querySelector("#candidate-audio-device");
   const videoDevice = document.querySelector("#candidate-video-device");
   if (audioDevice) audioDevice.addEventListener("change", switchCandidateDevices);
@@ -757,31 +907,33 @@ async function handleContentAction(event) {
   const { action, id } = button.dataset;
   const actions = {
     "create-question": openQuestionModal,
+    "create-position": openPositionModal,
+    "create-knowledge-base": () => openKnowledgeBaseModal(id),
+    "create-candidate-profile": openCandidateProfileModal,
+    "upload-resume": () => openResumeModal(id),
     "create-role": openRoleModal,
     "generate-plan": openPlanModal,
     "approve-plan": () => approvePlan(id, button),
-    "create-interview": openInterviewModal,
+    "create-interview": openAppointmentModal,
     "create-provider": openProviderModal,
     "create-route": openRouteModal,
+    "edit-provider": () => openProviderEditModal(id),
     "go-questions": () => navigate("questions"),
     "go-interviews": () => navigate("interviews"),
     "clear-search": () => { state.questionResults = null; render(); },
     "view-question": () => openQuestionDetails(id),
     "open-interview": () => navigate("interviews", id),
-    "open-candidate-room": () => openCandidateRoom(id),
-    "start-interview": () => startInterview(id, button),
     "pause-interview": () => controlInterview(id, "pause", "interviewer paused", button),
     "recover-interview": () => controlInterview(id, "recover", "interviewer resumed", button),
     "skip-interview-turn": () => controlInterview(id, "skip", "interviewer skipped turn", button),
     "cancel-interview": () => controlInterview(id, "cancel", "interviewer cancelled", button),
     "complete-interview": () => completeInterview(id, button),
     "refresh-interviews": refreshInterviews,
-    "test-provider": () => testProvider(id, button),
+    "test-provider": () => openProviderTestModal(id),
     "test-route": () => testRoute(id, button),
     "candidate-enable-media": enableCandidateMedia,
     "candidate-toggle-audio": toggleCandidateAudio,
     "candidate-toggle-video": toggleCandidateVideo,
-    "candidate-start-session": startCandidateSession,
     "candidate-speak": speakCandidateQuestion,
     "candidate-record": startCandidateRecording,
     "candidate-stop-recording": stopCandidateRecording,
@@ -794,8 +946,9 @@ function runQuickAction() {
   const actions = {
     overview: openQuestionModal,
     questions: openQuestionModal,
+    workflow: openPositionModal,
     plans: openRoleModal,
-    interviews: openInterviewModal,
+    interviews: openAppointmentModal,
     live: () => navigate("interviews"),
     models: openProviderModal,
   };
@@ -810,9 +963,14 @@ async function searchQuestions(event) {
   try {
     const data = new FormData(form);
     const difficulty = data.get("difficulty");
+    const knowledgeBaseId = data.get("knowledge_base_id");
+    const knowledgeBase = state.knowledgeBases.find((item) => item.id === knowledgeBaseId);
+    if (!knowledgeBase) throw new Error("请选择有效的岗位题库范围");
     const result = await api(`${API}/questions/search`, {
       method: "POST",
       body: {
+        job_position_id: knowledgeBase.job_position_id,
+        knowledge_base_ids: [knowledgeBase.id],
         query: data.get("query"),
         filters: difficulty ? { difficulty: [difficulty] } : {},
         limit: 50,
@@ -827,12 +985,212 @@ async function searchQuestions(event) {
   }
 }
 
+async function submitInvitation(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const submit = form.querySelector('button[type="submit"]');
+  const data = new FormData(form);
+  const token = state.invitationToken;
+  const notice = state.publicInvitation?.consent || {};
+  setBusy(submit, true, "正在核验");
+  try {
+    await api(`${API}/public/interview-invitations/${encodeURIComponent(token)}/intake`, {
+      method: "POST",
+      body: {
+        name: data.get("name"),
+        email: data.get("email"),
+        phone: data.get("phone"),
+        consent: {
+          accepted: data.get("privacy_accepted") === "on",
+          version: notice.version || "v1",
+          recording_accepted: data.get("recording_accepted") === "on",
+        },
+      },
+    });
+    const browserSupported = Boolean(navigator.mediaDevices?.getUserMedia && window.MediaRecorder);
+    let microphoneGranted = false;
+    if (browserSupported) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+        microphoneGranted = stream.getAudioTracks().length > 0;
+        stream.getTracks().forEach((track) => track.stop());
+      } catch {
+        microphoneGranted = false;
+      }
+    }
+    const mimeTypes = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"];
+    const audioContentType = mimeTypes.find((value) => window.MediaRecorder?.isTypeSupported?.(value)) || "audio/webm";
+    const readiness = await api(`${API}/public/interview-invitations/${encodeURIComponent(token)}/readiness`, {
+      method: "POST",
+      body: { browser_supported: browserSupported, microphone_granted: microphoneGranted, audio_content_type: audioContentType },
+    });
+    if (!readiness.can_start) throw new Error("麦克风或面试运行条件尚未就绪，请检查权限和预约时间后重试");
+    const result = await api(`${API}/public/interview-invitations/${encodeURIComponent(token)}/start`, { method: "POST" });
+    window.location.href = result.candidate_join_url;
+  } catch (error) {
+    setBusy(submit, false);
+    toast("暂时无法进入面试", error.message, "error");
+  }
+}
+
+async function refreshWorkflow() {
+  const [positions, candidates, appointments] = await Promise.all([
+    api(`${API}/job-positions`),
+    api(`${API}/candidate-profiles`),
+    api(`${API}/interview-appointments`),
+  ]);
+  state.positions = newestFirst(positions.items);
+  state.candidates = newestFirst(candidates.items);
+  state.appointments = newestFirst(appointments.items);
+  const groups = await Promise.all(
+    state.positions.map((item) => api(`${API}/job-positions/${encodeURIComponent(item.id)}/knowledge-bases`))
+  );
+  state.knowledgeBases = newestFirst(groups.flatMap((item) => item.items || []));
+}
+
+function openPositionModal() {
+  openModal("新建岗位", `<form id="position-create-form"><div class="form-grid">
+    ${field("岗位编码", `<input class="form-input" name="code" placeholder="backend_engineer" required />`)}
+    ${field("岗位名称", `<input class="form-input" name="name" placeholder="后端工程师" required />`)}
+    ${field("岗位说明", `<textarea class="form-textarea" name="description"></textarea>`, true)}
+  </div></form>`, { submitLabel: "创建岗位", submitIcon: "briefcase-business", onSubmit: createPosition, formId: "position-create-form" });
+}
+
+async function createPosition(form, submit) {
+  const data = new FormData(form);
+  setBusy(submit, true, "创建中");
+  const item = await api(`${API}/job-positions`, { method: "POST", body: { code: data.get("code"), name: data.get("name"), description: data.get("description") } });
+  await refreshWorkflow();
+  closeModal();
+  render();
+  toast("岗位已创建", `${item.name} 可以添加多个岗位题库`);
+}
+
+function openKnowledgeBaseModal(positionId) {
+  const position = state.positions.find((item) => item.id === positionId);
+  if (!position) return;
+  openModal(`为 ${position.name} 添加题库`, `<form id="knowledge-base-form"><div class="form-grid">
+    <input type="hidden" name="position_id" value="${escapeHtml(positionId)}" />
+    ${field("题库名称", `<input class="form-input" name="name" required />`, true)}
+    ${field("说明", `<textarea class="form-textarea" name="description"></textarea>`, true)}
+    ${field("语言", `<select class="form-select" name="language"><option value="zh-CN">中文</option><option value="en-US">English</option></select>`)}
+    ${field("音色配置", `<input class="form-input" name="voice_profile_id" value="voice_default_cn" required />`)}
+  </div></form>`, { submitLabel: "创建题库", submitIcon: "library-big", onSubmit: createKnowledgeBase, formId: "knowledge-base-form" });
+}
+
+async function createKnowledgeBase(form, submit) {
+  const data = new FormData(form);
+  setBusy(submit, true, "创建中");
+  const item = await api(`${API}/job-positions/${encodeURIComponent(data.get("position_id"))}/knowledge-bases`, { method: "POST", body: { name: data.get("name"), description: data.get("description"), language: data.get("language"), voice_profile_id: data.get("voice_profile_id") } });
+  await refreshWorkflow();
+  closeModal();
+  render();
+  toast("岗位题库已创建", `${item.name} 等待录入题目和生成语音`);
+}
+
+function openCandidateProfileModal() {
+  openModal("录入候选人", `<form id="candidate-profile-form"><div class="form-grid">
+    ${field("姓名", `<input class="form-input" name="name" required />`)}
+    ${field("企业外部编号", `<input class="form-input" name="external_ref" />`)}
+    ${field("邮箱", `<input class="form-input" name="email" type="email" required />`)}
+    ${field("手机号", `<input class="form-input" name="phone" required />`)}
+  </div></form>`, { submitLabel: "保存候选人", submitIcon: "user-plus", onSubmit: createCandidateProfile, formId: "candidate-profile-form" });
+}
+
+async function createCandidateProfile(form, submit) {
+  const data = new FormData(form);
+  setBusy(submit, true, "保存中");
+  const item = await api(`${API}/candidate-profiles`, { method: "POST", body: { name: data.get("name"), email: data.get("email"), phone: data.get("phone"), external_ref: data.get("external_ref") || null } });
+  await refreshWorkflow();
+  closeModal();
+  render();
+  toast("候选人已录入", `${item.name} 可继续上传简历`);
+}
+
+function openResumeModal(candidateId) {
+  const candidate = state.candidates.find((item) => item.id === candidateId);
+  if (!candidate) return;
+  const roles = state.roles.filter((item) => item.job_position_id);
+  openModal(`上传 ${candidate.name} 的简历`, `<form id="resume-upload-form"><div class="form-grid">
+    <input type="hidden" name="candidate_id" value="${escapeHtml(candidateId)}" />
+    ${field("本地 PDF", `<input class="form-input" name="file" type="file" accept="application/pdf,.pdf" />`, true, "选择本地 PDF，或在下方填写一个公开 HTTPS PDF 地址")}
+    ${field("PDF URL", `<input class="form-input" name="source_url" type="url" placeholder="https://example.com/resume.pdf" />`, true, "系统会在隔离区下载、校验、扫描并解析；不接受内网地址或带凭据的 URL")}
+    ${field("面向岗位要求（可选，保存后立即 AI 审阅）", `<select class="form-select" name="role_requirement_id"><option value="">仅保存到简历库</option>${roles.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.title)}</option>`).join("")}</select>`, true)}
+    <div class="field field-full"><span id="resume-ingestion-status" class="field-hint" role="status">文件仅保存在私有存储中，下载使用短期签名地址并记录访问审计。</span></div>
+  </div></form>`, { submitLabel: "保存并处理", submitIcon: "file-up", onSubmit: uploadResume, formId: "resume-upload-form" });
+}
+
+async function uploadResume(form, submit) {
+  const data = new FormData(form);
+  const candidateId = data.get("candidate_id");
+  const file = data.get("file");
+  const sourceUrl = String(data.get("source_url") || "").trim();
+  if ((!file || !file.size) && !sourceUrl) throw new Error("请选择本地 PDF，或填写 PDF URL");
+  if (file && file.size && sourceUrl) throw new Error("本地 PDF 和 PDF URL 只能选择一种");
+  setBusy(submit, true, "正在安全摄取");
+  const idempotencyKey = globalThis.crypto?.randomUUID?.() || `resume-${Date.now()}`;
+  let queued;
+  if (file && file.size) {
+    const upload = new FormData();
+    upload.set("file", file, file.name);
+    upload.set("display_name", file.name);
+    queued = await api(`${API}/candidate-profiles/${encodeURIComponent(candidateId)}/resumes`, {
+      method: "POST",
+      body: upload,
+      headers: { "Idempotency-Key": idempotencyKey },
+    });
+  } else {
+    queued = await api(`${API}/candidate-profiles/${encodeURIComponent(candidateId)}/resumes/import-url`, {
+      method: "POST",
+      body: { url: sourceUrl, display_name: sourceUrl.split("/").pop() || "resume.pdf" },
+      headers: { "Idempotency-Key": idempotencyKey },
+    });
+  }
+  const job = await waitForResumeIngestion(queued.ingestion_job_id);
+  const resume = job.resume_document;
+  if (resume.status !== "ready") {
+    closeModal();
+    toast("简历已进入处理队列", "后台 worker 完成扫描和解析后即可发起岗位审阅");
+    return;
+  }
+  const roleId = data.get("role_requirement_id");
+  let message = "简历已保存到企业简历库";
+  if (roleId) {
+    const role = state.roles.find((item) => item.id === roleId);
+    await api(`${API}/candidate-profiles/${encodeURIComponent(candidateId)}/resume-reviews`, { method: "POST", body: { resume_document_id: resume.id, job_position_id: role.job_position_id, role_requirement_id: role.id } });
+    message = "AI 审阅已完成，经历问题等待人工批准";
+  }
+  closeModal();
+  render();
+  toast("简历处理完成", message);
+}
+
+async function waitForResumeIngestion(jobId) {
+  const status = document.querySelector("#resume-ingestion-status");
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const job = await api(`${API}/file-ingestion-jobs/${encodeURIComponent(jobId)}`);
+    const resumeStatus = job.resume_document?.status || job.status;
+    if (status) status.textContent = `摄取状态：${statusLabel(resumeStatus)}（${attempt + 1}/30）`;
+    if (resumeStatus === "ready") return job;
+    if (resumeStatus === "failed" || job.status === "dead_letter") {
+      throw new Error(job.resume_document?.processing_error?.message || job.last_error || "简历摄取失败");
+    }
+    await new Promise((resolve) => window.setTimeout(resolve, 1000));
+  }
+  return api(`${API}/file-ingestion-jobs/${encodeURIComponent(jobId)}`);
+}
+
 function openQuestionModal() {
+  if (!state.knowledgeBases.length) {
+    toast("暂时无法创建", "请先创建岗位题库", "error");
+    return;
+  }
+  const knowledgeBaseControl = `<select class="form-select" name="knowledge_base_id" required>${state.knowledgeBases.map((item) => { const position = state.positions.find((value) => value.id === item.job_position_id); return `<option value="${escapeHtml(item.id)}">${escapeHtml(position?.name || "岗位")} · ${escapeHtml(item.name)}</option>`; }).join("")}</select>`;
   openModal("新建题目", `
     <form id="question-create-form">
       <div class="form-grid">
         ${field("题目标题", `<input class="form-input" name="title" required maxlength="120" />`, true)}
-        ${field("题库 ID", `<input class="form-input" name="knowledge_base_id" value="kb_backend" required />`)}
+        ${field("岗位题库", knowledgeBaseControl)}
         ${field("实际题干", `<textarea class="form-textarea" name="question_text" required></textarea>`, true)}
         ${field("标准答案", `<textarea class="form-textarea" name="standard_answer" required></textarea>`, true)}
         ${field("关键点", `<textarea class="form-textarea" name="key_points" required placeholder="每行一个关键点"></textarea>`, true, "至少填写一个关键点")}
@@ -853,11 +1211,12 @@ async function createQuestion(form, submit) {
   const keyPoints = splitLines(data.get("key_points")).map((text) => ({ text, weight: 1 }));
   if (!keyPoints.length) throw new Error("请至少填写一个关键点");
   setBusy(submit, true, "正在索引");
-  const item = await api(`${API}/questions`, {
+  const knowledgeBaseId = data.get("knowledge_base_id");
+  const item = await api(`${API}/knowledge-bases/${encodeURIComponent(knowledgeBaseId)}/questions`, {
     method: "POST",
     body: {
       title: data.get("title"),
-      knowledge_base_id: data.get("knowledge_base_id"),
+      knowledge_base_id: knowledgeBaseId,
       question_text: data.get("question_text"),
       standard_answer: data.get("standard_answer"),
       key_points: keyPoints,
@@ -868,10 +1227,11 @@ async function createQuestion(form, submit) {
     },
   });
   await refreshCollection("questions");
+  await refreshWorkflow();
   state.questionResults = null;
   closeModal();
   render();
-  toast("题目已创建", `${item.title} 已完成索引`);
+  toast("题目已创建", `${item.title} 已校验并生成读题语音`);
 }
 
 function openQuestionDetails(id) {
@@ -886,8 +1246,13 @@ function openQuestionDetails(id) {
 }
 
 function openRoleModal() {
+  if (!state.positions.length) {
+    toast("暂时无法创建", "请先在招聘流程中创建岗位", "error");
+    return;
+  }
   openModal("新建岗位要求", `
     <form id="role-create-form"><div class="form-grid">
+      ${field("归属岗位", `<select class="form-select" name="job_position_id" required>${state.positions.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join("")}</select>`, true)}
       ${field("岗位名称", `<input class="form-input" name="title" required />`, true)}
       ${field("岗位级别", `<select class="form-select" name="seniority"><option value="junior">初级</option><option value="mid">中级</option><option value="senior" selected>高级</option><option value="expert">专家</option></select>`)}
       ${field("岗位描述", `<textarea class="form-textarea" name="description" required></textarea>`, true)}
@@ -905,7 +1270,8 @@ function openRoleModal() {
 async function createRole(form, submit) {
   const data = new FormData(form);
   setBusy(submit, true, "创建中");
-  const item = await api(`${API}/role-requirements`, {
+  const positionId = data.get("job_position_id");
+  const item = await api(`${API}/job-positions/${encodeURIComponent(positionId)}/role-requirements`, {
     method: "POST",
     body: {
       title: data.get("title"),
@@ -923,15 +1289,17 @@ async function createRole(form, submit) {
 }
 
 function openPlanModal() {
-  if (!state.roles.length || !state.questions.length) {
-    toast("暂时无法生成", "请先创建岗位要求和题目", "error");
+  const scopedRoles = state.roles.filter((item) => item.job_position_id);
+  if (!scopedRoles.length || !state.candidates.length || !state.knowledgeBases.length) {
+    toast("暂时无法生成", "请先创建岗位要求、候选人和岗位题库", "error");
     return;
   }
   openModal("生成面试计划", `
     <form id="plan-create-form"><div class="form-grid">
-      ${field("岗位要求", `<select class="form-select" name="role_requirement_id">${state.roles.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.title)}</option>`).join("")}</select>`, true)}
+      ${field("岗位要求", `<select class="form-select" name="role_requirement_id">${scopedRoles.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.title)}</option>`).join("")}</select>`, true)}
+      ${field("候选人", `<select class="form-select" name="candidate_profile_id">${state.candidates.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.name)}</option>`).join("")}</select>`, true)}
       ${field("题目数量", `<input class="form-input" name="question_count" type="number" min="1" max="20" value="${Math.min(8, Math.max(1, state.questions.length))}" required />`)}
-      ${field("题库 ID", `<input class="form-input" name="knowledge_base_ids" value="kb_backend" />`, true)}
+      ${field("岗位题库", `<select class="form-select" name="knowledge_base_id">${state.knowledgeBases.map((item) => { const position = state.positions.find((value) => value.id === item.job_position_id); return `<option value="${escapeHtml(item.id)}">${escapeHtml(position?.name || "岗位")} · ${escapeHtml(item.name)}</option>`; }).join("")}</select>`, true)}
       ${field("优先覆盖维度", `<input class="form-input" name="coverage" placeholder="python, database, system_design" />`)}
       ${field("单技能最多题数", `<input class="form-input" name="max_same_skill_questions" type="number" min="1" max="20" value="3" required />`)}
     </div></form>`, {
@@ -945,12 +1313,19 @@ function openPlanModal() {
 
 async function generatePlan(form, submit) {
   const data = new FormData(form);
+  const role = state.roles.find((item) => item.id === data.get("role_requirement_id"));
+  const knowledgeBase = state.knowledgeBases.find((item) => item.id === data.get("knowledge_base_id"));
+  if (!role || !knowledgeBase || role.job_position_id !== knowledgeBase.job_position_id) {
+    throw new Error("岗位要求与岗位题库必须属于同一岗位");
+  }
   setBusy(submit, true, "生成中");
   const plan = await api(`${API}/interview-plans/generate`, {
     method: "POST",
     body: {
       role_requirement_id: data.get("role_requirement_id"),
-      knowledge_base_ids: splitComma(data.get("knowledge_base_ids")),
+      job_position_id: role.job_position_id,
+      candidate_profile_id: data.get("candidate_profile_id"),
+      knowledge_base_ids: [knowledgeBase.id],
       question_count: Number(data.get("question_count")),
       strategy: {
         coverage: splitComma(data.get("coverage")),
@@ -963,7 +1338,7 @@ async function generatePlan(form, submit) {
   await refreshCollection("plans");
   closeModal();
   render();
-  toast("计划草稿已生成", `已选择 ${plan.items.length} 道题目，请审批后创建面试`);
+  toast("计划草稿已生成", `已形成 ${planSlots(plan).length} 个抽题槽位，请审批后创建预约`);
 }
 
 async function approvePlan(id, button) {
@@ -984,55 +1359,57 @@ async function approvePlan(id, button) {
   }
 }
 
-function openInterviewModal() {
-  const approvedPlans = state.plans.filter((plan) => plan.status === "approved");
+function openAppointmentModal() {
+  const approvedPlans = state.plans.filter(
+    (plan) => plan.status === "approved" && plan.job_position_id && plan.candidate_profile_id
+  );
   if (!approvedPlans.length) {
-    toast("暂时无法创建", "请先审批至少一份面试计划", "error");
+    toast("暂时无法创建", "请先审批候选人和岗位范围明确的面试计划", "error");
     return;
   }
-  openModal("创建面试", `
+  openModal("创建面试预约", `
     <form id="interview-create-form"><div class="form-grid">
-      ${field("已审批面试计划", `<select class="form-select" name="plan_id">${approvedPlans.map((plan) => { const role = state.roles.find((item) => item.id === plan.role_requirement_id); return `<option value="${escapeHtml(plan.id)}">${escapeHtml(role?.title || "面试计划")} · ${plan.items.length} 题</option>`; }).join("")}</select>`, true)}
-      ${field("候选人姓名", `<input class="form-input" name="candidate_name" required />`)}
-      ${field("候选人邮箱", `<input class="form-input" name="candidate_email" type="email" />`)}
-      ${field("计划时间", `<input class="form-input" name="scheduled_at" type="datetime-local" />`)}
+      ${field("已审批候选人计划", `<select class="form-select" name="plan_id">${approvedPlans.map((plan) => { const role = state.roles.find((item) => item.id === plan.role_requirement_id); const candidate = state.candidates.find((item) => item.id === plan.candidate_profile_id); const position = state.positions.find((item) => item.id === plan.job_position_id); return `<option value="${escapeHtml(plan.id)}">${escapeHtml(candidate?.name || "候选人")} · ${escapeHtml(position?.name || role?.title || "岗位")} · ${planSlots(plan).length} 个槽位</option>`; }).join("")}</select>`, true)}
+      ${field("开始时间", `<input class="form-input" name="scheduled_start_at" type="datetime-local" required />`)}
+      ${field("结束时间", `<input class="form-input" name="scheduled_end_at" type="datetime-local" required />`)}
     </div></form>`, {
-      submitLabel: "创建会话",
+      submitLabel: "创建预约并生成邀请",
       submitIcon: "calendar-plus",
-      onSubmit: createInterview,
+      onSubmit: createAppointment,
       formId: "interview-create-form",
     });
 }
 
-async function createInterview(form, submit) {
+async function createAppointment(form, submit) {
   const data = new FormData(form);
+  const plan = state.plans.find((item) => item.id === data.get("plan_id"));
+  if (!plan) throw new Error("请选择有效的已审批计划");
+  const scheduledStartAt = new Date(data.get("scheduled_start_at"));
+  const scheduledEndAt = new Date(data.get("scheduled_end_at"));
+  if (Number.isNaN(scheduledStartAt.getTime()) || Number.isNaN(scheduledEndAt.getTime()) || scheduledStartAt >= scheduledEndAt) {
+    throw new Error("结束时间必须晚于开始时间");
+  }
   setBusy(submit, true, "创建中");
-  const interview = await api(`${API}/interviews`, {
+  const appointment = await api(`${API}/interview-appointments`, {
     method: "POST",
     body: {
-      plan_id: data.get("plan_id"),
-      candidate: { name: data.get("candidate_name"), email: data.get("candidate_email") || null },
-      scheduled_at: data.get("scheduled_at") || null,
-      settings: { record_audio: false, record_video: false, allow_text_fallback: true, avatar_id: "avatar_default_cn" },
+      plan_id: plan.id,
+      candidate_profile_id: plan.candidate_profile_id,
+      job_position_id: plan.job_position_id,
+      scheduled_start_at: scheduledStartAt.toISOString(),
+      scheduled_end_at: scheduledEndAt.toISOString(),
+      settings: { record_audio: true, record_video: false, avatar_id: "avatar_default_cn" },
     },
   });
-  await refreshCollection("interviews");
+  const invited = await api(`${API}/interview-appointments/${encodeURIComponent(appointment.id)}/invite`, {
+    method: "POST",
+    body: { expires_at: scheduledEndAt.toISOString() },
+  });
+  await refreshCollection("appointments");
   closeModal();
-  toast("面试已创建", `${interview.candidate.name} 的会话已就绪`);
-  navigate("interviews", interview.id);
-}
-
-async function startInterview(id, button) {
-  setBusy(button, true, "启动中");
-  try {
-    await api(`${API}/interviews/${encodeURIComponent(id)}/start`, { method: "POST" });
-    await refreshCollection("interviews");
-    navigate("interviews", id);
-    toast("面试已开始", "实时会话已连接");
-  } catch (error) {
-    setBusy(button, false);
-    toast("启动失败", error.message, "error");
-  }
+  const invitationUrl = `${window.location.origin}${invited.join_url}`;
+  openModal("预约与邀请已创建", `<div class="field"><label>候选人邀请链接</label><textarea class="form-textarea" readonly>${escapeHtml(invitationUrl)}</textarea><span class="field-hint">请通过企业认可的安全渠道发送给计划绑定的候选人。链接包含一次性凭据。</span></div><a class="button button-primary" href="${escapeHtml(invited.join_url)}" target="_blank" rel="noopener noreferrer" style="margin-top:16px;"><i data-lucide="external-link" aria-hidden="true"></i>预览邀请页</a>`, { submitLabel: null });
+  toast("预约已创建", "一次性候选人邀请链接已生成");
 }
 
 async function controlInterview(id, action, reason, button) {
@@ -1057,36 +1434,6 @@ async function controlInterview(id, action, reason, button) {
   }
 }
 
-async function submitAnswer(event) {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const submit = form.querySelector("button[type=submit]");
-  const data = new FormData(form);
-  setBusy(submit, true, "评分中");
-  try {
-    const result = await api(`${API}/interviews/${encodeURIComponent(state.selectedInterview.id)}/answers`, {
-      method: "POST",
-      body: {
-        turn_id: state.selectedInterview.current_turn_id,
-        final_transcript: data.get("final_transcript"),
-        language: "zh-CN",
-        duration_seconds: 0,
-      },
-    });
-    state.activeEvaluation = result.evaluation;
-    state.selectedInterview = await api(`${API}/interviews/${encodeURIComponent(state.selectedInterview.id)}`);
-    state.report = state.selectedInterview.status === "report_ready"
-      ? await api(`${API}/interviews/${encodeURIComponent(state.selectedInterview.id)}/report`)
-      : null;
-    await refreshCollection("interviews");
-    render();
-    toast("评分完成", `本题得分 ${result.evaluation.score}`);
-  } catch (error) {
-    setBusy(submit, false);
-    toast("提交失败", error.message, "error");
-  }
-}
-
 async function completeInterview(id, button) {
   setBusy(button, true, "生成中");
   try {
@@ -1102,15 +1449,6 @@ async function completeInterview(id, button) {
     setBusy(button, false);
     toast("报告生成失败", error.message, "error");
   }
-}
-
-function openCandidateRoom(id) {
-  const interview = state.interviews.find((item) => item.id === id);
-  if (!interview?.candidate_join_url) {
-    toast("候选人链接不可用", "请重新创建面试会话", "error");
-    return;
-  }
-  window.open(interview.candidate_join_url, "_blank", "noopener,noreferrer");
 }
 
 async function enableCandidateMedia() {
@@ -1202,24 +1540,11 @@ function stopCandidateMedia() {
   if (window.speechSynthesis) window.speechSynthesis.cancel();
 }
 
-async function startCandidateSession() {
-  if (!state.selectedInterview || !state.candidateMediaStream) return;
-  try {
-    await api(`${API}/interviews/${encodeURIComponent(state.selectedInterview.id)}/start`, { method: "POST" });
-    state.selectedInterview = await api(`${API}/interviews/${encodeURIComponent(state.selectedInterview.id)}`);
-    await ensureCandidateSocket();
-    render();
-    window.setTimeout(speakCandidateQuestion, 250);
-  } catch (error) {
-    toast("无法开始面试", error.message, "error");
-  }
-}
-
 async function speakCandidateQuestion() {
   const interview = state.selectedInterview;
   if (!interview?.current_turn_id) return;
   try {
-    const response = await api(`${API}/interviews/${encodeURIComponent(interview.id)}/avatar/speak`, {
+    const response = await candidateApi("/avatar/speak", {
       method: "POST",
       body: { turn_id: interview.current_turn_id, language: "zh-CN", voice: "default" },
     });
@@ -1300,6 +1625,7 @@ async function handleCandidateSocketEvent(messageEvent) {
   const payload = event.payload || {};
   if (event.type === "media.recording.stopped") {
     state.candidateAudioUri = payload.audio_uri;
+    state.candidateAudioMimeType = payload.mime_type || "audio/webm;codecs=opus";
     state.candidateRecordingPending = false;
     render();
     return;
@@ -1320,13 +1646,13 @@ async function handleCandidateSocketEvent(messageEvent) {
     state.candidateTranscript = "";
     state.candidateInterimTranscript = "";
     state.candidateAudioUri = null;
-    state.selectedInterview = await api(`${API}/interviews/${encodeURIComponent(state.selectedInterview.id)}`);
+    state.selectedInterview = await candidateApi();
     render();
     if (state.selectedInterview.current_turn_id) window.setTimeout(speakCandidateQuestion, 300);
     return;
   }
   if (event.type === "interview.completed") {
-    state.selectedInterview = await api(`${API}/interviews/${encodeURIComponent(state.selectedInterview.id)}`);
+    state.selectedInterview = await candidateApi();
     render();
     return;
   }
@@ -1342,7 +1668,7 @@ async function startCandidateRecording() {
     return;
   }
   if (!window.MediaRecorder) {
-    toast("录音不可用", "当前浏览器不支持 MediaRecorder，请使用文本补答", "error");
+    toast("录音不可用", "当前浏览器不支持 MediaRecorder，无法形成服务端权威转写", "error");
     return;
   }
   try {
@@ -1446,23 +1772,28 @@ function stopCandidateRecording() {
 
 async function submitCandidateAnswer() {
   const text = state.candidateTranscript.trim();
-  if (!text || state.candidateRecording || state.candidateRecordingPending) return;
+  if (!state.candidateAudioUri || state.candidateRecording || state.candidateRecordingPending) return;
   try {
-    const socket = await ensureCandidateSocket();
-    socket.send(JSON.stringify({
-      type: "candidate.transcript.final",
-      turn_id: state.selectedInterview.current_turn_id,
-      payload: {
-        text,
-        confidence: state.candidateRecognition ? 0 : 0.5,
-        language: "zh-CN",
-        source: "browser_speech_fallback",
-        duration_seconds: state.candidateRecordingDuration,
-        audio_uri: state.candidateAudioUri,
-      },
-    }));
     const submit = document.querySelector('[data-action="candidate-submit-answer"]');
-    setBusy(submit, true, "正在评分");
+    setBusy(submit, true, "服务端转写中");
+    const localDevelopment = ["localhost", "127.0.0.1", "::1"].includes(window.location.hostname);
+    const body = {
+      turn_id: state.selectedInterview.current_turn_id,
+      audio_uri: state.candidateAudioUri,
+      content_type: state.candidateAudioMimeType,
+      language: "zh-CN",
+      duration_seconds: state.candidateRecordingDuration,
+      ...(localDevelopment && text ? { development_transcript: text, development_confidence: 0.85 } : {}),
+    };
+    const result = await candidateApi("/audio-answers", { method: "POST", body });
+    state.candidateLastEvaluation = result.evaluation;
+    state.candidateTranscript = "";
+    state.candidateInterimTranscript = "";
+    state.candidateAudioUri = null;
+    state.selectedInterview = await candidateApi();
+    render();
+    toast("评分完成", `本题得分 ${result.evaluation.score}`);
+    if (state.selectedInterview.current_turn_id) window.setTimeout(speakCandidateQuestion, 300);
   } catch (error) {
     toast("回答提交失败", error.message, "error");
   }
@@ -1486,26 +1817,45 @@ async function refreshInterviews() {
 
 function openProviderModal() {
   const implemented = state.catalog.filter((item) => item.implemented);
+  const initialDefaults = implemented[0]?.defaults || {};
   openModal("添加 Provider 配置", `
     <form id="provider-create-form"><div class="form-grid">
       ${field("Provider", `<select class="form-select" name="provider_id">${implemented.map((item) => `<option value="${escapeHtml(item.provider_id)}">${escapeHtml(item.display_name)}</option>`).join("")}</select>`)}
       ${field("配置名称", `<input class="form-input" name="display_name" value="开发模型" required />`)}
-      ${field("Base URL", `<input class="form-input" name="base_url" placeholder="https://api.example.com/v1" />`, true)}
-      ${field("测试模型", `<input class="form-input" name="test_model" placeholder="chat-model-default" />`)}
+      ${field("Base URL", `<input class="form-input" name="base_url" value="${escapeHtml(initialDefaults.base_url || "")}" placeholder="由 Provider manifest 提供默认值" />`, true)}
+      ${field("TTS Endpoint", `<input class="form-input" name="tts_endpoint" value="${escapeHtml(initialDefaults.tts_endpoint || "")}" placeholder="可选；DashScope 非标准地域或专属空间使用" />`, true)}
+      ${field("默认音色", `<input class="form-input" name="default_voice" value="${escapeHtml(initialDefaults.default_voice || "")}" placeholder="如 alloy、Cherry、longanyang" />`)}
+      ${field("使用环境代理", `<select class="form-select" name="use_environment_proxy"><option value="false">否（推荐）</option><option value="true">是</option></select>`, false, "仅显式启用时读取 HTTP_PROXY/ALL_PROXY。")}
       ${field("API Key", `<input class="form-input" name="api_key" type="password" autocomplete="new-password" />`)}
+      ${field("能力测试", `<span class="field-hint">保存后点击“测试”，分别选择 LLM、Embedding 或 TTS 及对应模型。</span>`, true)}
     </div></form>`, {
       submitLabel: "保存配置",
       submitIcon: "save",
       onSubmit: createProvider,
       formId: "provider-create-form",
     });
+  const form = modalRoot.querySelector("#provider-create-form");
+  form?.elements.provider_id?.addEventListener("change", () => applyProviderManifestDefaults(form));
+}
+
+function applyProviderManifestDefaults(form) {
+  const provider = state.catalog.find((item) => item.provider_id === form.elements.provider_id.value);
+  const defaults = provider?.defaults || {};
+  for (const fieldName of ["base_url", "tts_endpoint", "default_voice"]) {
+    if (form.elements[fieldName]) form.elements[fieldName].value = defaults[fieldName] || "";
+  }
+  if (form.elements.use_environment_proxy) {
+    form.elements.use_environment_proxy.value = String(Boolean(defaults.use_environment_proxy));
+  }
 }
 
 async function createProvider(form, submit) {
   const data = new FormData(form);
   const config = {};
   if (data.get("base_url")) config.base_url = data.get("base_url");
-  if (data.get("test_model")) config.test_model = data.get("test_model");
+  if (data.get("tts_endpoint")) config.tts_endpoint = data.get("tts_endpoint");
+  if (data.get("default_voice")) config.default_voice = data.get("default_voice");
+  config.use_environment_proxy = data.get("use_environment_proxy") === "true";
   setBusy(submit, true, "保存中");
   const item = await api(`${API}/admin/model-provider-configs`, {
     method: "POST",
@@ -1523,15 +1873,124 @@ async function createProvider(form, submit) {
   toast("配置已保存", item.display_name);
 }
 
+function openProviderEditModal(id) {
+  const config = state.providerConfigs.find((item) => item.id === id);
+  if (!config) return;
+  const provider = state.catalog.find((item) => item.provider_id === config.provider_id);
+  const values = config.config || {};
+  openModal("编辑 Provider 配置", `
+    <form id="provider-edit-form"><div class="form-grid">
+      ${field("Provider", `<input class="form-input" value="${escapeHtml(provider?.display_name || config.provider_id)}" disabled />`)}
+      ${field("状态", `<select class="form-select" name="enabled"><option value="true" ${config.enabled ? "selected" : ""}>已启用</option><option value="false" ${config.enabled ? "" : "selected"}>已停用</option></select>`)}
+      ${field("配置名称", `<input class="form-input" name="display_name" value="${escapeHtml(config.display_name)}" required />`, true)}
+      ${field("Base URL", `<input class="form-input" name="base_url" value="${escapeHtml(values.base_url || "")}" required />`, true)}
+      ${field("TTS Endpoint", `<input class="form-input" name="tts_endpoint" value="${escapeHtml(values.tts_endpoint || "")}" placeholder="可选" />`, true)}
+      ${field("默认音色", `<input class="form-input" name="default_voice" value="${escapeHtml(values.default_voice || "")}" placeholder="如 tongtong、Cherry、alloy" />`)}
+      ${field("使用环境代理", `<select class="form-select" name="use_environment_proxy"><option value="false" ${values.use_environment_proxy ? "" : "selected"}>否（推荐）</option><option value="true" ${values.use_environment_proxy ? "selected" : ""}>是</option></select>`, false, "启用 SOCKS 代理时运行环境必须安装对应 transport。")}
+      ${field("替换 API Key", `<input class="form-input" name="api_key" type="password" autocomplete="new-password" placeholder="留空则保留现有密钥" />`, true)}
+    </div></form>`, {
+      submitLabel: "保存修改",
+      submitIcon: "save",
+      onSubmit: (form, submit) => updateProvider(config, form, submit),
+      formId: "provider-edit-form",
+    });
+}
+
+async function updateProvider(current, form, submit) {
+  const data = new FormData(form);
+  const config = { ...(current.config || {}) };
+  config.base_url = String(data.get("base_url") || "").trim();
+  config.use_environment_proxy = data.get("use_environment_proxy") === "true";
+  for (const fieldName of ["tts_endpoint", "default_voice"]) {
+    const value = String(data.get(fieldName) || "").trim();
+    if (value) config[fieldName] = value;
+    else delete config[fieldName];
+  }
+  const body = {
+    expected_version: current.version,
+    display_name: data.get("display_name"),
+    enabled: data.get("enabled") === "true",
+    config,
+  };
+  if (data.get("api_key")) body.credentials = { api_key: data.get("api_key") };
+  setBusy(submit, true, "保存中");
+  const item = await api(`${API}/admin/model-provider-configs/${encodeURIComponent(current.id)}`, {
+    method: "PATCH",
+    body,
+  });
+  await refreshCollection("providerConfigs");
+  closeModal();
+  render();
+  toast("配置已更新", item.display_name);
+}
+
+function openProviderTestModal(id) {
+  const config = state.providerConfigs.find((item) => item.id === id);
+  const provider = state.catalog.find((item) => item.provider_id === config?.provider_id);
+  if (!config || !provider) return;
+  const supported = ["llm.chat_json", "llm.chat_text", "embedding.text", "tts.synthesize", "stt.batch", "avatar.speak"];
+  const capabilities = (provider.capabilities || []).filter((item) => supported.includes(item));
+  if (!capabilities.length) {
+    toast("暂时无法测试", "该 Provider 没有统一连接测试协议", "error");
+    return;
+  }
+  const capability = capabilities[0];
+  const models = providerModelsForCapability(provider, capability);
+  const model = providerTestModel(config, provider, capability);
+  openModal("测试 Provider 能力", `
+    <form id="provider-test-form"><div class="form-grid">
+      ${field("Provider", `<input class="form-input" value="${escapeHtml(config.display_name)}" disabled />`)}
+      ${field("能力", `<select class="form-select" name="capability">${capabilities.map((item) => `<option value="${escapeHtml(item)}">${escapeHtml(item)}</option>`).join("")}</select>`)}
+      ${field("模型 ID", `<input class="form-input" name="model" list="provider-test-model-options" value="${escapeHtml(model || "")}" required /><datalist id="provider-test-model-options">${models.map((item) => `<option value="${escapeHtml(item.model_id)}">${escapeHtml(item.label || item.model_id)}</option>`).join("")}</datalist>`, true, "模型必须属于所选能力；例如 GLM LLM 用 glm-5.2，TTS 用 glm-tts。")}
+    </div></form>`, {
+      submitLabel: "开始测试",
+      submitIcon: "flask-conical",
+      onSubmit: (form, submit) => testProvider(config.id, form, submit),
+      formId: "provider-test-form",
+      small: true,
+    });
+  const form = modalRoot.querySelector("#provider-test-form");
+  form?.elements.capability?.addEventListener("change", () => applyProviderTestModelCatalog(config, provider, form));
+}
+
+function providerTestModel(config, provider, capability) {
+  const configured = config.config || {};
+  if (configured.test_models?.[capability]) return configured.test_models[capability];
+  const models = providerModelsForCapability(provider, capability);
+  if (configured.test_model && (!(provider.models || []).length || models.some((item) => item.model_id === configured.test_model))) {
+    return configured.test_model;
+  }
+  return preferredProviderModel(models)?.model_id || "";
+}
+
+function applyProviderTestModelCatalog(config, provider, form) {
+  const capability = form.elements.capability.value;
+  const models = providerModelsForCapability(provider, capability);
+  form.elements.model.value = providerTestModel(config, provider, capability);
+  const options = modalRoot.querySelector("#provider-test-model-options");
+  if (options) options.innerHTML = models.map((item) => `<option value="${escapeHtml(item.model_id)}">${escapeHtml(item.label || item.model_id)}</option>`).join("");
+}
+
 function openRouteModal() {
   if (!state.providerConfigs.length) return;
-  const capabilities = ["llm.chat_json", "embedding.text"];
+  const targets = state.providerConfigs.filter((config) => config.enabled).flatMap((config) => {
+    const provider = state.catalog.find((item) => item.provider_id === config.provider_id && item.implemented);
+    return (provider?.capabilities || []).map((capability) => ({ config, capability }));
+  });
+  if (!targets.length) {
+    toast("暂时无法创建", "没有已启用且可调用的 Provider 配置", "error");
+    return;
+  }
+  const initialProvider = state.catalog.find((item) => item.provider_id === targets[0].config.provider_id);
+  const initialModels = providerModelsForCapability(initialProvider, targets[0].capability);
+  const initialModel = preferredProviderModel(initialModels);
   openModal("添加能力路由", `
     <form id="route-create-form"><div class="form-grid">
       ${field("调用用途", `<input class="form-input" name="purpose" value="answer_evaluation" required />`)}
-      ${field("模型能力", `<select class="form-select" name="capability">${capabilities.map((item) => `<option value="${escapeHtml(item)}">${escapeHtml(item)}</option>`).join("")}</select>`)}
-      ${field("Provider 配置", `<select class="form-select" name="provider_config_id">${state.providerConfigs.map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.display_name)}</option>`).join("")}</select>`)}
-      ${field("模型 ID", `<input class="form-input" name="model" value="mock-json" required />`)}
+      ${field("Provider 与能力", `<select class="form-select" name="target">${targets.map(({ config, capability }) => `<option value="${escapeHtml(`${config.id}::${capability}`)}">${escapeHtml(config.display_name)} · ${escapeHtml(capability)}</option>`).join("")}</select>`, true)}
+      ${field("模型 ID", `<input class="form-input" name="model" list="route-model-options" value="${escapeHtml(initialModel?.model_id || "")}" placeholder="从 Provider 模型目录选择" required /><datalist id="route-model-options">${initialModels.map((item) => `<option value="${escapeHtml(item.model_id)}">${escapeHtml(item.label || item.model_id)}</option>`).join("")}</datalist>`)}
+      ${field("超时（秒）", `<input class="form-input" name="timeout_s" type="number" min="1" max="300" value="30" required />`)}
+      ${field("重试次数", `<input class="form-input" name="retry_count" type="number" min="0" max="3" value="1" required />`)}
     </div></form>`, {
       submitLabel: "保存路由",
       submitIcon: "route",
@@ -1539,19 +1998,49 @@ function openRouteModal() {
       formId: "route-create-form",
       small: true,
     });
+  const form = modalRoot.querySelector("#route-create-form");
+  form?.elements.target?.addEventListener("change", () => applyRouteModelCatalog(form));
+}
+
+function providerModelsForCapability(provider, capability) {
+  return (provider?.models || []).filter((item) => (item.capabilities || []).includes(capability));
+}
+
+function preferredProviderModel(models) {
+  return models.find((item) => item.default) || models[0] || null;
+}
+
+function applyRouteModelCatalog(form) {
+  const [providerConfigId, capability] = String(form.elements.target.value || "").split("::", 2);
+  const config = state.providerConfigs.find((item) => item.id === providerConfigId);
+  const provider = state.catalog.find((item) => item.provider_id === config?.provider_id);
+  const models = providerModelsForCapability(provider, capability);
+  const preferred = preferredProviderModel(models);
+  form.elements.model.value = preferred?.model_id || "";
+  form.elements.model.placeholder = provider?.model_selection === "predefined"
+    ? "请选择目录中的模型"
+    : "可选择目录模型或填写自定义模型 ID";
+  const options = modalRoot.querySelector("#route-model-options");
+  if (options) options.innerHTML = models.map((item) => `<option value="${escapeHtml(item.model_id)}">${escapeHtml(item.label || item.model_id)}</option>`).join("");
 }
 
 async function createRoute(form, submit) {
   const data = new FormData(form);
+  const [providerConfigId, capability] = String(data.get("target") || "").split("::", 2);
+  if (!providerConfigId || !capability) throw new Error("请选择有效的 Provider 与能力");
   setBusy(submit, true, "保存中");
   const route = await api(`${API}/admin/model-routes`, {
     method: "POST",
     body: {
-      capability: data.get("capability"),
+      capability,
       purpose: data.get("purpose"),
-      primary: { provider_config_id: data.get("provider_config_id"), model: data.get("model"), timeout_s: 30 },
+      primary: {
+        provider_config_id: providerConfigId,
+        model: data.get("model"),
+        timeout_s: Number(data.get("timeout_s")),
+      },
       fallbacks: [],
-      policy: { max_retries: 1 },
+      policy: { retry_count: Number(data.get("retry_count")) },
       enabled: true,
     },
   });
@@ -1561,15 +2050,23 @@ async function createRoute(form, submit) {
   toast("路由已保存", `${route.purpose} · ${route.capability}`);
 }
 
-async function testProvider(id, button) {
-  setBusy(button, true, "测试中");
+async function testProvider(id, form, submit) {
+  const data = new FormData(form);
+  setBusy(submit, true, "测试中");
   try {
-    const result = await api(`${API}/admin/model-provider-configs/${encodeURIComponent(id)}/test`, { method: "POST" });
+    const result = await api(`${API}/admin/model-provider-configs/${encodeURIComponent(id)}/test`, {
+      method: "POST",
+      body: {
+        capability: data.get("capability"),
+        model: data.get("model"),
+      },
+    });
+    closeModal();
     toast("Provider 可用", `${result.provider?.provider_id || "provider"} · ${result.latency_ms || result.provider?.latency_ms || 0} ms`);
   } catch (error) {
     toast("Provider 测试失败", error.message, "error");
   } finally {
-    setBusy(button, false);
+    setBusy(submit, false);
   }
 }
 
@@ -1638,8 +2135,6 @@ async function handleInterviewerSocketEvent(messageEvent) {
   const payload = event.payload || {};
   if (event.type === "stt.transcript.partial" || event.type === "stt.transcript.final") {
     state.liveTranscript = payload.text || "";
-    const textarea = document.querySelector("#answer-form textarea");
-    if (textarea) textarea.value = state.liveTranscript;
     return;
   }
   if (event.type === "media.recording.started") {
@@ -1674,10 +2169,14 @@ function updateSocketStatus(label) {
 }
 
 async function api(path, options = {}) {
-  const fetchOptions = { method: options.method || "GET", headers: { Accept: "application/json" } };
+  const fetchOptions = { method: options.method || "GET", headers: { Accept: "application/json", ...(options.headers || {}) } };
   if (options.body !== undefined) {
-    fetchOptions.headers["Content-Type"] = "application/json";
-    fetchOptions.body = JSON.stringify(options.body);
+    if (options.body instanceof FormData) {
+      fetchOptions.body = options.body;
+    } else {
+      fetchOptions.headers["Content-Type"] = "application/json";
+      fetchOptions.body = JSON.stringify(options.body);
+    }
   }
   let response;
   try {

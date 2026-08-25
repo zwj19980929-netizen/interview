@@ -5,7 +5,11 @@
   "capabilities": [
     "avatar.speak",
     "embedding.text",
-    "llm.chat_json"
+    "llm.chat_json",
+    "llm.chat_text",
+    "stt.streaming",
+    "stt.batch",
+    "tts.synthesize"
   ],
   "config_schema": {
     "type": "object",
@@ -17,8 +21,11 @@
   },
   "models": [
     {"model_id": "mock-json", "capabilities": ["llm.chat_json"]},
+    {"model_id": "mock-text", "capabilities": ["llm.chat_text"]},
     {"model_id": "mock-embedding", "capabilities": ["embedding.text"], "embedding_dimensions": 16},
-    {"model_id": "mock-avatar", "capabilities": ["avatar.speak"]}
+    {"model_id": "mock-avatar", "capabilities": ["avatar.speak"]},
+    {"model_id": "mock-stt", "capabilities": ["stt.streaming", "stt.batch"]},
+    {"model_id": "mock-tts", "capabilities": ["tts.synthesize"]}
   ],
   "entrypoint": "app.providers.mock.provider:MockProvider"
 }

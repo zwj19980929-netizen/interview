@@ -4,7 +4,31 @@
 
 ## 当前完成快照
 
-里程碑 0-7 的旧版可运行 MVP 骨架已经落地。当前实现包括事务型 Persistence seam、SQLite/Memory contract、Interview Plan Assembly、已审批计划、InterviewSession 聚合快照、统一生命周期命令与事件、Outbox worker、浏览器语音兜底面试、append-only 评分/报告和 Model Invocation。里程碑 6 目前只完成 `avatar.speak` mock 与浏览器读题降级，尚未完成 STT/TTS 统一 schema 和真实语音 adapter。旧 MVP 验证了技术骨架，但没有覆盖新确认的岗位题库、简历审阅、预约匹配、随机抽题、真实服务端 STT 和企业音频复核流程。后续从里程碑 8 继续，并保持已有 deep module 边界。
+里程碑 0-13 的仓库内实现已经落地并通过 99 项自动化测试。当前闭环包括题库批量构建、PDF/URL 简历安全摄取与私有文件、脱敏 Resume Review、候选人专属计划、预约邀请页/明确同意/准入、候选人 token 安全投影、HMAC 稳定随机抽题、服务端 streaming/batch STT、逐题评分、报告导出、企业复核、RBAC/审计/公开限流、到期数据清理、PostgreSQL/RLS adapter、Outbox dead-letter、Redis 实时事件、心跳监控、抽题公平性评估，以及 OpenAI-compatible、DeepSeek、智谱 Chat/GLM-TTS 与 DashScope/千问模型 adapter。
+
+状态必须分成“仓库 verified”和“外部 environment_pending”：OpenAI-compatible、DeepSeek、智谱与 DashScope/千问 adapter 已在仓库完成，但没有真实账号/凭据/区域时不能完成生产联调；真实 PostgreSQL/Redis、阿里云 OSS、恶意文件扫描器和 STT/数字人同样保留外部边界。`INTERVIEWER_RUNTIME_ENV=production` 要求显式、非 mock 且近期健康的语音/评分 route、扫描器和生产密钥，否则邀请/start 失败关闭。邮件/短信与 WebRTC/视频数字人还需要用户选择外部通道或供应商。
+
+## 里程碑状态标记
+
+| 里程碑 | 状态 | 已完成范围 | 未满足的主要验收 |
+| --- | --- | --- | --- |
+| 0 项目骨架 | ✅ verified | FastAPI、健康检查、测试、启动和 worker 命令 | 观测平台由部署环境选择 |
+| 1 题库管理 | ✅ verified | CRUD/归档、JSON import、rebuild/build job、语音重建 | 无仓库阻塞 |
+| 2 模型网关和供应商配置 | ✅ verified | chat/embedding/STT/TTS/avatar schema、invoke/open_stream、加密凭证、共享断路器、manifest 模型目录；OpenAI-compatible、DeepSeek、智谱与 DashScope/千问 adapter | 真实凭据/区域/模型健康测试 `environment_pending`；STT/数字人待选型 |
+| 3 题库查询和候选池 | ✅ closed | Question Catalog，Memory/SQLite/PostgreSQL 查询实现，旧向量题库 interface 已删除 | 真实 PostgreSQL `EXPLAIN` 待环境验收 |
+| 4 岗位要求和面试计划 | ✅ closed | execution v2 canonical 槽位、显式迁移、冻结候选池、人工编辑/审批、统一物化 | 部署旧数据须先运行迁移命令 |
+| 5 面试会话和实时事件 | ✅ verified | 生命周期、持久事件、WebSocket、Redis bus、心跳超时 | WebRTC `external_choice_required` |
+| 6 数字人和语音能力 | ✅ verified（TTS adapter/语音协议） | streaming/batch STT、OpenAI-compatible/智谱 GLM-TTS/DashScope TTS、私有复制、avatar seam、batch 修复 | TTS 外部联调 `environment_pending`；STT/视频 adapter 待选型 |
+| 7 评分和报告 | ✅ verified | 解释性评分、current-only revision、JSON/CSV 导出 | 金标校准需要业务样本 |
+| 8 岗位与岗位题库构建 | ✅ verified | import/rebuild/build、Outbox、语音版本/readiness | 真实 TTS `environment_pending` |
+| 9 企业简历库与 AI 经历问题 | ✅ verified | PDF/URL、SSRF/扫描/解析、私有原件与解析文本、加密联系人、本地/OSS contract | OSS/扫描器 `environment_pending` |
+| 10 候选人专属计划、预约与填报匹配 | ✅ verified | 哈希 token、邀请 UI、强匹配、同意、时间/设备/model gate、原子 start、候选人窄接口与安全投影、RBAC/审计/PG 约束 | 邮件/短信 `external_choice_required` |
+| 11 可审计随机抽题与服务端语音闭环 | ✅ verified | HMAC 选择、唯一事实、stream final、batch 修复、两阶段评分 | 真实 STT 指标待外部录音集 |
+| 12 客观报告与企业复核 | ✅ verified | 签名音频、实际下载审计、reviewer 权限、revision、导出 | ATS 决定不属于 AI 报告 |
+| 12.5 核心一致性与隐私修复 | ✅ closed | 六项修复、显式迁移、旧 interface 删除与端到端回归 | 外部环境验收单独列示 |
+| 13 生产化与公平性加固 | ✅ verified（仓库） | PostgreSQL/RLS、加密/RBAC/审计、Outbox、Redis、心跳、公平性 | 外部服务均按实际状态待验收 |
+
+下面各里程碑保留“目标—任务—验收”作为已经执行的规格与回归基线，不是未领取的 TODO；当前状态以以上表格和文末外部环境清单为准。
 
 ## 里程碑 0：项目骨架
 
@@ -48,7 +72,7 @@
 - 建立 Model Invocation deep module：单一 `invoke` interface、provider manifest entrypoint、能力枚举、mock adapter。
 - 实现 `ModelProviderConfig`、`ModelRoute`、`ModelInvocationLog`。
 - 实现 provider catalog、供应商配置、路由配置和测试调用 API。
-- 实现 `mock` provider 和 `openai_compatible` provider 骨架。
+- 实现可执行的 `mock`、`openai_compatible`、`deepseek`、`zhipuai` 和 `dashscope` provider adapter；共享 OpenAI-compatible runtime 吸收 HTTP/鉴权/错误/结构化输出，manifest 驱动默认配置和模型目录。
 - 定义 `llm.chat_json`、`llm.chat_text` 的统一请求/响应；`embedding.text` 只作为可选实验能力。
 
 验收：
@@ -89,18 +113,18 @@
 
 - 输入岗位要求后能生成一份包含题目、顺序、权重、预计时长的计划。
 - 计划权重合计为 1、题目预计时长合计等于岗位面试时长，未覆盖维度不会静默丢失。
-- 面试官可以删除或调整计划项。
+- 面试官可以删除或调整草稿槽位，批准后计划不可原地修改。
 
 ## 里程碑 5：面试会话和实时事件
 
-目标：完成一次文本或音频兜底面试。
+目标：完成一次由预约准入、服务端语音转写驱动的面试。
 
 建议任务：
 
 - 实现 `InterviewSession`、`InterviewTurn`、`CandidateAnswer`。
 - 通过统一生命周期命令实现创建、启动、暂停/超时恢复、跳题、结束和取消。
 - 实现 WebSocket 事件包络、持久领域事件和会话状态同步，REST 与 WebSocket 共用迁移规则。
-- MVP 先支持文本回答；随后支持音频分片和 STT mock。
+- 候选人只提交录音或服务端 streaming STT 音频；浏览器 partial 仅作显示，不能形成答案。
 
 验收：
 
@@ -164,7 +188,10 @@
 
 建议任务：
 
-- 实现 `CandidateProfile`、`ResumeDocument`、私有简历对象存储和文件扫描/解析。
+- 实现 `CandidateProfile` 和不可变 `ResumeDocument`；简历当前只接受 PDF。
+- 定义 Private File Storage deep module，在相同 interface 下提供 `LocalPrivateFileAdapter` 和 `AliyunOssFileAdapter`；业务代码不直接依赖路径、bucket URL 或 `oss2`。
+- 实现两种 PDF 摄取入口：浏览器 multipart 本地上传，以及公开 HTTPS URL 异步导入；两者共用隔离、哈希、类型校验、恶意文件扫描、私有存储和 PDF 解析流水线。
+- URL 导入实现 SSRF 防护、逐跳重定向校验、DNS/IP 校验、大小/超时限制和来源 URL 脱敏；不支持认证 URL 或企业私网 URL。
 - 加密联系方式并建立带租户盐的精确查找哈希。
 - 实现 Resume Review deep module：脱敏、项目/职责/技能证据提取、证据位置和告警。
 - 生成 `ExperienceQuestion` 草稿，支持人工编辑、批准/拒绝和批准后的语音生成。
@@ -172,6 +199,9 @@
 
 验收：
 
+- 同一业务流程可以从本地 PDF 和公开 HTTPS PDF URL 创建 `ResumeDocument`；成功后均只读取系统托管文件，不依赖原 URL。
+- 本地开发文件不暴露在静态目录；切换到阿里云 OSS 只改配置和 adapter，API、Resume Review 与历史 `ResumeDocument` 语义不变。
+- 非 PDF、超限、恶意文件、私网/环回 URL、重定向绕过和下载超时均失败关闭，并保留可审计失败码；重试不重复创建版本或对象。
 - 同一简历可针对不同岗位生成独立审阅，输入版本相同的重试幂等。
 - 每个经历问题可追溯到项目证据和核验重点；未经人工批准不能进入计划。
 - AI 输入不包含照片和与工作能力无关的受保护属性，不直接生成录用结论。
@@ -232,33 +262,54 @@
 - 复核人修正转写后新增评分/报告 revision，历史版本保持可查。
 - 无权限或过期签名 URL 不能播放音频，所有访问有审计事件。
 
+## 里程碑 12.5：核心一致性与隐私修复
+
+目标：先消除深度审查发现的执行真相分裂、准入缺口和 revision 污染，再扩展生产能力。详细修改步骤与测试矩阵见 [已知问题与修复设计](known-issues-and-remediation.md)。
+
+完成结果（2026-08-25）：
+
+- `PLAN-001`：已由 Interview Plan Assembly 统一 execution v2 编辑、审批与执行物化；旧数据使用显式一次性迁移，旧 `items` runtime interface 已删除。
+- `CONSENT-001`：已校验服务端允许的实际告知版本、明确隐私/录音同意，并冻结服务端时间和 notice hash。
+- `APPOINTMENT-001`：已由 Appointment Admission 在最终事务内校验时间窗、同意、设备/模型 readiness，消费预约并唯一创建/START 会话。
+- `REPORT-001`：已物化各答案的 current evaluation 集合，报告所有字段只从该集合推导。
+- `SEARCH-001`：公开搜索和计划装配已共用 Question Catalog，结构化过滤已下推 Memory/SQLite Persistence backend。
+- `CANDIDATE-ACCESS-001`：候选人页面已改用 token 保护的 public 窄接口和 allow-list 投影，不再依赖后台 Bearer API，也不暴露标准答案、rubric、候选池或未来题干。
+
+验收：
+
+- 人工编辑并批准计划后，预约执行同一 revision；旧计划显式迁移保持题目、权重和阶段语义。
+- 拒绝/缺失同意、窗口外 start、过期 readiness 均失败且无部分写入；并发 start 只创建一个会话。
+- 被替代的历史评分不影响当前报告；当前 `evaluation_ids` 与答案当前指针集合一致。
+- 未配置 embedding 时，公开结构化搜索、候选池装配和预约闭环全部通过。
+- 六项代码、显式迁移、旧 interface 删除、contract/回归测试和文档已同时完成，本里程碑按仓库范围标记 `closed`；外部服务状态不随之改变。
+
 ## 里程碑 13：生产化与公平性加固
 
 目标：把新闭环变成可试点系统。
 
-建议任务：
+完成结果（仓库范围，2026-08-25）：
 
-- 迁移 PostgreSQL、私有对象存储、密钥管理、RBAC、租户 RLS、审计和数据到期删除；pgvector 不列为正式面试验收依赖。
-- 加固 Outbox：指数退避、最大尝试、dead-letter、指标、告警和消息队列唤醒。
-- 增加 Provider readiness、跨实例断路器、成本和数据区域策略。
-- 建立题目难度、随机抽题分布、STT、简历证据和 AI/人工评分离线评估集。
-- 增加 WebRTC、多实例实时事件分发、心跳超时监控；最后接真实视频数字人和口型同步。
+- 13A：`FileObject + PrivateFileStorage`、multipart/URL PDF、逐跳 SSRF、隔离/扫描/解析、原件/解析文本私有化、双入口任务状态 UI 和旧 `resume_text` 删除均完成。
+- 13B：本地私有 adapter、阿里云 OSS adapter、SSE/header、短期签名和同 interface contract 完成；真实 bucket/RAM/区域为 `environment_pending`。
+- 13C：`stt.streaming` schema/open_stream/WebSocket、唯一 final、断流 batch 修复、OpenAI-compatible/智谱 GLM-TTS/DashScope TTS、非 mock 私有复制和生产 readiness TTL 完成；外部凭据/区域/音质验收为 `environment_pending`，真实 STT/数字人仍需选型。
+- 13D：PostgreSQL/RLS migration、RBAC、HTTP/敏感访问审计、联系人/凭证加密、到期数据 dry-run/显式清理、Outbox 指数退避/dead-letter/指标/重放、共享断路器、Redis bus 和心跳监控完成。
+- 13E：报告导出、复核签名媒体、实际下载审计和抽题公平性 API 完成；邮件/短信、WebRTC、视频数字人和真实金标评估需要外部通道、厂商与业务样本。
 
-验收：
+仓库验收：
 
-- 外部供应商、worker 或连接中断后任务可恢复且不重复抽题/计分。
-- 不同候选人的抽题难度与覆盖分布可比较，低置信度结果进入人工复核。
-- 敏感数据访问、供应商发送、回听、导出和删除均可审计。
+- 本地/URL PDF 的成功、幂等、无效签名、恶意文件、环回 URL、私有下载和本地/OSS contract 测试通过。
+- streaming final 端到端、断流修复边界、worker dead-letter/replay、持久共享断路器、RBAC/未认证审计、敏感 URL token 脱敏、媒体下载审计均有自动化测试。
+- PostgreSQL migration 的唯一约束/RLS 不变量已离线验证；真实集群 contract 和 `EXPLAIN` 必须在部署环境补验。
+- 公平性服务可比较同岗位题量、难度与技能覆盖；报告继续强制人类最终决策。
 
-## 当前执行优先级
+## 后续环境验收顺序
 
-必须按依赖顺序推进：
+这些步骤不是仓库代码缺口，只有外部条件就绪后才能执行：
 
-1. 里程碑 8：岗位题库、结构化候选池和题目语音。
-2. 里程碑 9：简历库、AI 审阅和经历问题。
-3. 里程碑 10：候选人专属计划、预约、填报匹配。
-4. 里程碑 11：随机抽题、服务端 STT、逐题生命周期。
-5. 里程碑 12：报告与企业复核。
-6. 里程碑 13：数据库、权限、WebRTC、数字人和生产加固。
+1. 在目标 PostgreSQL/Redis 上执行迁移、RLS 跨租户、并发/故障恢复和多实例广播测试。
+2. 在私有阿里云 OSS bucket 与真实扫描器上执行上传、SSE、签名过期、感染文件和迁移演练。
+3. 为 OpenAI-compatible 或 DashScope 提供真实凭据、区域和模型，验证 LLM schema、TTS 音质/延迟/费用、私有资产复制与 readiness 失效；另行选择 STT 厂商，用真实录音测 WER、partial/final 延迟和断流 batch 修复。
+4. 选择邮件/短信通道、WebRTC/SFU 和视频数字人供应商后，再实现其专属 adapter、模板、会话映射和合规验收。
+5. 用企业人工金标建立题目难度、Resume Review 证据准确率及 AI/人工评分一致性基线；录用结果不能直接当作无偏标签。
 
-真实服务端 STT 不再属于“第二阶段可选增强”，而是正式预约可开始的必要能力；WebRTC 和真实视频数字人仍可以在音频 WebSocket 闭环稳定后实现。向量数据库同样不属于当前必做项，只有题库治理出现可测量的语义搜索/近似去重需求后再单独立项。
+正式服务端 STT 是生产预约的必要能力；WebRTC/视频数字人不阻塞已验证的 WebSocket 音频闭环。向量数据库也不属于必做项，只有题库治理出现可测量需求后再单独立项。

@@ -28,6 +28,13 @@ class RoleRequirementService:
             return transaction.role_requirements.list()
 
     def create_role_requirement(self, payload: Dict[str, Any], organization_id: str = "org_default") -> Dict[str, Any]:
+        position_id = payload.get("job_position_id")
+        if position_id:
+            with self.persistence.transaction(organization_id) as transaction:
+                if transaction.job_positions.get(position_id) is None:
+                    from app.core.errors import ApiError
+
+                    raise ApiError("JOB_POSITION_NOT_FOUND", "Job position does not exist.", status_code=404)
         must_have = [normalize_skill(skill) for skill in payload.get("must_have_skills", [])]
         nice_to_have = [normalize_skill(skill) for skill in payload.get("nice_to_have_skills", [])]
         skill_priorities: Dict[str, float] = {}
@@ -71,6 +78,7 @@ class RoleRequirementService:
         item = {
             "id": role_id,
             "organization_id": organization_id,
+            "job_position_id": payload.get("job_position_id"),
             "title": payload["title"],
             "description": payload["description"],
             "must_have_skills": must_have,

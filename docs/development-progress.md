@@ -1,205 +1,97 @@
 # 开发进度
 
-本文件记录当前实现状态。AI 协作者接手时，先读 `AGENTS.md`，再读本文，避免重复搭建或误以为某些模块已经生产可用。
+## 2026-08-25 完成快照
 
-## 当前阶段
+仓库内可独立完成的里程碑 0-13 能力已经实现并通过自动化验证：岗位题库构建、PDF/URL 简历安全摄取、私有文件、候选人/计划/预约、明确同意、可审计随机抽题、服务端 streaming/batch STT、评分、报告导出、企业复核、RBAC/审计、Outbox 加固、PostgreSQL/RLS adapter、Redis 事件 adapter、心跳监控和抽题公平性评估均已有代码与测试。
 
-当前已完成旧版 0-1 可运行闭环和核心持久化边界。存储已经从纯内存升级为本地 SQLite，业务 module 统一走事务型 Persistence seam；代码中仍有本地 JSON 向量 + Python 余弦相似度实验，但下一版正式抽题和评分已决定不依赖向量数据库。新确认的“岗位题库—简历库—预约—服务端语音面试—企业复核”目标流程尚未形成闭环，不能把旧版直接创建面试和浏览器转写演示视为新需求已完成。
+这里的“完成”只表示仓库实现与本地/离线验收完成，不等于外部生产环境已经通过。OpenAI-compatible、DeepSeek、智谱与 DashScope/千问的 LLM HTTP adapter 已落地，OpenAI-compatible、智谱 GLM-TTS 与 DashScope 还覆盖 TTS 子集；但真实 PostgreSQL/Redis、阿里云 OSS、恶意文件扫描器、外部模型/语音账号和视频数字人仍需要部署环境、区域、凭据和测试数据；生产 readiness 在这些依赖缺失或健康检查过期时失败关闭。
 
-## 已确认的下一版业务目标（尚未实现）
+当前统一验证基线：
 
-1. `JobPosition` 成为岗位题库、岗位要求、简历审阅、计划和预约的共同上层资源；每个 `KnowledgeBase` 只属于一个岗位。
-2. 上传岗位题库后，通过持久异步工作项校验标准答案、关键点、rubric、技能、难度和题型，并生成每道题的 `QuestionSpeechAsset`；不生成必需向量索引。
-3. 企业维护组织级简历库，上传候选人姓名、邮箱、手机号和简历；AI 针对指定岗位异步审阅简历项目并生成可人工审核的经历问题和读题语音。
-4. 计划包含岗位题库抽题槽位与已批准经历问题；预约绑定岗位、候选人、题库版本、已批准计划、时间窗和一次性邀请。
-5. 候选人通过邀请填报姓名、邮箱、手机号和授权，至少以邮箱或手机号与预约绑定记录强匹配后才能进入设备检查和开始面试。
-6. 数字人在冻结候选池内按会话种子进行可审计随机检索，播放预生成语音；题库题逐题完成服务端 STT 和评分后，再进入简历经历问题。
-7. 面试结束后输出总分与客观岗位匹配证据；企业可以查看每题答案、转写、评分证据和原始语音，修正转写并重评，最终招聘决定仍由人员完成。
+- `PYTHONPYCACHEPREFIX=/private/tmp/interviewer_pycache .venv/bin/python -m compileall -q app tests`：通过。
+- `node --check app/web/app.js`：通过。
+- `.venv/bin/python -m pytest -q`：`99 passed in 2.97s`。
+- `git diff --check`：通过。
 
-## 已完成
+## 里程碑对账
 
-- 新增 FastAPI 后端入口：`app/main.py`。
-- 新增内置面试官 Web 工作台：
-  - 静态应用目录：`app/web/`
-  - 总览、题库、面试计划、面试会话和模型服务五个工作区
-  - 题目创建与检索、岗位创建、计划生成、面试创建与启动、文本答题、评分和报告查看
-  - Provider 配置、能力路由创建和测试入口
-  - 同源挂载到 `GET /`，静态资源使用 `/web/*`
-  - Lucide 图标库固定版本随应用分发，不依赖运行时 CDN
-  - 响应式桌面和移动端布局，包含数字人面试官视觉资产
-- 新增候选人独立面试房间：
-  - 使用带候选人 token 的 `/#candidate/{interview_id}?token=...` 加入链接
-  - 摄像头预览、麦克风/摄像头开关和输入设备切换
-  - 使用 `MediaRecorder` 录制回答，并通过 WebSocket 发送二进制音频分片
-  - 支持浏览器 Speech Recognition 实时转写；不支持时可手动编辑最终转写
-  - 当前题目朗读、录音计时、评分状态、题目推进和面试完成状态
-- 新增数字人读题 MVP：
-  - `avatar.speak` 统一请求/响应和模型网关路由
-  - `POST /api/v1/interviews/{interview_id}/avatar/speak`
-  - mock provider 返回 `browser_speech` 降级计划，前端使用 Speech Synthesis 朗读并驱动说话状态
-  - 保留音频、视频和 WebRTC 供应商输出模式，业务服务不绑定具体厂商
-- 新增统一错误结构：`app/core/errors.py`。
-- 新增可切换存储入口：`app/repositories/provider.py`。
-- 新增内存存储：`app/repositories/memory.py`。
-- 新增本地 SQLite 存储：`app/repositories/sqlite.py`。
-- 新增数据库与向量存储设计：`docs/database-and-vector-storage.md`。
-- 新增事务型持久化 seam：
-  - interface 与领域化事务工作区：`app/persistence/interface.py`
-  - Memory adapter：`app/persistence/memory.py`
-  - SQLite adapter：`app/persistence/sqlite.py`
-  - adapter 选择入口：`app/persistence/provider.py`
-  - 统一并发冲突、记录冲突和未找到错误
-  - Outbox 幂等键、执行状态、尝试次数、租约和失败信息
-- 全部业务 module 已迁移到新持久化 seam：
-  - 创建 Question 与 Outbox 工作项原子提交
-  - Embedding 调用位于数据库事务之外
-  - 索引成功时原子保存向量、递增 Question version 并完成工作项
-  - Provider 失败时保留 Question、标记 `index_status=failed` 并保存可重试工作项
-  - Question、RoleRequirement、InterviewPlan、InterviewSession、模型配置、路由、密钥和调用日志都不再直接访问 Store collection
-  - 所有可变聚合从 `version=1` 开始，更新使用显式 expected version
-  - 正式面试只允许从 `approved` 计划创建
-  - InterviewSession 拥有 InterviewCandidate、InterviewPlanSnapshot、完整 InterviewQuestionSnapshot、轮次和答案
-  - 评分、重评和报告只读取冻结快照，不读取当前题库或当前计划
-  - AnswerEvaluation 与 InterviewReport 使用 append-only revision 和当前指针
-  - 重评自动通过 Outbox 新增报告 revision，提供评分和报告历史查询 API
-- 新增 `InterviewSessionLifecycle` 深模块：
-  - `LifecycleCommand -> LifecycleDecision(session, events, effects)` 是唯一会话状态迁移接口
-  - 统一创建、就绪、开始、暂停、超时、继续、恢复、跳题、取消、人工结束、回答提交、评分结果和报告结果
-  - 最后一题评分完成或被跳过后自动进入完成/报告流程，传输层不再判断何时换题或生成报告
-  - 暂停保留当前轮次和中断原因；暂停期间评分完成后，恢复命令可修复下一题或报告触发
-  - 评分/报告失败任务被 worker 重领时先形成 `*.retry_started` 事实，再安全提交原 revision，修复失败后无法回到生成态的问题
-  - 领域事件按会话 sequence 持久追加，并与聚合更新、Outbox 效果原子提交
-  - REST、WebSocket、数字人和 Outbox worker 均通过该 seam 校验状态与当前轮次
-- 新增独立 Outbox worker：
-  - 入口：`app/workers/outbox.py` / `interviewer-outbox-worker`
-  - 支持题目索引、答案评分和报告生成工作项
-  - 支持失败任务与过期租约恢复，租约 token 防止陈旧 worker 提交
-  - 请求进程仍会立即尝试同一处理器，以保持当前同步 API 体验
-- 深化 Model Invocation module：
-  - 能力枚举：`app/model_gateway/capabilities.py`
-  - 统一请求/响应：`app/model_gateway/schemas.py`
-  - provider manifest 扫描及 `entrypoint` adapter 加载：`app/model_gateway/registry.py`
-  - 单一执行 interface：`ModelGateway.invoke(capability, request, route=None)`
-  - 统一 route 解析、每 target 重试与 fallback、硬超时、进程内断路器、响应 schema 校验、成本上限和逐 attempt 审计
-  - 请求日志只保存 SHA-256 脱敏哈希；失败返回 `invocation_id`、`route_id` 和 attempt 总数
-  - manifest 的配置/凭证 schema 在管理员写入时执行；活动 route 只能引用已实现且声明对应能力的 adapter
-- 新增 Interview Plan Assembly deep module：
-  - 类型化 `PlanAssemblyRequest -> assemble()` 是唯一自动计划装配 interface
-  - 岗位画像不再依赖固定技能清单；必备与加分技能按 3:1 建立优先级
-  - 候选题扩召回后统一执行覆盖配额、关键点去重、单技能上限、难度曲线、权重归一和时长守恒
-  - 每题选择理由与 `assembly_summary` 同源；候选池不足、未覆盖维度和约束放宽都显式返回
-  - 计划审批后，装配策略和摘要随 InterviewPlanSnapshot 冻结
-- 新增 provider 插件目录和 manifest：
-  - `app/providers/mock/provider.json`
-  - `app/providers/openai_compatible/provider.json`
-  - `app/providers/azure_openai/provider.json`
-  - `app/providers/anthropic/provider.json`
-  - `app/providers/gemini/provider.json`
-  - `app/providers/dashscope/provider.json`
-  - `app/providers/volcengine/provider.json`
-  - `app/providers/azure_speech/provider.json`
-  - `app/providers/tencent_cloud_speech/provider.json`
-- 新增 mock provider 能力：
-  - 文本 embedding 的确定性向量
-  - 单题评分的关键点覆盖启发式逻辑
-- 新增 `openai_compatible` provider 真实 HTTP 调用：
-  - `llm.chat_json` 调用 `/chat/completions`
-  - `embedding.text` 调用 `/embeddings`
-  - 支持 provider 错误映射、调用日志、离线 MockTransport 测试
-- 新增本地 provider secret 存储：
-  - 内存模式使用 `provider_secrets`
-  - SQLite 模式使用 `provider_secrets` 表
-  - API 响应仍只返回 `credential_ref`，不返回明文 credentials
-- 新增本地向量文档集合：`vector_documents`。
-- 创建题目时写入题目级和关键点级向量文档。
-- 搜索题目时组合向量相似度、关键词重合度和技能重合度。
-- 新增后台模型配置 API：
-  - provider catalog
-  - provider config 创建/列表/更新/测试
-  - model route 创建/列表/测试
-- 新增核心业务 service：
-  - 题库创建、列表、详情、搜索
-  - 岗位要求创建和基础画像解析
-  - 面试计划生成和更新
-  - 面试创建、启动、提交答案、重评、结束
-  - 单题评分和报告生成
-- 新增前端读取所需列表 API：
-  - `GET /api/v1/role-requirements`
-  - `GET /api/v1/interview-plans`
-  - `GET /api/v1/interviews`
-- 新增实时 WebSocket 会话入口：`/api/v1/interviews/{interview_id}/live`：
-  - 候选人 token 校验和面试官/候选人事件广播
-  - 会话恢复、录音开始/结束、partial/final 转写、评分和完成事件
-  - 二进制音频分片大小、总量和 MIME 类型校验
-  - 面试官 start/pause/resume/recover/next/complete/cancel 控制与 REST 共用生命周期命令；候选人控制越权会被拒绝
-  - REST 生命周期控制完成后向已连接 WebSocket 广播统一状态/当前题投影
-- 新增生命周期控制 API 与持久事件查询：pause、timeout、resume、recover、skip、cancel、complete 和 `GET /events`。
-- 新增本地敏感媒体适配器：`app/adapters/local_media.py`，录音默认写入 `data/media/`。
-- 新增主流程测试：`tests/test_mvp_flow.py`。
-- 新增 SQLite 持久化测试：`tests/test_sqlite_store.py`。
-- 新增 provider registry 测试：`tests/test_provider_registry.py`。
-- 新增 OpenAI-compatible provider 离线测试：`tests/test_openai_compatible_provider.py`。
-- 新增 Model Invocation 故障矩阵测试：`tests/test_model_invocation.py`，覆盖 manifest entrypoint、重试、schema fallback、硬超时、断路器、不可回退错误、成本和 attempt 日志。
-- 新增计划装配 interface 测试：`tests/test_plan_assembly.py`，覆盖能力配额、多样性、难度曲线、权重/时长守恒、候选池不足、策略校验和开放技能画像。
-- 新增实时媒体和数字人测试：`tests/test_realtime_media.py`。
-- 新增持久化 contract tests：`tests/test_persistence_contract.py`，同一套测试覆盖 Memory 和 SQLite adapter 的事务回滚、租户隔离、乐观并发、Outbox 幂等、过期租约回收、租约所有权和失败恢复。
-- 新增 InterviewSession 聚合测试：`tests/test_interview_session_aggregate.py`，覆盖计划审批、陈旧版本冲突、候选人所有权、计划/题目快照稳定性、append-only 评分与报告修订链。
-- 新增生命周期接口测试：`tests/test_interview_lifecycle.py`，覆盖非法迁移、自动换题/报告、跳题、超时恢复、取消和 append-only revision。
-- 更新 `pyproject.toml` 依赖和 pytest 配置。
-- 新增开发启动说明：`README.md`。
-- 新增 `.gitignore`，忽略虚拟环境、pytest 缓存和 Python 字节码。
+| 里程碑 | 仓库状态 | 已完成证据 | 外部/兼容边界 |
+| --- | --- | --- | --- |
+| 0 项目骨架 | ✅ verified | FastAPI、统一错误、健康检查、启动/worker 命令、自动化测试 | 生产观测平台由部署环境选择 |
+| 1 题库管理 | ✅ verified | CRUD/归档、JSON 批量 import、rebuild/build job、语音重建 | 批量 UI 仍以 API 为主 |
+| 2 模型网关 | ✅ verified | `chat_json/chat_text/embedding/STT/TTS/avatar` schema、invoke/open_stream、重试/fallback/超时/共享断路器、加密凭证；manifest defaults/模型目录/选择模式；OpenAI-compatible、DeepSeek、智谱与 DashScope/千问 adapter | 真实凭据、区域、模型授权和健康测试待联调；STT/数字人仍需选型 |
+| 3 结构化题库查询 | ✅ closed | Question Catalog、Memory/SQLite/PostgreSQL 下推实现、跨岗位拒绝；旧 QuestionService/向量 repository 已删除 | 真实 PostgreSQL 查询计划待环境验收 |
+| 4 岗位要求与计划 | ✅ closed | execution v2 canonical slots、显式一次性迁移、候选池冻结、覆盖/难度/去重、权重/时长守恒、审批不可变 | 部署旧数据时先运行迁移命令 |
+| 5 会话与实时事件 | ✅ verified | 生命周期、持久事件、WebSocket、Redis 跨实例 adapter、心跳超时恢复 | WebRTC 媒体仍为外部集成项 |
+| 6 数字人与语音 | ✅ verified（TTS adapter/语音协议） | streaming/batch STT、OpenAI-compatible/智谱 GLM-TTS/DashScope TTS、私有资产复制、avatar seam、断流 batch 修复 | TTS 真实凭据与生产 route 未验收；STT/视频 adapter 待选型 |
+| 7 评分与报告 | ✅ verified | 可解释评分、append-only revision、current-only 汇总、JSON/CSV 导出 | 真实 LLM 金标校准待业务数据 |
+| 8 岗位题库构建 | ✅ verified | import/rebuild/build、结构校验、Outbox、语音版本/readiness | 真实 TTS 音质与区域策略待联调 |
+| 9 企业简历库 | ✅ verified | multipart/URL、SSRF、隔离/扫描、PDF 解析、原件/解析文本私有 FileObject、本地/OSS contract、加密联系人 | 真实 OSS/扫描器待环境验收 |
+| 10 预约与填报 | ✅ verified | PATCH、哈希 token、邀请 UI、服务端告知/明确同意、强匹配、时间/设备/model gate、原子幂等 start、候选人安全投影 | 邮件/短信发送未选择通道 |
+| 11 可审计语音闭环 | ✅ verified | HMAC 选题、唯一选择事实、streaming final、batch 修复、两阶段评分 | 真实 STT WER/延迟待录音集 |
+| 12 企业复核 | ✅ verified | reviewer 权限、签名音频、授权与实际下载审计、转写/评分/报告 revision、导出 | ATS 人工决定集成不属于 AI 报告 |
+| 12.5 核心一致性 | ✅ closed | `PLAN/CONSENT/APPOINTMENT/REPORT/SEARCH/CANDIDATE-ACCESS` 回归矩阵；旧 runtime interface 已删除 | 外部环境验收独立列示 |
+| 13 生产化/公平性 | ✅ verified（仓库） | PostgreSQL/RLS migration、RBAC、审计、加密、Outbox dead-letter、共享断路器、Redis bus、心跳、公平性 API | 外部服务均标 `environment_pending` |
 
-## 已验证
+## 本轮实现清单
 
-- `.venv/bin/python -m pytest -q` 通过：当前 51 个测试通过。
-- `PYTHONPYCACHEPREFIX=/private/tmp/interviewer_pycache .venv/bin/python -m compileall app tests` 通过。
-- `.venv/bin/python main.py` 可启动服务，健康检查 `GET /healthz` 返回 `{"status":"ok"}`。
-- `GET /`、`GET /web/styles.css`、`GET /web/app.js` 和数字人图片资源已通过自动化测试。
-- Web 工作台已在 `1440x1000` 桌面视口和 `390x844` 移动视口完成实际浏览器截图检查。
-- 数字人实时面试页已完成实际浏览器渲染检查，图片、会话状态、轮次和报告布局正常。
-- 候选人房间已使用 Chromium 虚拟摄像头和麦克风完成实际浏览器端到端检查：设备授权、录音、WebSocket 二进制音频上传、转写提交、评分和自动结束均通过。
-- 浏览器上传的 WebM 测试录音已成功落盘，并在答案记录中保存 `/media/...` URI。
-- 默认 SQLite 后端可启动服务，并生成本地数据库 `data/interviewer.sqlite3`。
-- `GET /api/v1/admin/model-providers/catalog` 可从 `provider.json` 返回 9 个 provider，其中 `mock` 和 `openai_compatible` 的 `implemented=true`。
-- 直接运行 `.venv/bin/python -m compileall app tests` 会因为 macOS 用户缓存目录不在沙箱可写范围内失败；这不是代码语法问题。
+### PDF 与私有文件
 
-## 重要限制
+- `app/file_storage/` 提供 `PrivateFileStorage`、本地私有 adapter、阿里云 OSS adapter 和最长 15 分钟签名访问。
+- `ResumeIngestionService` 统一 `local_upload/url_import -> quarantine -> validate -> scan -> private store -> parse -> ready`。
+- URL 下载在初始地址和每个重定向逐跳做 scheme、凭据、DNS 和非全局 IP 校验，禁用环境代理，并限制重定向、连接/读取时间与字节数。
+- 非 PDF、超限、加密 PDF、空文本、EICAR、环回/私网 URL 均失败关闭；幂等重试复用同一简历/工作项。
+- PDF 原件和解析文本分别写入私有 FileObject；公开 API 不返回正文、对象键或本地路径；旧 JSON `resume_text` 上传已删除。
+- Web 上传弹窗提供本地 PDF/公开 URL 双入口、任务状态轮询和 ready 后审阅。
 
-- 当前没有 `JobPosition` 聚合，`knowledge_base_id` 只是题目上的自由字符串；尚未实现岗位拥有多个题库、题库构建状态或跨岗位检索隔离。
-- 当前题目创建只触发本地 embedding；没有 `QuestionSpeechAsset`、异步 TTS 预生成、语音版本、失败重试或题库 readiness gate。
-- 当前没有企业简历库、候选人长期记录、简历文件版本、AI Resume Review、项目经历问题和人工批准流程。
-- 当前计划在生成时固定题目列表；没有冻结候选题池、会话随机种子、`QuestionSelection` 事实或断线后可重放的随机检索。
-- 当前面试由后台直接提交候选人信息创建；没有 `InterviewAppointment`、一次性公开邀请、Candidate Intake、姓名/邮箱/手机号匹配、授权版本和候选人 self-start。
-- 当前默认数据会写入 `data/interviewer.sqlite3`，但 schema 仍是文档型 MVP，不是最终关系模型。
-- 当前检索会保存和读取本地向量文档；这是旧版实验实现，不再是新主链路的前置条件。可以在迁移岗位题库后删除，或只保留为后台相似题实验；无需为完成 MVP 接入 pgvector。
-- 当前计划装配是确定性启发式策略，已经输出覆盖和放宽解释，但尚未用人工金标计划校准配额、重复阈值和难度曲线。
-- 当前评分是 mock provider 的关键点覆盖启发式，不是真实 LLM。
-- 当前 WebSocket 已支持音频分片和实时事件，但还没有 WebRTC 媒体通道、断点续传、消息队列或多实例连接广播。
-- 当前已经具备显式 `timeout` 命令和恢复语义，但尚无心跳截止时间监控器自动发出超时命令；事件日志随聚合持久化，也尚未拆成独立事件流或支持跨实例订阅。
-- 当前浏览器 Speech Recognition 只作为本地 MVP 转写方案，兼容性和稳定性受浏览器影响；尚未接入服务端流式 STT provider。
-- 当前数字人已接入 `avatar.speak` 网关和浏览器语音降级，但视觉仍是静态资产加说话动画；尚未接入真实视频数字人、唇形同步或供应商 WebRTC 流。
-- 当前候选人链接包含随机 token，但 token 尚无过期、撤销和一次性使用机制；面试官登录鉴权和组织权限也尚未实现。
-- 当前没有企业复核资源和音频签名 URL；虽能在本地保存回答音频，但不能按 reviewer 权限审计回听、修正转写或记录复核完成。
-- 当前录音保存在本地文件系统，未加密、未配置自动过期或对象存储访问签名，只适合本地开发。
-- 当前鉴权、租户权限、审计日志、密钥加密都还没有实现。
-- 当前 provider catalog 已经从 `provider.json` 扫描生成。
-- 当前 `mock` 和 `openai_compatible` provider 有实际执行逻辑；其它 provider 是 manifest 占位，尚未实现真实 SDK/API 调用。
-- 当前统一执行 schema 只覆盖 `llm.chat_json`、`embedding.text`、`avatar.speak`；Chat Text、STT、TTS 和 Moderation 必须在增加统一 schema 与 adapter 后才能进入活动 route。
-- 当前断路器是进程内状态，多进程/多实例之间不共享；成本估算依赖 provider config 的静态 pricing，尚未接入真实账单或指标系统。
-- 当前本地 provider secrets 是 SQLite 明文 JSON 存储，仅用于本地测试；生产必须替换为密钥管理器或加密字段。
-- 当前独立 Outbox worker 是 SQLite 轮询实现，尚未提供指数退避、最大尝试次数、dead-letter、任务监控指标或消息队列唤醒；数据库工作项与租约恢复语义已经具备。
-- 为保持 MVP 接口兼容，请求进程会在提交工作项后立即尝试处理；生产部署可改为返回异步状态并完全交给独立 worker。
-- 当前 InterviewSession 聚合以单个 JSON 文档保存；关系化 PostgreSQL 迁移后需要以外键和 revision 唯一约束保持同一语义。
+### API、异步任务与运维
 
-## 下一步
+- 补齐 CandidateProfile/Appointment/KnowledgeBase/Question PATCH、题目归档、题库 import/rebuild/build、题目/经历题语音重建、简历列表/详情和报告导出。
+- Outbox 支持最大尝试、指数退避、dead-letter、状态指标、租约恢复和带原因/主体/审计的人工重放。
+- 管理员可查询工作项、审计事件、公平性分布并触发心跳超时扫描。
+- 留存任务默认 dry-run；管理员显式执行后删除到期候选人的私有简历/录音并清空联系方式、审阅、转写、评分/报告敏感内容，操作全程审计。
 
-1. 先实现 `JobPosition` 与岗位拥有的 `KnowledgeBase`，迁移现有题目并在 repository、API、检索和前端强制岗位/题库边界。
-2. 扩展 Outbox 为题库导入、索引和 `tts.synthesize` 题目语音构建流水线，加入幂等、重试、dead-letter、构建状态和 readiness gate。
-3. 实现 `CandidateProfile`、`ResumeDocument`、私有对象存储、AI Resume Review、项目证据、经历问题人工审核和问题语音。
-4. 把 Interview Plan Assembly 调整为岗位题库抽题槽位 + 经历问题，冻结题库版本和候选清单；实现带种子、唯一约束和选择事实的 Question Selection。
-5. 实现 `InterviewAppointment`、token 哈希/过期/撤销/一次性消费、Candidate Intake、邮箱/手机号强匹配、同意记录和候选人 self-start。
-6. 增加 `stt.streaming` / `stt.batch` / `tts.synthesize` 统一 schema，接入一个真实服务端 STT/TTS provider；生产客户端不再提交 final transcript，断流走 batch 修复。
-7. 扩展生命周期为“抽题—播放语音—录音—transcribing—逐题评分—下一题—简历阶段—报告”，补齐中断恢复和阶段切换测试。
-8. 实现企业复核 API/UI、回答音频短期签名 URL、转写 revision、重评和客观 `job_fit_level`，不自动生成录用/淘汰决定。
-9. 引入 PostgreSQL、API 鉴权/RBAC、组织隔离、审计、加密、媒体留存和删除，并用 Persistence contract 与端到端测试验证；不把 pgvector 列为验收依赖。
-10. 最后再做 WebRTC、真实视频数字人、跨实例广播/断路器、心跳监控、指标告警和公平性离线评估。
+### 模型、语音与 readiness
+
+- `llm.chat_text` 已加入统一 schema；OpenAI-compatible 支持 Chat/Embedding/Speech TTS，DeepSeek/智谱 Chat 复用共享 runtime 并适配 JSON Object，智谱另实现官方 GLM-TTS，DashScope 支持 Qwen Chat/Embedding 以及 Qwen3-TTS/CosyVoice，均有离线 HTTP 合同测试。
+- Provider manifest 已驱动默认配置、predefined/customizable 模型选择与按能力模型候选；Provider test 接受 `capability + model`，管理 UI 支持配置编辑和按能力测试，智谱会把 `glm-5.2`/`glm-tts` 分别绑定 LLM/TTS。ModelRoute target/policy 使用强类型 API，未知字段返回 422、同组织重复 capability/purpose 返回冲突，predefined 目录外模型返回冲突；生产缺少精确 route 时返回 `provider_route_missing`，不再隐式使用 mock。
+- OpenAI-compatible 共享 transport 默认不继承环境代理，只有显式 `use_environment_proxy=true` 才读取代理变量；缺少 SOCKS transport 等初始化错误映射为 `provider_transport_unavailable`，不再泄漏原始 500。测试 helper 强制新建内存 store，`99` 项全量测试前后开发 SQLite 哈希保持一致。
+- `ModelGateway.open_stream()` 只在音频接受前允许 fallback；`ValidatedSTTStream` 校验 chunk/总量、事件序号和唯一 authoritative final。
+- `stt-stream` WebSocket 保存音频，stream final 直接提交评分，final 缺失/断流时使用 `stt.batch` 修复。
+- 非 mock TTS 结果必须从 data URI/受控 HTTP(S) 复制到 PrivateFileStorage 并形成 FileObject，才可标 `production_ready`。
+- 生产邀请/start 要求 streaming STT、batch STT、评分和题目语音 route 为非 mock、已实现且健康事实未过期。
+
+### 数据、安全与多实例
+
+- 联系方式采用 Fernet 密文和租户 HMAC 精确查找，API 只返回掩码；Provider credentials 在 repository seam 密封。
+- 生产 Bearer token 映射为 `Principal`，按 admin/interviewer/reviewer 做 RBAC；候选人 token 由生产密钥签名且不明文持久化/返回后台详情，public 窄接口的安全投影不包含标准答案、rubric、候选池或未来题干。
+- 所有 `/api/v1` HTTP 结果写元数据审计，未认证失败也记录；URL bearer token 在持久化前统一替换为 `{token}`。
+- invitation、候选人会话与签名文件端点按客户端/操作组限流；生产强制 Redis，缺失或故障时通用失败关闭，429/503 同样审计。
+- 回答录音和简历使用短期签名访问；音频授权与实际下载分别审计，不再挂载公开 `/media`。
+- PostgreSQL migration 提供 JSONB documents、乐观并发、Outbox/凭证/调用日志、关键唯一约束和强制租户 RLS。
+- Redis event bus 支持跨实例广播并忽略本实例回环；无 Redis 时本地 bus 保持相同 interface。
+- 模型断路器使用 Persistence 中的租户级 `ModelCircuitState`，应用实例共享失败/恢复状态。
+
+### 公平性与人工决策
+
+- 公平性服务按岗位比较会话题量、平均难度和技能覆盖，超过阈值产生人工复核告警并记录审计。
+- 报告始终 `human_decision_required=true`，不写录用/淘汰；真实人工金标、STT WER、评分一致性和漂移评估需企业样本。
+
+## 外部环境待验收
+
+| 项目 | 状态 | 为什么不能在仓库内宣称完成 | 已提供的验收入口 |
+| --- | --- | --- | --- |
+| PostgreSQL 集群/RLS/查询计划 | `environment_pending` | 当前环境没有可用 DSN/服务端 | adapter、migration、缺 DSN fail-fast、SQL 不变量测试 |
+| Redis 多实例广播 | `environment_pending` | 当前环境没有 Redis 集群和第二实例 | `RedisRealtimeEventBus` 与 lifespan subscriber |
+| 阿里云 OSS | `environment_pending` | 没有 bucket、RAM 凭据和区域 | OSS adapter、SSE/签名 fake-bucket contract |
+| 恶意文件扫描器 | `environment_pending` | 没有 ClamAV/企业扫描服务 | production 必配 command、超时/返回码 fail-closed、EICAR 测试 |
+| OpenAI-compatible/DeepSeek/智谱/DashScope 模型服务 | `environment_pending` | HTTP adapter 已实现，但当前没有真实 API Key、区域/模型授权、费用/延迟和结构化输出稳定性数据 | 离线 HTTP 合同、声明式模型目录、动态 route UI、私有 TTS copy/hash 与 readiness |
+| 真实 STT/视频数字人 | `external_choice_required` | 尚未指定厂商、账号、区域、模型和测试录音/视频协议 | 统一 schema、provider manifest、stream/batch repair、avatar 降级 seam |
+| 邮件/短信邀请 | `external_choice_required` | 未选择发送通道、域名、模板和合规策略 | 一次性邀请 token/API 已完成，当前由企业安全通道分发 |
+| WebRTC/视频口型同步 | `external_choice_required` | 依赖 SFU/数字人厂商会话协议 | WebSocket 音频闭环、avatar seam 和可替换实时网关已稳定 |
+
+## 已关闭的兼容边界
+
+- 管理员直接创建/启动会话、客户端 REST/WebSocket 文本答案、计划运行时 `items`、旧全局题目创建/列表和 `QuestionService`/向量 repository/worker 分支均已物理删除，不再用 production 条件分支隐藏。
+- 旧计划只能在应用升级前通过 `python -m app.migrations.plan_execution_v2 --dry-run` 检查，再执行无 `--dry-run` 的显式一次性迁移；运行时不会懒迁移。
+- 当前仓库 SQLite 数据检查为 0 份 InterviewPlan，未产生数据改写。接口删除和迁移行为由 `tests/test_production_compatibility.py`、`tests/test_plan_assembly.py` 覆盖，`COMPAT-001` 已标 `closed`。

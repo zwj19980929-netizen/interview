@@ -47,6 +47,54 @@ class _SQLiteTransactionBackend(TransactionBackend):
                     (collection, item["id"]),
                 )
 
+    def search_question_catalog(
+        self,
+        *,
+        organization_id: str,
+        job_position_id: str,
+        knowledge_base_ids: List[str],
+        skills: List[str],
+        difficulties: List[str],
+        question_types: List[str],
+    ) -> List[Document]:
+        clauses = [
+            "collection = 'questions'",
+            "json_extract(data, '$.organization_id') = ?",
+            "json_extract(data, '$.job_position_id') = ?",
+            "json_extract(data, '$.status') = 'active'",
+            "json_extract(data, '$.validation_status') = 'valid'",
+            "json_extract(data, '$.speech_status') = 'ready'",
+        ]
+        parameters: List[str] = [organization_id, job_position_id]
+        self._append_json_in_filter(clauses, parameters, "knowledge_base_id", knowledge_base_ids)
+        self._append_json_in_filter(clauses, parameters, "difficulty", difficulties)
+        self._append_json_in_filter(clauses, parameters, "type", question_types)
+        if skills:
+            placeholders = ", ".join("?" for _ in skills)
+            clauses.append(
+                "EXISTS (SELECT 1 FROM json_each(json_extract(data, '$.skills')) "
+                "WHERE json_each.value IN (%s))" % placeholders
+            )
+            parameters.extend(skills)
+        rows = self.connection.execute(
+            "SELECT data FROM documents WHERE %s ORDER BY id" % " AND ".join(clauses),
+            parameters,
+        ).fetchall()
+        return [json.loads(row["data"]) for row in rows]
+
+    def _append_json_in_filter(
+        self,
+        clauses: List[str],
+        parameters: List[str],
+        field: str,
+        values: List[str],
+    ) -> None:
+        if not values:
+            return
+        placeholders = ", ".join("?" for _ in values)
+        clauses.append("json_extract(data, '$.%s') IN (%s)" % (field, placeholders))
+        parameters.extend(values)
+
     def get_work_item(self, item_id: str) -> Optional[Document]:
         row = self.connection.execute(
             "SELECT data FROM outbox_work_items WHERE id = ?",
@@ -88,14 +136,14 @@ class _SQLiteTransactionBackend(TransactionBackend):
         if cursor.rowcount != 1:
             raise RuntimeError("Work item disappeared during transaction: %s" % item["id"])
 
-    def get_secret(self, item_id: str) -> Document:
+    def get_secret(self, organization_id: str, item_id: str) -> Document:
         row = self.connection.execute(
             "SELECT data FROM provider_secrets WHERE provider_config_id = ?",
             (item_id,),
         ).fetchone()
         return json.loads(row["data"]) if row else {}
 
-    def replace_secret(self, item_id: str, secret: Document) -> None:
+    def replace_secret(self, organization_id: str, item_id: str, secret: Document) -> None:
         self.connection.execute(
             """
             INSERT INTO provider_secrets(provider_config_id, data, updated_at)

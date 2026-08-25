@@ -1,0 +1,73 @@
+{
+  "provider_id": "zhipuai",
+  "display_name": "智谱 BigModel（GLM）",
+  "version": "1.1.0",
+  "capabilities": ["llm.chat_json", "llm.chat_text", "tts.synthesize"],
+  "model_selection": "predefined",
+  "defaults": {
+    "base_url": "https://open.bigmodel.cn/api/paas/v4",
+    "test_models": {
+      "llm.chat_json": "glm-5.2",
+      "llm.chat_text": "glm-5.2",
+      "tts.synthesize": "glm-tts"
+    },
+    "default_voice": "tongtong",
+    "use_environment_proxy": false
+  },
+  "config_schema": {
+    "type": "object",
+    "required": ["base_url"],
+    "properties": {
+      "base_url": {"type": "string"},
+      "test_model": {"type": "string"},
+      "test_models": {"type": "object"},
+      "timeout_s": {"type": "integer"},
+      "default_voice": {"type": "string"},
+      "voice_map": {"type": "object"},
+      "use_environment_proxy": {"type": "boolean"}
+    }
+  },
+  "credential_schema": {
+    "type": "object",
+    "required": ["api_key"],
+    "properties": {
+      "api_key": {"type": "string", "secret": true}
+    }
+  },
+  "models": [
+    {
+      "model_id": "glm-5.2",
+      "label": "GLM-5.2",
+      "capabilities": ["llm.chat_json", "llm.chat_text"],
+      "default": true
+    },
+    {
+      "model_id": "glm-5.1",
+      "label": "GLM-5.1",
+      "capabilities": ["llm.chat_json", "llm.chat_text"]
+    },
+    {
+      "model_id": "glm-5",
+      "label": "GLM-5",
+      "capabilities": ["llm.chat_json", "llm.chat_text"]
+    },
+    {
+      "model_id": "glm-4.7-flash",
+      "label": "GLM-4.7 Flash",
+      "capabilities": ["llm.chat_json", "llm.chat_text"]
+    },
+    {
+      "model_id": "glm-4.5-air",
+      "label": "GLM-4.5 Air",
+      "capabilities": ["llm.chat_json", "llm.chat_text"]
+    },
+    {
+      "model_id": "glm-tts",
+      "label": "GLM-TTS",
+      "capabilities": ["tts.synthesize"],
+      "default": true
+    }
+  ],
+  "entrypoint": "app.providers.zhipuai.provider:ZhipuAIProvider",
+  "implemented": true
+}

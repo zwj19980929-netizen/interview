@@ -1,12 +1,29 @@
 {
   "provider_id": "dashscope",
-  "display_name": "DashScope",
-  "version": "0.1.0",
-  "capabilities": ["llm.chat_json", "llm.chat_text", "embedding.text", "stt.batch", "tts.synthesize"],
+  "display_name": "阿里云百炼（千问 / Qwen）",
+  "version": "0.2.0",
+  "capabilities": ["llm.chat_json", "llm.chat_text", "embedding.text", "tts.synthesize"],
+  "model_selection": "customizable",
+  "defaults": {
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "test_model": "qwen-plus",
+    "default_voice": "Cherry",
+    "force_https_assets": true,
+    "use_environment_proxy": false
+  },
   "config_schema": {
     "type": "object",
+    "required": ["base_url"],
     "properties": {
-      "base_url": {"type": "string"}
+      "base_url": {"type": "string"},
+      "test_model": {"type": "string"},
+      "test_models": {"type": "object"},
+      "tts_endpoint": {"type": "string"},
+      "default_voice": {"type": "string"},
+      "voice_map": {"type": "object"},
+      "sample_rate_hz": {"type": "integer"},
+      "force_https_assets": {"type": "boolean"},
+      "use_environment_proxy": {"type": "boolean"}
     }
   },
   "credential_schema": {
@@ -16,8 +33,36 @@
       "api_key": {"type": "string", "secret": true}
     }
   },
-  "models": [],
+  "models": [
+    {
+      "model_id": "qwen-plus",
+      "label": "通义千问 Plus",
+      "capabilities": ["llm.chat_json", "llm.chat_text"],
+      "default": true
+    },
+    {
+      "model_id": "qwen3.8-max",
+      "label": "通义千问 3.8 Max",
+      "capabilities": ["llm.chat_json", "llm.chat_text"]
+    },
+    {
+      "model_id": "text-embedding-v4",
+      "label": "通义文本向量 V4",
+      "capabilities": ["embedding.text"],
+      "default": true
+    },
+    {
+      "model_id": "qwen3-tts-flash",
+      "label": "Qwen3-TTS Flash",
+      "capabilities": ["tts.synthesize"],
+      "default": true
+    },
+    {
+      "model_id": "cosyvoice-v3-flash",
+      "label": "CosyVoice V3 Flash",
+      "capabilities": ["tts.synthesize"]
+    }
+  ],
   "entrypoint": "app.providers.dashscope.provider:DashScopeProvider",
-  "implemented": false
+  "implemented": true
 }
-

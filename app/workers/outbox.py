@@ -8,7 +8,9 @@ from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
 from app.repositories.provider import get_store
 from app.services.interviews import InterviewService
-from app.services.questions import QuestionService
+from app.services.catalog import CatalogService
+from app.services.talent import TalentService
+from app.services.resume_ingestion import ResumeIngestionService
 
 
 class OutboxWorker:
@@ -16,7 +18,9 @@ class OutboxWorker:
 
     def __init__(self, store: InMemoryStore, *, persistence: Optional[Persistence] = None) -> None:
         self.persistence = persistence or persistence_for(store)
-        self.questions = QuestionService(store, persistence=self.persistence)
+        self.catalog = CatalogService(store, persistence=self.persistence)
+        self.talent = TalentService(store, persistence=self.persistence, catalog=self.catalog)
+        self.resume_ingestion = ResumeIngestionService(store, persistence=self.persistence)
         self.interviews = InterviewService(store, persistence=self.persistence)
 
     async def run_once(
@@ -31,8 +35,14 @@ class OutboxWorker:
         results: List[Dict[str, Any]] = []
         for item in items:
             try:
-                if item["kind"] == "question.index":
-                    await self.questions.process_index_work(item["id"], organization_id)
+                if item["kind"] == "question.speech.generate":
+                    await self.catalog.process_speech_work(item["id"], organization_id)
+                elif item["kind"] == "resume.review":
+                    await self.talent.process_review_work(item["id"], organization_id)
+                elif item["kind"] == "resume.ingest":
+                    await self.resume_ingestion.process(item["id"], organization_id)
+                elif item["kind"] in {"knowledge_base.import", "knowledge_base.rebuild"}:
+                    await self.catalog.process_build_work(item["id"], organization_id)
                 elif item["kind"] in {"answer.evaluate", "interview.report.generate"}:
                     await self.interviews.process_outbox_work(item["id"], organization_id)
                 else:

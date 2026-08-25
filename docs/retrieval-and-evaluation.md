@@ -2,6 +2,8 @@
 
 本文描述岗位题库候选池、简历审阅与经历问题、计划装配、面试中随机选择、服务端转写、逐题 AI 评分和最终岗位匹配报告的算法边界。MVP 的抽题与评分都不依赖向量数据库。
 
+当前实现说明：岗位题库路径和公开 `/questions/search` 已共用结构化 Question Catalog，Memory/SQLite/PostgreSQL backend 均有租户、岗位、题库、状态/readiness 和结构化条件查询实现，不依赖 embedding。`QuestionSelection` 采用 `HMAC-SHA256(session_seed, slot + question + version)` 排序选出稳定结果，而不是数据库 `ORDER BY random()`。服务端已实现 `stt.streaming` 的 open/chunk/partial/唯一 final 协议、权威 final 提交及断流 `stt.batch` 修复；本地 mock 需要显式开发输入，生产 readiness 只接受非 mock 且近期健康的 route。单题评分传入冻结 rubric、标准答案、关键点、岗位要求和服务端 final，并区分岗位题与经历题 profile；报告和 JSON/CSV 导出的分数、证据、风险与 `manual_review` 只读取各答案当前评分 revision。验证证据见 [已知问题与修复设计](known-issues-and-remediation.md)。
+
 ## 岗位题库入库、候选池与题目语音
 
 题目上传后进入持久异步构建流水线：
@@ -41,14 +43,16 @@
 
 ## 简历审阅与经历问题生成
 
-Resume Review 是指定 `ResumeDocument` 面向指定 `JobPosition + RoleRequirement version` 的异步任务：
+Resume Review 只能读取已完成摄取和解析的 `ResumeDocument`。本地 PDF 上传与 PDF URL 导入必须先收敛成同一种系统托管文件，再面向指定 `JobPosition + RoleRequirement version` 执行异步任务：
 
-1. 解析简历文件，去除页眉页脚、照片和与能力评估无关的敏感字段。
-2. 抽取项目、时间范围、候选人声称的职责、技术选择、量化结果和对应原文位置。
-3. 将项目证据映射到岗位技能维度，区分“简历明确写出”“模型推断”和“信息不足”。
-4. 为最相关项目生成经历核验问题，覆盖本人职责、技术权衡、困难、结果验证和复盘。
-5. 输出严格 JSON，保存 model/prompt/review revision；不得生成录用结论。
-6. 问题默认 `draft`，面试官可编辑、拒绝或批准。批准后异步生成问题语音。
+1. 摄取本地上传流或受控下载的公开 HTTPS URL，计算 SHA-256，并校验大小、`application/pdf` 和 PDF 文件签名。
+2. 文件先进入隔离区完成恶意文件扫描，再写入系统私有存储；外部 URL 不能成为后续解析和审阅的长期真相来源。
+3. 解析 PDF，去除页眉页脚、照片和与能力评估无关的敏感字段，并保存可追溯解析文本资产。
+4. 抽取项目、时间范围、候选人声称的职责、技术选择、量化结果和对应原文位置。
+5. 将项目证据映射到岗位技能维度，区分“简历明确写出”“模型推断”和“信息不足”。
+6. 为最相关项目生成经历核验问题，覆盖本人职责、技术权衡、困难、结果验证和复盘。
+7. 输出严格 JSON，保存 model/prompt/review revision；不得生成录用结论。
+8. 问题默认 `draft`，面试官可编辑、拒绝或批准。批准后异步生成问题语音。
 
 经历问题示例：
 
@@ -159,7 +163,7 @@ candidate audio -> realtime gateway -> stt.streaming
 - 浏览器 SpeechRecognition 只能本地开发预览，服务器忽略客户端提交的 final 和置信度。
 - 流式 STT 失败时先保存完整音频，将轮次保持 `transcribing` 并排队 `stt.batch`；补转写 final 到达后再评分。
 - 不同 Provider 的 partial 不能拼接。fallback 只能在流会话边界重开，或用 batch 对完整音频修复。
-- 预约允许文本兜底时，答案标记 `manual_text_fallback` 并强制进入报告复核提示；它不是 STT。
+- 不提供客户端文本兜底；服务端 streaming 失败后只能用完整录音执行 `stt.batch` 修复。补转写仍失败时保持 `transcribing`/可恢复失败态并请求人工处理，不能伪造 CandidateAnswer。
 - `stt_confidence` 低于语言/Provider 校准阈值时可继续评分，但评分置信度设上限并进入人工复核。
 
 回答结束由候选人提交、服务端静音检测、最长时限或面试官结束触发。服务端必须在音频 flush 完成后等待 final；不能在 `candidate.media.stop` 到达时直接拿客户端文本评分。
@@ -269,7 +273,11 @@ overall_score =
 
 `job_fit_evidence` 必须逐条关联岗位维度、题目、当前评分 revision 和回答证据。企业可回听语音、查看 final transcript、修正转写并重评；最终人员决定是独立业务动作，不能由报告自动写入。
 
+报告生成必须先从每个答案的 `current_evaluation_id` 物化 current evaluation 集合，`overall_score`、维度、证据、风险、`manual_review` 和 `evaluation_ids` 全部只从该集合计算。历史 revision 仅保留给引用它的历史报告，不能影响新报告。
+
 ## 质量与公平性评估
+
+当前 `FairnessEvaluationService` 和 `/api/v1/admin/evaluations/question-selection-fairness` 已按岗位输出样本量、每会话题量、平均难度、技能覆盖计数和分布差异告警，并记录审计；它不读取或生成录用结论。该实现用于发现抽题条件差异，不替代人工金标数据集、真实 STT WER 或 AI/人工评分一致性校准。
 
 - 每个岗位维护人工标注的题目、答案和经历问题评分样本。
 - 比较 AI 与人工评分一致性，按题型、语言、STT 置信度和 Provider 监控漂移。

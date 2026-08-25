@@ -17,7 +17,6 @@ class RealtimeInterviewSession:
         self.media = LocalMediaStorage()
         self.recording: Optional[LocalMediaRecording] = None
         self.recording_turn_id: Optional[str] = None
-        self.last_audio_uri: Optional[str] = None
 
     def validate_candidate_token(self, token: Optional[str]) -> None:
         self.interviews.validate_candidate_token(self.interview_id, token)
@@ -69,15 +68,16 @@ class RealtimeInterviewSession:
         if event_type.startswith("interviewer.control."):
             return self._handle_interviewer_control(event_type, payload)
         if event_type == "ping":
-            return [self._event("pong", {})]
+            heartbeat = self.interviews.record_heartbeat(
+                self.interview_id, participant=self.participant_role
+            )
+            return [self._event("pong", {"received_at": heartbeat["received_at"]})]
         if event_type == "candidate.media.start":
             return [self._start_recording(message.get("turn_id"), payload)]
         if event_type == "candidate.media.stop":
             return [self._stop_recording()]
         if event_type == "candidate.transcript.partial":
             return [self._transcript_event("stt.transcript.partial", message.get("turn_id"), payload)]
-        if event_type in {"candidate.transcript.final", "candidate.answer.text"}:
-            return await self._submit_transcript(message.get("turn_id"), payload)
         raise ApiError("REALTIME_EVENT_UNSUPPORTED", "Realtime event is not supported.")
 
     def _handle_interviewer_control(self, event_type: str, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -89,7 +89,6 @@ class RealtimeInterviewSession:
             )
         reason = str(payload.get("reason") or "interviewer_control")
         controls = {
-            "interviewer.control.start": lambda: self.interviews.start_interview(self.interview_id),
             "interviewer.control.pause": lambda: self.interviews.pause_interview(self.interview_id, reason),
             "interviewer.control.resume": lambda: self.interviews.resume_interview(self.interview_id, reason),
             "interviewer.control.recover": lambda: self.interviews.recover_interview(self.interview_id, reason),
@@ -121,7 +120,6 @@ class RealtimeInterviewSession:
         mime_type = str(payload.get("mime_type") or "")
         self.recording = self.media.start_recording(self.interview_id, active_turn["id"], mime_type)
         self.recording_turn_id = active_turn["id"]
-        self.last_audio_uri = None
         return self._event(
             "media.recording.started",
             {"mime_type": mime_type, "timeslice_ms": int(payload.get("timeslice_ms", 400))},
@@ -135,7 +133,6 @@ class RealtimeInterviewSession:
         turn_id = self.recording_turn_id
         self.recording = None
         self.recording_turn_id = None
-        self.last_audio_uri = result.audio_uri
         return self._event(
             "media.recording.stopped",
             {
@@ -159,62 +156,6 @@ class RealtimeInterviewSession:
             },
             turn_id=turn_id,
         )
-
-    async def _submit_transcript(self, turn_id: Optional[str], payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-        self._require_active_turn(turn_id)
-        text = str(payload.get("text") or "").strip()
-        if not text:
-            raise ApiError("ANSWER_TRANSCRIPT_REQUIRED", "Final transcript cannot be empty.")
-        if self.recording:
-            self._stop_recording()
-        events = [self._transcript_event("stt.transcript.final", turn_id, payload)]
-        result = await self.interviews.submit_answer(
-            self.interview_id,
-            {
-                "turn_id": turn_id,
-                "final_transcript": text,
-                "raw_transcript": text,
-                "stt_confidence": float(payload.get("confidence", 0.0)),
-                "language": payload.get("language", "zh-CN"),
-                "duration_seconds": int(payload.get("duration_seconds", 0)),
-                "audio_uri": self.last_audio_uri,
-            },
-        )
-        evaluation = result["evaluation"]
-        domain_event_types = {item["type"] for item in result.get("events", [])}
-        if "evaluation.requested" in domain_event_types:
-            events.append(self._event("evaluation.started", {}, turn_id=turn_id))
-        events.append(
-            self._event(
-                "evaluation.completed",
-                {
-                    "answer_id": result["answer"]["id"],
-                    "score": evaluation["score"],
-                    "confidence": evaluation["confidence"],
-                    "covered_key_points": evaluation["covered_key_points"],
-                    "missing_key_points": evaluation["missing_key_points"],
-                    "summary": evaluation["feedback"],
-                    "next_turn_id": result.get("next_turn_id"),
-                },
-                turn_id=turn_id,
-            )
-        )
-        self.last_audio_uri = None
-        interview = self.interviews.get_interview(self.interview_id)
-        current_turn = self._current_turn(interview)
-        if current_turn:
-            events.append(self._question_event(current_turn))
-        elif "report.completed" in domain_event_types and interview["status"] == "report_ready":
-            events.append(
-                self._event(
-                    "interview.completed",
-                    {
-                        "status": interview["status"],
-                        "report_ready": True,
-                    },
-                )
-            )
-        return events
 
     def _require_active_turn(self, turn_id: Optional[str]) -> None:
         self.interviews.require_active_turn(self.interview_id, turn_id)

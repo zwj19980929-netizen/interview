@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,21 +17,30 @@ def api_client() -> TestClient:
 
 
 def create_plan(api: TestClient) -> tuple:
+    position = api.post(
+        "/api/v1/job-positions",
+        json={"code": "architect", "name": "架构师"},
+    ).json()
+    knowledge_base = api.post(
+        "/api/v1/job-positions/%s/knowledge-bases" % position["id"],
+        json={"name": "架构题库"},
+    ).json()
     question = api.post(
-        "/api/v1/questions",
+        "/api/v1/knowledge-bases/%s/questions" % knowledge_base["id"],
         json={
-            "knowledge_base_id": "kb_aggregate",
+            "knowledge_base_id": knowledge_base["id"],
             "title": "事务边界",
             "question_text": "为什么外部模型调用不能放在数据库事务里？",
             "standard_answer": "长事务会扩大锁竞争和失败面，应使用 Outbox 分阶段提交。",
             "key_points": ["避免长事务", "Outbox 分阶段提交"],
             "difficulty": "senior",
             "skills": ["architecture"],
+            "rubric": {"semantic_correctness": 1.0},
         },
     )
     assert question.status_code == 200, question.text
     role = api.post(
-        "/api/v1/role-requirements",
+        "/api/v1/job-positions/%s/role-requirements" % position["id"],
         json={
             "title": "架构师",
             "description": "负责 architecture 与可靠性设计。",
@@ -40,11 +50,17 @@ def create_plan(api: TestClient) -> tuple:
         },
     )
     assert role.status_code == 200, role.text
+    candidate = api.post(
+        "/api/v1/candidate-profiles",
+        json={"name": "聚合测试候选人", "email": "aggregate@example.com", "phone": "13800138002"},
+    ).json()
     plan = api.post(
         "/api/v1/interview-plans/generate",
         json={
             "role_requirement_id": role.json()["id"],
-            "knowledge_base_ids": ["kb_aggregate"],
+            "job_position_id": position["id"],
+            "candidate_profile_id": candidate["id"],
+            "knowledge_base_ids": [knowledge_base["id"]],
             "question_count": 1,
         },
     )
@@ -52,13 +68,78 @@ def create_plan(api: TestClient) -> tuple:
     return question.json(), role.json(), plan.json()
 
 
+def admit_plan(api: TestClient, plan: dict) -> dict:
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    appointment = api.post(
+        "/api/v1/interview-appointments",
+        json={
+            "plan_id": plan["id"],
+            "candidate_profile_id": plan["candidate_profile_id"],
+            "job_position_id": plan["job_position_id"],
+            "scheduled_start_at": (now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
+            "scheduled_end_at": (now + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+            "settings": {"record_audio": True},
+        },
+    )
+    assert appointment.status_code == 200, appointment.text
+    invitation = api.post(
+        "/api/v1/interview-appointments/%s/invite" % appointment.json()["id"],
+        json={"expires_at": (now + timedelta(hours=1)).isoformat().replace("+00:00", "Z")},
+    )
+    assert invitation.status_code == 200, invitation.text
+    token = invitation.json()["invitation_token"]
+    notice = api.get("/api/v1/public/interview-invitations/%s" % token).json()["consent"]
+    intake = api.post(
+        "/api/v1/public/interview-invitations/%s/intake" % token,
+        json={
+            "name": "聚合测试候选人",
+            "email": "aggregate@example.com",
+            "phone": "13800138002",
+            "consent": {
+                "accepted": True,
+                "version": notice["version"],
+                "recording_accepted": True,
+            },
+        },
+    )
+    assert intake.status_code == 200, intake.text
+    readiness = api.post(
+        "/api/v1/public/interview-invitations/%s/readiness" % token,
+        json={"browser_supported": True, "microphone_granted": True, "audio_content_type": "audio/webm"},
+    )
+    assert readiness.status_code == 200, readiness.text
+    started = api.post("/api/v1/public/interview-invitations/%s/start" % token)
+    assert started.status_code == 200, started.text
+    return api.get("/api/v1/interviews/%s" % started.json()["interview_id"]).json()
+
+
+def audio_answer(api: TestClient, interview: dict, transcript: str):
+    return api.post(
+        "/api/v1/interviews/%s/audio-answers" % interview["id"],
+        json={
+            "turn_id": interview["current_turn_id"],
+            "audio_uri": "private-test://answer.webm",
+            "content_type": "audio/webm",
+            "development_transcript": transcript,
+            "duration_seconds": 5,
+        },
+    )
+
+
 def test_approved_plan_snapshot_and_optimistic_concurrency() -> None:
     api = api_client()
     question, _, plan = create_plan(api)
 
+    now = datetime.now(timezone.utc).replace(microsecond=0)
     rejected = api.post(
-        "/api/v1/interviews",
-        json={"plan_id": plan["id"], "candidate": {"name": "候选人"}},
+        "/api/v1/interview-appointments",
+        json={
+            "plan_id": plan["id"],
+            "candidate_profile_id": plan["candidate_profile_id"],
+            "job_position_id": plan["job_position_id"],
+            "scheduled_start_at": now.isoformat().replace("+00:00", "Z"),
+            "scheduled_end_at": (now + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
+        },
     )
     assert rejected.status_code == 409
     assert rejected.json()["error"]["code"] == "INTERVIEW_PLAN_NOT_APPROVED"
@@ -77,14 +158,9 @@ def test_approved_plan_snapshot_and_optimistic_concurrency() -> None:
     assert stale.status_code == 409
     assert stale.json()["error"]["code"] == "PERSISTENCE_CONFLICT"
 
-    interview = api.post(
-        "/api/v1/interviews",
-        json={"plan_id": plan["id"], "candidate": {"name": "候选人", "metadata": {"source": "test"}}},
-    )
-    assert interview.status_code == 200, interview.text
-    session = interview.json()
+    session = admit_plan(api, approved.json())
     assert session["candidate"]["interview_id"] == session["id"]
-    assert session["candidate"]["metadata"] == {"source": "test"}
+    assert session["candidate"]["metadata"] == {"candidate_profile_id": plan["candidate_profile_id"]}
     assert session["plan_snapshot"]["source_plan_version"] == approved.json()["version"]
     assert session["turns"][0]["question_snapshot"]["source_question_version"] == question["version"]
 
@@ -111,18 +187,8 @@ def test_evaluation_and_report_revisions_are_append_only() -> None:
         json={"expected_version": plan["version"], "status": "approved"},
     )
     assert approved.status_code == 200, approved.text
-    interview = api.post(
-        "/api/v1/interviews",
-        json={"plan_id": plan["id"], "candidate": {"name": "修订链候选人"}},
-    ).json()
-    started = api.post("/api/v1/interviews/%s/start" % interview["id"])
-    answer = api.post(
-        "/api/v1/interviews/%s/answers" % interview["id"],
-        json={
-            "turn_id": started.json()["current_turn_id"],
-            "final_transcript": "避免长事务，并用 Outbox 分阶段提交。",
-        },
-    )
+    interview = admit_plan(api, approved.json())
+    answer = audio_answer(api, interview, "避免长事务，并用 Outbox 分阶段提交。")
     assert answer.status_code == 200, answer.text
     answer_id = answer.json()["answer"]["id"]
     first_evaluation_id = answer.json()["evaluation"]["id"]
@@ -161,13 +227,8 @@ def test_lifecycle_controls_and_durable_events_share_one_seam() -> None:
         json={"expected_version": plan["version"], "status": "approved"},
     )
     assert approved.status_code == 200, approved.text
-    interview = api.post(
-        "/api/v1/interviews",
-        json={"plan_id": plan["id"], "candidate": {"name": "恢复测试候选人"}},
-    ).json()
-    started = api.post("/api/v1/interviews/%s/start" % interview["id"])
-    assert started.status_code == 200, started.text
-    turn_id = started.json()["current_turn_id"]
+    interview = admit_plan(api, approved.json())
+    turn_id = interview["current_turn_id"]
 
     timed_out = api.post(
         "/api/v1/interviews/%s/timeout" % interview["id"],
@@ -178,8 +239,12 @@ def test_lifecycle_controls_and_durable_events_share_one_seam() -> None:
     assert timed_out.json()["interruption"]["kind"] == "timeout"
 
     blocked_answer = api.post(
-        "/api/v1/interviews/%s/answers" % interview["id"],
-        json={"turn_id": turn_id, "final_transcript": "暂停期间不应接受回答"},
+        "/api/v1/interviews/%s/audio-answers" % interview["id"],
+        json={
+            "turn_id": turn_id,
+            "audio_uri": "private-test://paused.webm",
+            "development_transcript": "暂停期间不应接受回答",
+        },
     )
     assert blocked_answer.status_code == 409
     assert blocked_answer.json()["error"]["code"] == "INTERVIEW_NOT_IN_PROGRESS"
@@ -220,11 +285,7 @@ def test_manual_completion_skips_open_turns_before_requesting_report() -> None:
         json={"expected_version": plan["version"], "status": "approved"},
     )
     assert approved.status_code == 200, approved.text
-    interview = api.post(
-        "/api/v1/interviews",
-        json={"plan_id": plan["id"], "candidate": {"name": "提前结束候选人"}},
-    ).json()
-    assert api.post("/api/v1/interviews/%s/start" % interview["id"]).status_code == 200
+    interview = admit_plan(api, approved.json())
 
     completed = api.post("/api/v1/interviews/%s/complete" % interview["id"])
     assert completed.status_code == 200, completed.text
@@ -244,11 +305,7 @@ def test_failed_report_work_reenters_lifecycle_before_worker_retry() -> None:
         json={"expected_version": plan["version"], "status": "approved"},
     )
     assert approved.status_code == 200, approved.text
-    interview = api.post(
-        "/api/v1/interviews",
-        json={"plan_id": plan["id"], "candidate": {"name": "报告恢复候选人"}},
-    ).json()
-    assert api.post("/api/v1/interviews/%s/start" % interview["id"]).status_code == 200
+    interview = admit_plan(api, approved.json())
 
     service = InterviewService(get_store())
 
@@ -282,11 +339,7 @@ def test_failed_evaluation_work_reenters_lifecycle_before_worker_retry() -> None
         json={"expected_version": plan["version"], "status": "approved"},
     )
     assert approved.status_code == 200, approved.text
-    interview = api.post(
-        "/api/v1/interviews",
-        json={"plan_id": plan["id"], "candidate": {"name": "评分恢复候选人"}},
-    ).json()
-    started = api.post("/api/v1/interviews/%s/start" % interview["id"]).json()
+    interview = admit_plan(api, approved.json())
 
     service = InterviewService(get_store())
 
@@ -296,9 +349,14 @@ def test_failed_evaluation_work_reenters_lifecycle_before_worker_retry() -> None
     service.evaluation.evaluate_answer = fail_evaluation
     with pytest.raises(RuntimeError, match="evaluation provider unavailable"):
         asyncio.run(
-            service.submit_answer(
+            service.submit_audio_answer(
                 interview["id"],
-                {"turn_id": started["current_turn_id"], "final_transcript": "等待恢复评分"},
+                {
+                    "turn_id": interview["current_turn_id"],
+                    "audio_uri": "private-test://failure.webm",
+                    "content_type": "audio/webm",
+                    "development_transcript": "等待恢复评分",
+                },
             )
         )
 

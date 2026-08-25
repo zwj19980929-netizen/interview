@@ -201,6 +201,28 @@ async def test_pipeline_timeout_opens_circuit_and_future_call_skips_primary() ->
 
 
 @pytest.mark.anyio
+async def test_default_circuit_breaker_is_shared_through_persistence() -> None:
+    store = configured_store()
+    adapter = SlowAdapter()
+    invocation_route = route(
+        timeout_s=0.01,
+        policy={"circuit_failure_threshold": 1, "circuit_recovery_seconds": 60},
+    )
+    first_gateway = ModelGateway(store, provider_clients={"openai_compatible": adapter})
+    second_gateway = ModelGateway(store, provider_clients={"openai_compatible": adapter})
+
+    await first_gateway.invoke(cap.LLM_CHAT_JSON, request(), route=invocation_route)
+    await second_gateway.invoke(cap.LLM_CHAT_JSON, request(), route=invocation_route)
+
+    assert adapter.calls == 1
+    assert len(store.model_circuit_states) == 1
+    assert any(
+        item.get("error_code") == "provider_circuit_open"
+        for item in store.model_invocations
+    )
+
+
+@pytest.mark.anyio
 async def test_non_retryable_auth_error_does_not_fall_back() -> None:
     store = configured_store()
     adapter = ScriptedAdapter(
@@ -215,3 +237,30 @@ async def test_non_retryable_auth_error_does_not_fall_back() -> None:
     assert exc_info.value.details["attempts"] == 1
     assert len(store.model_invocations) == 1
     assert store.model_invocations[0]["provider_id"] == "openai_compatible"
+
+
+@pytest.mark.anyio
+async def test_production_requires_an_explicit_model_route(monkeypatch) -> None:
+    monkeypatch.setenv("INTERVIEWER_RUNTIME_ENV", "production")
+    store = InMemoryStore()
+    gateway = ModelGateway(store)
+
+    with pytest.raises(ProviderError) as exc_info:
+        await gateway.invoke(cap.LLM_CHAT_JSON, request())
+
+    assert exc_info.value.code == "provider_route_missing"
+
+    store.model_routes["route_default"] = {
+        "id": "route_default",
+        "organization_id": "org_default",
+        "capability": cap.LLM_CHAT_JSON,
+        "purpose": "default",
+        "primary": {"provider_config_id": "mpc_mock", "model": "mock-json", "timeout_s": 1},
+        "fallbacks": [],
+        "policy": {},
+        "enabled": True,
+    }
+    with pytest.raises(ProviderError) as default_exc_info:
+        await gateway.invoke(cap.LLM_CHAT_JSON, request())
+
+    assert default_exc_info.value.code == "provider_route_missing"

@@ -1,14 +1,23 @@
 {
   "provider_id": "openai_compatible",
   "display_name": "OpenAI Compatible",
-  "version": "0.1.0",
-  "capabilities": ["llm.chat_json", "embedding.text"],
+  "version": "0.2.0",
+  "capabilities": ["llm.chat_json", "llm.chat_text", "embedding.text", "tts.synthesize"],
+  "model_selection": "customizable",
+  "defaults": {},
   "config_schema": {
     "type": "object",
     "required": ["base_url"],
     "properties": {
       "base_url": {"type": "string"},
-      "organization": {"type": "string"}
+      "organization": {"type": "string"},
+      "test_model": {"type": "string"},
+      "test_models": {"type": "object"},
+      "use_environment_proxy": {"type": "boolean"},
+      "structured_output_mode": {"type": "string"},
+      "default_voice": {"type": "string"},
+      "voice_map": {"type": "object"},
+      "tts_instructions": {"type": "string"}
     }
   },
   "credential_schema": {

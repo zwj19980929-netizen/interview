@@ -22,6 +22,8 @@ class LifecycleCommandType(str, Enum):
     CANCEL = "cancel"
     SKIP_CURRENT_TURN = "skip_current_turn"
     COMPLETE = "complete"
+    TRANSCRIPTION_STARTED = "transcription_started"
+    TRANSCRIPTION_FAILED = "transcription_failed"
     ANSWER_SUBMITTED = "answer_submitted"
     REGRADE_REQUESTED = "regrade_requested"
     EVALUATION_SUCCEEDED = "evaluation_succeeded"
@@ -76,6 +78,8 @@ class InterviewSessionLifecycle:
             LifecycleCommandType.CANCEL: self._cancel,
             LifecycleCommandType.SKIP_CURRENT_TURN: self._skip_current_turn,
             LifecycleCommandType.COMPLETE: self._complete,
+            LifecycleCommandType.TRANSCRIPTION_STARTED: self._transcription_started,
+            LifecycleCommandType.TRANSCRIPTION_FAILED: self._transcription_failed,
             LifecycleCommandType.ANSWER_SUBMITTED: self._answer_submitted,
             LifecycleCommandType.REGRADE_REQUESTED: self._regrade_requested,
             LifecycleCommandType.EVALUATION_SUCCEEDED: self._evaluation_succeeded,
@@ -153,6 +157,7 @@ class InterviewSessionLifecycle:
             turn["status"] = "asking"
             turn["started_at"] = turn.get("started_at") or now
             session["current_turn_id"] = turn["id"]
+            session["phase"] = turn.get("phase", session.get("phase", "position_bank"))
         self._emit(session, events, "interview.started", {"current_turn_id": session.get("current_turn_id")}, now)
 
     def _pause(self, session: Document, payload: Document, now: str, events: List[Document], effects: List[Document]) -> None:
@@ -289,7 +294,7 @@ class InterviewSessionLifecycle:
         effects: List[Document],
     ) -> None:
         answer = deepcopy(payload["answer"])
-        turn = self.require_active_turn(session, answer["turn_id"], allowed_statuses=("asking",))
+        turn = self.require_active_turn(session, answer["turn_id"], allowed_statuses=("asking", "transcribing"))
         mutable_turn = self._turn(session, turn["id"])
         if any(item["turn_id"] == turn["id"] for item in session.get("answers", [])):
             self._invalid("The active turn already has an answer.")
@@ -303,6 +308,46 @@ class InterviewSessionLifecycle:
             now,
         )
         self._request_evaluation(session, answer, 1, payload.get("trigger_reason", "initial_scoring"), now, events, effects)
+
+    def _transcription_started(
+        self,
+        session: Document,
+        payload: Document,
+        now: str,
+        events: List[Document],
+        effects: List[Document],
+    ) -> None:
+        turn = self.require_active_turn(session, payload.get("turn_id"), allowed_statuses=("asking",))
+        mutable_turn = self._turn(session, turn["id"])
+        mutable_turn["status"] = "transcribing"
+        mutable_turn["recording"] = deepcopy(payload.get("recording", {}))
+        self._emit(
+            session,
+            events,
+            "transcription.started",
+            {"turn_id": turn["id"], "audio_uri": payload.get("recording", {}).get("audio_uri")},
+            now,
+        )
+
+    def _transcription_failed(
+        self,
+        session: Document,
+        payload: Document,
+        now: str,
+        events: List[Document],
+        effects: List[Document],
+    ) -> None:
+        turn = self.require_active_turn(session, payload.get("turn_id"), allowed_statuses=("transcribing",))
+        mutable_turn = self._turn(session, turn["id"])
+        mutable_turn["status"] = "asking"
+        mutable_turn["transcription_error"] = str(payload.get("error", "transcription failed"))[:500]
+        self._emit(
+            session,
+            events,
+            "transcription.failed",
+            {"turn_id": turn["id"], "error": mutable_turn["transcription_error"]},
+            now,
+        )
 
     def _regrade_requested(
         self,
@@ -554,9 +599,19 @@ class InterviewSessionLifecycle:
     ) -> None:
         next_turn = self._first_turn_with_status(session, ("pending",))
         if next_turn is not None:
+            previous_phase = session.get("phase")
             next_turn["status"] = "asking"
             next_turn["started_at"] = next_turn.get("started_at") or now
             session["current_turn_id"] = next_turn["id"]
+            session["phase"] = next_turn.get("phase", previous_phase or "position_bank")
+            if previous_phase and previous_phase != session["phase"]:
+                self._emit(
+                    session,
+                    events,
+                    "interview.phase_changed",
+                    {"from": previous_phase, "to": session["phase"]},
+                    now,
+                )
             self._emit(session, events, "turn.advanced", {"turn_id": next_turn["id"]}, now)
             return
         session["current_turn_id"] = None

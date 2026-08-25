@@ -2,6 +2,8 @@
 
 本文定义岗位题库、简历审阅、预约、实时面试和企业复核的核心实体、状态与存储边界。字段名用于指导数据库 schema、Pydantic schema 和 API 实现。
 
+当前实现已为本页主要聚合建立 versioned document repository，并把 `QuestionSelection`、候选人/计划/题目快照、轮次、回答、转写 revision、评分 revision 和报告 revision 保存在 `InterviewSession` 聚合中。Memory/SQLite 用于本地，PostgreSQL adapter 与迁移已提供 JSONB 持久化、乐观并发、Outbox 幂等、预约单会话/选择槽位约束和强制租户 RLS；真实 PostgreSQL 实例上的迁移、RLS 与查询计划仍属于部署环境验收。联系方式与 Provider 凭证在 repository 边界加密，PDF 原件和解析文本都由 `FileObject + PrivateFileStorage` 托管。
+
 ## 核心实体
 
 ### Organization
@@ -121,18 +123,53 @@
 
 ### ResumeDocument
 
-候选人简历文件的不可变版本。
+候选人简历 PDF 的不可变版本。`local_upload` 与 `url_import` 只是摄取来源，成功后都引用系统托管的私有文件对象；外部 URL 和解析文本都不能替代原始 PDF 作为版本真相。
 
 | 字段 | 说明 |
 | --- | --- |
 | `id` | 简历版本 ID |
 | `candidate_profile_id` | 所属候选人记录 |
-| `file_uri` | 加密对象存储地址 |
+| `source_type` | `local_upload`、`url_import` |
+| `original_file_name` | 清洗后的原始文件名，仅用于展示 |
+| `source_url_hash` | URL 导入来源的不可逆哈希，可为空；默认不保存完整 URL |
+| `file_object_id` | 系统私有文件对象 ID；业务层不保存调用方提交的 URI |
 | `file_hash` | 文件内容哈希 |
-| `mime_type` | PDF、DOCX 等允许类型 |
+| `mime_type` | 当前只允许 `application/pdf` |
+| `size_bytes` | 原始 PDF 字节数 |
+| `ingestion_status` | `queued`、`receiving`、`quarantined`、`scanning`、`stored`、`parsing`、`ready`、`failed` |
+| `scan_status` | `pending`、`clean`、`infected`、`failed` |
 | `parse_status` | `pending`、`parsed`、`failed` |
-| `parsed_text_uri` | 脱敏解析文本地址，可为空 |
+| `parsed_text_object_id` | 脱敏解析文本的私有文件对象 ID，可为空 |
+| `failure_code` | 摄取、扫描或解析失败原因枚举，可为空 |
 | `uploaded_by` | 上传人 |
+
+不变量：
+
+- `ready` 必须同时满足 PDF 类型/文件签名有效、扫描为 `clean`、原始文件已进入私有存储且解析成功。
+- `url_import` 的初始 URL 和每次重定向都必须通过 SSRF 校验；源站内容变化只能创建新 `ResumeDocument`，不能覆盖旧版本。
+- Resume Review 只能引用 `ready` 的 `ResumeDocument`，并从 `file_object_id`/`parsed_text_object_id` 读取；不能回源下载外部 URL。
+- 切换本地文件系统和阿里云 OSS 只改变私有文件 adapter，不改变 `ResumeDocument` ID、状态或业务 interface。
+
+### FileObject
+
+系统私有文件对象的元数据；数据库不保存文件 BLOB，业务资源不直接保存公开 URL 或本地绝对路径。
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | 文件对象 ID |
+| `organization_id` | 所属组织 |
+| `purpose` | `resume_pdf`、`resume_parsed_text`、`question_speech` 等用途 |
+| `status` | `awaiting_download`、`quarantined`、`ready`、`failed` |
+| `storage_backend` | `local_private` 或 `aliyun_oss` |
+| `object_key` | adapter 内部对象键，不作为公开 URL |
+| `content_type` | 受校验的 MIME |
+| `checksum` | `sha256:` 内容哈希 |
+| `byte_count` | 文件大小 |
+| `scan_status` | `pending`、`clean`、`derived_clean_source`、`failed` |
+| `source_type` | 上传、URL 导入或从可信 PDF 派生 |
+| `source_reference` | 脱敏来源路径/资源 ID，不含 query、fragment 或凭据 |
+
+PDF 原件扫描为 clean 后存为一个 FileObject；解析文本使用另一个 `resume_parsed_text` FileObject，`ResumeDocument` 只保存两者 ID。API projection 不返回解析正文、对象键或本地路径。
 
 ### ResumeReview
 
@@ -212,6 +249,8 @@ AI 生成内容默认为 `draft`，未经面试官批准不得进入正式计划
 | `assembly_summary` | 候选池规模、覆盖、告警和选择解释 |
 | `created_by` | 创建人 |
 
+`bank_slots + question_candidate_pools + experience_question_ids + selection_policy` 是计划唯一的 execution v2 representation。请求、响应和运行时持久化不得包含固定 `items`；升级旧数据只能在应用启动前运行显式一次性迁移，把固定题目转换为单候选槽位并写入 `execution_schema_version=2`。会话只能由预约 start 通过 Plan Assembly interface 读取该表示。
+
 `bank_slots` 示例：
 
 ```json
@@ -248,10 +287,12 @@ AI 生成内容默认为 `draft`，未经面试官批准不得进入正式计划
 | `status` | `draft`、`scheduled`、`invited`、`registered`、`consumed`、`cancelled`、`expired` |
 | `invitation_token_hash` | 一次性邀请 token 哈希 |
 | `invitation_expires_at` | 邀请过期时间 |
-| `settings` | 录音、文本兜底、数字人、语言和音色策略 |
+| `settings` | 录音、数字人、语言和音色策略 |
+| `admission_policy` | 冻结的提前/延后宽限、设备检查有效期和服务端 readiness 要求 |
+| `readiness_facts` | 最近一次浏览器、麦克风和音频格式检查结果、服务端检查时间及失效时间 |
 | `created_by` | 创建人 |
 
-只有计划、题库、经历问题语音和生产 STT 路由通过 readiness gate 后才能从 `scheduled` 进入 `invited`。token 只能被一次候选人登记消费，可撤销、不可明文持久化。
+只有计划、题库、经历问题语音和生产 STT 路由通过 readiness gate 后才能从 `scheduled` 进入 `invited`。token 只能被一次候选人登记消费，可撤销、不可明文持久化。邀请过期和预约 start 窗口是两个独立条件；默认允许开始的窗口为 `[scheduled_start_at, scheduled_end_at]`，任何宽限都必须显式冻结在 `admission_policy` 中。
 
 ### CandidateIntake
 
@@ -267,10 +308,14 @@ AI 生成内容默认为 `draft`，未经面试官批准不得进入正式计划
 | `matched_candidate_profile_id` | 匹配后的候选人记录 |
 | `match_method` | `email`、`phone`、`email_and_phone` |
 | `consent_version` | 隐私与录音告知版本 |
-| `consented_at` | 同意时间 |
+| `privacy_accepted` | 候选人是否明确接受隐私告知 |
+| `recording_accepted` | 候选人是否明确接受本次录音 |
+| `notice_hash` | 服务端允许版本对应的告知内容哈希 |
+| `consent_evidence_status` | `verified` 或迁移数据使用的 `legacy_unverified` |
+| `consented_at` | 服务端记录的同意时间 |
 | `submitted_at` | 提交时间 |
 
-匹配只针对预约已绑定的 `CandidateProfile`。至少一个邮箱或手机号必须精确匹配，姓名用于联合校验；禁止仅凭姓名模糊匹配，也不能通过错误差异暴露其他候选人是否存在。
+匹配只针对预约已绑定的 `CandidateProfile`。至少一个邮箱或手机号必须精确匹配，姓名用于联合校验；禁止仅凭姓名模糊匹配，也不能通过错误差异暴露其他候选人是否存在。预约创建时从服务端允许目录冻结实际告知正文、版本与内容 hash；候选人只能接受公开邀请返回的同一版本。服务端要求 `privacy_accepted=true`；预约设置 `record_audio=true` 时还必须满足 `recording_accepted=true`。客户端时间不是同意证据，重复 intake 也不能把已有授权覆盖为更弱授权；`legacy_unverified` 数据在生产 start 前必须重新同意。
 
 ### InterviewPlanSnapshot
 
@@ -287,6 +332,7 @@ AI 生成内容默认为 `draft`，未经面试官批准不得进入正式计划
 | `bank_slots` | 抽题槽位与规则 |
 | `question_candidate_pools` | 每个槽位冻结的 QuestionCandidatePool |
 | `experience_questions` | 已批准经历问题快照 |
+| `question_snapshots` | 本次选择后用于轮次与评分的题目快照列表；不得命名为 `items` |
 | `estimated_minutes` | 预计时长 |
 | `selection_policy` | 随机检索和约束策略 |
 
@@ -303,6 +349,10 @@ AI 生成内容默认为 `draft`，未经面试官批准不得进入正式计划
 | `masked_email` | 脱敏邮箱 |
 | `masked_phone` | 脱敏手机号 |
 | `consent_version` | 本次同意版本 |
+| `privacy_accepted` | 已验证的隐私同意事实 |
+| `recording_accepted` | 已验证的录音同意事实 |
+| `consent_notice_hash` | 对应告知内容哈希 |
+| `consented_at` | 服务端记录的同意时间 |
 
 ### QuestionSelection
 
@@ -333,7 +383,7 @@ AI 生成内容默认为 `draft`，未经面试官批准不得进入正式计划
 | `plan_snapshot` | 不可变计划快照 |
 | `candidate` | 本次会话候选人快照 |
 | `status` | 见状态机 |
-| `settings` | 录音、文本兜底、数字人和语言配置 |
+| `settings` | 录音、数字人和语言配置 |
 | `random_seed` | 抽题随机种子，创建后不可变 |
 | `current_turn_id` | 当前轮次 |
 | `current_report_id` | 当前报告 revision ID |
@@ -344,6 +394,8 @@ AI 生成内容默认为 `draft`，未经面试官批准不得进入正式计划
 | `completed_at` | 完成时间 |
 
 状态、抽题、轮次推进和报告触发只能由生命周期命令改变。REST、WebSocket、数字人、STT、评分和 worker 只提交命令或效果结果。
+
+候选人持有独立短期 `candidate_session_token`，它不授予后台资源访问权。Candidate Session Projection 使用 allow-list，只暴露姓名、会话状态、轮次 ID/顺序/状态，以及当前或已完成轮次的题干；不得暴露 token 本身、联系方式、计划/候选池、未来题干、`question_snapshot.standard_answer`、rubric、评分 revision 或报告。候选人录音提交还必须证明媒体属于当前 `interview_id + current_turn_id`。
 
 ### InterviewLifecycleEvent
 
@@ -462,9 +514,11 @@ AI 生成内容默认为 `draft`，未经面试官批准不得进入正式计划
 
 `job_fit_level` 是证据化辅助判断，不等于录用/淘汰决定。企业复核人可查看题目、音频、转写和评分，修正转写后产生新的评分与报告 revision；旧 revision 禁止覆盖。
 
+生成报告时先从每个 `CandidateAnswer.current_evaluation_id` 物化唯一的 current evaluation 集合。`overall_score`、维度、证据、风险、`manual_review` 和 `evaluation_ids` 必须全部从该集合计算；历史评分 revision 只属于引用它的历史报告，不能影响新报告。
+
 ### ModelProviderConfig、ModelRoute 与 ModelInvocationLog
 
-`ModelProviderConfig` 保存组织级 provider 配置与 `credential_ref`；`ModelRoute` 按 `organization_id + capability + purpose` 选择 primary、fallback、超时、重试和断路器策略；`ModelInvocationLog` 对每个 attempt 追加 provider、模型、延迟、成本、统一错误码和脱敏请求哈希。
+`ProviderManifest` 是安装期声明，不是租户聚合：它定义 provider 能力、非秘密 defaults、按 capability 的模型目录、`predefined/customizable` 选择模式和 runtime entrypoint。`ModelProviderConfig` 保存组织级 provider 配置与 `credential_ref`，创建时合并 manifest defaults 后校验；凭证不进入 defaults。多能力 Provider 的探针模型使用 `config.test_models[capability]`，旧 `test_model` 只在模型目录证明其属于当前能力时兼容读取，不能把 LLM 与 TTS 模型互换。配置更新携带 `expected_version`；未发送 `credentials` 表示保留现有密钥。`ModelRoute` 按 `organization_id + capability + purpose` 选择 primary、fallback、超时、重试和断路器策略；这一组合在组织内是应用层唯一键，重复创建必须冲突，不能让路由解析依赖列表顺序。route target 仅包含 `provider_config_id/model/timeout_s/pricing`，policy 仅包含 `retry_count/retry_backoff_ms/fallback_on/max_cost_usd_per_call/circuit_failure_threshold/circuit_recovery_seconds/readiness_ttl_seconds`，未知字段在 API 边界拒绝。`predefined` provider 的 route/测试模型必须在 manifest 中声明当前能力；`customizable` provider 可接受目录外模型。`ModelInvocationLog` 对每个 attempt 追加 provider、模型、延迟、成本、统一错误码和脱敏请求哈希。
 
 正式面试流程至少需要以下 purpose：
 
@@ -482,7 +536,7 @@ AI 生成内容默认为 `draft`，未经面试官批准不得进入正式计划
 
 ## 聚合版本与并发
 
-所有可变聚合根使用整数 `version` 做乐观并发，包括 `JobPosition`、`KnowledgeBase`、`Question`、`CandidateProfile`、`ResumeReview`、`ExperienceQuestion`、`RoleRequirement`、`InterviewPlan`、`InterviewAppointment`、`InterviewSession`、`ModelProviderConfig` 和 `ModelRoute`。
+所有可变聚合根使用整数 `version` 做乐观并发，包括 `JobPosition`、`KnowledgeBase`、`Question`、`CandidateProfile`、`ResumeDocument`、`ResumeReview`、`ExperienceQuestion`、`RoleRequirement`、`InterviewPlan`、`InterviewAppointment`、`InterviewSession`、`ModelProviderConfig` 和 `ModelRoute`。
 
 - 新聚合从 `version=1` 开始；写入必须匹配组织、ID 和旧 version。
 - 陈旧写入返回明确冲突，调用方重新读取并重新执行领域判断，不能静默覆盖。
@@ -507,6 +561,17 @@ stateDiagram-v2
   failed --> archived
 ```
 
+### ResumeDocument.ingestion_status
+
+```mermaid
+stateDiagram-v2
+  [*] --> processing
+  processing --> ready
+  processing --> failed
+```
+
+`ResumeDocument.status` 对调用方暴露 `processing/ready/failed`；细粒度阶段由 `FileObject.status/scan_status`、`DurableWorkItem.status` 和失败码共同表达。`local_upload` 先写隔离文件，`url_import` 由 worker 安全下载后进入同一处理器。失败重试复用同一工作项/简历版本；感染文件不得进入正式 FileObject，达到最大尝试后进入 dead-letter，只有审计后的人工重放才能继续。
+
 ### InterviewAppointment.status
 
 ```mermaid
@@ -525,8 +590,8 @@ stateDiagram-v2
 ```
 
 - `scheduled -> invited` 必须通过计划、题库、经历问题语音和 STT readiness gate。
-- `invited -> registered` 必须成功匹配候选人填报并保存同意记录。
-- `registered -> consumed` 与创建/启动唯一 `InterviewSession` 原子提交；重复 start 返回同一会话。
+- `invited -> registered` 必须成功匹配候选人填报并保存可验证的隐私/录音同意记录。
+- `registered -> consumed` 必须位于预约允许的 start 窗口，且设备和服务端 readiness fact 均未过期；准入判断、状态消费、创建/启动唯一 `InterviewSession` 在同一事务提交，重复 start 返回同一会话。
 
 ### InterviewSession.status
 
@@ -548,9 +613,9 @@ stateDiagram-v2
   paused --> cancelled
 ```
 
-- 候选人登记与设备就绪只进入 `waiting`；开始命令必须校验预约时间窗和生产 STT 路由。
+- 候选人登记与设备就绪只形成准入事实；公开 start 必须校验预约时间窗和生产 STT 路由，并在同一事务创建已进入 `in_progress` 的会话。
 - 岗位题库槽位按顺序选择并冻结问题；全部完成后才能进入 `resume_experience` 阶段。
-- 回答停止后进入 `transcribing`。只有服务端 final 或明确文本兜底才能进入 `evaluating`。
+- 回答停止后进入 `transcribing`。只有服务端 streaming/batch STT 的 authoritative final 才能进入 `evaluating`；客户端文本或浏览器 final 不是领域命令。
 - 评分完成后推进下一题；最后一题完成后形成 `completed` 并异步生成报告。
 - 暂停/断线保留当前轮次、选择事实和音频；恢复不得重新随机或重复评分。
 
@@ -603,7 +668,7 @@ stateDiagram-v2
 以下行为必须记录主体、组织、资源、时间和结果：
 
 - 创建或归档岗位，上传、编辑、发布题库，重建候选池或题目语音。
-- 上传、查看、下载或删除简历，触发 AI 审阅，编辑或批准经历问题。
+- 上传本地简历、提交 URL 导入、URL 拉取失败、扫描/解析、查看、下载或删除简历，触发 AI 审阅，编辑或批准经历问题。
 - 生成、修改、批准计划，创建、邀请、撤销、过期或消费预约。
 - 候选人填报、匹配成功/失败、同意隐私和录音告知。
 - 面试开始、随机选题、读题、STT final、暂停、恢复、结束和失败修复。
@@ -611,3 +676,10 @@ stateDiagram-v2
 - 新增、修改、测试或停用模型供应商配置和路由。
 
 审计载荷只保存资源 ID、结果和必要摘要，不保存明文 token、联系方式、简历、完整音频或供应商凭证。
+
+## 数据留存与删除
+
+- CandidateProfile 可设置 `retention_expires_at`。管理员留存任务默认只 dry-run，并记录候选 ID、数量和 cutoff；只有显式 `dry_run=false` 才执行物理/逻辑清理。
+- 清理会删除 PDF/解析文本私有对象和受控本地录音，清空联系人密文/查找哈希、简历审阅证据、经历题、转写、评分和报告敏感内容，并把聚合标为 `retention_purged`；仅保留最小资源 ID、时间和审计事实。
+- 物理文件删除在聚合状态提交前执行；删除失败时不把数据库伪标为已清理。已清理的签名 token 无法再解析到 ready FileObject。
+- 留存清理是管理员显式、不可逆动作；审计事件不得包含被删除正文或联系方式。

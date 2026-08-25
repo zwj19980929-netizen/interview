@@ -9,15 +9,25 @@ class InMemoryStore:
 
     def reset(self) -> None:
         self.questions: Dict[str, Dict[str, Any]] = {}
+        self.job_positions: Dict[str, Dict[str, Any]] = {}
+        self.knowledge_bases: Dict[str, Dict[str, Any]] = {}
+        self.question_speech_assets: Dict[str, Dict[str, Any]] = {}
         self.role_requirements: Dict[str, Dict[str, Any]] = {}
         self.interview_plans: Dict[str, Dict[str, Any]] = {}
+        self.candidate_profiles: Dict[str, Dict[str, Any]] = {}
+        self.resume_documents: Dict[str, Dict[str, Any]] = {}
+        self.file_objects: Dict[str, Dict[str, Any]] = {}
+        self.audit_events: Dict[str, Dict[str, Any]] = {}
+        self.resume_reviews: Dict[str, Dict[str, Any]] = {}
+        self.experience_questions: Dict[str, Dict[str, Any]] = {}
+        self.interview_appointments: Dict[str, Dict[str, Any]] = {}
+        self.candidate_intakes: Dict[str, Dict[str, Any]] = {}
         self.candidates: Dict[str, Dict[str, Any]] = {}
         self.interviews: Dict[str, Dict[str, Any]] = {}
         self.turns: Dict[str, Dict[str, Any]] = {}
         self.answers: Dict[str, Dict[str, Any]] = {}
         self.evaluations: Dict[str, Dict[str, Any]] = {}
         self.reports: Dict[str, Dict[str, Any]] = {}
-        self.vector_documents: Dict[str, Dict[str, Any]] = {}
         self.outbox_work_items: Dict[str, Dict[str, Any]] = {}
         self.provider_secrets: Dict[str, Dict[str, Any]] = {}
         self.provider_configs: Dict[str, Dict[str, Any]] = {
@@ -35,6 +45,7 @@ class InMemoryStore:
             }
         }
         self.model_routes: Dict[str, Dict[str, Any]] = {}
+        self.model_circuit_states: Dict[str, Dict[str, Any]] = {}
         self.model_invocations: List[Dict[str, Any]] = []
         self._after_reset()
 

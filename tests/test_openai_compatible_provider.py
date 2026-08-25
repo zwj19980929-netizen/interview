@@ -1,11 +1,21 @@
+import base64
+import hashlib
 import json
+import wave
+from io import BytesIO
 
 import httpx
 import pytest
 
 from app.model_gateway import capabilities as cap
 from app.model_gateway.gateway import ModelGateway
-from app.model_gateway.schemas import ChatJSONRequest, ChatMessage, TextEmbeddingRequest
+from app.model_gateway.schemas import (
+    ChatJSONRequest,
+    ChatMessage,
+    ChatTextRequest,
+    TextEmbeddingRequest,
+    TTSSynthesizeRequest,
+)
 from app.providers.openai_compatible.provider import OpenAICompatibleProvider
 from app.repositories.memory import InMemoryStore
 
@@ -17,6 +27,16 @@ def make_provider(handler):
         return httpx.AsyncClient(transport=transport, **kwargs)
 
     return OpenAICompatibleProvider(client_factory=client_factory)
+
+
+def wav_bytes(duration_ms: int = 1000, sample_rate: int = 8000) -> bytes:
+    output = BytesIO()
+    with wave.open(output, "wb") as target:
+        target.setnchannels(1)
+        target.setsampwidth(2)
+        target.setframerate(sample_rate)
+        target.writeframes(b"\x00\x00" * int(sample_rate * duration_ms / 1000))
+    return output.getvalue()
 
 
 @pytest.mark.anyio
@@ -89,6 +109,72 @@ async def test_openai_compatible_embedding_parses_vectors() -> None:
     assert response.vectors == [[0.1, 0.2], [0.3, 0.4]]
     assert response.dimensions == 2
     assert response.provider.request_id == "emb_test"
+
+
+@pytest.mark.anyio
+async def test_openai_compatible_chat_text_returns_plain_text() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "chat_text_test",
+                "choices": [{"message": {"content": "plain response"}}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+            },
+        )
+
+    response = await make_provider(handler).chat_text(
+        ChatTextRequest(purpose="summary", messages=[ChatMessage(role="user", content="ping")]),
+        config={"base_url": "https://models.example.com/v1"},
+        credentials={"api_key": "test-key"},
+        model="chat-model",
+        timeout_s=5,
+    )
+    assert response.text == "plain response"
+    assert response.usage.total_tokens == 5
+
+
+@pytest.mark.anyio
+async def test_openai_compatible_tts_returns_managed_data_audio() -> None:
+    seen = {}
+    audio = wav_bytes()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["authorization"] = request.headers.get("authorization")
+        seen["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            content=audio,
+            headers={"content-type": "audio/wav", "x-request-id": "speech_req_1"},
+        )
+
+    response = await make_provider(handler).synthesize_speech(
+        TTSSynthesizeRequest(
+            purpose="question_speech_generation",
+            text="请介绍一个项目。",
+            voice_profile_id="voice_default_cn",
+            format="audio/wav",
+        ),
+        config={"base_url": "https://api.openai.com/v1", "default_voice": "coral"},
+        credentials={"api_key": "test-key"},
+        model="gpt-4o-mini-tts",
+        timeout_s=5,
+    )
+
+    assert seen["url"] == "https://api.openai.com/v1/audio/speech"
+    assert seen["authorization"] == "Bearer test-key"
+    assert seen["payload"] == {
+        "model": "gpt-4o-mini-tts",
+        "input": "请介绍一个项目。",
+        "voice": "coral",
+        "response_format": "wav",
+        "speed": 1.0,
+    }
+    assert base64.b64decode(response.audio_uri.split(",", 1)[1]) == audio
+    assert response.content_hash == "sha256:%s" % hashlib.sha256(audio).hexdigest()
+    assert response.duration_ms == 1000
+    assert response.provider.request_id == "speech_req_1"
 
 
 @pytest.mark.anyio

@@ -25,6 +25,7 @@ class EvaluationService:
         self,
         answer: Dict[str, Any],
         question_snapshot: Dict[str, Any],
+        role_requirement: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         response = await self.gateway.invoke(
             cap.LLM_CHAT_JSON,
@@ -35,10 +36,12 @@ class EvaluationService:
                     ChatMessage(role="system", content="你是严格的面试评分助手，只输出结构化评分。"),
                     ChatMessage(
                         role="user",
-                        content="题目：%s\n标准答案：%s\n候选人回答：%s"
+                        content="题目：%s\n标准答案：%s\n评分标准：%s\n岗位要求：%s\n候选人回答：%s"
                         % (
                             question_snapshot["question_text"],
                             question_snapshot["standard_answer"],
+                            question_snapshot.get("rubric", {}),
+                            (role_requirement or {}).get("description", ""),
                             answer["final_transcript"],
                         ),
                     ),
@@ -51,6 +54,9 @@ class EvaluationService:
                         "dimension_scores",
                         "covered_key_points",
                         "missing_key_points",
+                        "incorrect_claims",
+                        "evidence",
+                        "review_flags",
                         "summary",
                     ],
                     "properties": {
@@ -60,6 +66,8 @@ class EvaluationService:
                         "covered_key_points": {"type": "array"},
                         "missing_key_points": {"type": "array"},
                         "incorrect_claims": {"type": "array"},
+                        "evidence": {"type": "array"},
+                        "review_flags": {"type": "array"},
                         "summary": {"type": "string"},
                         "suggested_followup": {"type": ["string", "null"]},
                     },
@@ -69,6 +77,9 @@ class EvaluationService:
                     "key_points": question_snapshot["key_points"],
                     "question_id": question_snapshot.get("source_question_id", question_snapshot["id"]),
                     "question_snapshot_id": question_snapshot["id"],
+                    "question_type": question_snapshot.get("source_type", "position_bank"),
+                    "role_requirement": role_requirement or {},
+                    "stt_confidence": answer.get("stt_confidence", 1.0),
                 },
             )
         )
@@ -87,6 +98,8 @@ class EvaluationService:
             "covered_key_points": data["covered_key_points"],
             "missing_key_points": data["missing_key_points"],
             "incorrect_claims": data.get("incorrect_claims", []),
+            "evidence": data.get("evidence", []),
+            "review_flags": data.get("review_flags", []),
             "feedback": data["summary"],
             "suggested_followup": data.get("suggested_followup"),
             "model_info": {
@@ -95,6 +108,9 @@ class EvaluationService:
                 "request_id": response.provider.request_id,
                 "prompt_version": "answer_evaluation.v1",
                 "rubric_source_question_version": question_snapshot["source_question_version"],
+                "scoring_profile": "resume_experience.v1"
+                if question_snapshot.get("source_type") == "resume_experience"
+                else "position_bank.v2",
             },
             "created_by": "system",
             "created_at": now,

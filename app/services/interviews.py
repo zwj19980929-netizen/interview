@@ -1,42 +1,79 @@
+import base64
 from copy import deepcopy
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+import hashlib
+import hmac
+import os
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app.core.errors import ApiError
 from app.core.ids import new_id
 from app.core.time import utc_now
+from app.domain.appointment_admission import AppointmentAdmission, ensure_utc, format_utc
 from app.domain.interview_lifecycle import (
     InterviewSessionLifecycle,
     LifecycleCommand,
     LifecycleCommandType,
     LifecycleDecision,
 )
+from app.model_gateway import capabilities as cap
+from app.model_gateway.gateway import ModelGateway
+from app.model_gateway.schemas import BatchSTTRequest
 from app.persistence.interface import Persistence, new_work_item
 from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
 from app.services.evaluation import EvaluationService
+from app.services.plan_assembly import InterviewPlanAssembly
 from app.services.reports import ReportService
 
 
 class InterviewService:
     """Transactional orchestration behind the InterviewSession lifecycle seam."""
 
-    def __init__(self, store: InMemoryStore, *, persistence: Optional[Persistence] = None) -> None:
+    def __init__(
+        self,
+        store: InMemoryStore,
+        *,
+        persistence: Optional[Persistence] = None,
+        clock: Optional[Callable[[], datetime]] = None,
+    ) -> None:
         self.persistence = persistence or persistence_for(store)
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.admission = AppointmentAdmission()
+        self.gateway = ModelGateway(store, persistence=self.persistence)
         self.lifecycle = InterviewSessionLifecycle()
         self.evaluation = EvaluationService(store, persistence=self.persistence)
         self.reports = ReportService(store, persistence=self.persistence)
+        self.plan_assembly = InterviewPlanAssembly(store, persistence=self.persistence)
 
     def list_interviews(self, organization_id: str = "org_default") -> List[Dict[str, Any]]:
         with self.persistence.transaction(organization_id) as transaction:
             return transaction.interview_sessions.list()
 
-    def create_interview(
+    def create_from_admitted_appointment(
         self,
-        payload: Dict[str, Any],
+        appointment_id: str,
         organization_id: str = "org_default",
     ) -> Dict[str, Any]:
         with self.persistence.transaction(organization_id) as transaction:
-            plan = transaction.interview_plans.get(payload["plan_id"])
+            existing = next(
+                (
+                    item
+                    for item in transaction.interview_sessions.list()
+                    if item.get("appointment_id") == appointment_id
+                ),
+                None,
+            )
+            if existing:
+                return existing
+            appointment = transaction.interview_appointments.get(appointment_id)
+            if appointment is None:
+                raise ApiError(
+                    "INTERVIEW_APPOINTMENT_NOT_FOUND",
+                    "Interview appointment does not exist.",
+                    status_code=404,
+                )
+            plan = transaction.interview_plans.get(appointment["plan_id"])
             if plan is None:
                 raise ApiError("INTERVIEW_PLAN_NOT_FOUND", "Interview plan does not exist.", status_code=404)
             if plan["status"] != "approved":
@@ -49,41 +86,100 @@ class InterviewService:
             if role is None:
                 raise ApiError("ROLE_REQUIREMENT_NOT_FOUND", "Role requirement does not exist.", status_code=404)
 
+            now_dt = ensure_utc(self.clock())
+            candidate_intake = next(
+                (
+                    item
+                    for item in transaction.candidate_intakes.list()
+                    if item.get("appointment_id") == appointment_id
+                ),
+                None,
+            )
+            readiness = self.admission.plan_readiness(
+                transaction,
+                plan,
+                now=now_dt,
+                ttl_seconds=int(
+                    appointment.get("admission_policy", {}).get(
+                        "model_readiness_ttl_seconds",
+                        60,
+                    )
+                ),
+            )
+            self.admission.validate_start(
+                appointment,
+                candidate_intake,
+                readiness,
+                now=now_dt,
+            )
+            candidate_profile = transaction.candidate_profiles.get(appointment["candidate_profile_id"])
+            if candidate_profile is None:
+                raise ApiError("CANDIDATE_PROFILE_NOT_FOUND", "Candidate profile does not exist.", status_code=404)
+            payload = {
+                "candidate_profile_id": candidate_profile["id"],
+                "candidate": {
+                    "name": candidate_profile["name"],
+                    "email": candidate_profile.get("email_masked") or "protected",
+                    "phone": candidate_profile.get("phone_masked") or "protected",
+                    "metadata": {"candidate_profile_id": candidate_profile["id"]},
+                },
+                "scheduled_at": appointment["scheduled_start_at"],
+                "settings": deepcopy(appointment.get("settings", {})),
+            }
+
+            session_seed = payload.get("session_seed") or new_id("session_seed")
+            question_selections, turn_blueprints = self.plan_assembly.materialize_execution(
+                transaction,
+                plan,
+                session_seed,
+            )
             interview_id = new_id("iv")
-            now = utc_now()
+            now = format_utc(now_dt)
             candidate = {
-                "id": new_id("cand"),
+                "id": payload.get("candidate_profile_id") or new_id("cand"),
                 "organization_id": organization_id,
                 "interview_id": interview_id,
                 "name": payload["candidate"]["name"],
                 "email": payload["candidate"].get("email"),
+                "phone": payload["candidate"].get("phone"),
                 "metadata": deepcopy(payload["candidate"].get("metadata", {})),
+                "candidate_intake_id": (candidate_intake or {}).get("id"),
+                "consent_version": (candidate_intake or {}).get("consent_version"),
+                "privacy_accepted": (candidate_intake or {}).get("privacy_accepted"),
+                "recording_accepted": (candidate_intake or {}).get("recording_accepted"),
+                "consent_notice_hash": (candidate_intake or {}).get("notice_hash"),
+                "consented_at": (candidate_intake or {}).get("consented_at"),
                 "created_at": now,
             }
             turns: List[Dict[str, Any]] = []
-            snapshot_items: List[Dict[str, Any]] = []
-            for plan_item in sorted(plan["items"], key=lambda item: item["order"]):
-                question = transaction.questions.get(plan_item["question_id"])
+            question_snapshots: List[Dict[str, Any]] = []
+            for blueprint in sorted(turn_blueprints, key=lambda item: item["order"]):
+                source_type = blueprint.get("source_type", "position_bank")
+                question = deepcopy(blueprint.get("frozen_question")) or (
+                    transaction.experience_questions.get(blueprint["question_id"])
+                    if source_type == "resume_experience"
+                    else transaction.questions.get(blueprint["question_id"])
+                )
                 if question is None:
                     raise ApiError(
                         "INTERVIEW_PLAN_QUESTION_NOT_FOUND",
                         "An approved plan refers to a question that no longer exists.",
                         status_code=409,
                     )
-                question_snapshot = self._question_snapshot(question, now)
-                snapshot_item = deepcopy(plan_item)
-                snapshot_item["question_snapshot_id"] = question_snapshot["id"]
-                snapshot_items.append(snapshot_item)
+                question_snapshot = self._question_snapshot(question, now, source_type=source_type)
+                snapshot_entry = deepcopy(blueprint)
+                snapshot_entry["question_snapshot_id"] = question_snapshot["id"]
+                question_snapshots.append(snapshot_entry)
                 turns.append(
                     {
                         "id": new_id("turn"),
                         "interview_id": interview_id,
-                        "plan_item_id": plan_item["id"],
-                        "plan_item_snapshot_id": plan_item["id"],
+                        "turn_blueprint_id": blueprint["id"],
                         "question_id": question["id"],
                         "question_snapshot_id": question_snapshot["id"],
                         "question_snapshot": question_snapshot,
-                        "order": plan_item["order"],
+                        "order": blueprint["order"],
+                        "phase": source_type,
                         "status": "pending",
                         "question_spoken_text": question_snapshot["spoken_text"],
                         "started_at": None,
@@ -98,20 +194,33 @@ class InterviewService:
                 "approved_at": plan.get("approved_at") or plan["updated_at"],
                 "estimated_minutes": plan["estimated_minutes"],
                 "assembly_policy": deepcopy(plan.get("assembly_policy", {})),
+                "selection_policy": deepcopy(plan.get("selection_policy", plan.get("assembly_policy", {}))),
                 "assembly_summary": deepcopy(plan.get("assembly_summary", {})),
                 "role_requirement": deepcopy(role),
-                "items": snapshot_items,
+                "question_snapshots": question_snapshots,
+                "job_position_id": plan.get("job_position_id"),
+                "candidate_profile_id": plan.get("candidate_profile_id"),
+                "resume_review_id": plan.get("resume_review_id"),
+                "knowledge_base_ids": deepcopy(plan.get("knowledge_base_ids", [])),
+                "knowledge_base_snapshots": deepcopy(plan.get("knowledge_base_snapshots", [])),
+                "bank_slots": deepcopy(plan.get("bank_slots", [])),
+                "experience_question_ids": deepcopy(plan.get("experience_question_ids", [])),
+                "experience_question_snapshots": deepcopy(plan.get("experience_question_snapshots", [])),
+                "question_selections": deepcopy(question_selections),
                 "created_at": now,
             }
-            candidate_session_token = new_id("candidate_token")
             session = {
                 "id": interview_id,
                 "organization_id": organization_id,
+                "appointment_id": appointment_id,
                 "plan_id": plan["id"],
                 "plan_snapshot": plan_snapshot,
                 "candidate_id": candidate["id"],
                 "candidate": candidate,
                 "status": "scheduled",
+                "phase": turns[0].get("phase", "position_bank") if turns else "position_bank",
+                "session_seed": session_seed,
+                "question_selections": deepcopy(question_selections),
                 "settings": deepcopy(payload.get("settings", {})),
                 "scheduled_at": payload.get("scheduled_at"),
                 "current_turn_id": None,
@@ -129,15 +238,34 @@ class InterviewService:
                 "completed_at": None,
                 "created_at": now,
                 "updated_at": now,
-                "candidate_session_token": candidate_session_token,
-                "candidate_join_url": "/#candidate/%s?token=%s" % (interview_id, candidate_session_token),
             }
             decision = self.lifecycle.execute(
                 session,
                 LifecycleCommand(LifecycleCommandType.CREATE),
                 now=now,
             )
-            return transaction.interview_sessions.add(decision.session)
+            decision = self.lifecycle.execute(
+                decision.session,
+                LifecycleCommand(LifecycleCommandType.START),
+                now=now,
+            )
+            session = transaction.interview_sessions.add(decision.session)
+            appointment = transaction.interview_appointments.get(appointment_id)
+            if appointment is None or appointment["status"] != "registered":
+                raise ApiError(
+                    "APPOINTMENT_NOT_REGISTERED",
+                    "Appointment must be registered before session creation.",
+                    status_code=409,
+                )
+            appointment["status"] = "consumed"
+            appointment["consumed_at"] = now
+            appointment["consumed_token_hash"] = appointment.get("invitation_token_hash")
+            appointment["invitation_token_hash"] = None
+            appointment["updated_at"] = now
+            transaction.interview_appointments.update(
+                appointment, expected_version=appointment["version"]
+            )
+            return session
 
     def mark_participant_ready(
         self,
@@ -156,18 +284,6 @@ class InterviewService:
             organization_id,
         )
         return session
-
-    def start_interview(
-        self,
-        interview_id: str,
-        organization_id: str = "org_default",
-    ) -> Dict[str, Any]:
-        session, _ = self._apply_command(
-            interview_id,
-            LifecycleCommand(LifecycleCommandType.START),
-            organization_id,
-        )
-        return self._start_response(session)
 
     def pause_interview(
         self,
@@ -240,6 +356,44 @@ class InterviewService:
         with self.persistence.transaction(organization_id) as transaction:
             return self._required(transaction.interview_sessions.get(interview_id))
 
+    def get_candidate_interview(
+        self,
+        interview_id: str,
+        token: Optional[str],
+        organization_id: str = "org_default",
+    ) -> Dict[str, Any]:
+        self.validate_candidate_token(interview_id, token, organization_id)
+        session = deepcopy(self.get_interview(interview_id, organization_id))
+        current_turn_id = session.get("current_turn_id")
+        turns = []
+        for turn in session.get("turns", []):
+            projection = {
+                "id": turn["id"],
+                "order": turn["order"],
+                "status": turn["status"],
+            }
+            if turn["id"] == current_turn_id or turn["status"] in {"completed", "skipped"}:
+                projection["question_spoken_text"] = turn.get("question_spoken_text", "")
+            turns.append(projection)
+        return {
+            "id": session["id"],
+            "status": session["status"],
+            "phase": session.get("phase"),
+            "current_turn_id": current_turn_id,
+            "candidate": {"name": session.get("candidate", {}).get("name", "候选人")},
+            "turns": turns,
+            "answers": [
+                {
+                    "id": answer.get("id"),
+                    "turn_id": answer.get("turn_id"),
+                    "evaluation_status": answer.get("evaluation_status"),
+                }
+                for answer in session.get("answers", [])
+            ],
+            "created_at": session.get("created_at"),
+            "updated_at": session.get("updated_at"),
+        }
+
     def list_lifecycle_events(
         self,
         interview_id: str,
@@ -277,20 +431,94 @@ class InterviewService:
         organization_id: str = "org_default",
     ) -> None:
         session = self.get_interview(interview_id, organization_id)
-        if not token or token != session.get("candidate_session_token"):
+        expected = self._candidate_session_token(session)
+        if not token or not hmac.compare_digest(str(token), expected):
             raise ApiError("CANDIDATE_SESSION_TOKEN_INVALID", "Candidate session token is invalid.", status_code=403)
 
-    async def submit_answer(
+    def candidate_join_url(self, session: Dict[str, Any]) -> str:
+        return "/#candidate/%s?token=%s" % (session["id"], self._candidate_session_token(session))
+
+    def _candidate_session_token(self, session: Dict[str, Any]) -> str:
+        secret = os.getenv("INTERVIEWER_CANDIDATE_TOKEN_SECRET", "").strip()
+        if not secret:
+            if os.getenv("INTERVIEWER_RUNTIME_ENV", "development").lower() == "production":
+                raise ApiError(
+                    "CANDIDATE_TOKEN_SECRET_REQUIRED",
+                    "Candidate session token signing is not configured.",
+                    status_code=503,
+                )
+            secret = "local-development-candidate-token-secret"
+        if os.getenv("INTERVIEWER_RUNTIME_ENV", "development").lower() == "production" and len(secret) < 32:
+            raise ApiError(
+                "CANDIDATE_TOKEN_SECRET_WEAK",
+                "Candidate session token signing secret must contain at least 32 characters.",
+                status_code=503,
+            )
+        payload = "%s:%s" % (session["id"], session.get("created_at", ""))
+        digest = hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest()
+        encoded = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+        return "candidate.%s" % encoded
+
+    async def submit_candidate_audio_answer(
+        self,
+        interview_id: str,
+        token: Optional[str],
+        payload: Dict[str, Any],
+        organization_id: str = "org_default",
+    ) -> Dict[str, Any]:
+        self.validate_candidate_token(interview_id, token, organization_id)
+        session = self.get_interview(interview_id, organization_id)
+        turn_id = self._resolve_turn_id(session, payload.get("turn_id"), None)
+        expected_prefix = "/media/%s/%s/" % (interview_id, turn_id)
+        if not str(payload.get("audio_uri") or "").startswith(expected_prefix):
+            raise ApiError(
+                "CANDIDATE_AUDIO_SCOPE_INVALID",
+                "Candidate audio must belong to the active interview turn.",
+                status_code=403,
+            )
+        return await self.submit_audio_answer(interview_id, payload, organization_id)
+
+    def record_heartbeat(
+        self,
+        interview_id: str,
+        *,
+        participant: str,
+        organization_id: str = "org_default",
+    ) -> Dict[str, Any]:
+        with self.persistence.transaction(organization_id) as transaction:
+            session = self._required(transaction.interview_sessions.get(interview_id))
+            now = utc_now()
+            session.setdefault("heartbeats", {})[participant] = now
+            session["last_activity_at"] = now
+            session["updated_at"] = now
+            updated = transaction.interview_sessions.update(session, expected_version=session["version"])
+        return {"interview_id": interview_id, "participant": participant, "received_at": now, "version": updated["version"]}
+
+    async def _accept_authoritative_transcript(
         self,
         interview_id: str,
         payload: Dict[str, Any],
         organization_id: str = "org_default",
     ) -> Dict[str, Any]:
+        transcript_source = payload.get("transcript_source")
+        provider = payload.get("stt_provider") or {}
+        if (
+            transcript_source not in {"server_batch", "server_streaming"}
+            or not provider.get("provider_id")
+            or not payload.get("audio_uri")
+        ):
+            raise ApiError(
+                "AUTHORITATIVE_TRANSCRIPT_REQUIRED",
+                "Answers require server STT provenance and a persisted audio reference.",
+                status_code=409,
+            )
         with self.persistence.transaction(organization_id) as transaction:
             session = self._required(transaction.interview_sessions.get(interview_id))
             starting_event_sequence = len(session.get("lifecycle_events", []))
             turn_id = self._resolve_turn_id(session, payload.get("turn_id"), payload.get("question_id"))
-            turn = self.lifecycle.require_active_turn(session, turn_id, allowed_statuses=("asking",))
+            turn = self.lifecycle.require_active_turn(
+                session, turn_id, allowed_statuses=("asking", "transcribing")
+            )
             now = utc_now()
             answer = {
                 "id": new_id("ans"),
@@ -303,6 +531,17 @@ class InterviewService:
                 "final_transcript": payload["final_transcript"],
                 "audio_uri": payload.get("audio_uri"),
                 "stt_confidence": payload.get("stt_confidence", 1.0),
+                "transcript_source": transcript_source,
+                "stt_provider": deepcopy(payload.get("stt_provider")),
+                "transcript_segments": deepcopy(payload.get("transcript_segments", [])),
+                "transcript_revisions": [
+                    {
+                        "revision": 1,
+                        "text": payload["final_transcript"],
+                        "source": transcript_source,
+                        "created_at": now,
+                    }
+                ],
                 "language": payload.get("language", "zh-CN"),
                 "duration_seconds": payload.get("duration_seconds", 0),
                 "evaluation_status": "pending",
@@ -339,6 +578,131 @@ class InterviewService:
                 if item["sequence"] > starting_event_sequence
             ],
         }
+
+    async def submit_audio_answer(
+        self,
+        interview_id: str,
+        payload: Dict[str, Any],
+        organization_id: str = "org_default",
+    ) -> Dict[str, Any]:
+        if (
+            payload.get("development_transcript")
+            and os.getenv("INTERVIEWER_RUNTIME_ENV", "development").lower() == "production"
+        ):
+            raise ApiError(
+                "DEVELOPMENT_TRANSCRIPT_NOT_ALLOWED",
+                "Development transcript injection is disabled in production.",
+                status_code=409,
+            )
+        session = self.get_interview(interview_id, organization_id)
+        turn_id = self._resolve_turn_id(session, payload.get("turn_id"), None)
+        self.lifecycle.require_active_turn(session, turn_id, allowed_statuses=("asking",))
+        self._apply_command(
+            interview_id,
+            LifecycleCommand(
+                LifecycleCommandType.TRANSCRIPTION_STARTED,
+                {
+                    "turn_id": turn_id,
+                    "recording": {
+                        "audio_uri": payload["audio_uri"],
+                        "content_type": payload.get("content_type", "audio/webm;codecs=opus"),
+                    },
+                },
+            ),
+            organization_id,
+        )
+        try:
+            response = await self.gateway.invoke(
+                cap.STT_BATCH,
+                BatchSTTRequest(
+                    organization_id=organization_id,
+                    purpose="candidate_answer_repair",
+                    audio_uri=payload["audio_uri"],
+                    content_type=payload.get("content_type", "audio/webm;codecs=opus"),
+                    language=payload.get("language", "zh-CN"),
+                    metadata={
+                        "development_transcript": payload.get("development_transcript"),
+                        "confidence": payload.get("development_confidence", 0.9),
+                        "duration_ms": int(payload.get("duration_seconds", 0)) * 1000,
+                    },
+                ),
+            )
+        except Exception as exc:
+            self._apply_command(
+                interview_id,
+                LifecycleCommand(
+                    LifecycleCommandType.TRANSCRIPTION_FAILED,
+                    {"turn_id": turn_id, "error": str(exc)},
+                ),
+                organization_id,
+            )
+            raise
+        result = await self._accept_authoritative_transcript(
+            interview_id,
+            {
+                "turn_id": turn_id,
+                "final_transcript": response.text,
+                "raw_transcript": response.text,
+                "stt_confidence": response.confidence,
+                "language": response.language,
+                "duration_seconds": payload.get("duration_seconds", 0),
+                "audio_uri": payload["audio_uri"],
+                "transcript_source": response.source,
+                "stt_provider": response.provider.model_dump(),
+                "transcript_segments": [item.model_dump() for item in response.segments],
+            },
+            organization_id,
+        )
+        result["transcription"] = response.model_dump()
+        return result
+
+    async def submit_streaming_answer(
+        self,
+        interview_id: str,
+        payload: Dict[str, Any],
+        organization_id: str = "org_default",
+    ) -> Dict[str, Any]:
+        """Accept only a validated provider final from the server-side stream module."""
+        provider = payload.get("provider") or {}
+        if not payload.get("final_transcript") or not provider.get("provider_id"):
+            raise ApiError(
+                "STREAMING_TRANSCRIPT_INVALID",
+                "Streaming answers require an authoritative provider final.",
+                status_code=409,
+            )
+        session = self.get_interview(interview_id, organization_id)
+        turn_id = self._resolve_turn_id(session, payload.get("turn_id"), None)
+        self.lifecycle.require_active_turn(session, turn_id, allowed_statuses=("asking",))
+        self._apply_command(
+            interview_id,
+            LifecycleCommand(
+                LifecycleCommandType.TRANSCRIPTION_STARTED,
+                {
+                    "turn_id": turn_id,
+                    "recording": {
+                        "audio_uri": payload["audio_uri"],
+                        "content_type": payload.get("content_type", "audio/webm;codecs=opus"),
+                    },
+                },
+            ),
+            organization_id,
+        )
+        return await self._accept_authoritative_transcript(
+            interview_id,
+            {
+                "turn_id": turn_id,
+                "final_transcript": payload["final_transcript"],
+                "raw_transcript": payload["final_transcript"],
+                "stt_confidence": payload.get("confidence", 0.0),
+                "language": payload.get("language", "zh-CN"),
+                "duration_seconds": payload.get("duration_seconds", 0),
+                "audio_uri": payload["audio_uri"],
+                "transcript_source": "server_streaming",
+                "stt_provider": deepcopy(provider),
+                "transcript_segments": deepcopy(payload.get("segments", [])),
+            },
+            organization_id,
+        )
 
     async def regrade_answer(
         self,
@@ -443,7 +807,11 @@ class InterviewService:
             question_snapshot = deepcopy(self._turn_by_id(session, answer["turn_id"])["question_snapshot"])
 
         try:
-            evaluation = await self.evaluation.evaluate_answer(answer, question_snapshot)
+            evaluation = await self.evaluation.evaluate_answer(
+                answer,
+                question_snapshot,
+                session.get("plan_snapshot", {}).get("role_requirement"),
+            )
         except Exception as exc:
             with self.persistence.transaction(organization_id) as transaction:
                 session = self._required(transaction.interview_sessions.get(interview_id))
@@ -640,20 +1008,28 @@ class InterviewService:
                 return turn["id"]
         return session.get("current_turn_id")
 
-    def _question_snapshot(self, question: Dict[str, Any], created_at: str) -> Dict[str, Any]:
+    def _question_snapshot(
+        self,
+        question: Dict[str, Any],
+        created_at: str,
+        *,
+        source_type: str = "position_bank",
+    ) -> Dict[str, Any]:
         return {
             "id": new_id("question_snapshot"),
             "source_question_id": question["id"],
             "source_question_version": question["version"],
-            "title": question["title"],
+            "source_type": source_type,
+            "title": question.get("title") or ("简历经历问题" if source_type == "resume_experience" else "面试题"),
             "question_text": question["question_text"],
             "spoken_text": question["question_text"],
             "standard_answer": question["standard_answer"],
             "key_points": deepcopy(question["key_points"]),
             "rubric": deepcopy(question.get("rubric", {})),
-            "difficulty": question["difficulty"],
-            "type": question["type"],
+            "difficulty": question.get("difficulty", "mid"),
+            "type": question.get("type", "resume_experience"),
             "skills": deepcopy(question.get("skills", [])),
+            "speech_asset_id": question.get("speech_asset_id"),
             "created_at": created_at,
         }
 
@@ -680,12 +1056,3 @@ class InterviewService:
             return None
         report = next((item for item in session.get("report_revisions", []) if item["id"] == report_id), None)
         return deepcopy(report) if report else None
-
-    def _start_response(self, session: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "id": session["id"],
-            "status": session["status"],
-            "live_ws_url": "/api/v1/interviews/%s/live" % session["id"],
-            "current_turn_id": session.get("current_turn_id"),
-            "version": session["version"],
-        }
