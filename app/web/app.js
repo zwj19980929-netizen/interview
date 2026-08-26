@@ -1896,8 +1896,14 @@ async function createProviderConnection(provider, form, submit) {
   const data = new FormData(form);
   setBusy(submit, true, "保存中");
   const item = await api(`${API}/admin/model-provider-connections`, { method: "POST", body: { provider_id: provider.provider_id, display_name: data.get("display_name"), enabled: true, connection_config: readSchemaForm(form, provider.connection_form, "connection"), credentials: readSchemaForm(form, provider.credential_form, "credential") } });
-  await refreshCollection("providerConnections");
-  closeModal(); render(); toast("厂商连接已保存", item.display_name);
+  try {
+    const validated = await api(`${API}/admin/model-provider-connections/${encodeURIComponent(item.id)}/validate`, { method: "POST" });
+    await refreshCollection("providerConnections"); closeModal(); render();
+    toast("厂商连接已验证", validated.last_validation?.message || item.display_name);
+  } catch (error) {
+    await refreshCollection("providerConnections"); closeModal(); render();
+    toast("连接已保存，但 API Key 校验失败", error.message, "error");
+  }
 }
 
 function openProviderEditModal(id) {
@@ -1919,7 +1925,7 @@ async function updateProviderConnection(current, provider, form, submit) {
 
 async function validateProviderConnection(id, button) {
   setBusy(button, true, "校验中");
-  try { const item = await api(`${API}/admin/model-provider-connections/${encodeURIComponent(id)}/validate`, { method: "POST" }); await refreshCollection("providerConnections"); render(); toast("连接字段有效", item.last_validation?.message || item.credential_status); }
+  try { const item = await api(`${API}/admin/model-provider-connections/${encodeURIComponent(id)}/validate`, { method: "POST" }); await refreshCollection("providerConnections"); render(); toast("API Key 有效", item.last_validation?.message || item.credential_status); }
   catch (error) { toast("连接校验失败", error.message, "error"); }
   finally { setBusy(button, false); }
 }

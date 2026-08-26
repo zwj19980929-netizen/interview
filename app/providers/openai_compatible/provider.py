@@ -34,6 +34,27 @@ class OpenAICompatibleProvider:
     def __init__(self, client_factory: Optional[AsyncClientFactory] = None) -> None:
         self.client_factory = client_factory or httpx.AsyncClient
 
+    async def validate_credentials(
+        self, config: Dict[str, Any], credentials: Dict[str, Any], *, timeout_s: int = 10
+    ) -> Dict[str, str]:
+        response = await self._get(
+            "%s/models" % _base_url(config),
+            api_key=_api_key(credentials),
+            timeout_s=timeout_s,
+            use_environment_proxy=bool(config.get("use_environment_proxy", False)),
+        )
+        models = response.get("data")
+        if not isinstance(models, list):
+            raise ProviderError(
+                "provider_schema_invalid",
+                "Provider model-list response was invalid.",
+                retryable=True,
+            )
+        return {
+            "status": "valid",
+            "message": "API Key authenticated successfully; provider returned %s accessible models." % len(models),
+        }
+
     async def invoke(self, capability: str, request: Any, context: ProviderContext) -> Any:
         if capability == cap.LLM_CHAT_JSON and isinstance(request, ChatJSONRequest):
             return await self.chat_json(
@@ -337,6 +358,42 @@ class OpenAICompatibleProvider:
                 "provider_schema_invalid",
                 "Provider response was not valid JSON.",
                 retryable=True,
+            ) from exc
+
+    async def _get(
+        self,
+        url: str,
+        *,
+        api_key: str,
+        timeout_s: int,
+        use_environment_proxy: bool = False,
+    ) -> Dict[str, Any]:
+        try:
+            async with self.client_factory(timeout=timeout_s, trust_env=use_environment_proxy) as client:
+                response = await client.get(url, headers={"Authorization": "Bearer %s" % api_key})
+        except ImportError as exc:
+            raise ProviderError(
+                "provider_transport_unavailable",
+                "Provider HTTP transport or configured proxy dependency is unavailable.",
+                retryable=False,
+            ) from exc
+        except httpx.TimeoutException as exc:
+            raise ProviderError("provider_timeout", "Provider credential validation timed out.", retryable=True) from exc
+        except httpx.HTTPError as exc:
+            raise ProviderError("provider_server_error", "Provider credential validation failed.", retryable=True) from exc
+        if response.status_code in {401, 403}:
+            raise ProviderError("provider_auth_failed", "Provider credentials were rejected.", retryable=False)
+        if response.status_code == 429:
+            raise ProviderError("provider_rate_limited", "Provider rate limited credential validation.", retryable=True)
+        if response.status_code >= 500:
+            raise ProviderError("provider_server_error", "Provider returned a server error.", retryable=True)
+        if response.status_code >= 400:
+            raise ProviderError("provider_bad_request", "Provider rejected credential validation.", retryable=False)
+        try:
+            return response.json()
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ProviderError(
+                "provider_schema_invalid", "Provider credential response was not valid JSON.", retryable=True
             ) from exc
 
     async def _post_binary(

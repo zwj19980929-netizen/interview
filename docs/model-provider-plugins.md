@@ -563,7 +563,7 @@ readiness 是带检查时间和有效期的事实，不是永久布尔值；超�
 | --- | --- | --- |
 | `GET` | `/api/v1/admin/model-providers/catalog` | 查看系统已安装 provider 插件和能力 |
 | `POST/GET/PATCH` | `/api/v1/admin/model-provider-connections` | 管理组织级厂商连接，凭证字段脱敏 |
-| `POST` | `/api/v1/admin/model-provider-connections/{id}/validate` | 本地校验连接和凭证完整性 |
+| `POST` | `/api/v1/admin/model-provider-connections/{id}/validate` | 通过 Provider adapter 执行真实凭证鉴权探针 |
 | `GET` | `/api/v1/admin/model-provider-connections/{id}/model-catalog` | 获取模型类型、目录和动态表单 |
 | `POST/GET/PATCH` | `/api/v1/admin/model-configurations` | 管理具体模型配置 |
 | `POST` | `/api/v1/admin/model-configurations/{id}/test` | 对具体模型执行能力探针 |
@@ -572,6 +572,8 @@ readiness 是带检查时间和有效期的事实，不是永久布尔值；超�
 | `POST` | `/api/v1/admin/model-routes/{id}/test` | 测试路由和 fallback |
 
 两个 `PATCH` 都必须携带 `expected_version`。连接文档和凭证引用使用同一租户事务更新；并发版本不匹配时拒绝写入。连接编辑时空密码不能清除现有密钥。模型测试只使用 ModelConfiguration 已保存的模型标识与参数，不允许客户端在测试时临时替换模型。`llm.chat_json` 连通性探针必须携带最小 JSON Schema；对仅支持 `json_object` 的厂商，adapter 同时下发 schema、合法 JSON 示例和 `response_format` JSON Object 约束，避免把普通文本响应误判为结构化输出。
+
+ProviderConnection 凭证校验也属于 Provider adapter seam：管理服务只调用 `validate_credentials(connection_config, credentials)` 并保存状态，具体鉴权方式由插件吸收。OpenAI-compatible、DeepSeek 与 DashScope 优先使用 Bearer 认证的模型列表接口，不产生文本生成费用；没有独立凭证接口的厂商可由插件使用最小、固定模型探针，或显式返回 `model_required`。鉴权成功只证明 API Key 与连接端点有效，不代表所有具体模型均已授权、可调用或符合业务 schema；每个 ModelConfiguration 仍必须单独测试。
 
 新增供应商插件后，`catalog` 必须能读出 manifest，不需要改业务服务。
 

@@ -77,6 +77,47 @@ async def test_vendor_chat_json_reuses_compatible_runtime_with_json_object(
 
 
 @pytest.mark.anyio
+async def test_deepseek_validates_api_key_with_model_list_without_generation() -> None:
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["method"] = request.method
+        seen["url"] = str(request.url)
+        seen["authorization"] = request.headers.get("authorization")
+        return httpx.Response(200, json={"object": "list", "data": [{"id": "deepseek-v4-pro"}]})
+
+    result = await make_provider(DeepSeekProvider, handler).validate_credentials(
+        {"base_url": "https://api.deepseek.com"}, {"api_key": "deepseek-key"}, timeout_s=5
+    )
+
+    assert seen == {
+        "method": "GET",
+        "url": "https://api.deepseek.com/models",
+        "authorization": "Bearer deepseek-key",
+    }
+    assert result["status"] == "valid"
+
+
+@pytest.mark.anyio
+async def test_zhipu_validates_api_key_with_minimal_provider_owned_probe() -> None:
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200, json={"id": "credential_probe", "choices": [{"message": {"content": "pong"}}]}
+        )
+
+    result = await make_provider(ZhipuAIProvider, handler).validate_credentials(
+        {"base_url": "https://open.bigmodel.cn/api/paas/v4"}, {"api_key": "zhipu-key"}, timeout_s=5
+    )
+
+    assert seen["payload"]["model"] == "glm-4.7-flash"
+    assert seen["payload"]["max_tokens"] == 1
+    assert result["status"] == "valid"
+
+
+@pytest.mark.anyio
 async def test_zhipu_glm_tts_uses_official_speech_contract() -> None:
     seen = {}
 

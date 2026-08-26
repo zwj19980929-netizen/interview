@@ -1,7 +1,7 @@
 from typing import Any, Dict
 
 from app.model_gateway.errors import ProviderError
-from app.model_gateway.schemas import TTSSynthesizeRequest, TTSSynthesizeResponse
+from app.model_gateway.schemas import ChatMessage, ChatTextRequest, TTSSynthesizeRequest, TTSSynthesizeResponse
 from app.providers.openai_compatible.provider import OpenAICompatibleProvider
 
 
@@ -10,6 +10,26 @@ class ZhipuAIProvider(OpenAICompatibleProvider):
 
     provider_id = "zhipuai"
     structured_output_mode = "json_object"
+
+    async def validate_credentials(
+        self, config: Dict[str, Any], credentials: Dict[str, Any], *, timeout_s: int = 10
+    ) -> Dict[str, str]:
+        await self.chat_text(
+            ChatTextRequest(
+                purpose="provider_credential_validation",
+                messages=[ChatMessage(role="user", content="ping")],
+                temperature=0,
+                max_output_tokens=1,
+            ),
+            config=config,
+            credentials=credentials,
+            model="glm-4.7-flash",
+            timeout_s=timeout_s,
+        )
+        return {
+            "status": "valid",
+            "message": "API Key authenticated successfully with the provider credential probe.",
+        }
 
     async def synthesize_speech(
         self,

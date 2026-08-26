@@ -151,6 +151,42 @@ async def test_untested_model_can_run_probe_and_receives_saved_defaults() -> Non
     assert service.list_model_configurations()[0]["status"] == "ready"
 
 
+@pytest.mark.anyio
+async def test_provider_connection_validation_crosses_provider_adapter_seam() -> None:
+    store = reset_store_for_tests()
+    service = ModelAdminService(store)
+    connection = service.create_provider_connection(
+        {
+            "provider_id": "deepseek",
+            "display_name": "Credential preflight",
+            "connection_config": {},
+            "credentials": {"api_key": "test-key"},
+        }
+    )
+    seen = {}
+
+    class Adapter:
+        provider_id = "deepseek"
+
+        async def invoke(self, capability, request, context):
+            raise AssertionError("credential validation must not invoke a configured model")
+
+        async def validate_credentials(self, config, credentials, *, timeout_s):
+            seen.update(config=config, credentials=credentials, timeout_s=timeout_s)
+            return {"status": "valid", "message": "Remote credentials accepted."}
+
+    service.gateway = ModelGateway(store, provider_clients={"deepseek": Adapter()})
+    result = await service.validate_provider_connection(connection["id"])
+
+    assert result["credential_status"] == "valid"
+    assert result["last_validation"]["message"] == "Remote credentials accepted."
+    assert seen == {
+        "config": {"base_url": "https://api.deepseek.com", "use_environment_proxy": False},
+        "credentials": {"api_key": "test-key"},
+        "timeout_s": 10,
+    }
+
+
 def test_legacy_documents_migrate_without_dual_route_representation() -> None:
     legacy = {
         "id": "mpc_legacy",

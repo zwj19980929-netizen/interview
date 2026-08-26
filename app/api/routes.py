@@ -179,7 +179,7 @@ async def patch_model_provider_connection(connection_id: str, payload: ProviderC
 
 @router.post("/api/v1/admin/model-provider-connections/{connection_id}/validate")
 async def validate_model_provider_connection(connection_id: str) -> Dict[str, Any]:
-    return services()["model_admin"].validate_provider_connection(connection_id)
+    return await services()["model_admin"].validate_provider_connection(connection_id)
 
 
 @router.get("/api/v1/admin/model-provider-connections/{connection_id}/model-catalog")

@@ -202,3 +202,19 @@
   - 停止旧 PID `14840` 并通过 macOS Terminal 启动修复版 PID `16697`；`GET /healthz` 返回 `{"status":"ok"}`。
   - 真实调用 `POST /api/v1/admin/model-configurations/model_cfg_ef64e33ec0b641a8/test`：HTTP 请求成功，DeepSeek `deepseek-v4-pro` 返回 `{"message":"pong"}`，用量 `173 + 38 = 211 tokens`，模型配置标记为 `ready`。
 - 未完成事项或恢复说明：无；此次真实探针产生一次 DeepSeek 调用计费/配额用量，调用日志按现有 Model Invocation 规则保留。
+
+## 2026-08-26 · PROVIDER-CREDENTIAL-PREFLIGHT-001
+
+- 目标：在管理员添加模型厂商连接时立即执行真实 API Key 鉴权探针，而不是只校验字段格式或等到具体模型测试。
+- 关联问题：ProviderConnection 的 `/validate` 当前只返回 `model_required`，不会访问厂商；前端添加连接后也不会自动校验密钥。
+- 状态：`verified`。
+- 实际修改文件：`app/providers/openai_compatible/provider.py`、`app/providers/zhipuai/provider.py`、`app/providers/mock/provider.py`、`app/services/model_admin.py`、`app/api/routes.py`、`app/web/app.js`、`tests/test_model_configuration_v2.py`、`tests/test_openai_compatible_vendor_providers.py`、`docs/api-design.md`、`docs/model-provider-plugins.md`、`docs/change-log.md`。
+- 实现结果：Provider adapter seam 新增 `validate_credentials`。OpenAI-compatible、DeepSeek 和 DashScope 通过 Bearer 认证的 `/models` 执行无文本生成费用探针；智谱插件使用 `glm-4.7-flash` 的单 token 最小探针；Mock 使用本地结果。管理服务将远程结果持久化为 `valid` / `invalid` / `model_required`，前端创建连接后会立即执行该校验；失败连接保留供管理员编辑修复。连接层校验不替代每个 ModelConfiguration 的模型权限与输出契约测试。
+- 验证命令与结果：
+  - Provider/配置定向测试：`20 passed in 0.93s`。
+  - `PYTHONPYCACHEPREFIX=/private/tmp/interviewer-credential-pyc .venv/bin/python -m compileall -q app tests`：通过。
+  - `PYTHONPYCACHEPREFIX=/private/tmp/interviewer-credential-pyc .venv/bin/python -m pytest -q`：`109 passed in 3.63s`。
+  - `node --check app/web/app.js` 与 `git diff --check`：通过。
+  - 停止旧 PID `16697` 并启动更新版 PID `18926`，监听 `127.0.0.1:8000`。
+  - 真实调用 `POST /api/v1/admin/model-provider-connections/provider_conn_f4b6040cac554a6e/validate`：DeepSeek API Key 鉴权成功，`credential_status=valid`，厂商返回 `3` 个当前可访问模型。
+- 未完成事项或恢复说明：添加厂商连接的请求会先保存加密凭证，再执行远程校验；远程失败不删除连接，以便修正 Base URL 或 API Key。智谱凭证探针会产生极小的模型调用配额/计费；其余已实现的 OpenAI-compatible 列表探针不生成 token。

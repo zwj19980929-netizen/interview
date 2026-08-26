@@ -31,6 +31,11 @@ from app.model_gateway.schemas import (
 class MockProvider:
     provider_id = "mock"
 
+    async def validate_credentials(
+        self, config: Dict[str, Any], credentials: Dict[str, Any], *, timeout_s: int = 10
+    ) -> Dict[str, str]:
+        return {"status": "valid", "message": "Local mock provider connection is valid."}
+
     async def invoke(self, capability: str, request: Any, context: ProviderContext) -> Any:
         provider = ProviderMeta(
             provider_id=self.provider_id,

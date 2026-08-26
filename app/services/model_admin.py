@@ -136,7 +136,7 @@ class ModelAdminService:
             item["updated_at"] = utc_now()
             return transaction.provider_connections.update(item, expected_version=expected_version)
 
-    def validate_provider_connection(
+    async def validate_provider_connection(
         self, connection_id: str, organization_id: str = "org_default"
     ) -> Dict[str, Any]:
         with self.persistence.transaction(organization_id) as transaction:
@@ -145,16 +145,31 @@ class ModelAdminService:
                 raise ApiError("PROVIDER_CONNECTION_NOT_FOUND", "Provider connection does not exist.", status_code=404)
             manifest = get_provider_manifest(item["provider_id"])
             validate_form_values(manifest["connection_form"], item["connection_config"], path="connection_config")
-            validate_form_values(
-                manifest["credential_form"], transaction.provider_secrets.get(connection_id), path="credentials"
-            )
-            item["credential_status"] = "valid" if item["provider_id"] == "mock" else "model_required"
+            credentials = transaction.provider_secrets.get(connection_id)
+            validate_form_values(manifest["credential_form"], credentials, path="credentials")
+        adapter = self.gateway.providers.adapter(item["provider_id"], manifest["capabilities"][0])
+        validator = getattr(adapter, "validate_credentials", None)
+        if not callable(validator):
+            result = {
+                "status": "model_required",
+                "message": "This provider requires a concrete model test to validate credentials.",
+            }
+        else:
+            try:
+                result = await validator(item["connection_config"], credentials, timeout_s=10)
+            except Exception as exc:
+                self._record_connection_health(connection_id, organization_id, "invalid", str(exc))
+                raise
+        status = str(result.get("status") or "valid")
+        with self.persistence.transaction(organization_id) as transaction:
+            item = transaction.provider_connections.get(connection_id)
+            if item is None:
+                raise ApiError("PROVIDER_CONNECTION_NOT_FOUND", "Provider connection does not exist.", status_code=404)
+            item["credential_status"] = status
             item["last_validation"] = {
-                "status": item["credential_status"],
+                "status": status,
                 "checked_at": utc_now(),
-                "message": "Configure and test a concrete model to complete remote credential validation."
-                if item["credential_status"] == "model_required"
-                else "Local provider connection is valid.",
+                "message": str(result.get("message") or "Provider credentials are valid."),
             }
             item["updated_at"] = utc_now()
             return transaction.provider_connections.update(item, expected_version=item["version"])
@@ -409,6 +424,22 @@ class ModelAdminService:
                 connection["last_validation"] = {"status": connection["credential_status"], "checked_at": utc_now(), "error": error[:500] if error else None}
                 connection["updated_at"] = utc_now()
                 transaction.provider_connections.update(connection, expected_version=connection["version"])
+
+    def _record_connection_health(
+        self, connection_id: str, organization_id: str, status: str, error: Optional[str]
+    ) -> None:
+        with self.persistence.transaction(organization_id) as transaction:
+            connection = transaction.provider_connections.get(connection_id)
+            if connection is None:
+                return
+            connection["credential_status"] = status
+            connection["last_validation"] = {
+                "status": status,
+                "checked_at": utc_now(),
+                "error": error[:500] if error else None,
+            }
+            connection["updated_at"] = utc_now()
+            transaction.provider_connections.update(connection, expected_version=connection["version"])
 
     def _record_route_health(self, route_id: str, organization_id: str, *, status: str, error: Optional[str]) -> None:
         with self.persistence.transaction(organization_id) as transaction:

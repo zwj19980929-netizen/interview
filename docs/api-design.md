@@ -522,7 +522,7 @@ class ModelGateway:
 | --- | --- | --- |
 | `GET` | `/api/v1/admin/model-providers/catalog` | 已安装插件、能力和实现状态 |
 | `POST/GET/PATCH` | `/api/v1/admin/model-provider-connections` | 管理厂商连接；凭证只写入、读取时仅返回状态 |
-| `POST` | `/api/v1/admin/model-provider-connections/{id}/validate` | 校验连接字段与凭证是否具备创建模型的条件，不产生付费模型调用 |
+| `POST` | `/api/v1/admin/model-provider-connections/{id}/validate` | 通过 Provider adapter 执行真实 API Key 鉴权探针，保存 `valid` / `invalid` / `model_required` 状态 |
 | `GET` | `/api/v1/admin/model-provider-connections/{id}/model-catalog` | 返回该连接可配置的模型类型、模型目录和动态表单 schema |
 | `POST/GET/PATCH` | `/api/v1/admin/model-configurations` | 管理具体模型及其厂商参数、统一默认参数和启用状态 |
 | `POST` | `/api/v1/admin/model-configurations/{id}/test` | 以模型配置的统一能力探针进行真实调用并更新健康状态 |
