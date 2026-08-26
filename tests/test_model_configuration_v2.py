@@ -123,10 +123,11 @@ async def test_untested_model_can_run_probe_and_receives_saved_defaults() -> Non
         async def invoke(self, capability, request, context):
             seen["temperature"] = request.temperature
             seen["max_output_tokens"] = request.max_output_tokens
+            seen["json_schema"] = request.json_schema
             seen["connection_config"] = context.connection_config
             seen["model_settings"] = context.model_settings
             return ChatJSONResponse(
-                data={},
+                data={"message": "pong"},
                 usage=Usage(),
                 provider=ProviderMeta(provider_id="openai_compatible", model=context.model, request_id="probe", latency_ms=1),
             )
@@ -138,6 +139,12 @@ async def test_untested_model_can_run_probe_and_receives_saved_defaults() -> Non
     assert seen == {
         "temperature": 0.7,
         "max_output_tokens": 321,
+        "json_schema": {
+            "type": "object",
+            "required": ["message"],
+            "properties": {"message": {"type": "string"}},
+            "additionalProperties": False,
+        },
         "connection_config": {"base_url": "https://models.example.com/v1", "use_environment_proxy": False},
         "model_settings": {"structured_output_mode": "json_object"},
     }

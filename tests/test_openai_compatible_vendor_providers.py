@@ -68,6 +68,7 @@ async def test_vendor_chat_json_reuses_compatible_runtime_with_json_object(
     assert seen["payload"]["response_format"] == {"type": "json_object"}
     assert seen["payload"]["messages"][0]["role"] == "system"
     assert "JSON Schema" in seen["payload"]["messages"][0]["content"]
+    assert 'Example JSON output: {"score":0}' in seen["payload"]["messages"][0]["content"]
     assert seen["payload"]["messages"][1]["content"] == "评价答案"
     assert response.data == {"score": 88}
     assert response.provider.provider_id == expected_provider_id

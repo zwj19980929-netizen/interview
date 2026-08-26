@@ -45,6 +45,8 @@ class MockProvider:
                 data = review_resume(request.metadata)
             elif request.purpose == "role_parsing":
                 data = {"parsed": True, "profile": request.metadata}
+            elif request.purpose == "model_configuration_test":
+                data = {"message": "pong"}
             else:
                 data = {"result": "mock", "purpose": request.purpose}
             usage = Usage(

@@ -571,7 +571,7 @@ readiness 是带检查时间和有效期的事实，不是永久布尔值；超�
 | `GET` | `/api/v1/admin/model-routes` | 查看路由 |
 | `POST` | `/api/v1/admin/model-routes/{id}/test` | 测试路由和 fallback |
 
-两个 `PATCH` 都必须携带 `expected_version`。连接文档和凭证引用使用同一租户事务更新；并发版本不匹配时拒绝写入。连接编辑时空密码不能清除现有密钥。模型测试只使用 ModelConfiguration 已保存的模型标识与参数，不允许客户端在测试时临时替换模型。
+两个 `PATCH` 都必须携带 `expected_version`。连接文档和凭证引用使用同一租户事务更新；并发版本不匹配时拒绝写入。连接编辑时空密码不能清除现有密钥。模型测试只使用 ModelConfiguration 已保存的模型标识与参数，不允许客户端在测试时临时替换模型。`llm.chat_json` 连通性探针必须携带最小 JSON Schema；对仅支持 `json_object` 的厂商，adapter 同时下发 schema、合法 JSON 示例和 `response_format` JSON Object 约束，避免把普通文本响应误判为结构化输出。
 
 新增供应商插件后，`catalog` 必须能读出 manifest，不需要改业务服务。
 

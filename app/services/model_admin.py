@@ -421,7 +421,17 @@ class ModelAdminService:
 
     def _probe_request(self, capability: str, organization_id: str, purpose: str) -> Any:
         if capability == cap.LLM_CHAT_JSON:
-            return ChatJSONRequest(organization_id=organization_id, purpose=purpose, messages=[ChatMessage(role="user", content="ping")])
+            return ChatJSONRequest(
+                organization_id=organization_id,
+                purpose=purpose,
+                messages=[ChatMessage(role="user", content="Return a JSON object with message set to pong.")],
+                json_schema={
+                    "type": "object",
+                    "required": ["message"],
+                    "properties": {"message": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            )
         if capability == cap.LLM_CHAT_TEXT:
             return ChatTextRequest(organization_id=organization_id, purpose=purpose, messages=[ChatMessage(role="user", content="ping")])
         if capability == cap.EMBEDDING_TEXT:

@@ -122,11 +122,24 @@ class OpenAICompatibleProvider:
         )
         choice = (response.get("choices") or [{}])[0]
         message = choice.get("message") or {}
-        content = message.get("content") or "{}"
+        content = message.get("content")
+        finish_reason = choice.get("finish_reason")
+        if not isinstance(content, str) or not content.strip():
+            raise ProviderError(
+                "provider_schema_invalid",
+                "Provider returned empty JSON content.",
+                retryable=True,
+                details={"finish_reason": finish_reason} if finish_reason else None,
+            )
         try:
             data = json.loads(content)
         except json.JSONDecodeError as exc:
-            raise ProviderError("provider_schema_invalid", "Provider response was not valid JSON.", retryable=True) from exc
+            raise ProviderError(
+                "provider_schema_invalid",
+                "Provider response was not valid JSON.",
+                retryable=True,
+                details={"finish_reason": finish_reason} if finish_reason else None,
+            ) from exc
 
         usage_data = response.get("usage") or {}
         usage = Usage(
@@ -146,10 +159,14 @@ class OpenAICompatibleProvider:
         )
 
     def _schema_prompt_messages(self, messages: list[Dict[str, Any]], json_schema: Dict[str, Any]) -> list[Dict[str, Any]]:
+        example = _json_schema_example(json_schema)
         instruction = (
             "Return only one valid JSON object matching this JSON Schema. "
-            "Do not add markdown fences or explanatory text. Schema: %s"
-            % json.dumps(json_schema, ensure_ascii=False, separators=(",", ":"))
+            "Do not add markdown fences or explanatory text. Schema: %s. Example JSON output: %s"
+            % (
+                json.dumps(json_schema, ensure_ascii=False, separators=(",", ":")),
+                json.dumps(example, ensure_ascii=False, separators=(",", ":")),
+            )
         )
         return [{"role": "system", "content": instruction}, *messages]
 
@@ -360,6 +377,37 @@ class OpenAICompatibleProvider:
         if response.status_code >= 400:
             raise ProviderError("provider_bad_request", "Provider rejected the request.", retryable=False)
         return response
+
+
+def _json_schema_example(schema: Dict[str, Any]) -> Any:
+    if "const" in schema:
+        return schema["const"]
+    values = schema.get("enum")
+    if isinstance(values, list) and values:
+        return values[0]
+    schema_type = schema.get("type")
+    if isinstance(schema_type, list):
+        schema_type = next((item for item in schema_type if item != "null"), "null")
+    if schema_type == "object" or "properties" in schema:
+        properties = schema.get("properties") or {}
+        required = schema.get("required") or []
+        return {
+            name: _json_schema_example(properties[name])
+            for name in required
+            if name in properties and isinstance(properties[name], dict)
+        }
+    if schema_type == "array":
+        items = schema.get("items")
+        return [_json_schema_example(items)] if schema.get("minItems", 0) > 0 and isinstance(items, dict) else []
+    if schema_type == "integer":
+        return 0
+    if schema_type == "number":
+        return 0.0
+    if schema_type == "boolean":
+        return False
+    if schema_type == "null":
+        return None
+    return "example"
 
 
 def _base_url(config: Dict[str, Any]) -> str:

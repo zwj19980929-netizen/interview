@@ -186,3 +186,19 @@
   - SQLite `PRAGMA integrity_check` 返回 `ok`；旧 `provider_configs` collection 已删除，`provider_secrets.provider_connection_id` 已存在。
   - `/healthz`、工作区业务集合、Provider catalog、ProviderConnection、ModelConfiguration 和 ModelRoute API 均返回 HTTP 200；工作区首屏所需接口不再出现 500。
 - 未完成事项或恢复说明：迁移前备份保留在 `/private/tmp/interviewer-pre-model-v2-20260825.sqlite3`，可在服务停止后恢复。迁移得到的智谱 LLM/TTS 模型状态为 `untested`，需补有效 API Key 并分别测试后才能创建生产路由。
+
+## 2026-08-26 · DEEPSEEK-JSON-PROBE-001
+
+- 目标：修复 DeepSeek V4 Pro 模型配置测试将普通文本响应当作 JSON 解析，从而误报 `provider_schema_invalid` 的问题。
+- 关联问题：模型配置的 `llm.chat_json` 连通性探针未提供 JSON Schema，导致 OpenAI-compatible/DeepSeek adapter 不会启用结构化输出。
+- 状态：`verified`。
+- 实际修改文件：`app/services/model_admin.py`、`app/providers/openai_compatible/provider.py`、`app/providers/mock/provider.py`、`tests/test_model_configuration_v2.py`、`tests/test_openai_compatible_vendor_providers.py`、`docs/model-provider-plugins.md`、`docs/change-log.md`。
+- 实现结果：`llm.chat_json` 配置/路由探针现在携带要求 `message` 字段的最小 JSON Schema；OpenAI-compatible 的 `json_object`/`prompt` 路径会向厂商同时传入 schema 和由 schema 生成的合法 JSON 示例；空内容与非 JSON 内容保留结构化错误并附带非敏感 `finish_reason`。Mock provider 也返回符合同一探针 schema 的 `pong`。
+- 验证命令与结果：
+  - Provider/配置定向回归：`23 passed in 0.91s`。
+  - `PYTHONPYCACHEPREFIX=/private/tmp/interviewer-deepseek-pyc .venv/bin/python -m compileall -q app tests`：通过。
+  - `PYTHONPYCACHEPREFIX=/private/tmp/interviewer-deepseek-pyc .venv/bin/python -m pytest -q`：`106 passed in 3.35s`。
+  - `git diff --check`：通过。
+  - 停止旧 PID `14840` 并通过 macOS Terminal 启动修复版 PID `16697`；`GET /healthz` 返回 `{"status":"ok"}`。
+  - 真实调用 `POST /api/v1/admin/model-configurations/model_cfg_ef64e33ec0b641a8/test`：HTTP 请求成功，DeepSeek `deepseek-v4-pro` 返回 `{"message":"pong"}`，用量 `173 + 38 = 211 tokens`，模型配置标记为 `ready`。
+- 未完成事项或恢复说明：无；此次真实探针产生一次 DeepSeek 调用计费/配额用量，调用日志按现有 Model Invocation 规则保留。
