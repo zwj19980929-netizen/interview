@@ -179,7 +179,7 @@
 - 目标：修复模型配置 v2 发布后本地工作区所有业务 API 因旧 SQLite `provider_secrets` 字段而返回 500 的启动故障，备份并执行已验证的一次性数据迁移。
 - 关联问题：`MODEL-CONFIG-V2-001`；服务端日志确认 `sqlite3.OperationalError: no such column: provider_connection_id`。
 - 状态：`complete`。
-- 实际操作：停止 PID `13643`；将 `data/interviewer.sqlite3` 原样备份到 `/private/tmp/interviewer-pre-model-v2-20260825.sqlite3`；执行模型配置 v2 迁移并重启为 PID `14128`。
+- 实际操作：停止 PID `13643`；将 `data/interviewer.sqlite3` 原样备份到 `/private/tmp/interviewer-pre-model-v2-20260825.sqlite3`；执行模型配置 v2 迁移；因工具 PTY 会暂停进程，最终通过 macOS Terminal 持续启动为 PID `14840`。
 - 验证命令与结果：
   - 迁移前数据库与备份 SHA-256 均为 `56cbde2321bbf707d6696bd5590d33217011e6955d34fe10deeb42d48af26bb2`。
   - 迁移输出：`2` 个 ProviderConnection、`2` 个 ModelConfiguration、`0` 个 ModelRoute。
