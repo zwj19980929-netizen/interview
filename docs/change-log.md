@@ -173,3 +173,16 @@
   - `git diff --check`：通过。
   - `.venv/bin/python -m app.migrations.model_configuration_v2 data/interviewer.sqlite3 --dry-run`：输出 `2` 个 ProviderConnection、`2` 个 ModelConfiguration、`0` 个 ModelRoute；dry-run 未修改开发数据库。
 - 未完成事项或恢复说明：未执行开发 SQLite 的实际单向迁移，部署升级前需先复核 dry-run，再去掉 `--dry-run` 执行；真实供应商 API Key、模型授权、费用/延迟及音质仍需逐个 ModelConfiguration 联调，不能由离线测试标记生产健康。
+
+## 2026-08-25 · MODEL-CONFIG-V2-LOCAL-MIGRATION
+
+- 目标：修复模型配置 v2 发布后本地工作区所有业务 API 因旧 SQLite `provider_secrets` 字段而返回 500 的启动故障，备份并执行已验证的一次性数据迁移。
+- 关联问题：`MODEL-CONFIG-V2-001`；服务端日志确认 `sqlite3.OperationalError: no such column: provider_connection_id`。
+- 状态：`complete`。
+- 实际操作：停止 PID `13643`；将 `data/interviewer.sqlite3` 原样备份到 `/private/tmp/interviewer-pre-model-v2-20260825.sqlite3`；执行模型配置 v2 迁移并重启为 PID `14128`。
+- 验证命令与结果：
+  - 迁移前数据库与备份 SHA-256 均为 `56cbde2321bbf707d6696bd5590d33217011e6955d34fe10deeb42d48af26bb2`。
+  - 迁移输出：`2` 个 ProviderConnection、`2` 个 ModelConfiguration、`0` 个 ModelRoute。
+  - SQLite `PRAGMA integrity_check` 返回 `ok`；旧 `provider_configs` collection 已删除，`provider_secrets.provider_connection_id` 已存在。
+  - `/healthz`、工作区业务集合、Provider catalog、ProviderConnection、ModelConfiguration 和 ModelRoute API 均返回 HTTP 200；工作区首屏所需接口不再出现 500。
+- 未完成事项或恢复说明：迁移前备份保留在 `/private/tmp/interviewer-pre-model-v2-20260825.sqlite3`，可在服务停止后恢复。迁移得到的智谱 LLM/TTS 模型状态为 `untested`，需补有效 API Key 并分别测试后才能创建生产路由。
