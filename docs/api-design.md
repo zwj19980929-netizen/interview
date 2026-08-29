@@ -419,8 +419,11 @@ React 岗位卡片根据该岗位是否已有要求，显示“添加岗位要�
   "scheduled_end_at": "2026-09-01T03:00:00Z",
   "settings": {
     "record_audio": true,
+    "record_video": false,
+    "avatar_mode": "local",
     "avatar_id": "avatar_default_cn",
-    "voice_profile_id": "voice_cn_01"
+    "voice_profile_id": "voice_cn_01",
+    "language": "zh-CN"
   },
   "admission_policy": {
     "early_start_grace_seconds": 0,
@@ -430,6 +433,8 @@ React 岗位卡片根据该岗位是否已有要求，显示“添加岗位要�
   }
 }
 ```
+
+`settings.avatar_mode` 只接受 `local | cloud`。新预约省略时默认 `local`；`local` 复用计划冻结的 `QuestionSpeechAsset` 并由候选人浏览器渲染形象，`cloud` 调用已配置的 `avatar.speak/interview_question_delivery` route。已持久化但没有该字段的历史预约/会话按 `cloud` 解释，避免升级后改变旧场次。`PATCH` 只合并显式提供的 settings 字段。
 
 邀请响应只在签发时返回一次明文 URL：
 
@@ -497,12 +502,14 @@ React 工作台必须在这个一次性响应弹窗中提供“复制链接”�
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/api/v1/public/interviews/{interview_id}` | 返回候选人姓名、会话状态和安全轮次投影；未来题干和所有答案/rubric/候选池均隐藏 |
+| `GET` | `/api/v1/public/interviews/{interview_id}` | 返回候选人姓名、会话状态、`avatar_mode` 和安全轮次投影；未来题干和所有答案/rubric/候选池均隐藏 |
 | `POST` | `/api/v1/public/interviews/{interview_id}/audio-answers` | 提交当前轮次录音；媒体 URI 必须属于该会话和轮次，服务端从受控本地媒体或 `private-file://` FileObject 读取音频并经 STT 后评分；接口不向 Provider 暴露对象存储凭据 |
-| `POST` | `/api/v1/public/interviews/{interview_id}/avatar/speak` | 读取当前安全题干并通过 avatar/TTS seam 朗读；响应兼容 `browser_speech/audio/video/webrtc`，WebRTC 响应带不透明 `session_id/player_kind` |
+| `POST` | `/api/v1/public/interviews/{interview_id}/avatar/speak` | 读取当前安全题干并通过 Avatar Delivery seam 朗读；响应兼容 `browser_speech/audio/video/webrtc`，并返回实际 `avatar_mode`；WebRTC 响应带不透明 `session_id/player_kind` |
 | `POST` | `/api/v1/public/interviews/{interview_id}/avatar/session/close` | 关闭当前候选人已取得的数智人会话，释放云渲染/SFU 并发；要求候选人 token |
 
 候选人 token 由至少 32 字符的 `INTERVIEWER_CANDIDATE_TOKEN_SECRET` 对会话 ID 与创建时间做 HMAC-SHA256 派生，不明文持久化或出现在后台详情；验证使用常量时间比较，错误 token 返回 403。候选人 WebSocket 继续使用 `/interviews/{id}/live?role=candidate&token=...`，连接后只能发送设备就绪、媒体开始/分片/停止、未受信 partial 和心跳事件。
+
+Avatar Delivery 响应额外包含 `avatar_mode=local|cloud` 和可空的 `fallback_reason=cloud_unavailable`。自研模式的 `audio_uri` 必须是当前轮次冻结语音的五分钟签名地址，不能返回 `private-file://`、对象键或供应商临时 URL。云模式缺少真实 route 或调用失败时不再次复制播放分支，而是调用同一个 local adapter；此时 `avatar_mode=local` 且设置 fallback reason。只有返回 `session_id` 的云媒体需要调用 close。
 
 真实流式转写使用 `/api/v1/interviews/{interview_id}/stt-stream?token=...`：客户端先发送 `stream.open`（正式 Web 端为 `audio/pcm + 16000 Hz + mono`），随后发送二进制 PCM chunk，最后发送 `stream.finish`。服务端返回 `stream.ready/transcript.partial/transcript.final/stream.closed`，且只有唯一 `transcript.final` 可创建 CandidateAnswer；连接或 Provider 失败后使用已保存录音走 `stt.batch`，不信任浏览器 SpeechRecognition。
 

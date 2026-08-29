@@ -28,6 +28,10 @@ _Avoid_: ForLoopTTS、BulkButtonRequest、CeleryJob
 由题目版本和 KnowledgeBaseSpeechProfile revision 确定、异步生成的不可变读题语音，供数字人或音频降级路径读取。
 _Avoid_: BrowserSpeech、TemporaryTTS、AudioURL
 
+**AvatarDelivery**:
+按 InterviewAppointment 冻结的 `avatar_mode` 把当前轮次题干交付给候选人的统一边界；LocalAvatarDelivery 复用 QuestionSpeechAsset 和浏览器形象，CloudAvatarDelivery 复用模型路由与 WebRTC/SFU，两者共享响应与播放/关闭合同。
+_Avoid_: AvatarProviderSwitch、ReactAudioFallback、TencentService
+
 **QuestionGenerationBatch**:
 一次面向指定 KnowledgeBase、基于题库定位、标签和可选要求形成的候选题生成与人工审核集合；确认导入前不属于正式题库。
 _Avoid_: AutoImport、PromptResult、QuestionList
@@ -93,7 +97,7 @@ _Avoid_: TopNQuestions、SearchResult、GeneratedList
 _Avoid_: FixedQuestionList、EditableItems、DualPlanRepresentation
 
 **InterviewAppointment**:
-绑定候选人、岗位、岗位题库、已批准计划和时间窗的预约与一次性邀请；只有通过 readiness gate 且位于允许的 start 窗口内才能消费并创建 InterviewSession。
+绑定候选人、岗位、岗位题库、已批准计划、时间窗和 `local/cloud` AvatarDelivery 策略的预约与一次性邀请；只有通过 readiness gate 且位于允许的 start 窗口内才能消费并创建 InterviewSession。
 _Avoid_: InterviewSession、CalendarEvent、JoinLink
 
 **CandidateIntake**:

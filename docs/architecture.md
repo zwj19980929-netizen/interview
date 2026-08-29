@@ -43,6 +43,9 @@ flowchart LR
   Jobs --> SpeechAsset[题目语音资产]
   Jobs --> Gateway[Model Invocation]
   RT --> Orchestrator[面试编排]
+  Orchestrator --> AvatarDelivery[Avatar Delivery]
+  AvatarDelivery --> SpeechAsset
+  AvatarDelivery --> Gateway
   Orchestrator --> Selection[Question Selection]
   Selection --> DB
   Orchestrator --> Speech[服务端语音识别]
@@ -83,6 +86,7 @@ flowchart LR
 | Interview Plan Assembly | 从岗位要求、岗位题库和简历审阅形成计划 | 产出抽题槽位、结构化 `QuestionCandidatePool`、经历问题、阶段顺序、权重和解释 |
 | 计划审批与预约 | 批准计划，绑定岗位、候选人、题库、时间窗和邀请 | 计划、题库、简历审阅和语音资产未就绪时不得发出正式邀请 |
 | Appointment Reminder | 候选人确认预约后安排并发送开始前 30 分钟邮件提醒 | DurableWorkItem 只保存预约 ID；发送时才解密邮箱，SMTP 凭据只来自环境变量 |
+| Avatar Delivery | 按预约冻结的 `avatar_mode` 选择自研或云数字人，并归一化播放和关闭合同 | 深模块；`local` 复用冻结题目语音和候选人端渲染，`cloud` 复用 Model Gateway/WebRTC；云失败只通过同一本地 adapter 降级 |
 | Question Selection | 在计划冻结的结构化候选池中为题库槽位抽题 | 深模块；使用 SQL 过滤、会话随机种子、去重、覆盖和难度约束，保存选择事实并冻结题目快照；不依赖向量数据库 |
 | InterviewSession 生命周期 | 接受领域命令，推进会话/轮次并形成持久事件 | REST、WebSocket、数字人和 worker 不得自行改状态 |
 | 实时网关 | WebSocket/WebRTC 信令、音频分片和状态投影 | 不决定抽题、状态迁移或评分 |
@@ -91,7 +95,7 @@ flowchart LR
 | 逐题评分 | 使用冻结题目、服务端最终转写和岗位要求输出可解释评分 | 保存命中点、缺失点、证据、置信度与 revision |
 | 报告与企业复核 | 汇总岗位维度、经历问题和风险提示，提供答案与音频复核 | 报告使用“匹配度/需复核”，最终决定由企业人员完成 |
 
-内置 Web 工作台以 React 19 + Vite 构建，FastAPI 只托管生产 bundle、图片和 vendor 资产；浏览器仍与后端同源，不新增 BFF 或复制领域规则。`WorkbenchProvider` 统一持有 hash 路由、认证会话、角色重定向、资源缓存、弹窗、toast 和可取消请求；Workspace Query 按角色与路由加载资源。题库一级路由只加载全组织 KnowledgeBase 摘要，`/#questions/{knowledge_base_id}` 详情路由才加载该题库的 Question、KnowledgeBaseSpeechProfile、可选 TTS 模型/声音和最近构建，避免继续把所有题目平铺在题库首页；总览仍只读取 `/workspace/question-overview`。Candidate Interview Runtime 独占候选人媒体、WebSocket、本地完整录音和失败恢复。业务组件与命令 hooks 已按 `questions/workflow/plans/interviews/models/candidate` 分区，React feature registry 声明导航和角色，旧全局 DOM/controller 已物理删除。浏览器 WebSocket 使用后台 Bearer 换取的短期面试范围 ticket，后端仍兼容非浏览器客户端直接提供 `Authorization` header。
+内置 Web 工作台以 React 19 + Vite 构建，FastAPI 只托管生产 bundle、图片和 vendor 资产；浏览器仍与后端同源，不新增 BFF 或复制领域规则。`WorkbenchProvider` 统一持有 hash 路由、认证会话、角色重定向、资源缓存、弹窗、toast 和可取消请求；Workspace Query 按角色与路由加载资源。题库一级路由只加载全组织 KnowledgeBase 摘要，`/#questions/{knowledge_base_id}` 详情路由才加载该题库的 Question、KnowledgeBaseSpeechProfile、可选 TTS 模型/声音和最近构建，避免继续把所有题目平铺在题库首页；总览仍只读取 `/workspace/question-overview`。Candidate Interview Runtime 独占候选人媒体、WebSocket、本地完整录音和失败恢复；Avatar Delivery Runtime 以同一个 `play/stop` interface 处理冻结音频、浏览器语音、云视频/WebRTC 和云会话关闭。业务组件与命令 hooks 已按 `questions/workflow/plans/interviews/models/candidate` 分区，React feature registry 声明导航和角色，旧全局 DOM/controller 已物理删除。浏览器 WebSocket 使用后台 Bearer 换取的短期面试范围 ticket，后端仍兼容非浏览器客户端直接提供 `Authorization` header。
 
 ## 核心业务流程
 
@@ -179,6 +183,7 @@ sequenceDiagram
 - WebSocket：会话状态、题目事件、partial/final 转写、评分进度和错误通知。
 - WebRTC：生产候选人音频流和数字人媒体；MVP 可先用 WebSocket 发送 Opus/WebM 音频分片。
 - 题目语音是可版本化资产，优先由题库当前 KnowledgeBaseSpeechProfile 预生成；播放失败时按预约策略降级为服务端 TTS 或文字，不能让客户端自报已朗读。
+- 新预约默认 `avatar_mode=local`：服务端只签发当前轮次冻结语音的短期访问地址，浏览器用内置形象和说话状态渲染，不创建云会话。显式 `cloud` 继续走腾讯云 WebRTC/SFU；缺 route 或 Provider 失败时复用同一 local adapter，并返回 `fallback_reason=cloud_unavailable`。历史预约缺少该字段时按 `cloud` 解释，保持旧链路语义。
 - 候选人回答必须在服务端进入 `stt.streaming` 或以完整录音进入 `stt.batch`。流中断时保存音频，轮次保持 `transcribing`，由 `stt.batch` 修复后再评分。
 
 ## 数据流
@@ -224,7 +229,7 @@ sequenceDiagram
 - 候选人专属计划以 execution v2 槽位、冻结 `QuestionCandidatePool` 和经历题快照为唯一执行表示；会话只能由预约创建。预约使用服务端告知与明确授权、哈希 token、强匹配、带 TTL 的准入事实、时间窗、原子消费和并发幂等 self-start。
 - `QuestionSelection` 使用会话种子与 HMAC-SHA256 在批准候选池内稳定随机，选择事实与题目快照保存在会话聚合中；岗位题完成后生命周期进入 `resume_experience`。
 - 音频回答会先进入 `transcribing`；React 候选人端把麦克风重采样为 16 kHz 单声道 PCM，经独立 `stt-stream` WebSocket 交给 `ModelGateway.open_stream()`，校验有序 partial/final，并只把唯一服务端 final 交给评分；浏览器 WebM 完整录音链路仍作为建流失败时的 batch 修复路径。本地 mock 允许显式开发转写输入，生产配置禁止该输入。
-- 国内实时媒体实现仍保持 provider seam：DashScope adapter 把 PCM 映射为 Qwen-Audio 3.0 duplex WebSocket、把私有录音映射为 Qwen3-ASR batch；腾讯云数智人 adapter 用 HTTPS 管理 create/stat/start/close、用签名 WSS command channel 发送 SEND_TEXT，媒体由腾讯云 WebRTC/SFU 承载，React 通过 TCPlayerLite 播放 `webrtc://`。切换厂商不改变 InterviewSession 状态机；离场、换流和异常必须关闭数智人会话释放并发。
+- 国内实时媒体实现仍保持 provider seam：DashScope adapter 把 PCM 映射为 Qwen-Audio 3.0 duplex WebSocket、把私有录音映射为 Qwen3-ASR batch；Avatar Delivery 在该 seam 上方按预约选择 adapter，自研模式复用 `QuestionSpeechAsset + PrivateFileStorage`，云模式继续由腾讯云数智人 adapter 用 HTTPS 管理 create/stat/start/close、用签名 WSS command channel 发送 SEND_TEXT，媒体由腾讯云 WebRTC/SFU 承载，React 通过 TCPlayerLite 播放 `webrtc://`。切换模式或厂商不改变 InterviewSession 状态机；离场、换流和异常必须关闭数智人会话释放并发。
 - 企业复核 projection、五分钟签名音频访问、实际下载审计、append-only 转写修正、重评、报告 revision、JSON/CSV 导出和复核完成记录已实现。
 - 后台 Bearer RBAC、候选人 token 窄接口与 allow-list 安全投影、Redis fail-closed 公开限流、HTTP 元数据审计、联系人/Provider 凭证加密、显式到期数据清理、Outbox 退避/dead-letter/监控/重放、数据库共享断路器、Redis 跨实例事件 adapter、心跳超时监控、抽题公平性分布及脱敏评分金标校准已实现。
 - PostgreSQL adapter 与显式 `python -m app.migrations.postgresql` 部署迁移已实现，包含租户 RLS、预约单会话、选择槽位和 Outbox 幂等约束；迁移 owner 与最小权限 runtime role 分离，应用启动只读校验 schema、从不执行 DDL。Memory/SQLite 仍用于本地测试。

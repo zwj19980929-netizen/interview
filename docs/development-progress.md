@@ -1,16 +1,18 @@
 # 开发进度
 
-## 2026-08-27 完成快照
+## 2026-08-28 完成快照
 
 仓库内可独立完成的里程碑 0-13 能力已经实现并通过自动化验证：岗位题库构建、PDF/URL 简历安全摄取、岗位初筛/人工复核/7 天差异化留存、候选人 CRUD、私有文件、候选人/计划/预约、明确同意、可审计随机抽题、服务端 streaming/batch STT、评分、报告导出、企业复核、RBAC/审计、Outbox 加固、PostgreSQL/RLS adapter、Redis 事件 adapter、心跳监控和抽题公平性评估均已有代码与测试。
 
 这里的“完成”只表示仓库实现与本地/离线验收完成，不等于外部生产环境已经通过。DashScope 已有 Qwen-Audio 3.0 实时 ASR/Qwen3-ASR batch adapter，腾讯云智能数智人已有 WebRTC 云渲染会话 adapter 与候选人 TCPlayerLite 播放；本机 PostgreSQL 16、Redis 7 和官方 ClamAV daemon 已完成隔离集成验收，但目标 PostgreSQL/Redis、阿里云 OSS、生产扫描签名更新、阿里/腾讯账号、模型/形象授权、云渲染并发和真实脱敏金标仍需要部署环境输入；生产 readiness 在依赖缺失或健康检查过期时失败关闭。
 
+预约现已显式选择“自研数字人 / 云数字人”。新预约默认低成本自研模式：复用计划冻结的题目 TTS 私有资产，服务端签发短期地址，React 内置形象展示统一说话状态，不创建云会话；云模式完整保留腾讯 create/stat/start/WSS drive/WebRTC/SFU/close 链路，并在不可用时通过同一个 LocalAvatarDelivery 降级。历史无 `avatar_mode` 数据继续按云模式解释，既有链路未删除；后端和浏览器分别只有一个 delivery/playback interface，避免两套业务控制代码。
+
 当前统一验证基线：
 
 - `PYTHONPYCACHEPREFIX=/private/tmp/interviewer_pycache .venv/bin/python -m compileall -q app tests`：通过。
-- `cd app/web && npm run build && npm test -- --run`：React 生产构建通过，Vitest `22 passed`；此前依赖审计为 0 个 high 漏洞。
-- `.venv/bin/python -m pytest -q`：`166 passed, 5 skipped`；5 个环境测试仅在提供真实 PostgreSQL/Redis/clamd 地址时启用。
+- `cd app/web && npm test -- --run && npm run build`：React 生产构建通过，Vitest `31 passed`；此前依赖审计为 0 个 high 漏洞。
+- `.venv/bin/python -m pytest -q`：`204 passed, 5 skipped`；5 个环境测试仅在提供真实 PostgreSQL/Redis/clamd 地址时启用。
 - `git diff --check`：通过。
 
 ### React Web 工作台
@@ -18,6 +20,7 @@
 - `app/web` 已建立 React 19 + Vite 工程，FastAPI 从 `/web/bundles/*` 同源托管生产 bundle，并保留 `/web/assets/*`、`/web/vendor/*` 和既有业务 API 路径。
 - 总览、题库、招聘流程、面试计划、面试会话、模型服务、公开邀请和候选人面试入口已无损接入 React shell；框架切换不改变 REST/WebSocket 路径或请求体。
 - 面试计划的“生成并启用”在同一 Plan Assembly 事务内完成就绪校验和批准，工作台不再要求创建人点击“审批计划”；API 仍保留默认草稿模式供需要编辑/分权审批的客户端使用。一次性邀请弹窗提供“复制链接”和即时反馈。
+- 创建预约表单增加数字人方案选择，默认“自研数字人（推荐，低成本）”，也可选择“云数字人（实时视频，需配置服务）”；候选人房间展示实际执行模式和云失败降级原因，两种模式共用播放、停止与云 session 回收 runtime。
 - 候选人邀请页已把“身份核验并确认预约”与“到点检查设备并进入面试”拆开；确认事务创建提前 30 分钟的持久邮件提醒，队列不携带邮箱明文，SMTP 授权码通过空置的环境变量占位等待部署配置。
 - 招聘流程已支持岗位增查改删；删除前展示候选人/岗位要求/计划/预约影响并要求输入完整岗位名称，确认后清除该岗位候选人敏感数据、归档下游流程，同时保留共享题库与不可识别历史。
 - 新建岗位弹窗同时采集首版岗位要求、必备/加分技能、目标级别和面试时长；后端原子创建 JobPosition 与 RoleRequirement，创建后可直接用于简历初筛。既有岗位卡片同时提供“添加岗位要求/新增要求版本”，无需删除重建。
@@ -39,8 +42,8 @@
 | 2 模型网关 | ✅ closed（配置 v2 + Prompt 治理） | `chat_json/chat_text/embedding/STT/TTS/avatar` schema、invoke/open_stream、重试/fallback/超时/共享断路器、加密凭证；国内媒体选型已实现 DashScope ASR 与腾讯云数智人 WebRTC adapter | 真实凭据、区域、模型/形象授权、并发和健康测试待联调 |
 | 3 结构化题库查询 | ✅ closed | Question Catalog、Memory/SQLite/PostgreSQL 下推实现、跨岗位拒绝；旧 QuestionService/向量 repository 已删除 | 真实 PostgreSQL 查询计划待环境验收 |
 | 4 岗位要求与计划 | ✅ closed | execution v2 canonical slots、显式一次性迁移、候选池冻结、覆盖/难度/去重、权重/时长守恒、审批不可变 | 部署旧数据时先运行迁移命令 |
-| 5 会话与实时事件 | ✅ verified | 生命周期、持久事件、WebSocket、Redis 跨实例 adapter、心跳超时恢复、浏览器 16k PCM 实时 STT、腾讯 WebRTC/SFU 播放与会话回收 | 目标网络/浏览器与腾讯并发仍需外部验收 |
-| 6 数字人与语音 | ✅ verified（仓库） | DashScope streaming/batch STT、OpenAI-compatible/智谱/DashScope TTS、腾讯云数智人 WebRTC、私有资产复制、断流 batch 修复 | 阿里/腾讯真实凭据、音质/WER/延迟/费用和生产 route 未验收 |
+| 5 会话与实时事件 | ✅ verified | 生命周期、持久事件、WebSocket、Redis 跨实例 adapter、心跳超时恢复、浏览器 16k PCM 实时 STT、统一 Avatar Delivery Runtime、腾讯 WebRTC/SFU 播放与会话回收 | 目标网络/浏览器与腾讯并发仍需外部验收 |
+| 6 数字人与语音 | ✅ verified（仓库） | 预约级 local/cloud 选择、冻结 TTS 签名播放、浏览器本地形象、云失败复用 local 降级、DashScope streaming/batch STT、真实 TTS、腾讯云数智人 WebRTC | 阿里/腾讯真实凭据、音质/WER/延迟/费用和生产 route 未验收；自研形象后续可扩展口型/3D |
 | 7 评分与报告 | ✅ verified | 可解释评分、append-only revision、current-only 汇总、JSON/CSV 导出、脱敏人工金标一致性/公平性校准 API | 真实脱敏金标尚未提供，不能形成业务校准结论 |
 | 8 岗位题库构建 | ✅ verified | import/rebuild/build、结构校验、Outbox、语音版本/readiness | 真实 TTS 音质与区域策略待联调 |
 | 9 企业简历库 | ✅ verified | multipart/URL、SSRF、隔离/扫描、保留页边界解析、原件/解析文本私有 FileObject、候选人及简历版本 CRUD、异步单次/Map-Reduce 可解释初筛、版本化 0–59/60–74/75–100 分数带、人工复核/7 天自动留存、本地/OSS contract、加密联系人 | 真实 OSS/扫描器、目标模型上下文预算与真实简历初筛校准待环境验收 |

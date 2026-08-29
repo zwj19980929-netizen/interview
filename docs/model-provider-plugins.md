@@ -444,6 +444,8 @@ Model Invocation 校验 content type、最大大小、非空音频和 duration�
   "audio_uri": null,
   "session_id": "session_01J",
   "player_kind": "tencent_web_player",
+  "avatar_mode": "cloud",
+  "fallback_reason": null,
   "visemes": [],
   "provider": {
     "provider_id": "tencent_cloud_avatar",
@@ -454,16 +456,18 @@ Model Invocation 校验 content type、最大大小、非空音频和 duration�
 }
 ```
 
-`mode` 约定：
+`mode` 是媒体交付形态，`avatar_mode` 是预约选择后实际执行的策略，两者不能混用。约定：
 
 - `browser_speech`：本地 Mock 或最终降级模式，前端用系统语音合成朗读，并只展示明确的模拟说话状态。
 - `audio`：Provider 返回 `audio_uri`，前端播放音频并可根据 `visemes` 或音频能量驱动嘴型。
 - `video`：Provider 返回可直接播放的数字人视频流地址。
 - `webrtc`：Provider 返回实时会话或信令入口；实际媒体使用 WebRTC，不能把视频帧塞入业务 WebSocket。
 
-所有模式必须返回实际朗读的 `text` 和 Provider 元数据。数字人失败时依次降级到 `tts.synthesize`、`browser_speech` 和纯文字题干。
+所有模式必须返回实际朗读的 `text` 和 Provider 元数据。Avatar Delivery 位于 Model Gateway 上方：`avatar_mode=local` 不调用 avatar Provider，而是复用计划冻结且已私有化的 QuestionSpeechAsset，签发短期 URL 并在浏览器本地渲染；没有真实音频的开发夹具才使用 `browser_speech`。`avatar_mode=cloud` 保留现有 `avatar.speak/interview_question_delivery` route；route 缺失或 Provider 失败时复用 LocalAvatarDelivery，响应改为实际的 `avatar_mode=local` 并标记 `fallback_reason=cloud_unavailable`。
 
 `media_http` 默认调用 `POST {base_url}/avatar/speak`，JSON 包含 `model/text/avatar_id/voice/language/request_id`。响应至少提供 `mode` 与对应的 `audio_uri` 或 `stream_url`；公网 HTTP 媒体默认强制 HTTPS。腾讯实现返回 `webrtc://` 并由专属 TCPlayerLite 播放页处理，候选人业务组件不解析厂商信令。任何 WebRTC 会话都要提供关闭路径；若 create/stat/start/drive 中途失败，adapter 也会 best-effort close。
+
+自研模式不是伪造一个新的外部 Provider，也不复制腾讯 adapter。后端 `AvatarDelivery.speak` 和前端 Avatar Delivery Runtime 的 `play/stop` 是两个稳定 interface；`LocalAvatarDelivery` 与 `CloudAvatarDelivery` 是真实的两种实现。腾讯云路径、WSS 命令通道、TCPlayerLite 和 close 合同继续保留，并以 `TODO(cloud-avatar-expansion)` 标识后续多云形象、WHEP 或自建 SFU 的扩展 seam。
 
 ## 配置模型
 

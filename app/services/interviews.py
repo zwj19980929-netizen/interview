@@ -398,6 +398,7 @@ class InterviewService:
             "id": session["id"],
             "status": session["status"],
             "phase": session.get("phase"),
+            "avatar_mode": session.get("settings", {}).get("avatar_mode", "cloud"),
             "current_turn_id": current_turn_id,
             "candidate": {"name": session.get("candidate", {}).get("name", "候选人")},
             "turns": turns,

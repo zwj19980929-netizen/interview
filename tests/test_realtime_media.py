@@ -1,17 +1,21 @@
 from pathlib import Path
 import asyncio
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
 
 from app.main import create_app
+from app.core.ids import new_id
+from app.core.time import utc_now
+from app.file_storage.provider import private_file_storage, reset_private_file_storage_for_tests
 from app.repositories.provider import reset_store_for_tests
 from app.repositories.provider import get_store
 from app.persistence.provider import persistence_for
 from app.workers.outbox import OutboxWorker
 
 
-def _create_started_interview(api: TestClient) -> dict:
+def _create_started_interview(api: TestClient, *, avatar_mode: str = "local") -> dict:
     position = api.post(
         "/api/v1/job-positions",
         json={"code": "realtime", "name": "实时系统工程师"},
@@ -79,7 +83,7 @@ def _create_started_interview(api: TestClient) -> dict:
             "job_position_id": position["id"],
             "scheduled_start_at": (now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
             "scheduled_end_at": (now + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
-            "settings": {"record_audio": True, "record_video": False, "avatar_id": "avatar_default_cn"},
+            "settings": {"record_audio": True, "record_video": False, "avatar_mode": avatar_mode, "avatar_id": "avatar_default_cn"},
         },
     )
     assert appointment.status_code == 200, appointment.text
@@ -117,6 +121,8 @@ def _create_started_interview(api: TestClient) -> dict:
 
 def test_avatar_and_realtime_audio_flow(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setenv("INTERVIEWER_MEDIA_PATH", str(tmp_path))
+    monkeypatch.setenv("INTERVIEWER_PRIVATE_FILE_ROOT", str(tmp_path / "private"))
+    reset_private_file_storage_for_tests()
     reset_store_for_tests()
     api = TestClient(create_app())
     interview = _create_started_interview(api)
@@ -130,8 +136,67 @@ def test_avatar_and_realtime_audio_flow(tmp_path: Path, monkeypatch) -> None:
     )
     assert avatar.status_code == 200, avatar.text
     assert avatar.json()["mode"] == "browser_speech"
+    assert avatar.json()["avatar_mode"] == "local"
     assert avatar.json()["text"] == detail["turns"][0]["question_spoken_text"]
-    assert avatar.json()["provider"]["provider_id"] == "mock"
+    assert avatar.json()["provider"]["provider_id"] == "browser_local_avatar"
+
+    speech_asset_id = detail["turns"][0]["question_snapshot"]["speech_asset_id"]
+    content = b"RIFF-local-avatar-audio"
+    checksum = hashlib.sha256(content).hexdigest()
+    stored = private_file_storage().store(
+        organization_id="org_default",
+        object_id=new_id("speech_file"),
+        content=content,
+        content_type="audio/wav",
+        checksum=checksum,
+    )
+    persistence = persistence_for(get_store())
+    with persistence.transaction("org_default") as transaction:
+        file_object = transaction.file_objects.add(
+            {
+                "id": new_id("file"),
+                "organization_id": "org_default",
+                "purpose": "question_speech",
+                "status": "ready",
+                "storage_backend": stored.storage_backend,
+                "object_key": stored.object_key,
+                "content_type": stored.content_type,
+                "checksum": stored.checksum,
+                "byte_count": stored.byte_count,
+                "scan_status": "not_applicable",
+                "source_type": "test_fixture",
+                "created_at": utc_now(),
+                "updated_at": utc_now(),
+            }
+        )
+        asset = transaction.question_speech_assets.get(speech_asset_id)
+        asset["file_object_id"] = file_object["id"]
+        asset["audio_uri"] = "private-file://%s" % file_object["id"]
+        transaction.question_speech_assets.update(asset, expected_version=asset["version"])
+
+    local_audio = api.post(
+        "/api/v1/public/interviews/%s/avatar/speak" % interview_id,
+        headers={"X-Candidate-Session-Token": interview["candidate_session_token"]},
+        json={"turn_id": turn_id, "language": "zh-CN", "voice": "default"},
+    )
+    assert local_audio.status_code == 200, local_audio.text
+    assert local_audio.json()["mode"] == "audio"
+    assert local_audio.json()["avatar_mode"] == "local"
+    assert local_audio.json()["audio_uri"].startswith("/api/v1/private-files/")
+    assert api.get(local_audio.json()["audio_uri"]).content == content
+
+    with persistence.transaction("org_default") as transaction:
+        session = transaction.interview_sessions.get(interview_id)
+        session["settings"]["avatar_mode"] = "cloud"
+        transaction.interview_sessions.update(session, expected_version=session["version"])
+    cloud_fallback = api.post(
+        "/api/v1/public/interviews/%s/avatar/speak" % interview_id,
+        headers={"X-Candidate-Session-Token": interview["candidate_session_token"]},
+        json={"turn_id": turn_id, "language": "zh-CN", "voice": "default"},
+    )
+    assert cloud_fallback.status_code == 200, cloud_fallback.text
+    assert cloud_fallback.json()["avatar_mode"] == "local"
+    assert cloud_fallback.json()["fallback_reason"] == "cloud_unavailable"
 
     websocket_url = "/api/v1/interviews/%s/live?role=candidate&token=%s" % (
         interview_id,
@@ -217,6 +282,7 @@ def test_avatar_and_realtime_audio_flow(tmp_path: Path, monkeypatch) -> None:
     assert recording.headers["content-type"].startswith("audio/webm")
     audit = api.get("/api/v1/admin/audit-events").json()["items"]
     assert any(item["action"] == "answer.audio.downloaded" and item["resource_id"] == answer_id for item in audit)
+    assert any(item["action"] == "question_speech.access_granted" and item["resource_id"] == speech_asset_id for item in audit)
 
 
 def test_candidate_websocket_rejects_invalid_token(tmp_path: Path, monkeypatch) -> None:

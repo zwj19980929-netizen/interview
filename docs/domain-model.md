@@ -413,12 +413,18 @@ Plan Assembly 支持两种显式命令语义：API 客户端可以先产生 `dra
 | `invitation_token_hash` | 一次性邀请 token 哈希 |
 | `invitation_expires_at` | 邀请过期时间 |
 | `email_reminder` | `{status, scheduled_for, work_item_id, sent_at, last_error_code}`；内部投影可追踪持久提醒，公开投影不得返回工作项 ID/错误细节 |
-| `settings` | 录音、数字人、语言和音色策略 |
+| `settings` | 冻结 `{record_audio, record_video, avatar_mode, avatar_id, voice_profile_id, language}`；`avatar_mode` 只允许 `local/cloud` |
 | `admission_policy` | 冻结的提前/延后宽限、设备检查有效期和服务端 readiness 要求 |
 | `readiness_facts` | 最近一次浏览器、麦克风和音频格式检查结果、服务端检查时间及失效时间 |
 | `created_by` | 创建人 |
 
 只有计划、题库、经历问题语音和生产 STT 路由通过 readiness gate 后才能从 `scheduled` 进入 `invited`。token 只能被一次候选人登记消费，可撤销、不可明文持久化。`registered` 表示候选人身份与同意已核验、预约已确认；该事务同时幂等创建面试前 30 分钟的 `appointment.reminder.email` 工作项，但不得自动设备检查或 start。邀请过期和预约 start 窗口是两个独立条件；默认允许开始的窗口为 `[scheduled_start_at, scheduled_end_at]`，任何宽限都必须显式冻结在 `admission_policy` 中。
+
+新建预约默认 `avatar_mode=local`，显式选择 `cloud` 才创建供应商实时会话。历史预约/会话没有该字段时按 `cloud` 解释。Appointment start 把完整 settings 冻结到 InterviewSession；会话开始后不能通过前端临时切换模式，以免改变费用、媒体授权和审计语义。
+
+### AvatarDelivery
+
+当前轮次题干的统一交付边界，不是新的持久实体。`LocalAvatarDelivery` 只读取 `InterviewQuestionSnapshot.speech_asset_id`，通过 PrivateFileStorage 签发短期地址并让候选人端渲染内置形象；开发 mock 没有真实音频时才返回 `browser_speech`。`CloudAvatarDelivery` 保留 Model Gateway 的 `avatar.speak` route、供应商 session 与 WebRTC/SFU 媒体。两者返回同一个 `AvatarSpeakResponse`；云失败通过 LocalAvatarDelivery 降级，不允许业务路由或 React 组件各自再实现一套降级规则。
 
 ### CandidateIntake
 
@@ -521,7 +527,7 @@ Plan Assembly 支持两种显式命令语义：API 客户端可以先产生 `dra
 
 状态、抽题、轮次推进和报告触发只能由生命周期命令改变。REST、WebSocket、数字人、STT、评分和 worker 只提交命令或效果结果。
 
-候选人持有独立短期 `candidate_session_token`，它不授予后台资源访问权。Candidate Session Projection 使用 allow-list，只暴露姓名、会话状态、轮次 ID/顺序/状态，以及当前或已完成轮次的题干；不得暴露 token 本身、联系方式、计划/候选池、未来题干、`question_snapshot.standard_answer`、rubric、评分 revision 或报告。候选人录音提交还必须证明媒体属于当前 `interview_id + current_turn_id`。
+候选人持有独立短期 `candidate_session_token`，它不授予后台资源访问权。Candidate Session Projection 使用 allow-list，只暴露姓名、会话状态、冻结的 `avatar_mode`、轮次 ID/顺序/状态，以及当前或已完成轮次的题干；不得暴露 token 本身、联系方式、计划/候选池、未来题干、`question_snapshot.standard_answer`、rubric、评分 revision 或报告。候选人录音提交还必须证明媒体属于当前 `interview_id + current_turn_id`。
 
 ### InterviewLifecycleEvent
 

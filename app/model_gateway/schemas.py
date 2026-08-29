@@ -175,12 +175,14 @@ class AvatarSpeakRequest(BaseModel):
 class AvatarSpeakResponse(BaseModel):
     speech_id: str
     status: str = "ready"
-    mode: str
+    mode: Literal["browser_speech", "audio", "video", "webrtc"]
     text: str
     stream_url: Optional[str] = None
     audio_uri: Optional[str] = None
     session_id: Optional[str] = None
     player_kind: Literal["native_url", "whep", "tencent_web_player"] = "native_url"
+    avatar_mode: Literal["local", "cloud"] = "cloud"
+    fallback_reason: Optional[Literal["cloud_unavailable"]] = None
     visemes: List[Dict[str, Any]] = Field(default_factory=list)
     provider: ProviderMeta
 

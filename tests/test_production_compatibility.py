@@ -6,7 +6,25 @@ from app.main import create_app
 from app.migrations.plan_execution_v2 import migrate_session_document
 from app.core.errors import ApiError
 from app.services.interviews import InterviewService
-from app.schemas.api import InterviewPlanPatch
+from app.schemas.api import InterviewAppointmentCreate, InterviewPlanPatch
+
+
+def test_appointment_avatar_mode_is_explicit_and_defaults_to_local() -> None:
+    base = {
+        "plan_id": "plan_1",
+        "candidate_profile_id": "candidate_1",
+        "job_position_id": "position_1",
+        "scheduled_start_at": "2026-08-28T10:00:00Z",
+        "scheduled_end_at": "2026-08-28T11:00:00Z",
+    }
+    assert InterviewAppointmentCreate.model_validate(base).settings.avatar_mode == "local"
+    assert InterviewAppointmentCreate.model_validate(
+        {**base, "settings": {"avatar_mode": "cloud"}}
+    ).settings.avatar_mode == "cloud"
+    with pytest.raises(ValidationError):
+        InterviewAppointmentCreate.model_validate(
+            {**base, "settings": {"avatar_mode": "unknown"}}
+        )
 
 
 def test_direct_interview_and_plan_items_interfaces_are_removed(monkeypatch) -> None:

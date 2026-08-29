@@ -67,7 +67,7 @@ class AppointmentService:
                 raise ApiError("APPOINTMENT_PLAN_SCOPE_MISMATCH", "Plan does not match candidate and position.", status_code=409)
             now_dt = self._now()
             readiness = self._readiness(transaction, plan, now=now_dt)
-            settings = {"record_audio": True, **deepcopy(payload.get("settings", {}))}
+            settings = self._normalized_settings(payload.get("settings"), default_avatar_mode="local")
             raw_policy = deepcopy(payload.get("admission_policy", {}))
             admission_policy = {
                 "early_start_grace_seconds": max(0, int(raw_policy.get("early_start_grace_seconds", 0))),
@@ -149,7 +149,11 @@ class AppointmentService:
             appointment["scheduled_start_at"] = start
             appointment["scheduled_end_at"] = end
             if payload.get("settings") is not None:
-                appointment["settings"] = {**appointment.get("settings", {}), **deepcopy(payload["settings"])}
+                appointment["settings"] = self._normalized_settings(
+                    payload["settings"],
+                    current=appointment.get("settings", {}),
+                    default_avatar_mode="cloud",
+                )
             if payload.get("admission_policy") is not None:
                 policy = {**appointment.get("admission_policy", {}), **deepcopy(payload["admission_policy"])}
                 for field in (
@@ -499,6 +503,29 @@ class AppointmentService:
 
     def _lookup_hash(self, organization_id: str, value: str) -> str:
         return self.sensitive.lookup_hash(organization_id, value)
+
+    def _normalized_settings(
+        self,
+        value: Optional[Dict[str, Any]],
+        *,
+        current: Optional[Dict[str, Any]] = None,
+        default_avatar_mode: str,
+    ) -> Dict[str, Any]:
+        settings = {
+            "record_audio": True,
+            "record_video": False,
+            "avatar_mode": default_avatar_mode,
+            "avatar_id": "avatar_default_cn",
+            "language": "zh-CN",
+            **deepcopy(current or {}),
+            **deepcopy(value or {}),
+        }
+        if settings.get("avatar_mode") not in {"local", "cloud"}:
+            raise ApiError(
+                "APPOINTMENT_AVATAR_MODE_INVALID",
+                "Appointment avatar mode must be local or cloud.",
+            )
+        return settings
 
     def _normalize_name(self, value: str) -> str:
         return re.sub(r"\s+", "", str(value)).casefold()

@@ -1143,7 +1143,11 @@ async def speak_public_candidate_question(
     x_candidate_session_token: str = Header(alias="X-Candidate-Session-Token"),
 ) -> Dict[str, Any]:
     services()["interviews"].validate_candidate_token(interview_id, x_candidate_session_token)
-    return await services()["avatar"].speak(interview_id, payload.model_dump())
+    return await services()["avatar"].speak(
+        interview_id,
+        payload.model_dump(),
+        actor_id="candidate_session:%s" % interview_id,
+    )
 
 
 @router.post("/api/v1/public/interviews/{interview_id}/avatar/session/close")

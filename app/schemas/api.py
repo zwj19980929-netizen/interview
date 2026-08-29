@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -284,20 +284,42 @@ class AudioAnswerSubmit(BaseModel):
     development_confidence: float = Field(default=0.9, ge=0.0, le=1.0)
 
 
+class InterviewAppointmentSettings(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    record_audio: bool = True
+    record_video: bool = False
+    avatar_mode: Literal["local", "cloud"] = "local"
+    avatar_id: str = Field(default="avatar_default_cn", min_length=1, max_length=128)
+    voice_profile_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    language: str = Field(default="zh-CN", min_length=2, max_length=32)
+
+
+class InterviewAppointmentSettingsPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    record_audio: Optional[bool] = None
+    record_video: Optional[bool] = None
+    avatar_mode: Optional[Literal["local", "cloud"]] = None
+    avatar_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    voice_profile_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
+    language: Optional[str] = Field(default=None, min_length=2, max_length=32)
+
+
 class InterviewAppointmentCreate(BaseModel):
     plan_id: str
     candidate_profile_id: str
     job_position_id: str
     scheduled_start_at: str
     scheduled_end_at: str
-    settings: Dict[str, Any] = Field(default_factory=dict)
+    settings: InterviewAppointmentSettings = Field(default_factory=InterviewAppointmentSettings)
     admission_policy: Dict[str, Any] = Field(default_factory=dict)
 
 
 class InterviewAppointmentPatch(VersionedPatch):
     scheduled_start_at: Optional[str] = None
     scheduled_end_at: Optional[str] = None
-    settings: Optional[Dict[str, Any]] = None
+    settings: Optional[InterviewAppointmentSettingsPatch] = None
     admission_policy: Optional[Dict[str, Any]] = None
 
 

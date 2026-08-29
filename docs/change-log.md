@@ -6,6 +6,21 @@
 
 每个工作项必须包含：日期、ID、目标、关联问题、状态、实际修改文件、验证命令与结果、未完成事项或恢复说明。
 
+## 2026-08-28 · DUAL-AVATAR-DELIVERY-001
+
+- 目标：保留现有腾讯云数字人 WebRTC/SFU 链路并标注后续扩展 TODO；新增预约级“自研数字人 / 云数字人”选择。自研模式复用计划冻结的题目 TTS 私有音频，在浏览器本地完成形象渲染和口型状态，不创建云数字人会话；两种模式共用 Avatar Delivery interface、候选人播放 runtime、失败降级与会话清理。
+- 关联问题：云数字人按会话/并发计费过高；现有预约只能隐式走单一数字人 route，无法按场次选择低成本本地渲染；冻结题目音频的内部 URI 不能直接作为候选人浏览器播放地址。
+- 状态：`verified`（仓库）；高精度本地口型/3D 与腾讯真实环境均按下述边界继续扩展。
+- 计划修改：预约 settings 合同与会话安全投影、Avatar Delivery 深模块、候选人本地数字人播放/动画、预约选择 UI、后端与 React 测试、生产 bundle，以及架构/API/领域/Provider/进度/路线图文档。
+- 兼容与安全边界：不删除或改写腾讯云 Provider、WSS 命令通道、TCPlayerLite 页面和关闭接口；历史预约没有 `avatar_mode` 时继续按云模式解释。新预约默认自研模式但可显式选择云模式。自研模式只播放当前轮次冻结且已进入 PrivateFileStorage 的题目语音，签发短期受控地址；不暴露对象键、供应商凭据、标准答案或未来题目。
+- 实际修改文件：
+  - 合同与服务：`app/schemas/api.py`、`app/model_gateway/schemas.py`、`app/services/appointments.py`、`app/services/avatar.py`、`app/services/interviews.py`、`app/api/routes.py`。
+  - React 与生产 bundle：`app/web/candidate/avatar-runtime.js`、`app/web/src/features/candidate/Page.jsx`、`app/web/src/features/interviews/Page.jsx`、`app/web/src/App.test.jsx`、`app/web/candidate/avatar-runtime.test.js`、`app/web/dist/index.html`、`app/web/dist/bundles/index-jppRnCoU.js`；构建删除旧 hash bundle `index-BAySj2hk.js`。
+  - 验收：`tests/test_realtime_media.py`、`tests/test_production_compatibility.py`。
+  - 文档：`docs/architecture.md`、`docs/api-design.md`、`docs/domain-model.md`、`docs/model-provider-plugins.md`、`CONTEXT.md`、`docs/known-issues-and-remediation.md`、`docs/development-progress.md`、`docs/implementation-roadmap.md`、本日志。
+- 验证命令与结果：定向 Python 合同/实时媒体 `8 passed in 1.64s`；`PYTHONPYCACHEPREFIX=/private/tmp/interviewer_pycache .venv/bin/python -m compileall -q app tests` 通过；`.venv/bin/python -m pytest -q` 为 `204 passed, 5 skipped in 9.42s`；`cd app/web && npm test -- --run` 为 `31 passed`；`npm run build` 成功并生成生产 bundle；`git diff --check` 通过。测试覆盖预约默认/显式/非法模式、本地浏览器语音、本地冻结音频五分钟签名访问与审计、云不可用明确降级、统一前端音频/浏览器语音/WebRTC lifecycle、云 session close 和预约表单 payload。
+- 未完成事项或恢复说明：自研模式当前是低成本 2D 浏览器形象、冻结 TTS 音频、呼吸/说话状态和音量条，不声称已有音素级嘴型或 3D 实时驱动；后续在保留 AvatarDelivery interface 下扩展 Live2D/3D、viseme 或自建 WHEP/SFU。腾讯真实账号、授权形象、并发、媒体质量和费用仍为 `environment_pending`，本轮未写入凭据或发起真实供应商调用。预约 settings 已是 JSON 文档，不需要数据库迁移。首次从仓库根目录执行 `npm test` 因该目录没有 `package.json` 返回 ENOENT，随后在 `app/web` 重跑通过；失败命令没有仓库或业务数据副作用。
+
 ## 2026-08-28 · CANDIDATE-BOOKING-REMINDER-001
 
 - 目标：把候选人邀请页从“核验后立即开始面试”拆成“核验身份并确认预约”与“到预约时间后检查设备并进入面试”两步；预约确认后创建面试前 30 分钟的持久邮件提醒任务。

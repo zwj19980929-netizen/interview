@@ -95,6 +95,7 @@ describe("React workbench shell", () => {
 
   it("copies the one-time candidate invitation link with one click", async () => {
     window.history.replaceState(null, "", "#interviews");
+    const appointmentBodies = [];
     const writeText = vi.fn(async () => {});
     Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
     const plan = { id: "plan_1", status: "approved", candidate_profile_id: "candidate_1", job_position_id: "position_1" };
@@ -102,7 +103,7 @@ describe("React workbench shell", () => {
     globalThis.fetch = async (path, options = {}) => {
       const url = String(path);
       if (url.endsWith("/auth/session")) return new Response(JSON.stringify({ actor_id: "admin_1", organization_id: "org_1", roles: ["admin"], authenticated: true }));
-      if (url.endsWith("/interview-appointments") && options.method === "POST") return new Response(JSON.stringify({ id: "appointment_1", scheduled_end_at: "2026-09-02T02:00:00.000Z" }));
+      if (url.endsWith("/interview-appointments") && options.method === "POST") { appointmentBodies.push(JSON.parse(options.body)); return new Response(JSON.stringify({ id: "appointment_1", scheduled_end_at: "2026-09-02T02:00:00.000Z" })); }
       if (url.endsWith("/interview-appointments/appointment_1/invite") && options.method === "POST") return new Response(JSON.stringify({ join_url: "/#invite/token_123" }));
       if (url.endsWith("/interview-plans")) return new Response(JSON.stringify({ items: [plan] }));
       if (url.endsWith("/candidate-profiles")) return new Response(JSON.stringify({ items: [candidate] }));
@@ -115,6 +116,9 @@ describe("React workbench shell", () => {
     for (let attempt = 0; attempt < 30 && !create; attempt += 1) { await new Promise((resolve) => setTimeout(resolve, 10)); create = [...host.querySelectorAll("button")].find((node) => node.textContent === "创建预约"); }
     await act(async () => create.click());
     const dialog = document.querySelector('[role="dialog"][aria-label="创建面试预约"]');
+    expect(dialog.textContent).toContain("自研数字人（推荐，低成本）");
+    expect(dialog.textContent).toContain("云数字人（实时视频，需配置服务）");
+    expect(dialog.querySelector('[name="avatar_mode"]').value).toBe("local");
     const start = dialog.querySelector('[name="scheduled_start_at"]');
     const end = dialog.querySelector('[name="scheduled_end_at"]');
     await act(async () => {
@@ -126,6 +130,7 @@ describe("React workbench shell", () => {
     for (let attempt = 0; attempt < 30 && !copy; attempt += 1) { await new Promise((resolve) => setTimeout(resolve, 10)); copy = [...document.querySelectorAll("button")].find((node) => node.textContent === "复制链接"); }
     await act(async () => copy.click());
     expect(writeText).toHaveBeenCalledWith(`${window.location.origin}/#invite/token_123`);
+    expect(appointmentBodies[0].settings.avatar_mode).toBe("local");
     expect(copy.textContent).toBe("已复制");
     await act(async () => root.unmount());
   });

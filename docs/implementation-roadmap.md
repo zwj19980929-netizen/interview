@@ -4,7 +4,7 @@
 
 ## 当前完成快照
 
-里程碑 0-13 的仓库内实现已经落地并持续通过自动化测试。当前闭环包括 React Web 工作台、题库批量构建、PDF/URL 简历安全摄取与私有文件、脱敏 Resume Review、可解释岗位初筛/人工复核/7 天差异化留存、候选人 CRUD、候选人专属计划、预约邀请页/明确同意/准入、候选人 token 安全投影、HMAC 稳定随机抽题、服务端 streaming/batch STT、逐题评分、报告导出、企业复核、RBAC/审计/公开限流、到期数据清理、PostgreSQL/RLS adapter、Outbox dead-letter、Redis 实时事件、心跳监控、抽题与评分公平性评估，以及 OpenAI-compatible、DeepSeek、智谱 Chat/GLM-TTS、DashScope/千问和腾讯云数智人 adapter。
+里程碑 0-13 的仓库内实现已经落地并持续通过自动化测试。当前闭环包括 React Web 工作台、题库批量构建、PDF/URL 简历安全摄取与私有文件、脱敏 Resume Review、可解释岗位初筛/人工复核/7 天差异化留存、候选人 CRUD、候选人专属计划、预约邀请页/明确同意/准入、候选人 token 安全投影、HMAC 稳定随机抽题、服务端 streaming/batch STT、预约级自研/云数字人选择与统一降级、逐题评分、报告导出、企业复核、RBAC/审计/公开限流、到期数据清理、PostgreSQL/RLS adapter、Outbox dead-letter、Redis 实时事件、心跳监控、抽题与评分公平性评估，以及 OpenAI-compatible、DeepSeek、智谱 Chat/GLM-TTS、DashScope/千问和腾讯云数智人 adapter。
 
 状态必须分成“仓库 verified”“本机集成 verified”和“目标环境 pending”：国内实时媒体已选定并实现 DashScope/Qwen ASR 与腾讯云智能数智人 WebRTC/SFU，但没有真实账号、Workspace、形象资产、并发、路由健康和测试样本时不能完成生产联调；PostgreSQL 16、Redis 7 和官方 ClamAV daemon 已通过本机隔离集成测试，目标集群、阿里云 OSS、完整病毒库更新与告警仍保留外部边界。`INTERVIEWER_RUNTIME_ENV=production` 要求私有对象存储、显式非 mock 且近期健康的语音/评分 route、扫描器和生产密钥，否则邀请/start 失败关闭。
 
@@ -17,8 +17,8 @@
 | 2 模型网关和供应商配置 | ✅ verified | chat/embedding/STT/TTS/avatar schema、invoke/open_stream、加密凭证、共享断路器、manifest 模型目录；DashScope ASR 与腾讯云数智人 adapter | 真实凭据/区域/模型/形象授权和健康测试 `environment_pending` |
 | 3 题库查询和候选池 | ✅ closed | Question Catalog，Memory/SQLite/PostgreSQL 查询实现，本机 PostgreSQL 16 RLS/索引 `EXPLAIN`，旧向量题库 interface 已删除 | 目标生产集群需复验 |
 | 4 岗位要求和面试计划 | ✅ closed | execution v2 canonical 槽位、显式迁移、冻结候选池、API 草稿编辑/审批、React 一次确认原子生成并启用、统一物化 | 部署旧数据须先运行迁移命令 |
-| 5 面试会话和实时事件 | ✅ verified（仓库） | 生命周期、持久事件、WebSocket、Redis bus、心跳超时、16k PCM 实时 ASR、腾讯 WebRTC/SFU 播放/回收 | 目标网络和厂商并发 `environment_pending` |
-| 6 数字人和语音能力 | ✅ verified（仓库） | DashScope streaming/batch STT、真实 TTS、腾讯云数智人 WebRTC、私有复制、batch 修复 | 阿里/腾讯真实账号与指标验收 `environment_pending` |
+| 5 面试会话和实时事件 | ✅ verified（仓库） | 生命周期、持久事件、WebSocket、Redis bus、心跳超时、16k PCM 实时 ASR、统一本地/云播放 runtime、腾讯 WebRTC/SFU 播放/回收 | 目标网络和厂商并发 `environment_pending` |
+| 6 数字人和语音能力 | ✅ verified（仓库） | 预约级 local/cloud AvatarDelivery、自研形象复用冻结 TTS 与签名私有音频、云失败降级、DashScope streaming/batch STT、真实 TTS、腾讯云 WebRTC | 阿里/腾讯真实账号与指标验收 `environment_pending`；更高精度本地口型/3D 为后续体验扩展 |
 | 7 评分和报告 | ✅ verified（仓库） | 解释性评分、current-only revision、JSON/CSV 导出、脱敏人工金标校准 API | 真实金标 `data_pending` |
 | 8 岗位与岗位题库构建 | ✅ verified | import/rebuild/build、Outbox、语音版本/readiness | 真实 TTS `environment_pending` |
 | 9 企业简历库、岗位初筛与 AI 经历问题 | ✅ verified | PDF/URL、SSRF/扫描/解析、私有原件与解析文本、候选人及简历版本 CRUD、受控简历展示、可解释初筛/人工复核、7 天自动留存、加密联系人、本地/OSS contract | OSS/扫描器与真实简历校准 `environment_pending` |
@@ -143,12 +143,14 @@
 - 定义 `stt.streaming`、`stt.batch`、`tts.synthesize`、`avatar.speak` 统一请求/响应。
 - 实现语音和数字人 provider 插件接口，通过模型网关调用。
 - 实现 mock 数字人：先返回 TTS 音频或读题文本。
+- 实现 `AvatarDelivery` 深模块和预约级 `local/cloud` 选择：Local adapter 复用冻结 TTS 私有音频与浏览器渲染，Cloud adapter 复用统一模型路由；两者共享响应、播放与关闭合同。
 - 在真实厂商端点/凭据验收前保留 mock；生产只启用测试通过的 DashScope streaming/batch route。
 - 腾讯云数智人负责云渲染和 SFU；adapter 以 HTTPS 管理会话、以签名 WSS 长连接发送文本驱动，候选人端 TCPlayerLite 拉取 WebRTC 并在离场关闭。
 
 验收：
 
 - 数字人供应商不可用时，系统能降级为文字或普通 TTS。
+- 新预约默认自研数字人且不创建云会话；显式云模式保留旧链路，失败时返回实际 local 模式和可观察原因。
 - STT 输出 partial/final 事件，final 才进入评分。
 
 ## 里程碑 7：评分和报告
@@ -383,7 +385,7 @@
 1. 在目标 PostgreSQL/Redis 上执行迁移、RLS 跨租户、并发/故障恢复和多实例广播测试。
 2. 在私有阿里云 OSS bucket 与真实扫描器上执行上传、SSE、签名过期、感染文件和迁移演练。
 3. 为 OpenAI-compatible、DashScope 或 `media_http` 提供真实凭据、区域、模型和端点，验证 LLM schema、TTS/数字人音质、STT WER、final 延迟/费用、私有资产复制和 readiness 失效；若目标要求实时 partial，再在现有 provider seam 内实现其专属流协议。
-4. 为已实现的 SMTP 提醒配置目标服务授权码、发件域名并完成退信/送达率/合规验收；为已选定的腾讯云 WebRTC/SFU 数智人配置 AppKey、AccessToken、形象资产与并发，在目标浏览器完成建流、口型、回收、费用和合规验收；短信通道仍待选择。普通 HTTPS 数字人视频继续由 `media_http` 支持。
+4. 为已实现的 SMTP 提醒配置目标服务授权码、发件域名并完成退信/送达率/合规验收；自研数字人已可作为默认低成本路径，后续可在保留 AvatarDelivery interface 的前提下扩展更精确口型、Live2D/3D 或自建 WHEP。为可选腾讯云 WebRTC/SFU 配置 AppKey、AccessToken、形象资产与并发，在目标浏览器完成建流、口型、回收、费用和合规验收；短信通道仍待选择。普通 HTTPS 数字人视频继续由 `media_http` 支持。
 5. 用企业人工金标建立题目难度、Resume Review 证据准确率及 AI/人工评分一致性基线；录用结果不能直接当作无偏标签。
 
-正式服务端 STT 是生产预约的必要能力；DashScope STT 与腾讯 WebRTC 数智人已有仓库实现，但在真实凭据、授权资产、目标网络和指标验收前仍不能视为生产就绪。向量数据库不属于必做项，只有题库治理出现可测量需求后再单独立项。
+正式服务端 STT 是生产预约的必要能力；默认自研数字人不依赖腾讯云，但仍要求真实 TTS 冻结音频和私有文件存储就绪。DashScope STT 与可选腾讯 WebRTC 数智人已有仓库实现，在真实凭据、授权资产、目标网络和指标验收前不能把对应外部 route 视为生产就绪。向量数据库不属于必做项，只有题库治理出现可测量需求后再单独立项。
