@@ -9,6 +9,7 @@ class InMemoryStore:
 
     def reset(self) -> None:
         self.questions: Dict[str, Dict[str, Any]] = {}
+        self.question_generation_batches: Dict[str, Dict[str, Any]] = {}
         self.job_positions: Dict[str, Dict[str, Any]] = {}
         self.knowledge_bases: Dict[str, Dict[str, Any]] = {}
         self.question_speech_assets: Dict[str, Dict[str, Any]] = {}

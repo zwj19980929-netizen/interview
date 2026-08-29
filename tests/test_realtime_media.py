@@ -1,4 +1,5 @@
 from pathlib import Path
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
@@ -7,6 +8,7 @@ from app.main import create_app
 from app.repositories.provider import reset_store_for_tests
 from app.repositories.provider import get_store
 from app.persistence.provider import persistence_for
+from app.workers.outbox import OutboxWorker
 
 
 def _create_started_interview(api: TestClient) -> dict:
@@ -31,7 +33,8 @@ def _create_started_interview(api: TestClient) -> dict:
             "rubric": {"semantic_correctness": 1.0},
         },
     )
-    assert question.status_code == 200, question.text
+    assert question.status_code == 202, question.text
+    asyncio.run(OutboxWorker(get_store()).run_once())
 
     role = api.post(
         "/api/v1/job-positions/%s/role-requirements" % position["id"],
@@ -194,6 +197,8 @@ def test_avatar_and_realtime_audio_flow(tmp_path: Path, monkeypatch) -> None:
     )
     assert submitted.status_code == 200, submitted.text
     assert submitted.json()["status"] == "report_ready"
+    assert submitted.json()["evaluation"] == {"status": "completed"}
+    assert "score" not in submitted.text
 
     completed = api.get("/api/v1/interviews/%s" % interview_id)
     assert completed.status_code == 200

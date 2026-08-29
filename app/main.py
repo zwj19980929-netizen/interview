@@ -16,6 +16,7 @@ from app.persistence.errors import PersistenceError
 
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
+WEB_DIST_DIR = WEB_DIR / "dist"
 
 
 @asynccontextmanager
@@ -45,13 +46,20 @@ def create_app() -> FastAPI:
     app.add_exception_handler(PersistenceError, persistence_error_handler)
     app.add_middleware(AuthAuditMiddleware)
     app.include_router(router)
-    app.mount("/web", StaticFiles(directory=WEB_DIR), name="web")
     media_dir = Path(os.getenv("INTERVIEWER_MEDIA_PATH", "data/media"))
     media_dir.mkdir(parents=True, exist_ok=True)
 
+    @app.get("/web/styles.css", include_in_schema=False)
+    async def legacy_web_stylesheet() -> FileResponse:
+        return FileResponse(WEB_DIR / "styles.css")
+
+    app.mount("/web/assets", StaticFiles(directory=WEB_DIR / "assets"), name="web-assets")
+    app.mount("/web/vendor", StaticFiles(directory=WEB_DIR / "vendor"), name="web-vendor")
+    app.mount("/web", StaticFiles(directory=WEB_DIST_DIR, check_dir=False, html=True), name="web")
+
     @app.get("/", include_in_schema=False)
     async def web_console() -> FileResponse:
-        return FileResponse(WEB_DIR / "index.html")
+        return FileResponse(WEB_DIST_DIR / "index.html")
 
     return app
 

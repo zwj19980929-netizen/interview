@@ -16,6 +16,8 @@ class PrivateFileStorage(Protocol):
 
     backend_name: str
 
+    def healthcheck(self) -> None: ...
+
     def store(
         self,
         *,

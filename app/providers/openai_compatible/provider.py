@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, Optional
 
 import httpx
 
+from app.core.prompt.contracts import structured_output_instruction
 from app.model_gateway.errors import ProviderError
 from app.model_gateway.schemas import (
     ChatJSONRequest,
@@ -25,6 +26,29 @@ from app.model_gateway import capabilities as cap
 
 
 AsyncClientFactory = Callable[..., httpx.AsyncClient]
+
+
+def parse_json_object_content(content: str) -> Dict[str, Any]:
+    """Accept one complete JSON object with optional reasoning/fence wrappers."""
+    text = content.strip()
+    try:
+        value = json.loads(text)
+        if isinstance(value, dict):
+            return value
+    except json.JSONDecodeError:
+        pass
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(text):
+        if character != "{":
+            continue
+        try:
+            value, end = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        remainder = text[index + end :].strip()
+        if isinstance(value, dict) and remainder in {"", "```"}:
+            return value
+    raise json.JSONDecodeError("No complete JSON object found", text, 0)
 
 
 class OpenAICompatibleProvider:
@@ -145,24 +169,40 @@ class OpenAICompatibleProvider:
         message = choice.get("message") or {}
         content = message.get("content")
         finish_reason = choice.get("finish_reason")
+        usage_data = response.get("usage") or {}
+        diagnostics = _completion_diagnostics(
+            usage_data,
+            finish_reason=finish_reason,
+            requested_max_output_tokens=request.max_output_tokens,
+            content_length=len(content) if isinstance(content, str) else 0,
+        )
+        if finish_reason == "length":
+            raise ProviderError(
+                "provider_output_truncated",
+                "Provider output reached the configured token limit before completing JSON "
+                "(finish_reason=length, content_length=%s)."
+                % diagnostics["content_length"],
+                retryable=False,
+                details=diagnostics,
+            )
         if not isinstance(content, str) or not content.strip():
             raise ProviderError(
                 "provider_schema_invalid",
                 "Provider returned empty JSON content.",
                 retryable=True,
-                details={"finish_reason": finish_reason} if finish_reason else None,
+                details=diagnostics,
             )
         try:
-            data = json.loads(content)
+            data = parse_json_object_content(content)
         except json.JSONDecodeError as exc:
             raise ProviderError(
                 "provider_schema_invalid",
-                "Provider response was not valid JSON.",
+                "Provider response was not valid JSON (finish_reason=%s, content_length=%s)."
+                % (finish_reason or "unknown", len(content)),
                 retryable=True,
-                details={"finish_reason": finish_reason} if finish_reason else None,
+                details=diagnostics,
             ) from exc
 
-        usage_data = response.get("usage") or {}
         usage = Usage(
             input_tokens=usage_data.get("prompt_tokens", 0),
             output_tokens=usage_data.get("completion_tokens", 0),
@@ -180,15 +220,7 @@ class OpenAICompatibleProvider:
         )
 
     def _schema_prompt_messages(self, messages: list[Dict[str, Any]], json_schema: Dict[str, Any]) -> list[Dict[str, Any]]:
-        example = _json_schema_example(json_schema)
-        instruction = (
-            "Return only one valid JSON object matching this JSON Schema. "
-            "Do not add markdown fences or explanatory text. Schema: %s. Example JSON output: %s"
-            % (
-                json.dumps(json_schema, ensure_ascii=False, separators=(",", ":")),
-                json.dumps(example, ensure_ascii=False, separators=(",", ":")),
-            )
-        )
+        instruction = structured_output_instruction(json_schema)
         return [{"role": "system", "content": instruction}, *messages]
 
     async def embed_text(
@@ -436,35 +468,38 @@ class OpenAICompatibleProvider:
         return response
 
 
-def _json_schema_example(schema: Dict[str, Any]) -> Any:
-    if "const" in schema:
-        return schema["const"]
-    values = schema.get("enum")
-    if isinstance(values, list) and values:
-        return values[0]
-    schema_type = schema.get("type")
-    if isinstance(schema_type, list):
-        schema_type = next((item for item in schema_type if item != "null"), "null")
-    if schema_type == "object" or "properties" in schema:
-        properties = schema.get("properties") or {}
-        required = schema.get("required") or []
-        return {
-            name: _json_schema_example(properties[name])
-            for name in required
-            if name in properties and isinstance(properties[name], dict)
-        }
-    if schema_type == "array":
-        items = schema.get("items")
-        return [_json_schema_example(items)] if schema.get("minItems", 0) > 0 and isinstance(items, dict) else []
-    if schema_type == "integer":
+def _completion_diagnostics(
+    usage_data: Dict[str, Any],
+    *,
+    finish_reason: Any,
+    requested_max_output_tokens: int,
+    content_length: int,
+) -> Dict[str, Any]:
+    """Return token/termination facts that are safe to persist on failed calls."""
+    completion_details = usage_data.get("completion_tokens_details") or {}
+    if not isinstance(completion_details, dict):
+        completion_details = {}
+    reasoning_tokens = completion_details.get("reasoning_tokens")
+    if reasoning_tokens is None:
+        reasoning_tokens = usage_data.get("reasoning_tokens")
+    diagnostics: Dict[str, Any] = {
+        "finish_reason": str(finish_reason or "unknown"),
+        "requested_max_output_tokens": int(requested_max_output_tokens),
+        "content_length": max(0, int(content_length)),
+        "input_tokens": _nonnegative_int(usage_data.get("prompt_tokens")),
+        "output_tokens": _nonnegative_int(usage_data.get("completion_tokens")),
+        "total_tokens": _nonnegative_int(usage_data.get("total_tokens")),
+    }
+    if reasoning_tokens is not None:
+        diagnostics["reasoning_tokens"] = _nonnegative_int(reasoning_tokens)
+    return diagnostics
+
+
+def _nonnegative_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
         return 0
-    if schema_type == "number":
-        return 0.0
-    if schema_type == "boolean":
-        return False
-    if schema_type == "null":
-        return None
-    return "example"
 
 
 def _base_url(config: Dict[str, Any]) -> str:

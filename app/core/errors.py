@@ -37,6 +37,8 @@ async def api_error_handler(_: Request, exc: ApiError) -> JSONResponse:
 
 async def provider_error_handler(_: Request, exc: ProviderError) -> JSONResponse:
     status_code = 502
+    if exc.code == "provider_rate_limited":
+        status_code = 429
     if exc.code in {"provider_auth_failed", "provider_bad_request", "provider_capability_missing"}:
         status_code = 400
     return JSONResponse(

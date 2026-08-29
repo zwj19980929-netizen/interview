@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from app.core.errors import ApiError
 from app.core.ids import new_id
 from app.core.time import utc_now
+from app.adapters.private_media import read_managed_audio
 from app.domain.appointment_admission import AppointmentAdmission, ensure_utc, format_utc
 from app.domain.interview_lifecycle import (
     InterviewSessionLifecycle,
@@ -261,6 +262,24 @@ class InterviewService:
             appointment["consumed_at"] = now
             appointment["consumed_token_hash"] = appointment.get("invitation_token_hash")
             appointment["invitation_token_hash"] = None
+            reminder = deepcopy(appointment.get("email_reminder") or {})
+            reminder_work_id = reminder.get("work_item_id")
+            if reminder_work_id:
+                reminder_work = transaction.outbox.get(reminder_work_id)
+                if reminder_work and reminder_work.get("status") not in {"completed", "cancelled"}:
+                    transaction.outbox.cancel(
+                        reminder_work_id,
+                        reason="appointment_consumed",
+                        actor_id="appointment_admission",
+                    )
+                    reminder.update(
+                        {
+                            "status": "skipped",
+                            "result_status": "skipped_appointment_consumed",
+                            "updated_at": now,
+                        }
+                    )
+                    appointment["email_reminder"] = reminder
             appointment["updated_at"] = now
             transaction.interview_appointments.update(
                 appointment, expected_version=appointment["version"]
@@ -469,8 +488,21 @@ class InterviewService:
         self.validate_candidate_token(interview_id, token, organization_id)
         session = self.get_interview(interview_id, organization_id)
         turn_id = self._resolve_turn_id(session, payload.get("turn_id"), None)
+        audio_uri = str(payload.get("audio_uri") or "")
         expected_prefix = "/media/%s/%s/" % (interview_id, turn_id)
-        if not str(payload.get("audio_uri") or "").startswith(expected_prefix):
+        private_scope_valid = False
+        if audio_uri.startswith("private-file://"):
+            file_id = audio_uri.removeprefix("private-file://")
+            with self.persistence.transaction(organization_id) as transaction:
+                file_object = transaction.file_objects.get(file_id)
+            private_scope_valid = bool(
+                file_object
+                and file_object.get("purpose") == "candidate_answer_audio"
+                and file_object.get("interview_id") == interview_id
+                and file_object.get("turn_id") == turn_id
+                and file_object.get("status") == "ready"
+            )
+        if not audio_uri.startswith(expected_prefix) and not private_scope_valid:
             raise ApiError(
                 "CANDIDATE_AUDIO_SCOPE_INVALID",
                 "Candidate audio must belong to the active interview turn.",
@@ -612,6 +644,17 @@ class InterviewService:
             organization_id,
         )
         try:
+            try:
+                audio_bytes = read_managed_audio(
+                    self.persistence, organization_id, payload["audio_uri"]
+                )
+            except ApiError:
+                # Preserve the documented development-only transcript fixture path.
+                # Production never accepts development_transcript and therefore
+                # always requires server-managed audio to exist.
+                if not payload.get("development_transcript"):
+                    raise
+                audio_bytes = b""
             response = await self.gateway.invoke(
                 cap.STT_BATCH,
                 BatchSTTRequest(
@@ -625,6 +668,7 @@ class InterviewService:
                         "confidence": payload.get("development_confidence", 0.9),
                         "duration_ms": int(payload.get("duration_seconds", 0)) * 1000,
                     },
+                    audio_bytes=audio_bytes,
                 ),
             )
         except Exception as exc:

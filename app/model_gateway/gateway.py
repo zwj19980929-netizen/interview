@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, Optional
 from pydantic import BaseModel
 
 from app.core.ids import new_id
+from app.core.prompt.validation import StructuredResponseValidationError, validate_structured_response
 from app.core.time import utc_now
 from app.model_gateway import capabilities as cap
 from app.model_gateway.errors import ProviderError
@@ -37,6 +38,13 @@ from app.model_gateway.streaming import ValidatedSTTStream
 from app.persistence.interface import Persistence
 from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
+
+
+def _nonnegative_int(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 @dataclass
@@ -314,6 +322,7 @@ class ModelGateway:
                         fallback_index=fallback_index,
                         request_hash=request_hash,
                         error_code=exc.code,
+                        error_details=exc.details,
                     )
                     can_retry = exc.retryable and exc.code != "provider_circuit_open" and attempt <= retry_count
                     if can_retry:
@@ -440,6 +449,7 @@ class ModelGateway:
                     fallback_index=fallback_index,
                     request_hash=request_hash,
                     error_code=exc.code,
+                    error_details=exc.details,
                 )
                 if not exc.retryable or fallback_index + 1 >= len(targets):
                     self._annotate_error(exc, invocation_id, resolved_route, fallback_index + 1)
@@ -584,7 +594,10 @@ class ModelGateway:
             self._schema_error("Provider response does not match the unified response type.")
         if isinstance(request, ChatJSONRequest) and isinstance(response, ChatJSONResponse):
             if request.json_schema:
-                self._validate_json_value(response.data, request.json_schema, path="$")
+                try:
+                    validate_structured_response(response.data, request.json_schema)
+                except StructuredResponseValidationError as exc:
+                    self._schema_error(str(exc))
         elif isinstance(request, ChatTextRequest) and isinstance(response, ChatTextResponse):
             if not response.text.strip():
                 self._schema_error("Text response cannot be empty.")
@@ -604,52 +617,6 @@ class ModelGateway:
         elif isinstance(request, TTSSynthesizeRequest) and isinstance(response, TTSSynthesizeResponse):
             if not response.audio_uri or not response.content_type.startswith("audio/"):
                 self._schema_error("TTS response is missing a supported audio asset.")
-
-    def _validate_json_value(self, value: Any, schema: Dict[str, Any], *, path: str) -> None:
-        if "enum" in schema and value not in schema["enum"]:
-            self._schema_error("JSON response failed enum validation at %s." % path)
-        schema_type = schema.get("type")
-        if isinstance(schema_type, list):
-            if not any(self._matches_json_type(value, item) for item in schema_type):
-                self._schema_error("JSON response has the wrong type at %s." % path)
-        elif schema_type and not self._matches_json_type(value, schema_type):
-            self._schema_error("JSON response has the wrong type at %s." % path)
-        if isinstance(value, dict):
-            required = schema.get("required") or []
-            if any(key not in value for key in required):
-                self._schema_error("JSON response is missing required fields at %s." % path)
-            properties = schema.get("properties") or {}
-            for key, child_schema in properties.items():
-                if key in value:
-                    self._validate_json_value(value[key], child_schema, path="%s.%s" % (path, key))
-            if schema.get("additionalProperties") is False and set(value).difference(properties):
-                self._schema_error("JSON response has unexpected fields at %s." % path)
-        elif isinstance(value, list):
-            if "minItems" in schema and len(value) < int(schema["minItems"]):
-                self._schema_error("JSON response has too few items at %s." % path)
-            if "maxItems" in schema and len(value) > int(schema["maxItems"]):
-                self._schema_error("JSON response has too many items at %s." % path)
-            if schema.get("items"):
-                for index, item in enumerate(value):
-                    self._validate_json_value(item, schema["items"], path="%s[%s]" % (path, index))
-        elif isinstance(value, (int, float)) and not isinstance(value, bool):
-            if "minimum" in schema and value < schema["minimum"]:
-                self._schema_error("JSON response is below minimum at %s." % path)
-            if "maximum" in schema and value > schema["maximum"]:
-                self._schema_error("JSON response is above maximum at %s." % path)
-        elif isinstance(value, str) and "minLength" in schema and len(value) < int(schema["minLength"]):
-            self._schema_error("JSON response string is too short at %s." % path)
-
-    def _matches_json_type(self, value: Any, schema_type: str) -> bool:
-        return {
-            "object": isinstance(value, dict),
-            "array": isinstance(value, list),
-            "string": isinstance(value, str),
-            "integer": isinstance(value, int) and not isinstance(value, bool),
-            "number": isinstance(value, (int, float)) and not isinstance(value, bool),
-            "boolean": isinstance(value, bool),
-            "null": value is None,
-        }.get(schema_type, True)
 
     def _schema_error(self, message: str) -> None:
         raise ProviderError("provider_schema_invalid", message, retryable=True)
@@ -707,8 +674,19 @@ class ModelGateway:
         response: Optional[InvocationResponse] = None,
         estimated_cost_usd: float = 0.0,
         error_code: str = "",
+        error_details: Optional[Dict[str, Any]] = None,
     ) -> None:
         usage = getattr(response, "usage", None)
+        diagnostics = error_details or {}
+        input_tokens = usage.input_tokens if usage else _nonnegative_int(
+            diagnostics.get("input_tokens")
+        )
+        output_tokens = usage.output_tokens if usage else _nonnegative_int(
+            diagnostics.get("output_tokens")
+        )
+        total_tokens = usage.total_tokens if usage else _nonnegative_int(
+            diagnostics.get("total_tokens")
+        )
         item = {
             "id": new_id("mil"),
             "invocation_id": invocation_id,
@@ -724,11 +702,17 @@ class ModelGateway:
             "attempt": attempt,
             "fallback_index": fallback_index,
             "latency_ms": latency_ms,
-            "input_tokens": usage.input_tokens if usage else 0,
-            "output_tokens": usage.output_tokens if usage else 0,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
             "audio_seconds": None,
             "estimated_cost_usd": estimated_cost_usd,
             "error_code": error_code,
+            "finish_reason": diagnostics.get("finish_reason"),
+            "requested_max_output_tokens": diagnostics.get(
+                "requested_max_output_tokens"
+            ),
+            "reasoning_tokens": diagnostics.get("reasoning_tokens"),
             "redacted_request_hash": request_hash,
             "created_at": utc_now(),
         }

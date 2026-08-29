@@ -8,6 +8,8 @@ from app.core.errors import ApiError
 from app.core.ids import new_id
 from app.core.time import utc_now
 from app.file_storage.signing import FileAccessSigner
+from app.file_storage.provider import private_file_storage
+from app.file_storage.interface import PrivateFileStorage
 from app.persistence.interface import Persistence
 from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
@@ -23,6 +25,7 @@ class EnterpriseReviewService:
         *,
         persistence: Optional[Persistence] = None,
         interviews: Optional[InterviewService] = None,
+        storage: Optional[PrivateFileStorage] = None,
     ) -> None:
         self.persistence = persistence or persistence_for(store)
         self.interviews = interviews or InterviewService(store, persistence=self.persistence)
@@ -31,6 +34,7 @@ class EnterpriseReviewService:
             os.getenv("INTERVIEWER_MEDIA_SIGNING_SECRET", "")
             or os.getenv("INTERVIEWER_FILE_SIGNING_SECRET", "")
         )
+        self.private_storage = storage or private_file_storage()
 
     def get_review(self, interview_id: str, organization_id: str = "org_default") -> Dict[str, Any]:
         interview = self.interviews.get_interview(interview_id, organization_id)
@@ -122,11 +126,22 @@ class EnterpriseReviewService:
         if not answer.get("audio_uri"):
             raise ApiError("ANSWER_AUDIO_NOT_FOUND", "Answer has no audio recording.", status_code=404)
         audio_uri = str(answer["audio_uri"])
-        if not audio_uri.startswith("/media/"):
+        if audio_uri.startswith("private-file://"):
+            file_id = audio_uri.removeprefix("private-file://")
+            with self.persistence.transaction(organization_id) as transaction:
+                file_object = transaction.file_objects.get(file_id)
+            if (
+                file_object is None or file_object.get("purpose") != "candidate_answer_audio"
+                or file_object.get("interview_id") != interview_id or file_object.get("status") != "ready"
+            ):
+                raise ApiError("ANSWER_AUDIO_NOT_FOUND", "Answer audio does not exist.", status_code=404)
+            signed_object = audio_uri
+        elif audio_uri.startswith("/media/"):
+            signed_object = audio_uri.removeprefix("/media/")
+        else:
             raise ApiError("ANSWER_AUDIO_UNMANAGED", "Answer audio is not managed by private media storage.", status_code=409)
-        relative_path = audio_uri.removeprefix("/media/")
         token = self.media_signer.issue(
-            relative_path,
+            signed_object,
             expires_seconds=300,
             claims={
                 "organization_id": organization_id,
@@ -158,13 +173,29 @@ class EnterpriseReviewService:
 
     def open_audio_grant(self, token: str) -> Dict[str, Any]:
         payload = self.media_signer.verify(token)
-        path = (self.media_root / str(payload["object_key"])).resolve()
-        if self.media_root not in path.parents:
-            raise ApiError("MEDIA_ACCESS_INVALID", "Media access token is invalid.", status_code=403)
-        if not path.is_file():
-            raise ApiError("ANSWER_AUDIO_NOT_FOUND", "Answer audio does not exist.", status_code=404)
         claims = payload.get("claims") or {}
         organization_id = str(claims.get("organization_id") or "org_default")
+        signed_object = str(payload["object_key"])
+        if signed_object.startswith("private-file://"):
+            file_id = signed_object.removeprefix("private-file://")
+            with self.persistence.transaction(organization_id) as transaction:
+                file_object = transaction.file_objects.get(file_id)
+            if (
+                file_object is None or file_object.get("purpose") != "candidate_answer_audio"
+                or file_object.get("status") != "ready" or not file_object.get("object_key")
+            ):
+                raise ApiError("ANSWER_AUDIO_NOT_FOUND", "Answer audio does not exist.", status_code=404)
+            content = self.private_storage.open(str(file_object["object_key"]))
+            content_type = str(file_object.get("content_type") or "application/octet-stream")
+        else:
+            path = (self.media_root / signed_object).resolve()
+            if self.media_root not in path.parents:
+                raise ApiError("MEDIA_ACCESS_INVALID", "Media access token is invalid.", status_code=403)
+            if not path.is_file():
+                raise ApiError("ANSWER_AUDIO_NOT_FOUND", "Answer audio does not exist.", status_code=404)
+            content_types = {".webm": "audio/webm", ".ogg": "audio/ogg", ".m4a": "audio/mp4", ".wav": "audio/wav"}
+            content = path.read_bytes()
+            content_type = content_types.get(path.suffix.lower(), "application/octet-stream")
         with self.persistence.transaction(organization_id) as transaction:
             transaction.audit_events.add(
                 {
@@ -181,8 +212,7 @@ class EnterpriseReviewService:
                     "created_at": utc_now(),
                 }
             )
-        content_types = {".webm": "audio/webm", ".ogg": "audio/ogg", ".m4a": "audio/mp4", ".wav": "audio/wav"}
-        return {"content": path.read_bytes(), "content_type": content_types.get(path.suffix.lower(), "application/octet-stream")}
+        return {"content": content, "content_type": content_type}
 
     def complete_review(
         self, interview_id: str, payload: Dict[str, Any], organization_id: str = "org_default"

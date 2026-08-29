@@ -127,6 +127,9 @@ class BatchSTTRequest(BaseModel):
     language: str = "zh-CN"
     enable_word_timestamps: bool = True
     metadata: Dict[str, Any] = Field(default_factory=dict)
+    # Server-resolved private media. Excluded from dumps so logs and invocation
+    # hashes never serialize raw candidate audio.
+    audio_bytes: bytes = Field(default=b"", exclude=True, repr=False)
 
 
 class BatchSTTResponse(BaseModel):

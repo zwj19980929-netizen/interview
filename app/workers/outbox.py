@@ -9,8 +9,11 @@ from app.repositories.memory import InMemoryStore
 from app.repositories.provider import get_store
 from app.services.interviews import InterviewService
 from app.services.catalog import CatalogService
+from app.services.knowledge_base_speech import KnowledgeBaseSpeechService
+from app.services.question_generation import QuestionGenerationService
 from app.services.talent import TalentService
 from app.services.resume_ingestion import ResumeIngestionService
+from app.services.appointment_reminders import AppointmentReminderService
 
 
 class OutboxWorker:
@@ -19,9 +22,12 @@ class OutboxWorker:
     def __init__(self, store: InMemoryStore, *, persistence: Optional[Persistence] = None) -> None:
         self.persistence = persistence or persistence_for(store)
         self.catalog = CatalogService(store, persistence=self.persistence)
+        self.knowledge_base_speech = KnowledgeBaseSpeechService(store, persistence=self.persistence)
+        self.question_generation = QuestionGenerationService(store, persistence=self.persistence)
         self.talent = TalentService(store, persistence=self.persistence, catalog=self.catalog)
         self.resume_ingestion = ResumeIngestionService(store, persistence=self.persistence)
         self.interviews = InterviewService(store, persistence=self.persistence)
+        self.appointment_reminders = AppointmentReminderService(store, persistence=self.persistence)
 
     async def run_once(
         self,
@@ -35,18 +41,7 @@ class OutboxWorker:
         results: List[Dict[str, Any]] = []
         for item in items:
             try:
-                if item["kind"] == "question.speech.generate":
-                    await self.catalog.process_speech_work(item["id"], organization_id)
-                elif item["kind"] == "resume.review":
-                    await self.talent.process_review_work(item["id"], organization_id)
-                elif item["kind"] == "resume.ingest":
-                    await self.resume_ingestion.process(item["id"], organization_id)
-                elif item["kind"] in {"knowledge_base.import", "knowledge_base.rebuild"}:
-                    await self.catalog.process_build_work(item["id"], organization_id)
-                elif item["kind"] in {"answer.evaluate", "interview.report.generate"}:
-                    await self.interviews.process_outbox_work(item["id"], organization_id)
-                else:
-                    self._fail_unsupported(item, organization_id)
+                await self.run_item(item["id"], organization_id)
             except ConcurrencyConflict:
                 continue
             except Exception as exc:
@@ -63,6 +58,38 @@ class OutboxWorker:
                 }
             )
         return results
+
+    async def run_item(
+        self, work_item_id: str, organization_id: str = "org_default"
+    ) -> Dict[str, Any]:
+        with self.persistence.transaction(organization_id) as transaction:
+            item = transaction.outbox.get(work_item_id)
+        if item is None:
+            raise KeyError("Work item does not exist: %s" % work_item_id)
+        if item["kind"] == "question.speech.generate":
+            await self.catalog.process_speech_work(item["id"], organization_id)
+        elif item["kind"] in {"question_generation.plan", "question_generation.generate"}:
+            await self.question_generation.process_plan_work(item["id"], organization_id)
+        elif item["kind"] == "question_generation.generate_chunk":
+            await self.question_generation.process_chunk_work(item["id"], organization_id)
+        elif item["kind"] == "question_generation.merge":
+            self.question_generation.process_merge_work(item["id"], organization_id)
+        elif item["kind"] == "knowledge_base.speech.rebuild":
+            self.knowledge_base_speech.process_build_work(item["id"], organization_id)
+        elif item["kind"] == "resume.review":
+            await self.talent.process_review_work(item["id"], organization_id)
+        elif item["kind"] == "resume.ingest":
+            await self.resume_ingestion.process(item["id"], organization_id)
+        elif item["kind"] in {"knowledge_base.import", "knowledge_base.rebuild"}:
+            await self.catalog.process_build_work(item["id"], organization_id)
+        elif item["kind"] in {"answer.evaluate", "interview.report.generate"}:
+            await self.interviews.process_outbox_work(item["id"], organization_id)
+        elif item["kind"] == "appointment.reminder.email":
+            self.appointment_reminders.process_work_item(item["id"], organization_id)
+        else:
+            self._fail_unsupported(item, organization_id)
+        with self.persistence.transaction(organization_id) as transaction:
+            return transaction.outbox.get(work_item_id) or {"id": work_item_id, "status": "missing"}
 
     async def run_forever(
         self,

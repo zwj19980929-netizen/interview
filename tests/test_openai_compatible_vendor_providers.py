@@ -77,6 +77,39 @@ async def test_vendor_chat_json_reuses_compatible_runtime_with_json_object(
 
 
 @pytest.mark.anyio
+async def test_deepseek_chat_json_accepts_one_complete_object_after_reasoning_wrapper() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "deepseek_wrapped",
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {
+                            "content": '<think>先分析题库要求</think>\n```json\n{"questions":[{"title":"题目"}]}\n```'
+                        },
+                    }
+                ],
+            },
+        )
+
+    response = await make_provider(DeepSeekProvider, handler).chat_json(
+        ChatJSONRequest(
+            purpose="question_generation",
+            messages=[ChatMessage(role="user", content="生成题目")],
+            json_schema={"type": "object"},
+        ),
+        config={"base_url": "https://api.deepseek.com"},
+        credentials={"api_key": "deepseek-key"},
+        model="deepseek-v4-pro",
+        timeout_s=5,
+    )
+
+    assert response.data == {"questions": [{"title": "题目"}]}
+
+
+@pytest.mark.anyio
 async def test_deepseek_validates_api_key_with_model_list_without_generation() -> None:
     seen = {}
 

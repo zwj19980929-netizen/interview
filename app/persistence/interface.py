@@ -48,6 +48,8 @@ class TransactionBackend(Protocol):
 
     def replace_secret(self, organization_id: str, item_id: str, secret: Document) -> None: ...
 
+    def delete_secret(self, organization_id: str, item_id: str) -> None: ...
+
     def list_invocations(self) -> List[Document]: ...
 
     def insert_invocation(self, item: Document) -> None: ...
@@ -108,6 +110,23 @@ class VersionedDocumentRepository:
         item["version"] = expected_version + 1
         self._backend.replace_document(self._collection, item)
         return deepcopy(item)
+
+    def delete(self, item_id: str, *, expected_version: int) -> Document:
+        current = self._backend.get_document(self._collection, item_id)
+        if not current or current.get("organization_id") != self._organization_id:
+            raise RecordNotFound("%s does not exist: %s" % (self._entity_name, item_id))
+        current_version = int(current.get("version", 1))
+        if current_version != expected_version:
+            raise ConcurrencyConflict(
+                "%s %s expected version %s, found %s"
+                % (self._entity_name, item_id, expected_version, current_version)
+            )
+        self._backend.delete_documents(
+            self._collection,
+            lambda item: item.get("id") == item_id and item.get("organization_id") == self._organization_id,
+        )
+        current.setdefault("version", 1)
+        return deepcopy(current)
 
     def _require_tenant(self, item: Document) -> None:
         if item.get("organization_id") != self._organization_id:
@@ -185,7 +204,13 @@ class OutboxRepository:
             item
             for item in self.list()
             if (
-                item.get("status") in {"pending", "failed"}
+                (
+                    item.get("status") == "pending"
+                    or (
+                        item.get("status") == "failed"
+                        and item.get("error_retryable") is not False
+                    )
+                )
                 and _utc_is_due(item.get("available_at"))
             )
             or (
@@ -198,7 +223,9 @@ class OutboxRepository:
 
     def start(self, item_id: str, *, lease_seconds: int = 60) -> Document:
         item = self._required(item_id)
-        claimable_status = item["status"] in {"pending", "failed"}
+        claimable_status = item["status"] == "pending" or (
+            item["status"] == "failed" and item.get("error_retryable") is not False
+        )
         expired_lease = item["status"] == "running" and _utc_is_due(item.get("lease_expires_at"))
         if not _utc_is_due(item.get("available_at")) or not (claimable_status or expired_lease):
             raise ConcurrencyConflict("Work item is not claimable: %s" % item_id)
@@ -206,31 +233,51 @@ class OutboxRepository:
         item["attempt_count"] = int(item.get("attempt_count", 0)) + 1
         item["lease_token"] = new_id("lease")
         item["lease_expires_at"] = _utc_after(lease_seconds)
+        item.setdefault("first_started_at", utc_now())
+        item["started_at"] = utc_now()
+        item["finished_at"] = None
         item["updated_at"] = utc_now()
         self._backend.replace_work_item(item)
         return deepcopy(item)
 
-    def complete(self, item_id: str, *, lease_token: str) -> Document:
+    def complete(self, item_id: str, *, lease_token: str, result_status: Optional[str] = None) -> Document:
         item = self._required(item_id)
         self._require_lease(item, lease_token)
         item["status"] = "completed"
         item["lease_token"] = None
         item["lease_expires_at"] = None
         item["last_error"] = None
+        item["last_error_code"] = None
+        item["error_retryable"] = None
+        item["finished_at"] = utc_now()
+        if result_status is not None:
+            item["result_status"] = result_status
         item["updated_at"] = utc_now()
         self._backend.replace_work_item(item)
         return deepcopy(item)
 
-    def fail(self, item_id: str, error: str, *, lease_token: str) -> Document:
+    def fail(
+        self,
+        item_id: str,
+        error: str,
+        *,
+        lease_token: str,
+        error_code: Optional[str] = None,
+        retryable: Optional[bool] = None,
+    ) -> Document:
         item = self._required(item_id)
         self._require_lease(item, lease_token)
         max_attempts = max(1, int(item.get("max_attempts", 5)))
         exhausted = int(item.get("attempt_count", 0)) >= max_attempts
-        item["status"] = "dead_letter" if exhausted else "failed"
+        terminal = retryable is False or exhausted
+        item["status"] = "dead_letter" if terminal else "failed"
         item["lease_token"] = None
         item["lease_expires_at"] = None
         item["last_error"] = error[:1000]
-        if exhausted:
+        item["last_error_code"] = error_code
+        item["error_retryable"] = retryable
+        item["finished_at"] = utc_now()
+        if terminal:
             item["dead_lettered_at"] = utc_now()
         else:
             base = max(0, int(item.get("retry_base_seconds", 0)))
@@ -250,9 +297,31 @@ class OutboxRepository:
         item["lease_token"] = None
         item["lease_expires_at"] = None
         item["dead_lettered_at"] = None
+        item["finished_at"] = None
         item["replay_count"] = int(item.get("replay_count", 0)) + 1
         item["last_replay"] = {"reason": reason, "actor_id": actor_id, "replayed_at": utc_now()}
         item["updated_at"] = utc_now()
+        self._backend.replace_work_item(item)
+        return deepcopy(item)
+
+    def cancel(self, item_id: str, *, reason: str, actor_id: str) -> Document:
+        """Persist cooperative cancellation without terminating a worker process."""
+        item = self._required(item_id)
+        if item.get("status") in {"completed", "cancelled"}:
+            return deepcopy(item)
+        now = utc_now()
+        item["cancel_requested"] = {
+            "reason": str(reason)[:500],
+            "actor_id": actor_id,
+            "requested_at": now,
+        }
+        if item.get("status") != "running":
+            item["status"] = "cancelled"
+            item["lease_token"] = None
+            item["lease_expires_at"] = None
+            item["available_at"] = now
+            item["finished_at"] = now
+        item["updated_at"] = now
         self._backend.replace_work_item(item)
         return deepcopy(item)
 
@@ -292,6 +361,9 @@ class ProviderSecretRepository:
             self._vault.seal(deepcopy(credentials)),
         )
 
+    def delete(self, provider_connection_id: str) -> None:
+        self._backend.delete_secret(self._organization_id, provider_connection_id)
+
 
 class ModelInvocationRepository:
     def __init__(self, backend: TransactionBackend, organization_id: str) -> None:
@@ -322,6 +394,12 @@ class PersistenceTransaction:
             backend, organization_id, collection="knowledge_bases", entity_name="KnowledgeBase"
         )
         self.questions = QuestionRepository(backend, organization_id)
+        self.question_generation_batches = VersionedDocumentRepository(
+            backend,
+            organization_id,
+            collection="question_generation_batches",
+            entity_name="QuestionGenerationBatch",
+        )
         self.question_speech_assets = VersionedDocumentRepository(
             backend,
             organization_id,
@@ -416,6 +494,12 @@ def new_work_item(
         "lease_token": None,
         "lease_expires_at": None,
         "last_error": None,
+        "last_error_code": None,
+        "error_retryable": None,
+        "first_started_at": None,
+        "started_at": None,
+        "finished_at": None,
+        "cancel_requested": None,
         "created_at": now,
         "updated_at": now,
     }

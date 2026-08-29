@@ -96,6 +96,61 @@ def test_version_conflicts_are_explicit(persistence_bundle) -> None:
     assert current["version"] == 2
 
 
+def test_question_generation_batches_share_the_versioned_persistence_contract(persistence_bundle) -> None:
+    _, persistence = persistence_bundle
+    item = {
+        "id": "question_gen_contract",
+        "organization_id": "org_a",
+        "knowledge_base_id": "kb_contract",
+        "status": "reviewing",
+        "drafts": [],
+        "created_at": "2026-08-27T00:00:00Z",
+        "updated_at": "2026-08-27T00:00:00Z",
+    }
+    with persistence.transaction("org_a") as transaction:
+        saved = transaction.question_generation_batches.add(item)
+    with persistence.transaction("org_b") as transaction:
+        assert transaction.question_generation_batches.get(saved["id"]) is None
+    with persistence.transaction("org_a") as transaction:
+        current = transaction.question_generation_batches.get(saved["id"])
+        current["status"] = "importing"
+        updated = transaction.question_generation_batches.update(
+            current, expected_version=current["version"]
+        )
+    assert updated["version"] == 2
+    assert updated["status"] == "importing"
+
+
+def test_versioned_document_and_provider_secret_delete_are_atomic(persistence_bundle) -> None:
+    _, persistence = persistence_bundle
+    connection = {
+        "id": "provider_delete_contract",
+        "organization_id": "org_a",
+        "provider_id": "mock",
+        "display_name": "Delete contract",
+        "created_at": "2026-08-26T00:00:00Z",
+        "updated_at": "2026-08-26T00:00:00Z",
+    }
+    with persistence.transaction("org_a") as transaction:
+        saved = transaction.provider_connections.add(connection)
+        transaction.provider_secrets.replace(saved["id"], {"api_key": "contract-secret"})
+
+    with pytest.raises(ConcurrencyConflict):
+        with persistence.transaction("org_a") as transaction:
+            transaction.provider_connections.delete(saved["id"], expected_version=2)
+            transaction.provider_secrets.delete(saved["id"])
+
+    with persistence.transaction("org_a") as transaction:
+        assert transaction.provider_connections.get(saved["id"]) is not None
+        assert transaction.provider_secrets.get(saved["id"]) == {"api_key": "contract-secret"}
+        transaction.provider_connections.delete(saved["id"], expected_version=1)
+        transaction.provider_secrets.delete(saved["id"])
+
+    with persistence.transaction("org_a") as transaction:
+        assert transaction.provider_connections.get(saved["id"]) is None
+        assert transaction.provider_secrets.get(saved["id"]) == {}
+
+
 def test_question_catalog_search_is_filtered_inside_each_persistence_adapter(persistence_bundle) -> None:
     _, persistence = persistence_bundle
 
@@ -116,7 +171,7 @@ def test_question_catalog_search_is_filtered_inside_each_persistence_adapter(per
         transaction.questions.add(catalog_question("q_inactive", status="archived"))
         transaction.questions.add(catalog_question("q_invalid", validation_status="invalid"))
         transaction.questions.add(catalog_question("q_speech_pending", speech_status="pending"))
-        transaction.questions.add(catalog_question("q_other_position", job_position_id="position_b"))
+        transaction.questions.add(catalog_question("q_reused_position", job_position_id="position_b"))
         transaction.questions.add(catalog_question("q_other_kb", knowledge_base_id="kb_b"))
         transaction.questions.add(catalog_question("q_other_skill", skills=["database"]))
     with persistence.transaction("org_b") as transaction:
@@ -131,7 +186,7 @@ def test_question_catalog_search_is_filtered_inside_each_persistence_adapter(per
             question_types=["open_ended"],
         )
 
-    assert [item["id"] for item in matches] == ["q_match"]
+    assert [item["id"] for item in matches] == ["q_match", "q_reused_position"]
 
 
 def test_outbox_is_idempotent_and_commits_with_aggregate_result(persistence_bundle) -> None:
@@ -227,3 +282,37 @@ def test_outbox_dead_letter_and_manual_replay(persistence_bundle) -> None:
     assert replayed["attempt_count"] == 0
     assert replayed["replay_count"] == 1
     assert replayed["last_replay"]["actor_id"] == "admin_1"
+
+
+def test_non_retryable_outbox_failure_is_terminal_on_first_attempt(persistence_bundle) -> None:
+    _, persistence = persistence_bundle
+    item = new_work_item(
+        organization_id="org_a",
+        kind="contract.non-retryable",
+        aggregate_id="aggregate_non_retryable",
+        idempotency_key="contract.non-retryable:1",
+    )
+    item["max_attempts"] = 5
+    with persistence.transaction("org_a") as transaction:
+        saved = transaction.outbox.enqueue(item)
+        running = transaction.outbox.start(saved["id"])
+        failed = transaction.outbox.fail(
+            saved["id"],
+            "request cannot succeed unchanged",
+            lease_token=running["lease_token"],
+            error_code="provider_output_truncated",
+            retryable=False,
+        )
+
+    assert failed["attempt_count"] == 1
+    assert failed["status"] == "dead_letter"
+    assert failed["error_retryable"] is False
+    assert failed["dead_lettered_at"]
+    with persistence.transaction("org_a") as transaction:
+        assert saved["id"] not in {
+            candidate["id"] for candidate in transaction.outbox.claimable()
+        }
+        replayed = transaction.outbox.replay(
+            saved["id"], reason="operator changed the request", actor_id="admin_1"
+        )
+    assert replayed["status"] == "pending"

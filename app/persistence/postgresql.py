@@ -74,13 +74,12 @@ class _PostgreSQLTransactionBackend(TransactionBackend):
         clauses = [
             "collection = 'questions'",
             "organization_id = %s",
-            "data->>'job_position_id' = %s",
             "data->>'status' = 'active'",
             "data->>'validation_status' = 'valid'",
             "data->>'speech_status' = 'ready'",
             "data->>'knowledge_base_id' = ANY(%s)",
         ]
-        parameters: List[object] = [organization_id, job_position_id, knowledge_base_ids]
+        parameters: List[object] = [organization_id, knowledge_base_ids]
         if skills:
             clauses.append("data->'skills' ?| %s")
             parameters.append(skills)
@@ -145,6 +144,12 @@ class _PostgreSQLTransactionBackend(TransactionBackend):
             (item_id, organization_id, Jsonb(secret)),
         )
 
+    def delete_secret(self, organization_id: str, item_id: str) -> None:
+        self.connection.execute(
+            "DELETE FROM provider_secrets WHERE organization_id = %s AND provider_connection_id = %s",
+            (organization_id, item_id),
+        )
+
     def list_invocations(self) -> List[Document]:
         rows = self.connection.execute(
             "SELECT data FROM model_invocations ORDER BY created_at, id"
@@ -161,15 +166,30 @@ class _PostgreSQLTransactionBackend(TransactionBackend):
 class PostgreSQLPersistence:
     def __init__(self, store: PostgreSQLStore) -> None:
         self.store = store
-        self._ensure_schema()
+        self._verify_schema()
 
     def _connect(self) -> psycopg.Connection:
         return psycopg.connect(self.store.dsn, row_factory=dict_row)
 
-    def _ensure_schema(self) -> None:
+    def _verify_schema(self) -> None:
+        """Fail fast without granting the runtime role any DDL responsibility."""
         with self._connect() as connection:
-            for migration in MIGRATIONS:
-                connection.execute(migration.read_text(encoding="utf-8"))
+            row = connection.execute(
+                """
+                SELECT
+                    to_regclass('public.documents') AS documents,
+                    to_regclass('public.outbox_work_items') AS outbox_work_items,
+                    to_regclass('public.provider_secrets') AS provider_secrets,
+                    to_regclass('public.model_invocations') AS model_invocations
+                """
+            ).fetchone()
+            missing = [name for name, value in dict(row).items() if value is None]
+            if missing:
+                raise RuntimeError(
+                    "PostgreSQL schema is not migrated (%s missing). Run "
+                    "`python -m app.migrations.postgresql` with a migration-owner DSN before startup."
+                    % ", ".join(sorted(missing))
+                )
 
     @contextmanager
     def transaction(self, organization_id: str) -> Iterator[PersistenceTransaction]:

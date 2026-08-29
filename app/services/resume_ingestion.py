@@ -3,6 +3,7 @@ import hashlib
 import ipaddress
 import os
 import socket
+import struct
 import subprocess
 from io import BytesIO
 from pathlib import Path
@@ -22,6 +23,7 @@ from app.file_storage.provider import private_file_storage
 from app.persistence.interface import Persistence, new_work_item
 from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
+from app.services.resume_review import queue_resume_review
 
 
 PDF_CONTENT_TYPE = "application/pdf"
@@ -57,6 +59,63 @@ class CommandMalwareScanner:
             raise ApiError("FILE_MALWARE_DETECTED", "The uploaded file failed malware scanning.", status_code=422)
         if completed.returncode != 0:
             raise ApiError("FILE_SCAN_FAILED", "The malware scanner could not verify the file.", status_code=503)
+
+
+class ClamdMalwareScanner:
+    """Streams private bytes to an internal clamd daemon using the INSTREAM protocol."""
+
+    def __init__(self, host: str, port: int = 3310, *, timeout_seconds: int = 30) -> None:
+        self.host = host
+        self.port = port
+        self.timeout_seconds = timeout_seconds
+
+    def scan(self, content: bytes) -> None:
+        try:
+            with socket.create_connection(
+                (self.host, self.port), timeout=self.timeout_seconds
+            ) as connection:
+                connection.sendall(b"zINSTREAM\0")
+                for offset in range(0, len(content), 64 * 1024):
+                    chunk = content[offset:offset + 64 * 1024]
+                    connection.sendall(struct.pack("!I", len(chunk)) + chunk)
+                connection.sendall(struct.pack("!I", 0))
+                response = _read_clamd_response(connection)
+        except (OSError, TimeoutError) as exc:
+            raise ApiError(
+                "FILE_SCAN_FAILED", "The malware scanner is unavailable.", status_code=503
+            ) from exc
+        if response.endswith(" OK"):
+            return
+        if response.endswith(" FOUND"):
+            raise ApiError(
+                "FILE_MALWARE_DETECTED", "The uploaded file failed malware scanning.", status_code=422
+            )
+        raise ApiError(
+            "FILE_SCAN_FAILED", "The malware scanner could not verify the file.", status_code=503
+        )
+
+
+def clamd_ping(host: str, port: int = 3310, timeout_seconds: int = 3) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=timeout_seconds) as connection:
+            connection.sendall(b"zPING\0")
+            return _read_clamd_response(connection) == "PONG"
+    except (OSError, TimeoutError):
+        return False
+
+
+def _read_clamd_response(connection: Any) -> str:
+    chunks = []
+    size = 0
+    while size < 16 * 1024:
+        chunk = connection.recv(min(4096, 16 * 1024 - size))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+        if b"\0" in chunk:
+            break
+    return b"".join(chunks).split(b"\0", 1)[0].decode("utf-8", errors="replace").strip()
 
 
 class SafePdfDownloader:
@@ -152,6 +211,7 @@ class ResumeIngestionService:
         content_type: str,
         content: bytes,
         idempotency_key: str = "",
+        review_request: Optional[Dict[str, str]] = None,
         organization_id: str = "org_default",
     ) -> Dict[str, Any]:
         self._validate_received_pdf(file_name, content_type, content)
@@ -164,6 +224,7 @@ class ResumeIngestionService:
             content=content,
             content_hash=digest,
             idempotency_key=idempotency_key or digest,
+            review_request=review_request,
             organization_id=organization_id,
         )
 
@@ -174,6 +235,7 @@ class ResumeIngestionService:
         source_url: str,
         file_name: str,
         idempotency_key: str,
+        review_request: Optional[Dict[str, str]] = None,
         organization_id: str = "org_default",
     ) -> Dict[str, Any]:
         self._validate_url_shape(source_url)
@@ -189,6 +251,7 @@ class ResumeIngestionService:
             idempotency_key=idempotency_key,
             organization_id=organization_id,
             source_url=source_url,
+            review_request=review_request,
         )
 
     async def process(self, work_item_id: str, organization_id: str = "org_default") -> Dict[str, Any]:
@@ -280,6 +343,24 @@ class ResumeIngestionService:
                 current_resume = transaction.resume_documents.update(
                     current_resume, expected_version=current_resume["version"]
                 )
+                review_request = current_work.get("payload", {}).get("review_request")
+                if review_request:
+                    position = transaction.job_positions.get(review_request["job_position_id"])
+                    role = transaction.role_requirements.get(review_request["role_requirement_id"])
+                    if position is None or role is None:
+                        raise ApiError(
+                            "RESUME_REVIEW_CONFIGURATION_MISSING",
+                            "The selected position requirement is no longer available.",
+                            status_code=409,
+                        )
+                    queue_resume_review(
+                        transaction,
+                        candidate_id=current_resume["candidate_profile_id"],
+                        resume=current_resume,
+                        position=position,
+                        role=role,
+                        organization_id=organization_id,
+                    )
                 transaction.outbox.complete(work_item_id, lease_token=current_work["lease_token"])
             self._discard_quarantine(work["id"])
             return current_resume
@@ -294,6 +375,309 @@ class ResumeIngestionService:
                 raise ApiError("FILE_INGESTION_JOB_NOT_FOUND", "File ingestion job does not exist.", status_code=404)
             resume = transaction.resume_documents.get(work["aggregate_id"])
         return {"job": self._public_work(work), "resume_document": resume}
+
+    def patch_resume(
+        self,
+        candidate_id: str,
+        resume_id: str,
+        payload: Dict[str, Any],
+        *,
+        actor_id: str,
+        organization_id: str = "org_default",
+    ) -> Dict[str, Any]:
+        display_name = Path(str(payload["display_name"]).strip()).name
+        if not display_name or display_name in {".", ".."} or Path(display_name).suffix.lower() != ".pdf":
+            raise ApiError(
+                "RESUME_DISPLAY_NAME_INVALID",
+                "Resume display name must be a PDF file name.",
+                status_code=422,
+            )
+        with self.persistence.transaction(organization_id) as transaction:
+            resume = transaction.resume_documents.get(resume_id)
+            if (
+                resume is None
+                or resume.get("candidate_profile_id") != candidate_id
+                or resume.get("status") in {"deleted", "deleting", "retention_purged"}
+            ):
+                raise ApiError("RESUME_DOCUMENT_NOT_FOUND", "Resume document does not exist.", status_code=404)
+            resume["file_name"] = display_name
+            resume["updated_at"] = utc_now()
+            updated = transaction.resume_documents.update(
+                resume,
+                expected_version=int(payload["expected_version"]),
+            )
+            file_object = transaction.file_objects.get(updated.get("file_object_id"))
+            if file_object and file_object.get("status") != "deleted":
+                file_object["original_file_name"] = display_name
+                file_object["updated_at"] = updated["updated_at"]
+                transaction.file_objects.update(file_object, expected_version=file_object["version"])
+            transaction.audit_events.add(
+                {
+                    "id": new_id("audit"),
+                    "organization_id": organization_id,
+                    "actor_id": actor_id,
+                    "action": "resume.display_name.updated",
+                    "resource_type": "resume_document",
+                    "resource_id": resume_id,
+                    "metadata": {"candidate_profile_id": candidate_id},
+                    "created_at": updated["updated_at"],
+                }
+            )
+            return updated
+
+    def delete_resume(
+        self,
+        candidate_id: str,
+        resume_id: str,
+        *,
+        expected_version: int,
+        actor_id: str,
+        organization_id: str = "org_default",
+    ) -> Dict[str, Any]:
+        with self.persistence.transaction(organization_id) as transaction:
+            resume = transaction.resume_documents.get(resume_id)
+            if (
+                resume is None
+                or resume.get("candidate_profile_id") != candidate_id
+                or resume.get("status") in {"deleted", "retention_purged"}
+            ):
+                raise ApiError("RESUME_DOCUMENT_NOT_FOUND", "Resume document does not exist.", status_code=404)
+            if int(resume.get("version", 1)) != int(expected_version):
+                raise ApiError(
+                    "RESUME_VERSION_CONFLICT",
+                    "Resume document version changed; refresh before deleting.",
+                    status_code=409,
+                )
+            reviews = [
+                item for item in transaction.resume_reviews.list() if item.get("resume_document_id") == resume_id
+            ]
+            review_ids = {item["id"] for item in reviews}
+            experience_questions = [
+                item
+                for item in transaction.experience_questions.list()
+                if item.get("resume_review_id") in review_ids
+            ]
+            experience_ids = {item["id"] for item in experience_questions}
+            referencing_plans = [
+                item
+                for item in transaction.interview_plans.list()
+                if item.get("resume_review_id") in review_ids
+                or bool(experience_ids.intersection(set(item.get("experience_question_ids", []))))
+            ]
+            referencing_sessions = [
+                item
+                for item in transaction.interview_sessions.list()
+                if item.get("plan_snapshot", {}).get("resume_review_id") in review_ids
+                or bool(
+                    experience_ids.intersection(
+                        set(item.get("plan_snapshot", {}).get("experience_question_ids", []))
+                    )
+                )
+            ]
+            if referencing_plans or referencing_sessions:
+                raise ApiError(
+                    "RESUME_DOCUMENT_IN_USE",
+                    "Resume is referenced by an interview plan or interview history and cannot be deleted.",
+                    status_code=409,
+                    details={
+                        "plan_ids": [item["id"] for item in referencing_plans],
+                        "interview_ids": [item["id"] for item in referencing_sessions],
+                    },
+                )
+            related_works = [
+                item
+                for item in transaction.outbox.list()
+                if item.get("aggregate_id") == resume_id or item.get("aggregate_id") in review_ids
+            ]
+            running = [item["id"] for item in related_works if item.get("status") == "running"]
+            if running:
+                raise ApiError(
+                    "RESUME_DOCUMENT_PROCESSING",
+                    "Resume has a running background task; retry after it stops.",
+                    status_code=409,
+                    details={"work_item_ids": running},
+                )
+            speech_assets = [
+                item
+                for item in transaction.question_speech_assets.list()
+                if item.get("owner_type") == "experience_question" and item.get("owner_id") in experience_ids
+            ]
+            file_ids = {
+                str(value)
+                for value in (resume.get("file_object_id"), resume.get("parsed_text_file_object_id"))
+                if value
+            }
+            file_ids.update(
+                str(item["file_object_id"])
+                for item in speech_assets
+                if item.get("file_object_id")
+            )
+            files = [transaction.file_objects.get(file_id) for file_id in file_ids]
+            for work in related_works:
+                if work.get("status") not in {"completed", "cancelled"}:
+                    transaction.outbox.cancel(
+                        work["id"],
+                        reason="Resume document deleted.",
+                        actor_id=actor_id,
+                    )
+            now = utc_now()
+            resume["status"] = "deleting"
+            resume["updated_at"] = now
+            transaction.resume_documents.update(resume, expected_version=expected_version)
+            transaction.audit_events.add(
+                {
+                    "id": new_id("audit"),
+                    "organization_id": organization_id,
+                    "actor_id": actor_id,
+                    "action": "resume.delete.requested",
+                    "resource_type": "resume_document",
+                    "resource_id": resume_id,
+                    "metadata": {
+                        "candidate_profile_id": candidate_id,
+                        "cancelled_work_count": len(
+                            [item for item in related_works if item.get("status") not in {"completed", "cancelled"}]
+                        ),
+                    },
+                    "created_at": now,
+                }
+            )
+
+        for work in related_works:
+            if work.get("kind") == "resume.ingest":
+                self._discard_quarantine(work["id"])
+        for file_object in files:
+            if file_object and file_object.get("object_key"):
+                self.storage.delete(str(file_object["object_key"]))
+
+        with self.persistence.transaction(organization_id) as transaction:
+            current = transaction.resume_documents.get(resume_id)
+            if current is None or current.get("status") != "deleting":
+                raise ApiError(
+                    "RESUME_DELETE_STATE_INVALID",
+                    "Resume deletion state changed unexpectedly.",
+                    status_code=409,
+                )
+            now = utc_now()
+            for file_id in file_ids:
+                file_object = transaction.file_objects.get(file_id)
+                if file_object is None:
+                    continue
+                file_object.update(
+                    {
+                        "status": "deleted",
+                        "object_key": None,
+                        "deleted_at": now,
+                        "updated_at": now,
+                    }
+                )
+                transaction.file_objects.update(file_object, expected_version=file_object["version"])
+            for review in reviews:
+                current_review = transaction.resume_reviews.get(review["id"])
+                if current_review is None:
+                    continue
+                current_review.update(
+                    {
+                        "status": "deleted",
+                        "project_evidence": [],
+                        "skill_evidence": [],
+                        "summary": None,
+                        "screening_recommendation": None,
+                        "screening_summary": None,
+                        "matched_requirements": [],
+                        "unmet_requirements": [],
+                        "evidence_chunks": [],
+                        "updated_at": now,
+                    }
+                )
+                transaction.resume_reviews.update(current_review, expected_version=current_review["version"])
+            candidate = transaction.candidate_profiles.get(candidate_id)
+            if candidate and candidate.get("retention_reason") == "screening_unqualified":
+                latest_by_position: Dict[str, Dict[str, Any]] = {}
+                for active_review in transaction.resume_reviews.list():
+                    if (
+                        active_review.get("candidate_profile_id") != candidate_id
+                        or active_review.get("status") in {"deleted", "retention_purged"}
+                    ):
+                        continue
+                    position_id = str(active_review.get("job_position_id") or "")
+                    previous = latest_by_position.get(position_id)
+                    if previous is None or str(active_review.get("created_at") or "") > str(
+                        previous.get("created_at") or ""
+                    ):
+                        latest_by_position[position_id] = active_review
+                outcomes = [
+                    item.get("human_decision") or item.get("screening_recommendation")
+                    for item in latest_by_position.values()
+                ]
+                if not outcomes or not all(outcome == "unqualified" for outcome in outcomes):
+                    candidate["retention_reason"] = None
+                    candidate["retention_expires_at"] = None
+                    candidate["updated_at"] = now
+                    transaction.candidate_profiles.update(candidate, expected_version=candidate["version"])
+            for question in experience_questions:
+                current_question = transaction.experience_questions.get(question["id"])
+                if current_question is None:
+                    continue
+                current_question.update(
+                    {
+                        "question_text": "[resume_deleted]",
+                        "standard_answer": "[resume_deleted]",
+                        "key_points": [],
+                        "evidence_refs": [],
+                        "status": "archived",
+                        "updated_at": now,
+                    }
+                )
+                transaction.experience_questions.update(
+                    current_question,
+                    expected_version=current_question["version"],
+                )
+            for asset in speech_assets:
+                current_asset = transaction.question_speech_assets.get(asset["id"])
+                if current_asset is None:
+                    continue
+                current_asset.update(
+                    {
+                        "status": "deleted",
+                        "audio_uri": None,
+                        "production_ready": False,
+                        "deleted_at": now,
+                        "updated_at": now,
+                    }
+                )
+                transaction.question_speech_assets.update(
+                    current_asset,
+                    expected_version=current_asset["version"],
+                )
+            current.update(
+                {
+                    "status": "deleted",
+                    "file_name": "[deleted].pdf",
+                    "file_hash": None,
+                    "parsed_text_file_object_id": None,
+                    "page_count": None,
+                    "processing_error": None,
+                    "deleted_at": now,
+                    "updated_at": now,
+                }
+            )
+            deleted = transaction.resume_documents.update(current, expected_version=current["version"])
+            transaction.audit_events.add(
+                {
+                    "id": new_id("audit"),
+                    "organization_id": organization_id,
+                    "actor_id": actor_id,
+                    "action": "resume.delete.completed",
+                    "resource_type": "resume_document",
+                    "resource_id": resume_id,
+                    "metadata": {
+                        "candidate_profile_id": candidate_id,
+                        "file_object_count": len(file_ids),
+                    },
+                    "created_at": now,
+                }
+            )
+            return deleted
 
     def issue_content_access(
         self,
@@ -352,11 +736,17 @@ class ResumeIngestionService:
         idempotency_key: str,
         organization_id: str,
         source_url: Optional[str] = None,
+        review_request: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         with self.persistence.transaction(organization_id) as transaction:
             candidate = transaction.candidate_profiles.get(candidate_id)
             if candidate is None:
                 raise ApiError("CANDIDATE_PROFILE_NOT_FOUND", "Candidate profile does not exist.", status_code=404)
+            normalized_review = self._validate_review_request(
+                transaction,
+                candidate=candidate,
+                review_request=review_request,
+            )
             existing_work = next(
                 (item for item in transaction.outbox.list() if item.get("idempotency_key") == "resume.ingest:%s:%s" % (candidate_id, idempotency_key)),
                 None,
@@ -415,6 +805,7 @@ class ResumeIngestionService:
                         "source_url_encrypted": self.sensitive.encrypt(source_url) if source_url else None,
                         "resume_document_id": resume["id"],
                         "file_object_id": file_object["id"],
+                        "review_request": normalized_review,
                     },
                 )
             )
@@ -425,6 +816,39 @@ class ResumeIngestionService:
                 self._mark_failed(work["id"], resume["id"], file_object["id"], None, RuntimeError("quarantine write failed"), organization_id)
                 raise
         return {"job": self._public_work(work), "resume_document": resume}
+
+    def _validate_review_request(
+        self,
+        transaction: Any,
+        *,
+        candidate: Dict[str, Any],
+        review_request: Optional[Dict[str, str]],
+    ) -> Optional[Dict[str, str]]:
+        if not review_request:
+            return None
+        position_id = str(review_request.get("job_position_id") or "").strip()
+        role_id = str(review_request.get("role_requirement_id") or "").strip()
+        if not position_id or not role_id:
+            raise ApiError(
+                "RESUME_REVIEW_CONFIGURATION_INCOMPLETE",
+                "Both job_position_id and role_requirement_id are required for automatic screening.",
+                status_code=422,
+            )
+        position = transaction.job_positions.get(position_id)
+        role = transaction.role_requirements.get(role_id)
+        if position is None or position.get("status") == "archived":
+            raise ApiError("JOB_POSITION_NOT_FOUND", "Job position does not exist.", status_code=404)
+        if role is None:
+            raise ApiError("ROLE_REQUIREMENT_NOT_FOUND", "Role requirement does not exist.", status_code=404)
+        if role.get("job_position_id") not in {None, position_id}:
+            raise ApiError("ROLE_POSITION_MISMATCH", "Role requirement belongs to another position.", status_code=409)
+        if candidate.get("job_position_id") and candidate.get("job_position_id") != position_id:
+            raise ApiError(
+                "CANDIDATE_POSITION_MISMATCH",
+                "Candidate belongs to another job position.",
+                status_code=409,
+            )
+        return {"job_position_id": position_id, "role_requirement_id": role_id}
 
     def _mark_failed(
         self,
@@ -466,7 +890,8 @@ class ResumeIngestionService:
             reader = PdfReader(BytesIO(content))
             if reader.is_encrypted:
                 raise ApiError("PDF_ENCRYPTED", "Encrypted PDF resumes are not accepted.", status_code=422)
-            text = "\n".join((page.extract_text() or "").strip() for page in reader.pages).strip()
+            # Form-feed is an internal page boundary used by long-resume evidence provenance.
+            text = "\f".join((page.extract_text() or "").strip() for page in reader.pages).strip()
         except ApiError:
             raise
         except Exception as exc:
@@ -496,11 +921,21 @@ class ResumeIngestionService:
 
     def _default_scanner(self) -> MalwareScanner:
         command = os.getenv("INTERVIEWER_FILE_SCANNER_COMMAND", "").strip()
+        clamd_host = os.getenv("INTERVIEWER_FILE_SCANNER_CLAMD_HOST", "").strip()
         runtime = os.getenv("INTERVIEWER_RUNTIME_ENV", "development").lower()
         if command:
             return CommandMalwareScanner(command)
+        if clamd_host:
+            return ClamdMalwareScanner(
+                clamd_host,
+                int(os.getenv("INTERVIEWER_FILE_SCANNER_CLAMD_PORT", "3310")),
+                timeout_seconds=int(os.getenv("INTERVIEWER_FILE_SCAN_TIMEOUT_SECONDS", "30")),
+            )
         if runtime == "production":
-            raise RuntimeError("INTERVIEWER_FILE_SCANNER_COMMAND is required in production.")
+            raise RuntimeError(
+                "INTERVIEWER_FILE_SCANNER_COMMAND or INTERVIEWER_FILE_SCANNER_CLAMD_HOST "
+                "is required in production."
+            )
         return SafeDevelopmentScanner()
 
     def _validate_url_shape(self, source_url: str) -> None:

@@ -1,7 +1,7 @@
 import os
 from typing import Any, Dict, List, Optional
 
-from app.adapters.local_media import LocalMediaRecording, LocalMediaStorage
+from app.adapters.private_media import media_recording_storage
 from app.core.errors import ApiError
 from app.model_gateway.errors import ProviderError
 from app.model_gateway.gateway import ModelGateway
@@ -19,8 +19,9 @@ class StreamingInterviewSTT:
         self.interview_id = interview_id
         self.interviews = InterviewService(store)
         self.gateway = ModelGateway(store, persistence=persistence_for(store))
-        self.media = LocalMediaStorage()
-        self.recording: Optional[LocalMediaRecording] = None
+        self.persistence = persistence_for(store)
+        self.media = media_recording_storage(self.persistence)
+        self.recording: Optional[Any] = None
         self.stream: Optional[ValidatedSTTStream] = None
         self.turn_id: Optional[str] = None
         self.content_type = "audio/webm;codecs=opus"

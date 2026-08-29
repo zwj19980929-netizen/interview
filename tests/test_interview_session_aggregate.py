@@ -38,7 +38,9 @@ def create_plan(api: TestClient) -> tuple:
             "rubric": {"semantic_correctness": 1.0},
         },
     )
-    assert question.status_code == 200, question.text
+    assert question.status_code == 202, question.text
+    asyncio.run(OutboxWorker(get_store()).run_once())
+    question = api.get("/api/v1/questions/%s" % question.json()["id"])
     role = api.post(
         "/api/v1/job-positions/%s/role-requirements" % position["id"],
         json={
@@ -216,7 +218,13 @@ def test_evaluation_and_report_revisions_are_append_only() -> None:
     assert reports[1]["supersedes_report_id"] == first_report_id
     assert session["answers"][0]["current_evaluation_id"] == evaluations[1]["id"]
     assert session["current_report_id"] == reports[1]["id"]
-    assert all(item["status"] == "completed" for item in get_store().outbox_work_items.values())
+    work_items = list(get_store().outbox_work_items.values())
+    assert all(
+        item["status"] == "completed"
+        for item in work_items
+        if item["kind"] != "appointment.reminder.email"
+    )
+    assert next(item for item in work_items if item["kind"] == "appointment.reminder.email")["status"] == "cancelled"
 
 
 def test_lifecycle_controls_and_durable_events_share_one_seam() -> None:

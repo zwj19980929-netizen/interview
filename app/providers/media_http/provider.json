@@ -1,0 +1,48 @@
+{
+  "schema_version": "2",
+  "provider_id": "media_http",
+  "display_name": "通用 HTTP 语音与数字人",
+  "version": "1.0.0",
+  "implemented": true,
+  "capabilities": ["stt.streaming", "stt.batch", "avatar.speak"],
+  "model_selection": "customizable",
+  "defaults": {"base_url": "https://media-provider.example.com/v1"},
+  "connection_form": {
+    "fields": [
+      {"name": "base_url", "label": "Base URL", "control": "text", "required": true, "placeholder": "https://media-provider.example.com/v1"},
+      {"name": "health_path", "label": "鉴权探针路径", "control": "text", "required": false, "default": "/health"},
+      {"name": "use_environment_proxy", "label": "使用环境代理", "control": "switch", "required": false, "default": false}
+    ]
+  },
+  "credential_form": {
+    "fields": [
+      {"name": "api_key", "label": "API Key", "control": "secret", "required": true}
+    ]
+  },
+  "model_types": {
+    "stt": {
+      "label": "语音识别",
+      "selection_mode": "customizable",
+      "capabilities": ["stt.streaming", "stt.batch"],
+      "configuration_form": {
+        "fields": [
+          {"name": "transcription_path", "label": "转写路径", "control": "text", "required": false, "default": "/audio/transcriptions"},
+          {"name": "audio_field", "label": "音频表单字段", "control": "text", "required": false, "default": "file"}
+        ]
+      }
+    },
+    "avatar": {
+      "label": "数字人",
+      "selection_mode": "customizable",
+      "capabilities": ["avatar.speak"],
+      "configuration_form": {
+        "fields": [
+          {"name": "speak_path", "label": "数字人驱动路径", "control": "text", "required": false, "default": "/avatar/speak"},
+          {"name": "allow_http_media", "label": "允许非 HTTPS 媒体（仅内网）", "control": "switch", "required": false, "default": false}
+        ]
+      }
+    }
+  },
+  "models": [],
+  "entrypoint": "app.providers.media_http.provider:MediaHttpProvider"
+}

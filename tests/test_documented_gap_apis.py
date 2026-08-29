@@ -62,8 +62,10 @@ def test_batch_import_build_query_question_update_archive_and_regenerate() -> No
         f"/api/v1/questions/{current['id']}/speech/regenerate",
         json={"expected_version": patched.json()["version"]},
     )
-    assert regenerated.status_code == 200, regenerated.text
-    assert regenerated.json()["speech_status"] == "ready"
+    assert regenerated.status_code == 202, regenerated.text
+    assert regenerated.json()["speech_status"] == "pending"
+    asyncio.run(OutboxWorker(get_store()).run_once())
+    regenerated = api.get(f"/api/v1/questions/{current['id']}")
     archived = api.patch(
         f"/api/v1/questions/{current['id']}",
         json={"expected_version": regenerated.json()["version"], "status": "archived"},
@@ -132,6 +134,8 @@ def test_real_tts_asset_is_copied_to_private_storage(tmp_path) -> None:
             },
         )
     )
+    asyncio.run(catalog.process_speech_work(question["job_id"]))
+    question = catalog.get_question(question["id"])
     with persistence.transaction("org_default") as transaction:
         asset = transaction.question_speech_assets.get(question["speech_asset_id"])
         file_object = transaction.file_objects.get(asset["file_object_id"])

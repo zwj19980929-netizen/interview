@@ -16,7 +16,7 @@ from app.domain.appointment_admission import (
     format_utc,
     parse_utc,
 )
-from app.persistence.interface import Persistence
+from app.persistence.interface import Persistence, new_work_item
 from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
 from app.services.interviews import InterviewService
@@ -113,6 +113,7 @@ class AppointmentService:
                     "registered_at": None,
                     "consumed_at": None,
                     "cancelled_at": None,
+                    "email_reminder": None,
                     "created_at": now,
                     "updated_at": now,
                 }
@@ -208,6 +209,7 @@ class AppointmentService:
             "status": appointment["status"],
             "required_fields": ["name", "email", "phone", "consent"],
             "consent": deepcopy(appointment["consent_notice"]),
+            "email_reminder": self._public_reminder_projection(appointment.get("email_reminder")),
         }
 
     def intake(self, token: str, payload: Dict[str, Any], organization_id: str = "org_default") -> Dict[str, Any]:
@@ -253,7 +255,22 @@ class AppointmentService:
                 None,
             )
             if existing and existing.get("consent_evidence_status") == "verified":
-                return {"appointment_id": appointment["id"], "status": appointment["status"], "matched": True}
+                reminder = self._ensure_email_reminder(transaction, appointment, organization_id)
+                if not appointment.get("email_reminder"):
+                    appointment["email_reminder"] = reminder
+                    appointment["updated_at"] = format_utc(self._now())
+                    appointment = transaction.interview_appointments.update(
+                        appointment,
+                        expected_version=appointment["version"],
+                    )
+                return {
+                    "appointment_id": appointment["id"],
+                    "status": appointment["status"],
+                    "matched": True,
+                    "scheduled_start_at": appointment["scheduled_start_at"],
+                    "scheduled_end_at": appointment["scheduled_end_at"],
+                    "email_reminder": self._public_reminder_projection(reminder),
+                }
             now = format_utc(self._now())
             intake = {
                     "id": new_id("intake"),
@@ -283,9 +300,18 @@ class AppointmentService:
                 transaction.candidate_intakes.add(intake)
             appointment["status"] = "registered"
             appointment["registered_at"] = now
+            reminder = self._ensure_email_reminder(transaction, appointment, organization_id)
+            appointment["email_reminder"] = reminder
             appointment["updated_at"] = now
             appointment = transaction.interview_appointments.update(appointment, expected_version=appointment["version"])
-            return {"appointment_id": appointment["id"], "status": appointment["status"], "matched": True}
+            return {
+                "appointment_id": appointment["id"],
+                "status": appointment["status"],
+                "matched": True,
+                "scheduled_start_at": appointment["scheduled_start_at"],
+                "scheduled_end_at": appointment["scheduled_end_at"],
+                "email_reminder": self._public_reminder_projection(reminder),
+            }
 
     def readiness(
         self,
@@ -384,6 +410,38 @@ class AppointmentService:
             ttl_seconds=ttl,
         )
 
+    def _ensure_email_reminder(
+        self,
+        transaction: Any,
+        appointment: Dict[str, Any],
+        organization_id: str,
+    ) -> Dict[str, Any]:
+        existing = deepcopy(appointment.get("email_reminder"))
+        if existing and existing.get("work_item_id"):
+            return existing
+        remind_at = self._parse_time(appointment["scheduled_start_at"]) - timedelta(minutes=30)
+        if remind_at < self._now():
+            remind_at = self._now()
+        work = new_work_item(
+            organization_id=organization_id,
+            kind="appointment.reminder.email",
+            aggregate_id=appointment["id"],
+            idempotency_key="appointment.reminder.email:%s" % appointment["id"],
+            payload={"appointment_id": appointment["id"]},
+        )
+        work["available_at"] = format_utc(remind_at)
+        work["max_attempts"] = 288
+        work["retry_base_seconds"] = 300
+        work["retry_max_seconds"] = 1800
+        queued = transaction.outbox.enqueue(work)
+        return {
+            "status": "scheduled",
+            "scheduled_for": queued["available_at"],
+            "work_item_id": queued["id"],
+            "sent_at": None,
+            "last_error_code": None,
+        }
+
     def _appointment_by_token(self, transaction: Any, token: str) -> Dict[str, Any]:
         token_hash = self._token_hash(token)
         appointment = next(
@@ -412,6 +470,15 @@ class AppointmentService:
         value.pop("invitation_token_hash", None)
         value.pop("consumed_token_hash", None)
         return value
+
+    def _public_reminder_projection(self, reminder: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not reminder:
+            return None
+        return {
+            key: reminder.get(key)
+            for key in ("status", "scheduled_for", "sent_at")
+            if reminder.get(key) is not None
+        }
 
     def _start_result(self, session: Dict[str, Any]) -> Dict[str, Any]:
         return {

@@ -9,6 +9,7 @@ from app.repositories.memory import InMemoryStore
 
 DOCUMENT_COLLECTIONS = [
     "questions",
+    "question_generation_batches",
     "job_positions",
     "knowledge_bases",
     "question_speech_assets",

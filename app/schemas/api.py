@@ -38,11 +38,30 @@ class QuestionSearchRequest(BaseModel):
     include_answer: bool = False
 
 
+class InitialRoleRequirementCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    must_have_skills: List[str] = Field(default_factory=list)
+    nice_to_have_skills: List[str] = Field(default_factory=list)
+    seniority: str = "mid"
+    interview_duration_minutes: int = Field(default=45, ge=5, le=480)
+
+
 class JobPositionCreate(BaseModel):
     code: str = Field(min_length=1)
     name: str = Field(min_length=1)
     description: str = ""
     status: str = "active"
+    initial_requirement: Optional[InitialRoleRequirementCreate] = None
+
+
+class JobPositionDeleteCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(ge=1)
+    confirmation: str = Field(min_length=1)
 
 
 class VersionedPatch(BaseModel):
@@ -51,11 +70,41 @@ class VersionedPatch(BaseModel):
     expected_version: int = Field(ge=1)
 
 
+class WebSocketTicketCreate(BaseModel):
+    interview_id: str = Field(min_length=1)
+
+
 class KnowledgeBaseCreate(BaseModel):
     name: str = Field(min_length=1)
     description: str = ""
     language: str = "zh-CN"
     voice_profile_id: str = "voice_default_cn"
+    positioning: str = ""
+    tags: List[str] = Field(default_factory=list, max_length=30)
+
+
+class KnowledgeBaseAssignmentCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    knowledge_base_id: str = Field(min_length=1)
+    expected_position_version: int = Field(ge=1)
+
+
+class KnowledgeBaseSpeechProfileUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(ge=1)
+    model_configuration_id: str = Field(min_length=1)
+    voice_profile_id: str = Field(min_length=1)
+    language: str = Field(default="zh-CN", min_length=2)
+    audio_format: str = Field(default="audio/wav", pattern=r"^audio/")
+    speaking_rate: float = Field(default=1.0, ge=0.5, le=2.0)
+
+
+class KnowledgeBaseSpeechRetry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_version: int = Field(ge=1)
 
 
 class QuestionPatch(VersionedPatch):
@@ -69,6 +118,45 @@ class QuestionPatch(VersionedPatch):
     role_families: Optional[List[str]] = None
     rubric: Optional[Dict[str, Any]] = None
     status: Optional[str] = None
+
+
+class QuestionGenerationCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model_configuration_id: str = Field(min_length=1)
+    target_count: int = Field(default=10, ge=1, le=30)
+    positioning: str = Field(default="", max_length=2000)
+    tags: List[str] = Field(default_factory=list, max_length=30)
+    requirements: str = Field(default="", max_length=4000)
+
+
+class GeneratedQuestionDraftPatch(VersionedPatch):
+    model_config = ConfigDict(extra="forbid")
+
+    title: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    question_text: Optional[str] = Field(default=None, min_length=1, max_length=4000)
+    standard_answer: Optional[str] = Field(default=None, min_length=1, max_length=8000)
+    key_points: Optional[List[Union[str, KeyPointInput]]] = None
+    difficulty: Optional[str] = None
+    type: Optional[str] = None
+    skills: Optional[List[str]] = None
+    rubric: Optional[Dict[str, Any]] = None
+
+
+class QuestionGenerationImport(VersionedPatch):
+    model_config = ConfigDict(extra="forbid")
+
+
+class GeneratedQuestionDraftImport(VersionedPatch):
+    model_config = ConfigDict(extra="forbid")
+
+    expected_draft_version: Optional[int] = Field(default=None, ge=1)
+
+
+class QuestionGenerationControl(VersionedPatch):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(default="manual", min_length=1, max_length=500)
 
 
 class KnowledgeBaseImport(BaseModel):
@@ -100,6 +188,8 @@ class InterviewPlanStrategy(BaseModel):
 
 
 class InterviewPlanGenerateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     role_requirement_id: str
     job_position_id: str = Field(min_length=1)
     candidate_profile_id: str = Field(min_length=1)
@@ -107,6 +197,7 @@ class InterviewPlanGenerateRequest(BaseModel):
     question_count: int = Field(default=8, ge=1, le=50)
     strategy: InterviewPlanStrategy = Field(default_factory=InterviewPlanStrategy)
     resume_review_id: Optional[str] = None
+    approve: bool = False
 
 
 class InterviewPlanPatch(BaseModel):
@@ -123,6 +214,7 @@ class CandidateProfileCreate(BaseModel):
     name: str = Field(min_length=1)
     email: str = Field(min_length=3)
     phone: str = Field(min_length=7)
+    job_position_id: Optional[str] = None
     external_ref: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
     retention_expires_at: Optional[str] = None
@@ -132,6 +224,7 @@ class CandidateProfilePatch(VersionedPatch):
     name: Optional[str] = Field(default=None, min_length=1)
     email: Optional[str] = Field(default=None, min_length=3)
     phone: Optional[str] = Field(default=None, min_length=7)
+    job_position_id: Optional[str] = None
     external_ref: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
     status: Optional[str] = None
@@ -146,12 +239,27 @@ class RetentionRun(BaseModel):
 class ResumeUrlImport(BaseModel):
     url: str = Field(min_length=8)
     display_name: str = "resume.pdf"
+    job_position_id: Optional[str] = None
+    role_requirement_id: Optional[str] = None
+
+
+class ResumeDocumentPatch(VersionedPatch):
+    display_name: str = Field(min_length=1, max_length=255)
 
 
 class ResumeReviewCreate(BaseModel):
     resume_document_id: str
     job_position_id: str
     role_requirement_id: str
+
+
+class ResumeReviewRetry(VersionedPatch):
+    reason: str = Field(default="interviewer_requested_retry", min_length=1, max_length=500)
+
+
+class CandidateScreeningReview(VersionedPatch):
+    decision: str = Field(pattern="^(qualified|unqualified)$")
+    note: str = Field(default="", max_length=2000)
 
 
 class ExperienceQuestionPatch(VersionedPatch):

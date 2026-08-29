@@ -1,8 +1,12 @@
 from copy import deepcopy
+import hashlib
+from io import BytesIO
+import wave
 from typing import Any, Dict, List, Optional
 
 from app.core.errors import ApiError
 from app.core.ids import new_id
+from app.core.prompt.contracts import prompt_contract
 from app.core.time import utc_now
 from app.model_gateway import capabilities as cap
 from app.model_gateway.forms import apply_form_defaults, validate_form_values
@@ -18,7 +22,6 @@ from app.model_gateway.schemas import (
     AvatarSpeakRequest,
     BatchSTTRequest,
     ChatJSONRequest,
-    ChatMessage,
     ChatTextRequest,
     StreamingSTTRequest,
     TextEmbeddingRequest,
@@ -97,6 +100,11 @@ class ModelAdminService:
         with self.persistence.transaction(organization_id) as transaction:
             return transaction.provider_connections.list()
 
+    def get_provider_connection(
+        self, connection_id: str, organization_id: str = "org_default"
+    ) -> Dict[str, Any]:
+        return self._connection(connection_id, organization_id)
+
     def patch_provider_connection(
         self,
         connection_id: str,
@@ -135,6 +143,50 @@ class ModelAdminService:
                     item[field] = payload[field]
             item["updated_at"] = utc_now()
             return transaction.provider_connections.update(item, expected_version=expected_version)
+
+    def delete_provider_connection(
+        self,
+        connection_id: str,
+        expected_version: int,
+        organization_id: str = "org_default",
+    ) -> Dict[str, Any]:
+        with self.persistence.transaction(organization_id) as transaction:
+            connection = transaction.provider_connections.get(connection_id)
+            if connection is None:
+                raise ApiError(
+                    "PROVIDER_CONNECTION_NOT_FOUND",
+                    "Provider connection does not exist.",
+                    status_code=404,
+                )
+            transaction.provider_connections.delete(connection_id, expected_version=expected_version)
+            models = [
+                item
+                for item in transaction.model_configurations.list()
+                if item.get("provider_connection_id") == connection_id
+            ]
+            model_ids = {item["id"] for item in models}
+            referenced_by = [
+                item["id"]
+                for item in transaction.knowledge_bases.list()
+                if (item.get("speech_profile") or {}).get("model_configuration_id") in model_ids
+            ]
+            if referenced_by:
+                raise ApiError(
+                    "MODEL_CONFIGURATION_IN_USE",
+                    "Provider contains TTS models still used by knowledge bases.",
+                    status_code=409,
+                    details={"knowledge_base_ids": sorted(referenced_by)},
+                )
+            deleted_route_ids = self._delete_model_dependencies(transaction, model_ids, organization_id)
+            for model in models:
+                transaction.model_configurations.delete(model["id"], expected_version=model["version"])
+            transaction.provider_secrets.delete(connection_id)
+        return {
+            "id": connection_id,
+            "deleted": True,
+            "deleted_model_configuration_ids": sorted(model_ids),
+            "deleted_model_route_ids": deleted_route_ids,
+        }
 
     async def validate_provider_connection(
         self, connection_id: str, organization_id: str = "org_default"
@@ -254,6 +306,51 @@ class ModelAdminService:
         with self.persistence.transaction(organization_id) as transaction:
             return transaction.model_configurations.list()
 
+    def get_model_configuration(
+        self, configuration_id: str, organization_id: str = "org_default"
+    ) -> Dict[str, Any]:
+        return self._model_configuration(configuration_id, organization_id)
+
+    def voice_catalog(
+        self, configuration_id: str, organization_id: str = "org_default"
+    ) -> Dict[str, Any]:
+        """Normalize a configured TTS model's selectable voices behind one interface."""
+        model = self._model_configuration(configuration_id, organization_id)
+        if cap.TTS_SYNTHESIZE not in model.get("supported_capabilities", []):
+            raise ApiError(
+                "MODEL_CONFIGURATION_CAPABILITY_MISMATCH",
+                "Model configuration does not support TTS synthesis.",
+                status_code=409,
+            )
+        settings = model.get("settings") or {}
+        default_voice = str(settings.get("default_voice") or "voice_default_cn").strip()
+        voice_map = settings.get("voice_map") or {}
+        voices: List[Dict[str, Any]] = []
+        seen = set()
+
+        def append(voice_id: str, label: str, *, default: bool = False) -> None:
+            value = str(voice_id or "").strip()
+            if not value or value in seen:
+                return
+            seen.add(value)
+            voices.append(
+                {
+                    "voice_profile_id": value,
+                    "label": str(label or value),
+                    "languages": [],
+                    "default": default,
+                }
+            )
+
+        append(default_voice, default_voice, default=True)
+        for profile_id, provider_voice in sorted(dict(voice_map).items()):
+            append(str(profile_id), "%s · %s" % (profile_id, provider_voice))
+        return {
+            "model_configuration_id": configuration_id,
+            "model_configuration_version": model["version"],
+            "items": voices,
+        }
+
     def patch_model_configuration(
         self, configuration_id: str, payload: Dict[str, Any], organization_id: str = "org_default"
     ) -> Dict[str, Any]:
@@ -289,6 +386,42 @@ class ModelAdminService:
             item["updated_at"] = utc_now()
             return transaction.model_configurations.update(item, expected_version=expected_version)
 
+    def delete_model_configuration(
+        self,
+        configuration_id: str,
+        expected_version: int,
+        organization_id: str = "org_default",
+    ) -> Dict[str, Any]:
+        with self.persistence.transaction(organization_id) as transaction:
+            model = transaction.model_configurations.get(configuration_id)
+            if model is None:
+                raise ApiError(
+                    "MODEL_CONFIGURATION_NOT_FOUND",
+                    "Model configuration does not exist.",
+                    status_code=404,
+                )
+            referenced_by = [
+                item["id"]
+                for item in transaction.knowledge_bases.list()
+                if (item.get("speech_profile") or {}).get("model_configuration_id") == configuration_id
+            ]
+            if referenced_by:
+                raise ApiError(
+                    "MODEL_CONFIGURATION_IN_USE",
+                    "TTS model configuration is still used by knowledge bases.",
+                    status_code=409,
+                    details={"knowledge_base_ids": sorted(referenced_by)},
+                )
+            transaction.model_configurations.delete(configuration_id, expected_version=expected_version)
+            deleted_route_ids = self._delete_model_dependencies(
+                transaction, {configuration_id}, organization_id
+            )
+        return {
+            "id": configuration_id,
+            "deleted": True,
+            "deleted_model_route_ids": deleted_route_ids,
+        }
+
     async def test_model_configuration(
         self,
         configuration_id: str,
@@ -307,7 +440,11 @@ class ModelAdminService:
             "purpose": "model_configuration_test",
             "primary": {"model_configuration_id": configuration_id, "timeout_s": 10},
             "fallbacks": [],
-            "policy": {"retry_count": 0, "circuit_failure_threshold": 0},
+            "policy": {
+                "retry_count": 2,
+                "retry_backoff_ms": 250,
+                "circuit_failure_threshold": 0,
+            },
             "enabled": True,
         }
         try:
@@ -315,7 +452,7 @@ class ModelAdminService:
             if capability == cap.STT_STREAMING:
                 stream = await self.gateway.open_stream(request, route=route)
                 events = list(stream.ready_events)
-                events.extend(await stream.send_audio(b"connection-test-audio"))
+                events.extend(await stream.send_audio(_probe_wav()))
                 events.extend(await stream.finish())
                 result = {"stream_id": stream.stream_id, "events": [item.model_dump() for item in events]}
             else:
@@ -409,6 +546,37 @@ class ModelAdminService:
             raise ApiError("MODEL_CONFIGURATION_NOT_FOUND", "Model configuration does not exist.", status_code=404)
         return item
 
+    def _delete_model_dependencies(
+        self,
+        transaction: Any,
+        model_configuration_ids: set[str],
+        organization_id: str,
+    ) -> List[str]:
+        if not model_configuration_ids:
+            return []
+        routes = [
+            route
+            for route in transaction.model_routes.list()
+            if any(
+                target.get("model_configuration_id") in model_configuration_ids
+                for target in [route.get("primary") or {}, *(route.get("fallbacks") or [])]
+            )
+        ]
+        for route in routes:
+            transaction.model_routes.delete(route["id"], expected_version=route["version"])
+        circuit_ids = {
+            "circuit_%s"
+            % hashlib.sha256(
+                ("%s:%s:%s" % (organization_id, model_id, capability)).encode("utf-8")
+            ).hexdigest()
+            for model_id in model_configuration_ids
+            for capability in cap.ALL_CAPABILITIES
+        }
+        for state in transaction.model_circuit_states.list():
+            if state["id"] in circuit_ids:
+                transaction.model_circuit_states.delete(state["id"], expected_version=state["version"])
+        return sorted(route["id"] for route in routes)
+
     def _record_model_health(self, configuration_id: str, organization_id: str, status: str, error: Optional[str]) -> None:
         with self.persistence.transaction(organization_id) as transaction:
             model = transaction.model_configurations.get(configuration_id)
@@ -452,19 +620,22 @@ class ModelAdminService:
 
     def _probe_request(self, capability: str, organization_id: str, purpose: str) -> Any:
         if capability == cap.LLM_CHAT_JSON:
+            contract = prompt_contract("json_probe", {})
             return ChatJSONRequest(
                 organization_id=organization_id,
                 purpose=purpose,
-                messages=[ChatMessage(role="user", content="Return a JSON object with message set to pong.")],
-                json_schema={
-                    "type": "object",
-                    "required": ["message"],
-                    "properties": {"message": {"type": "string"}},
-                    "additionalProperties": False,
-                },
+                messages=contract.messages,
+                json_schema=contract.response_schema,
+                metadata={"prompt_version": contract.version},
             )
         if capability == cap.LLM_CHAT_TEXT:
-            return ChatTextRequest(organization_id=organization_id, purpose=purpose, messages=[ChatMessage(role="user", content="ping")])
+            contract = prompt_contract("text_probe", {})
+            return ChatTextRequest(
+                organization_id=organization_id,
+                purpose=purpose,
+                messages=contract.messages,
+                metadata={"prompt_version": contract.version},
+            )
         if capability == cap.EMBEDDING_TEXT:
             return TextEmbeddingRequest(organization_id=organization_id, purpose=purpose, texts=["ping"])
         if capability == cap.AVATAR_SPEAK:
@@ -472,11 +643,17 @@ class ModelAdminService:
         if capability == cap.TTS_SYNTHESIZE:
             return TTSSynthesizeRequest(organization_id=organization_id, purpose=purpose, text="连接测试")
         if capability == cap.STT_BATCH:
-            return BatchSTTRequest(organization_id=organization_id, purpose=purpose, audio_uri="mock-media://connection-test.webm", metadata={"development_transcript": "连接测试"})
+            return BatchSTTRequest(
+                organization_id=organization_id,
+                purpose=purpose,
+                audio_uri="probe-audio://connection-test.wav",
+                content_type="audio/wav",
+                metadata={"development_transcript": "连接测试"},
+                audio_bytes=_probe_wav(),
+            )
         if capability == cap.STT_STREAMING:
             return StreamingSTTRequest(organization_id=organization_id, interview_id="connection_test", turn_id="connection_test_turn", purpose=purpose, metadata={"development_transcript": "连接测试", "confidence": 1.0})
         raise ApiError("MODEL_CAPABILITY_NOT_IMPLEMENTED", "Capability has no unified local test schema.", status_code=409)
-
     def _require_model_capability(self, model: Optional[Dict[str, Any]], capability: str) -> None:
         if model is None:
             raise ApiError("MODEL_CONFIGURATION_NOT_FOUND", "Configured model does not exist.", status_code=404)
@@ -505,3 +682,14 @@ class ModelAdminService:
         fallback_on = policy.get("fallback_on")
         if fallback_on is not None and (not isinstance(fallback_on, list) or not all(isinstance(item, str) for item in fallback_on)):
             raise ApiError("MODEL_ROUTE_INVALID", "fallback_on must be a list of error codes.", status_code=400)
+
+
+def _probe_wav() -> bytes:
+    """Small valid silent WAV used only for provider contract/authorization probes."""
+    target = BytesIO()
+    with wave.open(target, "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16000)
+        output.writeframes(b"\x00\x00" * 1600)
+    return target.getvalue()

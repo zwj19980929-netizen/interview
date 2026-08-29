@@ -65,8 +65,13 @@ class RedisRealtimeEventBus:
                 if payload.get("instance_id") == self.instance_id:
                     continue
                 await handler(str(payload["interview_id"]), dict(payload["event"]))
+        except Exception:
+            # Closing the Redis client unblocks a subscriber waiting in listen().
+            # That transport close is the expected shutdown path, not an outage.
+            if not self._closed:
+                raise
         finally:
-            await pubsub.close()
+            await pubsub.aclose()
 
     async def close(self) -> None:
         self._closed = True

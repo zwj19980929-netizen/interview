@@ -1,0 +1,502 @@
+import json
+from dataclasses import dataclass
+from typing import Any, Dict, List
+
+from app.model_gateway.schemas import ChatMessage
+
+
+@dataclass(frozen=True)
+class PromptContract:
+    """A versioned prompt and the response rules its caller expects."""
+
+    version: str
+    messages: List[ChatMessage]
+    response_schema: Dict[str, Any]
+
+
+def prompt_contract(name: str, context: Dict[str, Any]) -> PromptContract:
+    """Render one centrally governed prompt contract."""
+    if name == "question_blueprint_planning":
+        return _question_blueprint_planning(context)
+    if name == "question_blueprint_generation":
+        return _question_blueprint_generation(context)
+    if name == "question_generation":
+        return _question_generation(context)
+    if name == "answer_evaluation":
+        return _answer_evaluation(context)
+    if name == "resume_review":
+        return _resume_review(context)
+    if name == "resume_evidence_map":
+        return _resume_evidence_map(context)
+    if name == "resume_evidence_compaction":
+        return _resume_evidence_compaction(context)
+    if name == "resume_review_reduce":
+        return _resume_review_reduce(context)
+    if name == "json_probe":
+        return PromptContract(
+            version="json_probe.v1",
+            messages=[ChatMessage(role="user", content="Return one JSON object whose message field is exactly pong.")],
+            response_schema={
+                "type": "object",
+                "required": ["message"],
+                "properties": {"message": {"type": "string", "enum": ["pong"]}},
+                "additionalProperties": False,
+            },
+        )
+    if name in {"text_probe", "provider_credential_probe"}:
+        return PromptContract(
+            version="%s.v1" % name,
+            messages=[ChatMessage(role="user", content="ping")],
+            response_schema={},
+        )
+    raise ValueError("Unknown prompt contract: %s" % name)
+
+
+def structured_output_instruction(schema: Dict[str, Any]) -> str:
+    """Provider-neutral fallback instruction for JSON-object-only models."""
+    example = _json_schema_example(schema)
+    return (
+        "Return only one valid JSON object matching this JSON Schema. "
+        "Do not add markdown fences or explanatory text. Schema: %s. Example JSON output: %s"
+        % (
+            json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
+            json.dumps(example, ensure_ascii=False, separators=(",", ":")),
+        )
+    )
+
+
+def _question_generation(context: Dict[str, Any]) -> PromptContract:
+    target_count = max(1, min(30, int(context["target_count"])))
+    requirements = str(context.get("requirements") or "无额外要求")
+    user_prompt = (
+        "你是企业面试题库设计专家。请生成 %s 道可直接审核的中文面试题。\n"
+        "岗位：%s\n题库：%s\n题库定位：%s\n标签：%s\n额外要求：%s\n"
+        "每题必须提供非空标题、题干、标准答案、至少一个带正权重的关键点、至少一个技能标签、"
+        "难度（junior/mid/senior/expert）和题型（open_ended）。"
+        "题目之间不得重复，标准答案必须可用于解释性评分。输出务必精炼：标题不超过80字、题干不超过600字、"
+        "标准答案不超过1800字；每题1到6个关键点，每个关键点不超过240字。"
+        % (
+            target_count,
+            context.get("position_name") or "未命名岗位",
+            context.get("knowledge_base_name") or "未命名题库",
+            context.get("positioning") or "未填写",
+            "、".join(context.get("tags") or []) or "未填写",
+            requirements,
+        )
+    )
+    return PromptContract(
+        version="question_generation.v2",
+        messages=[
+            ChatMessage(role="system", content="只输出符合 JSON Schema 的对象，不输出 Markdown 或说明文字。"),
+            ChatMessage(role="user", content=user_prompt),
+        ],
+        response_schema={
+            "type": "object",
+            "required": ["questions"],
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": target_count,
+                    "items": _generated_question_schema(include_slot_id=False),
+                }
+            },
+            "additionalProperties": False,
+        },
+    )
+
+
+def _question_blueprint_planning(context: Dict[str, Any]) -> PromptContract:
+    target_count = max(1, min(30, int(context["target_count"])))
+    existing = context.get("existing_questions") or []
+    user_prompt = (
+        "你是企业面试题库规划专家。请先规划 %s 个互不重复的题目蓝图，不要生成完整题目或答案。\n"
+        "岗位：%s\n题库：%s\n题库定位：%s\n标签：%s\n额外要求：%s\n"
+        "每个蓝图必须使用唯一 slot_id（slot_01 起连续编号），并通过 topic、scenario、focus 的组合形成明确且互斥的考察目标。"
+        "蓝图之间不能只是同一问题的同义改写，也不能与已有题目重复。已有题目摘要：%s"
+        % (
+            target_count,
+            context.get("position_name") or "未命名岗位",
+            context.get("knowledge_base_name") or "未命名题库",
+            context.get("positioning") or "未填写",
+            "、".join(context.get("tags") or []) or "未填写",
+            context.get("requirements") or "无额外要求",
+            json.dumps(existing, ensure_ascii=False, separators=(",", ":")),
+        )
+    )
+    non_empty = {"type": "string", "minLength": 1}
+    blueprint = {
+        "type": "object",
+        "required": ["slot_id", "topic", "scenario", "focus", "difficulty", "question_type"],
+        "properties": {
+            "slot_id": non_empty,
+            "topic": non_empty,
+            "scenario": non_empty,
+            "focus": {"type": "array", "minItems": 1, "maxItems": 5, "items": non_empty},
+            "difficulty": {"type": "string", "enum": ["junior", "mid", "senior", "expert"]},
+            "question_type": {"type": "string", "enum": ["open_ended"]},
+        },
+        "additionalProperties": False,
+    }
+    return PromptContract(
+        version="question_blueprint_planning.v1",
+        messages=[
+            ChatMessage(role="system", content="只输出题目蓝图 JSON；确保每个槽位的主题、场景和考察点互斥。"),
+            ChatMessage(role="user", content=user_prompt),
+        ],
+        response_schema={
+            "type": "object",
+            "required": ["blueprints"],
+            "properties": {
+                "blueprints": {
+                    "type": "array",
+                    "minItems": target_count,
+                    "maxItems": target_count,
+                    "items": blueprint,
+                }
+            },
+            "additionalProperties": False,
+        },
+    )
+
+
+def _question_blueprint_generation(context: Dict[str, Any]) -> PromptContract:
+    blueprints = context.get("blueprints") or []
+    count = max(1, min(3, len(blueprints)))
+    user_prompt = (
+        "你是企业面试题库设计专家。请严格按以下蓝图逐槽位生成完整中文面试题，每个 slot_id 恰好一题：%s\n"
+        "题库定位：%s\n标签：%s\n额外要求：%s\n排除题目摘要：%s\n"
+        "不得更换 slot_id、合并槽位或生成排除题目的同义改写。每题必须提供可解释评分所需的标准答案、"
+        "带正权重关键点和技能标签。输出务必精炼：标题不超过80字、题干不超过600字、标准答案不超过1800字；"
+        "每题1到6个关键点，每个关键点不超过240字、别名最多4个，技能标签最多8个。"
+        % (
+            json.dumps(blueprints, ensure_ascii=False, separators=(",", ":")),
+            context.get("positioning") or "未填写",
+            "、".join(context.get("tags") or []) or "未填写",
+            context.get("requirements") or "无额外要求",
+            json.dumps(context.get("excluded_questions") or [], ensure_ascii=False, separators=(",", ":")),
+        )
+    )
+    question = _generated_question_schema(include_slot_id=True)
+    return PromptContract(
+        version="question_blueprint_generation.v2",
+        messages=[
+            ChatMessage(role="system", content="只输出符合 JSON Schema 的对象；每个蓝图槽位只生成一题。"),
+            ChatMessage(role="user", content=user_prompt),
+        ],
+        response_schema={
+            "type": "object",
+            "required": ["questions"],
+            "properties": {
+                "questions": {"type": "array", "minItems": count, "maxItems": count, "items": question}
+            },
+            "additionalProperties": False,
+        },
+    )
+
+
+def _generated_question_schema(*, include_slot_id: bool) -> Dict[str, Any]:
+    required = ["title", "question_text", "standard_answer", "key_points", "skills", "difficulty", "type"]
+    properties: Dict[str, Any] = {
+        "title": {"type": "string", "minLength": 1, "maxLength": 80},
+        "question_text": {"type": "string", "minLength": 1, "maxLength": 600},
+        "standard_answer": {"type": "string", "minLength": 1, "maxLength": 1800},
+        "key_points": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 6,
+            "items": {
+                "type": "object",
+                "required": ["text", "weight"],
+                "properties": {
+                    "text": {"type": "string", "minLength": 1, "maxLength": 240},
+                    "weight": {"type": "number", "minimum": 0.000001},
+                    "aliases": {
+                        "type": "array",
+                        "maxItems": 4,
+                        "items": {"type": "string", "minLength": 1, "maxLength": 80},
+                    },
+                },
+                "additionalProperties": False,
+            },
+        },
+        "skills": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 8,
+            "items": {"type": "string", "minLength": 1, "maxLength": 60},
+        },
+        "difficulty": {"type": "string", "enum": ["junior", "mid", "senior", "expert"]},
+        "type": {"type": "string", "enum": ["open_ended"]},
+    }
+    if include_slot_id:
+        required = ["slot_id", *required]
+        properties = {
+            "slot_id": {"type": "string", "minLength": 1, "maxLength": 40},
+            **properties,
+        }
+    return {
+        "type": "object",
+        "required": required,
+        "properties": properties,
+        "additionalProperties": False,
+    }
+
+
+def _answer_evaluation(context: Dict[str, Any]) -> PromptContract:
+    user_prompt = "题目：%s\n标准答案：%s\n评分标准：%s\n岗位要求：%s\n候选人回答：%s" % (
+        context["question_text"],
+        context["standard_answer"],
+        context.get("rubric", {}),
+        context.get("role_requirement", ""),
+        context["answer_text"],
+    )
+    return PromptContract(
+        version="answer_evaluation.v1",
+        messages=[
+            ChatMessage(role="system", content="你是严格的面试评分助手，只输出结构化评分。"),
+            ChatMessage(role="user", content=user_prompt),
+        ],
+        response_schema={
+            "type": "object",
+            "required": [
+                "score", "confidence", "dimension_scores", "covered_key_points", "missing_key_points",
+                "incorrect_claims", "evidence", "review_flags", "summary",
+            ],
+            "properties": {
+                "score": {"type": "integer", "minimum": 0, "maximum": 100},
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "dimension_scores": {"type": "object"},
+                "covered_key_points": {"type": "array"},
+                "missing_key_points": {"type": "array"},
+                "incorrect_claims": {"type": "array"},
+                "evidence": {"type": "array"},
+                "review_flags": {"type": "array"},
+                "summary": {"type": "string", "minLength": 1},
+                "suggested_followup": {"type": ["string", "null"]},
+            },
+        },
+    )
+
+
+def _resume_review_response_schema(*, require_source_pages: bool = False) -> Dict[str, Any]:
+    non_empty_string = {"type": "string", "minLength": 1}
+    question = {
+        "type": "object",
+        "required": ["question_text", "verification_points", "evidence_refs", "evaluation_guide"],
+        "properties": {
+            "question_text": non_empty_string,
+            "verification_points": {"type": "array", "minItems": 1, "items": non_empty_string},
+            "evidence_refs": {"type": "array", "items": non_empty_string},
+            "evaluation_guide": non_empty_string,
+        },
+        "additionalProperties": False,
+    }
+    evidence_required = ["label", "evidence", "source_pages"] if require_source_pages else ["label", "evidence"]
+    evidence = {
+        "type": "object",
+        "required": evidence_required,
+        "properties": {
+            "label": non_empty_string,
+            "evidence": non_empty_string,
+            "source_pages": {"type": "array", "items": {"type": "integer", "minimum": 1}},
+        },
+        "additionalProperties": False,
+    }
+    screening_evidence = {
+        "type": "object",
+        "required": ["requirement", "evidence", "source_pages"] if require_source_pages else ["requirement", "evidence"],
+        "properties": {
+            "requirement": non_empty_string,
+            "evidence": non_empty_string,
+            "source_pages": {"type": "array", "items": {"type": "integer", "minimum": 1}},
+        },
+        "additionalProperties": False,
+    }
+    screening_gap = {
+        "type": "object",
+        "required": ["requirement", "reason"],
+        "properties": {"requirement": non_empty_string, "reason": non_empty_string},
+        "additionalProperties": False,
+    }
+    return {
+        "type": "object",
+        "required": ["summary", "project_evidence", "skill_evidence", "screening", "experience_questions"],
+        "properties": {
+            "summary": non_empty_string,
+            "project_evidence": {"type": "array", "items": evidence},
+            "skill_evidence": {"type": "array", "items": evidence},
+            "warnings": {"type": "array", "items": non_empty_string},
+            "screening": {
+                "type": "object",
+                "required": ["recommendation", "score", "summary", "matched_requirements", "unmet_requirements"],
+                "properties": {
+                    "recommendation": {"type": "string", "enum": ["qualified", "unqualified", "manual_review"]},
+                    "score": {"type": "integer", "minimum": 0, "maximum": 100},
+                    "summary": non_empty_string,
+                    "matched_requirements": {"type": "array", "items": screening_evidence},
+                    "unmet_requirements": {"type": "array", "items": screening_gap},
+                },
+                "additionalProperties": False,
+            },
+            "experience_questions": {"type": "array", "minItems": 1, "items": question},
+        },
+        "additionalProperties": False,
+    }
+
+
+def _resume_review(context: Dict[str, Any]) -> PromptContract:
+    return PromptContract(
+        version="resume_review.v4",
+        messages=[
+            ChatMessage(
+                role="system",
+                content=(
+                    "只依据脱敏简历中的工作能力证据评估岗位初筛，并生成经历核验问题。"
+                    "匹配分必须为0到100的整数：0到59分 recommendation=unqualified，"
+                    "60到74分 recommendation=manual_review，75到100分 recommendation=qualified。"
+                    "不得使用性别、年龄、婚育、民族、照片等受保护属性；初筛结论仅是可人工复核的岗位匹配建议，不是录用决定。"
+                ),
+            ),
+            ChatMessage(
+                role="user",
+                content="岗位：%s\n要求：%s\n脱敏简历：%s"
+                % (context["position_name"], context["role_description"], context["sanitized_resume"]),
+            ),
+        ],
+        response_schema=_resume_review_response_schema(),
+    )
+
+
+def _resume_evidence_schema(*, max_items: int, include_source_pages: bool = False) -> Dict[str, Any]:
+    required = ["label", "evidence"]
+    properties: Dict[str, Any] = {
+        "label": {"type": "string", "minLength": 1},
+        "evidence": {"type": "string", "minLength": 1},
+    }
+    if include_source_pages:
+        required.append("source_pages")
+        properties["source_pages"] = {
+            "type": "array",
+            "minItems": 1,
+            "items": {"type": "integer", "minimum": 1},
+        }
+    item = {
+        "type": "object",
+        "required": required,
+        "properties": properties,
+        "additionalProperties": False,
+    }
+    return {
+        "type": "object",
+        "required": ["project_evidence", "skill_evidence", "warnings"],
+        "properties": {
+            "project_evidence": {"type": "array", "maxItems": max_items, "items": item},
+            "skill_evidence": {"type": "array", "maxItems": max_items, "items": item},
+            "warnings": {"type": "array", "maxItems": 8, "items": {"type": "string", "minLength": 1}},
+        },
+        "additionalProperties": False,
+    }
+
+
+def _resume_evidence_map(context: Dict[str, Any]) -> PromptContract:
+    return PromptContract(
+        version="resume_evidence_map.v1",
+        messages=[
+            ChatMessage(
+                role="system",
+                content=(
+                    "只从当前简历片段提取可核验的项目与技能证据，不做岗位符合性或录用判断。"
+                    "不得补写片段中不存在的经历，不得使用受保护属性。证据应短而具体。"
+                ),
+            ),
+            ChatMessage(
+                role="user",
+                content=(
+                    "岗位：%s\n岗位要求：%s\n必备技能：%s\n简历页范围：%s-%s\n简历片段：%s"
+                    % (
+                        context["position_name"],
+                        context["role_description"],
+                        "、".join(context.get("must_have_skills") or []) or "未填写",
+                        context["page_start"],
+                        context["page_end"],
+                        context["chunk_text"],
+                    )
+                ),
+            ),
+        ],
+        response_schema=_resume_evidence_schema(max_items=12),
+    )
+
+
+def _resume_evidence_compaction(context: Dict[str, Any]) -> PromptContract:
+    return PromptContract(
+        version="resume_evidence_compaction.v1",
+        messages=[
+            ChatMessage(
+                role="system",
+                content=(
+                    "合并重复的简历证据并保留来源页。优先保留岗位必备技能、本人职责、技术决策和量化结果；"
+                    "不得新增输入中不存在的事实，也不得形成候选人筛选结论。"
+                ),
+            ),
+            ChatMessage(
+                role="user",
+                content="岗位要求：%s\n必备技能：%s\n待压缩证据 JSON：%s"
+                % (
+                    context["role_description"],
+                    "、".join(context.get("must_have_skills") or []) or "未填写",
+                    context["evidence_json"],
+                ),
+            ),
+        ],
+        response_schema=_resume_evidence_schema(max_items=24, include_source_pages=True),
+    )
+
+
+def _resume_review_reduce(context: Dict[str, Any]) -> PromptContract:
+    return PromptContract(
+        version="resume_review_reduce.v2",
+        messages=[
+            ChatMessage(
+                role="system",
+                content=(
+                    "只依据已从全部简历分块提取并带来源页的证据，综合评估岗位初筛并生成经历核验问题。"
+                    "匹配分必须为0到100的整数：0到59分 recommendation=unqualified，"
+                    "60到74分 recommendation=manual_review，75到100分 recommendation=qualified。"
+                    "证据不足必须标为缺口并反映在匹配分中；不得使用受保护属性，不得把建议表述为录用决定。"
+                ),
+            ),
+            ChatMessage(
+                role="user",
+                content="岗位：%s\n要求：%s\n必备技能：%s\n规范化证据 JSON：%s"
+                % (
+                    context["position_name"],
+                    context["role_description"],
+                    "、".join(context.get("must_have_skills") or []) or "未填写",
+                    context["evidence_json"],
+                ),
+            ),
+        ],
+        response_schema=_resume_review_response_schema(require_source_pages=True),
+    )
+
+
+def _json_schema_example(schema: Dict[str, Any]) -> Any:
+    if "enum" in schema:
+        return schema["enum"][0]
+    schema_type = schema.get("type")
+    if isinstance(schema_type, list):
+        schema_type = next((item for item in schema_type if item != "null"), "null")
+    if schema_type == "object":
+        properties = schema.get("properties") or {}
+        return {key: _json_schema_example(value) for key, value in properties.items() if key in schema.get("required", [])}
+    if schema_type == "array":
+        return [_json_schema_example(schema.get("items") or {})] if int(schema.get("minItems", 0)) > 0 else []
+    if schema_type == "string":
+        return "example"
+    if schema_type in {"integer", "number"}:
+        return schema.get("minimum", 0)
+    if schema_type == "boolean":
+        return True
+    return None

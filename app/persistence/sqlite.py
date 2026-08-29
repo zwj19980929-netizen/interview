@@ -60,12 +60,11 @@ class _SQLiteTransactionBackend(TransactionBackend):
         clauses = [
             "collection = 'questions'",
             "json_extract(data, '$.organization_id') = ?",
-            "json_extract(data, '$.job_position_id') = ?",
             "json_extract(data, '$.status') = 'active'",
             "json_extract(data, '$.validation_status') = 'valid'",
             "json_extract(data, '$.speech_status') = 'ready'",
         ]
-        parameters: List[str] = [organization_id, job_position_id]
+        parameters: List[str] = [organization_id]
         self._append_json_in_filter(clauses, parameters, "knowledge_base_id", knowledge_base_ids)
         self._append_json_in_filter(clauses, parameters, "difficulty", difficulties)
         self._append_json_in_filter(clauses, parameters, "type", question_types)
@@ -152,6 +151,12 @@ class _SQLiteTransactionBackend(TransactionBackend):
             DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at
             """,
             (item_id, json.dumps(secret, ensure_ascii=False)),
+        )
+
+    def delete_secret(self, organization_id: str, item_id: str) -> None:
+        self.connection.execute(
+            "DELETE FROM provider_secrets WHERE provider_connection_id = ?",
+            (item_id,),
         )
 
     def list_invocations(self) -> List[Document]:

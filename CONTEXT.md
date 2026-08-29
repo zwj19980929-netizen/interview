@@ -9,16 +9,48 @@
 _Avoid_: Role、JobRequirement、PositionText
 
 **KnowledgeBase**:
-只属于一个 JobPosition 的知识库式题库，包含 Question、评分依据、索引与读题语音构建状态；一个岗位可以有多个 KnowledgeBase。
-_Avoid_: GlobalQuestionPool、QuestionList、SharedBank
+由组织统一维护、可显式关联到多个 JobPosition 的知识库式题库，包含 Question、评分依据、索引与读题语音构建状态；岗位复用题库时同时复用其 KnowledgeBaseSpeechProfile 和读题资产。
+_Avoid_: GlobalQuestionPool、QuestionList、CopiedBank、PositionVoiceOverride
+
+**PositionKnowledgeBaseAssignment**:
+JobPosition 对组织内既有 KnowledgeBase 的显式引用；它决定搜索和计划范围，但不拥有或复制题目、音色及语音资产。
+_Avoid_: CreateBankForm、CopiedKnowledgeBase、VoiceOverride
+
+**KnowledgeBaseSpeechProfile**:
+一个 KnowledgeBase 当前生效的读题语音选择，冻结 TTS ModelConfiguration、声音、语言、格式和语速并拥有独立 revision；新题库可从组织的 question_speech_generation route 初始化，之后只由题库显式配置推进。
+_Avoid_: GlobalTTSSetting、VoiceDropdownValue、ModelRouteAlias
+
+**KnowledgeBaseSpeechBuild**:
+面向一个 KnowledgeBaseSpeechProfile revision 的整库语音重建，汇总题目级生成进度、失败和重试结果；新 revision 不接受旧构建结果成为当前资产。
+_Avoid_: ForLoopTTS、BulkButtonRequest、CeleryJob
 
 **QuestionSpeechAsset**:
-由题目版本、语言和音色确定、异步生成的不可变读题语音，供数字人或音频降级路径读取。
+由题目版本和 KnowledgeBaseSpeechProfile revision 确定、异步生成的不可变读题语音，供数字人或音频降级路径读取。
 _Avoid_: BrowserSpeech、TemporaryTTS、AudioURL
 
+**QuestionGenerationBatch**:
+一次面向指定 KnowledgeBase、基于题库定位、标签和可选要求形成的候选题生成与人工审核集合；确认导入前不属于正式题库。
+_Avoid_: AutoImport、PromptResult、QuestionList
+
+**GeneratedQuestionDraft**:
+QuestionGenerationBatch 内可由面试官修改或删除的候选题，具有完整题干、答案、关键点和评分标签，但尚不能用于计划或面试。
+_Avoid_: Question、GeneratedQuestion、TemporaryQuestion
+
+**QuestionGenerationExecution**:
+QuestionGenerationBatch 的一个可停止执行代次；规划、分片和合并工作冻结 execution revision，旧代次的迟到结果不能进入当前批次；多槽位输出截断可在同一代次原子拆成单槽位替代工作。
+_Avoid_: CeleryTask、BrowserProgress、KillWorker
+
+**QuestionBlueprint**:
+智能生题规划阶段冻结的单个题目槽位，使用 topic、scenario 和 focus 定义互斥考察方向；它约束 Worker 生成，但不是候选题或正式题目。
+_Avoid_: QuestionType、DraftQuestion、PromptFragment
+
 **CandidateProfile**:
-企业上传到组织简历库、可参与多次面试的候选人记录，拥有联系方式和 ResumeDocument 版本；它不是某次面试的冻结快照。
+企业上传到组织简历库、录入时明确一个应聘 JobPosition、可参与后续面试流程的候选人记录，拥有联系方式和 ResumeDocument 版本；它不是某次面试的冻结快照。
 _Avoid_: InterviewCandidate、ApplicantForm、ResumeRow
+
+**PositionCandidateMembership**:
+CandidateProfile 对一个应聘 JobPosition 的明确归属；删除岗位会清除该归属内候选人的敏感数据，但保留不可识别的审计与历史面试占位。
+_Avoid_: CandidateRow、GlobalCandidate、UISection
 
 **ResumeDocument**:
 候选人简历 PDF 的不可变版本，可由本地文件上传或 URL 导入形成；原始文件与解析文本都由系统托管并可追溯。
@@ -37,8 +69,16 @@ _Avoid_: StaticMediaDirectory、OSSHelper、FileURLBuilder
 _Avoid_: UploadHandler、URLParser、ResumeTextImport
 
 **ResumeReview**:
-一个 ResumeDocument 面向一个 JobPosition 和 RoleRequirement version 的异步 AI 审阅，产出可追溯项目/技能证据与 ExperienceQuestion 草稿，不直接作出录用决定。
+一个 ResumeDocument 面向一个 JobPosition 和 RoleRequirement version 的异步 AI 审阅，产出可追溯项目/技能证据、CandidateScreening 建议与 ExperienceQuestion 草稿，不直接作出录用决定。
 _Avoid_: ResumeScore、HiringDecision、GenericSummary
+
+**ResumeEvidenceChunk**:
+ResumeReview 内部按 PDF 页边界和模型输入预算形成的完整证据提取单元，记录来源页、处理状态和 Prompt/Provider 元数据；它只产出项目/技能证据，不能单独形成 CandidateScreening 结论。
+_Avoid_: PartialScreening、PageDecision、TruncatedResume
+
+**CandidateScreening**:
+ResumeReview 基于脱敏简历与岗位能力要求形成的可解释初筛建议，包含匹配分、分数带结论、命中项和缺口；0–59 分为不符合、60–74 分为待人工复核、75–100 分为符合，人工复核可以覆盖生效结论但必须保留 AI 原始建议与审计。
+_Avoid_: HiringDecision、AutoReject、ResumeRank
 
 **ExperienceQuestion**:
 ResumeReview 依据候选人项目证据生成、经面试官批准后用于核验过往经历的问题。

@@ -9,10 +9,11 @@ from app.core.errors import ApiError
 from app.main import create_app
 from app.migrations.model_configuration_v2 import migrate_documents, migrate_sqlite
 from app.model_gateway.forms import validate_form_values
+from app.model_gateway.errors import ProviderError
 from app.model_gateway.gateway import ModelGateway
 from app.model_gateway.registry import get_provider_manifest
 from app.model_gateway.schemas import ChatJSONResponse, ProviderMeta, Usage
-from app.repositories.provider import reset_store_for_tests
+from app.repositories.provider import get_store, reset_store_for_tests
 from app.services.model_admin import ModelAdminService
 
 
@@ -93,6 +94,93 @@ def test_connection_model_and_route_are_separate_resources() -> None:
     assert "provider_config_id" not in str(route.json())
 
 
+def test_model_and_provider_crud_apply_scoped_cascades() -> None:
+    api = client()
+    connection = api.post(
+        "/api/v1/admin/model-provider-connections",
+        json={"provider_id": "mock", "display_name": "CRUD provider"},
+    ).json()
+    json_model = api.post(
+        "/api/v1/admin/model-configurations",
+        json={
+            "provider_connection_id": connection["id"],
+            "model_type": "llm",
+            "provider_model_id": "mock-json",
+            "display_name": "JSON model",
+        },
+    ).json()
+    text_model = api.post(
+        "/api/v1/admin/model-configurations",
+        json={
+            "provider_connection_id": connection["id"],
+            "model_type": "llm",
+            "provider_model_id": "mock-text",
+            "display_name": "Text model",
+        },
+    ).json()
+    json_route = api.post(
+        "/api/v1/admin/model-routes",
+        json={
+            "capability": "llm.chat_json",
+            "purpose": "answer_evaluation",
+            "primary": {"model_configuration_id": json_model["id"]},
+        },
+    ).json()
+
+    assert api.get(f"/api/v1/admin/model-provider-connections/{connection['id']}").json()["id"] == connection["id"]
+    assert api.get(f"/api/v1/admin/model-configurations/{json_model['id']}").json()["id"] == json_model["id"]
+
+    stale = api.delete(
+        f"/api/v1/admin/model-configurations/{json_model['id']}?expected_version={json_model['version'] + 1}"
+    )
+    assert stale.status_code == 409
+    assert api.get(f"/api/v1/admin/model-configurations/{json_model['id']}").status_code == 200
+
+    deleted_model = api.delete(
+        f"/api/v1/admin/model-configurations/{json_model['id']}?expected_version={json_model['version']}"
+    )
+    assert deleted_model.status_code == 200, deleted_model.text
+    assert deleted_model.json()["deleted_model_route_ids"] == [json_route["id"]]
+    remaining_models = api.get("/api/v1/admin/model-configurations").json()["items"]
+    assert [item["id"] for item in remaining_models] == [text_model["id"]]
+    assert api.get(f"/api/v1/admin/model-provider-connections/{connection['id']}").status_code == 200
+    assert api.get("/api/v1/admin/model-routes").json()["items"] == []
+
+    text_route = api.post(
+        "/api/v1/admin/model-routes",
+        json={
+            "capability": "llm.chat_text",
+            "purpose": "candidate_message",
+            "primary": {"model_configuration_id": text_model["id"]},
+        },
+    ).json()
+    deleted_provider = api.delete(
+        f"/api/v1/admin/model-provider-connections/{connection['id']}?expected_version={connection['version']}"
+    )
+    assert deleted_provider.status_code == 200, deleted_provider.text
+    assert deleted_provider.json()["deleted_model_configuration_ids"] == [text_model["id"]]
+    assert deleted_provider.json()["deleted_model_route_ids"] == [text_route["id"]]
+    remaining_connections = api.get("/api/v1/admin/model-provider-connections").json()["items"]
+    assert connection["id"] not in {item["id"] for item in remaining_connections}
+    assert api.get("/api/v1/admin/model-configurations").json()["items"] == []
+    assert api.get("/api/v1/admin/model-routes").json()["items"] == []
+    assert api.get(f"/api/v1/admin/model-provider-connections/{connection['id']}").status_code == 404
+    assert connection["id"] not in get_store().provider_secrets
+
+
+def test_provider_delete_is_tenant_scoped() -> None:
+    store = reset_store_for_tests()
+    service = ModelAdminService(store)
+    connection = service.create_provider_connection(
+        {"provider_id": "mock", "display_name": "Tenant A"}, organization_id="org_a"
+    )
+
+    with pytest.raises(ApiError, match="does not exist"):
+        service.delete_provider_connection(connection["id"], connection["version"], organization_id="org_b")
+
+    assert service.get_provider_connection(connection["id"], organization_id="org_a")["id"] == connection["id"]
+
+
 @pytest.mark.anyio
 async def test_untested_model_can_run_probe_and_receives_saved_defaults() -> None:
     store = reset_store_for_tests()
@@ -121,6 +209,9 @@ async def test_untested_model_can_run_probe_and_receives_saved_defaults() -> Non
         provider_id = "openai_compatible"
 
         async def invoke(self, capability, request, context):
+            seen["calls"] = seen.get("calls", 0) + 1
+            if seen["calls"] < 3:
+                raise ProviderError("provider_rate_limited", "retry", retryable=True)
             seen["temperature"] = request.temperature
             seen["max_output_tokens"] = request.max_output_tokens
             seen["json_schema"] = request.json_schema
@@ -137,12 +228,13 @@ async def test_untested_model_can_run_probe_and_receives_saved_defaults() -> Non
 
     assert result["provider"]["model"] == "chat-model"
     assert seen == {
+        "calls": 3,
         "temperature": 0.7,
         "max_output_tokens": 321,
         "json_schema": {
             "type": "object",
             "required": ["message"],
-            "properties": {"message": {"type": "string"}},
+                "properties": {"message": {"type": "string", "enum": ["pong"]}},
             "additionalProperties": False,
         },
         "connection_config": {"base_url": "https://models.example.com/v1", "use_environment_proxy": False},
@@ -255,9 +347,9 @@ def test_sqlite_migration_supports_dry_run_then_one_way_upgrade(tmp_path) -> Non
 
 
 def test_admin_console_uses_schema_renderer_and_no_legacy_endpoint() -> None:
-    script = Path("app/web/app.js").read_text(encoding="utf-8")
+    script = Path("app/web/src/features/models/Page.jsx").read_text(encoding="utf-8")
 
-    assert "schemaForm" in script
+    assert "SchemaFields" in script
     assert "connection_form" in script
     assert "model_types" in script
     assert "model-provider-configs" not in script

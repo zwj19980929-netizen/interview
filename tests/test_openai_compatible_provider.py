@@ -8,6 +8,7 @@ import httpx
 import pytest
 
 from app.model_gateway import capabilities as cap
+from app.model_gateway.errors import ProviderError
 from app.model_gateway.gateway import ModelGateway
 from app.model_gateway.schemas import (
     ChatJSONRequest,
@@ -78,6 +79,58 @@ async def test_openai_compatible_chat_json_parses_structured_response() -> None:
     assert response.data == {"score": 91, "summary": "ok"}
     assert response.usage.total_tokens == 15
     assert response.provider.request_id == "chatcmpl_test"
+
+
+@pytest.mark.anyio
+async def test_openai_compatible_chat_json_classifies_length_truncation_with_safe_usage() -> None:
+    partial_content = '{"questions":[{"title":"partial"}'
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "id": "chatcmpl_truncated",
+                "choices": [
+                    {
+                        "message": {"content": partial_content},
+                        "finish_reason": "length",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 940,
+                    "completion_tokens": 4400,
+                    "total_tokens": 5340,
+                    "completion_tokens_details": {"reasoning_tokens": 3100},
+                },
+            },
+        )
+
+    with pytest.raises(ProviderError) as exc_info:
+        await make_provider(handler).chat_json(
+            ChatJSONRequest(
+                purpose="question_blueprint_generation",
+                messages=[ChatMessage(role="user", content="sensitive prompt")],
+                max_output_tokens=4400,
+            ),
+            config={"base_url": "https://models.example.com/v1"},
+            credentials={"api_key": "test-key"},
+            model="reasoning-model",
+            timeout_s=5,
+        )
+
+    error = exc_info.value
+    assert error.code == "provider_output_truncated"
+    assert error.retryable is False
+    assert error.details == {
+        "finish_reason": "length",
+        "requested_max_output_tokens": 4400,
+        "content_length": len(partial_content),
+        "input_tokens": 940,
+        "output_tokens": 4400,
+        "total_tokens": 5340,
+        "reasoning_tokens": 3100,
+    }
+    assert partial_content not in str(error.details)
 
 
 @pytest.mark.anyio

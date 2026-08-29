@@ -81,10 +81,12 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
                 "difficulty": "mid",
             },
         )
-        assert question.status_code == 200, question.text
+        assert question.status_code == 202, question.text
         question_ids.append(question.json()["id"])
         assert question.json()["validation_status"] == "valid"
-        assert question.json()["speech_status"] == "ready"
+        assert question.json()["speech_status"] == "pending"
+
+    asyncio.run(OutboxWorker(get_store()).run_once())
 
     ready_kb = api.get(f"/api/v1/knowledge-bases/{knowledge_base_id}")
     assert ready_kb.json()["status"] == "ready"
@@ -146,9 +148,13 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
             "role_requirement_id": role.json()["id"],
         },
     )
-    assert review.status_code == 200, review.text
-    assert review.json()["status"] == "ready_for_review"
-    review_id = review.json()["id"]
+    assert review.status_code == 202, review.text
+    assert review.json()["review"]["status"] == "queued"
+    review_id = review.json()["review"]["id"]
+    asyncio.run(OutboxWorker(get_store()).run_once())
+    ready_review = api.get(f"/api/v1/resume-reviews/{review_id}")
+    assert ready_review.status_code == 200, ready_review.text
+    assert ready_review.json()["status"] == "ready_for_review"
 
     experience = api.get(f"/api/v1/resume-reviews/{review_id}/experience-questions")
     assert experience.status_code == 200
@@ -305,6 +311,16 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
         },
     )
     assert registered.status_code == 200, registered.text
+    assert registered.json()["status"] == "registered"
+    assert registered.json()["email_reminder"]["status"] == "scheduled"
+    stored_appointment = api.get(f"/api/v1/interview-appointments/{appointment.json()['id']}").json()
+    reminder_work = next(
+        item
+        for item in get_store().outbox_work_items.values()
+        if item.get("kind") == "appointment.reminder.email"
+    )
+    assert reminder_work["payload"] == {"appointment_id": appointment.json()["id"]}
+    assert reminder_work["id"] == stored_appointment["email_reminder"]["work_item_id"]
 
     device_ready = api.post(
         f"/api/v1/public/interview-invitations/{token}/readiness",
@@ -463,3 +479,117 @@ def test_cross_position_knowledge_base_is_rejected() -> None:
     )
     assert search.status_code == 409
     assert search.json()["error"]["code"] == "KNOWLEDGE_BASE_POSITION_MISMATCH"
+
+    current_second = api.get(f"/api/v1/job-positions/{second['id']}").json()
+    assigned = api.post(
+        f"/api/v1/job-positions/{second['id']}/knowledge-base-assignments",
+        json={
+            "knowledge_base_id": knowledge_base["id"],
+            "expected_position_version": current_second["version"],
+        },
+    )
+    assert assigned.status_code == 200, assigned.text
+    assert knowledge_base["id"] in assigned.json()["position"]["knowledge_base_ids"]
+    assert assigned.json()["knowledge_base"]["speech_profile"] == knowledge_base["speech_profile"]
+    assert [item["id"] for item in api.get(
+        f"/api/v1/job-positions/{second['id']}/knowledge-bases"
+    ).json()["items"]] == [knowledge_base["id"]]
+
+    linked_search = api.post(
+        "/api/v1/questions/search",
+        json={
+            "job_position_id": second["id"],
+            "knowledge_base_ids": [knowledge_base["id"]],
+            "query": "Python",
+        },
+    )
+    assert linked_search.status_code == 200, linked_search.text
+    assert linked_search.json()["items"] == []
+
+    linked_plan = api.post(
+        "/api/v1/interview-plans/generate",
+        json={
+            "role_requirement_id": role["id"],
+            "job_position_id": second["id"],
+            "candidate_profile_id": candidate["id"],
+            "knowledge_base_ids": [knowledge_base["id"]],
+            "question_count": 1,
+        },
+    )
+    assert linked_plan.status_code == 409
+    assert linked_plan.json()["error"]["code"] == "KNOWLEDGE_BASE_NOT_READY"
+
+
+def test_position_delete_requires_exact_confirmation_and_purges_only_its_candidates() -> None:
+    api = client()
+    target = api.post(
+        "/api/v1/job-positions", json={"code": "delete-me", "name": "待删除岗位"}
+    ).json()
+    survivor = api.post(
+        "/api/v1/job-positions", json={"code": "keep-me", "name": "保留岗位"}
+    ).json()
+    shared_bank = api.post(
+        f"/api/v1/job-positions/{target['id']}/knowledge-bases", json={"name": "共享题库"}
+    ).json()
+    survivor = api.get(f"/api/v1/job-positions/{survivor['id']}").json()
+    assigned = api.post(
+        f"/api/v1/job-positions/{survivor['id']}/knowledge-base-assignments",
+        json={
+            "knowledge_base_id": shared_bank["id"],
+            "expected_position_version": survivor["version"],
+        },
+    )
+    assert assigned.status_code == 200, assigned.text
+    deleted_candidate = api.post(
+        "/api/v1/candidate-profiles",
+        json={
+            "name": "删除候选人",
+            "email": "delete@example.com",
+            "phone": "13800138011",
+            "job_position_id": target["id"],
+        },
+    ).json()
+    kept_candidate = api.post(
+        "/api/v1/candidate-profiles",
+        json={
+            "name": "保留候选人",
+            "email": "keep@example.com",
+            "phone": "13800138012",
+            "job_position_id": survivor["id"],
+        },
+    ).json()
+
+    impact = api.get(f"/api/v1/job-positions/{target['id']}/deletion-impact")
+    assert impact.status_code == 200, impact.text
+    assert impact.json()["candidate_count"] == 1
+
+    wrong = api.request(
+        "DELETE",
+        f"/api/v1/job-positions/{target['id']}",
+        json={"expected_version": impact.json()["position_version"], "confirmation": "写错了"},
+    )
+    assert wrong.status_code == 422
+    assert wrong.json()["error"]["code"] == "JOB_POSITION_DELETE_CONFIRMATION_INVALID"
+    assert api.get(f"/api/v1/candidate-profiles/{deleted_candidate['id']}").json()["status"] == "active"
+
+    deleted = api.request(
+        "DELETE",
+        f"/api/v1/job-positions/{target['id']}",
+        headers={"X-Actor-Id": "position_admin"},
+        json={
+            "expected_version": impact.json()["position_version"],
+            "confirmation": target["name"],
+        },
+    )
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["candidate_count"] == 1
+    assert [item["id"] for item in api.get("/api/v1/job-positions").json()["items"]] == [survivor["id"]]
+    assert [item["id"] for item in api.get("/api/v1/candidate-profiles").json()["items"]] == [kept_candidate["id"]]
+    purged = api.get(f"/api/v1/candidate-profiles/{deleted_candidate['id']}").json()
+    assert purged["status"] == "retention_purged"
+    assert purged["name"] == "[retention_purged]"
+    assert purged["email"] == ""
+    assert api.get(f"/api/v1/knowledge-bases/{shared_bank['id']}").status_code == 200
+    assert [item["id"] for item in api.get(
+        f"/api/v1/job-positions/{survivor['id']}/knowledge-bases"
+    ).json()["items"]] == [shared_bank["id"]]

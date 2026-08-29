@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
@@ -16,6 +17,8 @@ from app.services.text import normalize_skill, tokenize
 from app.file_storage.interface import PrivateFileStorage
 from app.file_storage.provider import private_file_storage
 from app.services.private_assets import PrivateAssetImporter
+from app.services.retention import RetentionService
+from app.services.roles import build_role_requirement_document
 
 
 class CatalogService:
@@ -29,11 +32,14 @@ class CatalogService:
         gateway: Optional[ModelGateway] = None,
         storage: Optional[PrivateFileStorage] = None,
         asset_importer: Optional[PrivateAssetImporter] = None,
+        retention: Optional[RetentionService] = None,
     ) -> None:
+        self.store = store
         self.persistence = persistence or persistence_for(store)
         self.gateway = gateway or ModelGateway(store, persistence=self.persistence)
         self.storage = storage
         self.asset_importer = asset_importer or PrivateAssetImporter()
+        self.retention = retention
 
     def create_position(self, payload: Dict[str, Any], organization_id: str = "org_default") -> Dict[str, Any]:
         code = str(payload["code"]).strip().lower()
@@ -41,27 +47,78 @@ class CatalogService:
             if any(item["code"] == code for item in transaction.job_positions.list()):
                 raise ApiError("JOB_POSITION_CODE_CONFLICT", "Job position code already exists.", status_code=409)
             now = utc_now()
-            return transaction.job_positions.add(
+            position = transaction.job_positions.add(
                 {
                     "id": new_id("position"),
                     "organization_id": organization_id,
                     "code": code,
                     "name": str(payload["name"]).strip(),
                     "description": str(payload.get("description", "")).strip(),
+                    "knowledge_base_ids": [],
                     "status": payload.get("status", "active"),
                     "created_at": now,
                     "updated_at": now,
                 }
             )
+            requirement_payload = payload.get("initial_requirement")
+            if requirement_payload:
+                requirement = transaction.role_requirements.add(
+                    build_role_requirement_document(
+                        requirement_payload,
+                        organization_id=organization_id,
+                        job_position_id=position["id"],
+                        now=now,
+                    )
+                )
+                position["initial_role_requirement"] = requirement
+            return position
 
     def list_positions(self, organization_id: str = "org_default") -> List[Dict[str, Any]]:
         with self.persistence.transaction(organization_id) as transaction:
-            return transaction.job_positions.list()
+            knowledge_bases = transaction.knowledge_bases.list()
+            return [
+                self._project_position(item, knowledge_bases)
+                for item in transaction.job_positions.list()
+                if item.get("status") != "archived"
+            ]
+
+    def workspace_question_catalog(self, organization_id: str = "org_default") -> Dict[str, Any]:
+        """Return the managed question hierarchy from one persistence transaction."""
+        with self.persistence.transaction(organization_id) as transaction:
+            knowledge_bases = transaction.knowledge_bases.list()
+            return {
+                "positions": [
+                    self._project_position(item, knowledge_bases)
+                    for item in transaction.job_positions.list()
+                    if item.get("status") != "archived"
+                ],
+                "knowledge_bases": knowledge_bases,
+                "questions": transaction.questions.list(),
+            }
+
+    def workspace_question_overview(self, organization_id: str = "org_default") -> Dict[str, Any]:
+        with self.persistence.transaction(organization_id) as transaction:
+            questions = sorted(
+                transaction.questions.list(),
+                key=lambda item: str(item.get("created_at", "")),
+                reverse=True,
+            )
+        return {
+            "total": len(questions),
+            "ready": sum(
+                1
+                for item in questions
+                if item.get("validation_status") == "valid" and item.get("speech_status") == "ready"
+            ),
+            "recent": questions[:5],
+        }
 
     def get_position(self, position_id: str, organization_id: str = "org_default") -> Dict[str, Any]:
         with self.persistence.transaction(organization_id) as transaction:
             item = transaction.job_positions.get(position_id)
-        return self._required(item, "JOB_POSITION_NOT_FOUND", "Job position does not exist.")
+            knowledge_bases = transaction.knowledge_bases.list()
+        item = self._required(item, "JOB_POSITION_NOT_FOUND", "Job position does not exist.")
+        return self._project_position(item, knowledge_bases)
 
     def patch_position(
         self, position_id: str, payload: Dict[str, Any], organization_id: str = "org_default"
@@ -76,6 +133,112 @@ class CatalogService:
             item["updated_at"] = utc_now()
             return transaction.job_positions.update(item, expected_version=expected_version)
 
+    def position_deletion_impact(
+        self, position_id: str, organization_id: str = "org_default"
+    ) -> Dict[str, Any]:
+        with self.persistence.transaction(organization_id) as transaction:
+            position = transaction.job_positions.get(position_id)
+            self._required(position, "JOB_POSITION_NOT_FOUND", "Job position does not exist.")
+            candidate_ids = self._candidate_ids_for_position(transaction, position_id)
+            return {
+                "position_id": position_id,
+                "position_name": position["name"],
+                "position_version": position["version"],
+                "candidate_count": len(candidate_ids),
+                "role_requirement_count": sum(
+                    1
+                    for item in transaction.role_requirements.list()
+                    if item.get("job_position_id") == position_id and item.get("status") != "archived"
+                ),
+                "plan_count": sum(
+                    1
+                    for item in transaction.interview_plans.list()
+                    if item.get("job_position_id") == position_id and item.get("status") != "archived"
+                ),
+                "appointment_count": sum(
+                    1
+                    for item in transaction.interview_appointments.list()
+                    if item.get("job_position_id") == position_id and item.get("status") != "cancelled"
+                ),
+            }
+
+    def delete_position(
+        self,
+        position_id: str,
+        *,
+        expected_version: int,
+        confirmation: str,
+        actor_id: str,
+        organization_id: str = "org_default",
+    ) -> Dict[str, Any]:
+        impact = self.position_deletion_impact(position_id, organization_id)
+        if confirmation.strip() != impact["position_name"]:
+            raise ApiError(
+                "JOB_POSITION_DELETE_CONFIRMATION_INVALID",
+                "Type the exact job position name to confirm deletion.",
+                status_code=422,
+            )
+        with self.persistence.transaction(organization_id) as transaction:
+            position = transaction.job_positions.get(position_id)
+            self._required(position, "JOB_POSITION_NOT_FOUND", "Job position does not exist.")
+            position["status"] = "deleting"
+            position["updated_at"] = utc_now()
+            reserved = transaction.job_positions.update(position, expected_version=expected_version)
+            candidate_ids = self._candidate_ids_for_position(transaction, position_id)
+        retention = self.retention or RetentionService(self.store, persistence=self.persistence)
+        for candidate_id in candidate_ids:
+            retention.purge_candidate(candidate_id, organization_id)
+        with self.persistence.transaction(organization_id) as transaction:
+            position = transaction.job_positions.get(position_id)
+            position["status"] = "archived"
+            position["knowledge_base_ids"] = []
+            position["deleted_at"] = utc_now()
+            position["deleted_by"] = actor_id
+            position["updated_at"] = position["deleted_at"]
+            archived = transaction.job_positions.update(position, expected_version=reserved["version"])
+            for item in transaction.role_requirements.list():
+                if item.get("job_position_id") == position_id and item.get("status") != "archived":
+                    item.update({"status": "archived", "updated_at": position["deleted_at"]})
+                    transaction.role_requirements.update(item, expected_version=item["version"])
+            for item in transaction.interview_plans.list():
+                if item.get("job_position_id") == position_id and item.get("status") != "archived":
+                    item.update({"status": "archived", "updated_at": position["deleted_at"]})
+                    transaction.interview_plans.update(item, expected_version=item["version"])
+            for item in transaction.interview_appointments.list():
+                if item.get("job_position_id") == position_id and item.get("status") != "cancelled":
+                    item.update(
+                        {
+                            "status": "cancelled",
+                            "invitation_status": "revoked",
+                            "invitation_token_hash": None,
+                            "updated_at": position["deleted_at"],
+                        }
+                    )
+                    transaction.interview_appointments.update(item, expected_version=item["version"])
+            audit = transaction.audit_events.add(
+                {
+                    "id": new_id("audit"),
+                    "organization_id": organization_id,
+                    "actor_id": actor_id,
+                    "action": "job_position.delete.completed",
+                    "resource_type": "job_position",
+                    "resource_id": position_id,
+                    "metadata": {
+                        "candidate_count": len(candidate_ids),
+                        "role_requirement_count": impact["role_requirement_count"],
+                        "plan_count": impact["plan_count"],
+                        "appointment_count": impact["appointment_count"],
+                    },
+                    "created_at": position["deleted_at"],
+                }
+            )
+        return {
+            "deleted": True,
+            "position_id": archived["id"],
+            "candidate_count": len(candidate_ids),
+            "audit_event_id": audit["id"],
+        }
+
     def create_knowledge_base(
         self, position_id: str, payload: Dict[str, Any], organization_id: str = "org_default"
     ) -> Dict[str, Any]:
@@ -83,31 +246,76 @@ class CatalogService:
             position = transaction.job_positions.get(position_id)
             self._required(position, "JOB_POSITION_NOT_FOUND", "Job position does not exist.")
             now = utc_now()
-            return transaction.knowledge_bases.add(
+            default_profile = self._default_speech_profile(transaction, payload, now)
+            knowledge_base = transaction.knowledge_bases.add(
                 {
                     "id": new_id("kb"),
                     "organization_id": organization_id,
                     "job_position_id": position_id,
                     "name": str(payload["name"]).strip(),
                     "description": str(payload.get("description", "")).strip(),
+                    "positioning": str(payload.get("positioning", "")).strip(),
+                    "tags": [normalize_skill(item) for item in payload.get("tags", []) if normalize_skill(item)],
                     "language": payload.get("language", "zh-CN"),
                     "voice_profile_id": payload.get("voice_profile_id", "voice_default_cn"),
+                    "speech_profile": default_profile,
+                    "speech_build_status": "ready" if default_profile else "configuration_required",
                     "status": "draft",
                     "readiness": {"question_count": 0, "valid_count": 0, "speech_ready_count": 0},
                     "created_at": now,
                     "updated_at": now,
                 }
             )
+            assigned = list(dict.fromkeys([*position.get("knowledge_base_ids", []), knowledge_base["id"]]))
+            position["knowledge_base_ids"] = assigned
+            position["updated_at"] = now
+            transaction.job_positions.update(position, expected_version=position["version"])
+            return knowledge_base
+
+    def assign_knowledge_base(
+        self,
+        position_id: str,
+        knowledge_base_id: str,
+        *,
+        expected_position_version: int,
+        organization_id: str = "org_default",
+    ) -> Dict[str, Any]:
+        """Associate an existing organization bank without copying its questions or speech profile."""
+        with self.persistence.transaction(organization_id) as transaction:
+            position = transaction.job_positions.get(position_id)
+            self._required(position, "JOB_POSITION_NOT_FOUND", "Job position does not exist.")
+            knowledge_base = transaction.knowledge_bases.get(knowledge_base_id)
+            self._required(knowledge_base, "KNOWLEDGE_BASE_NOT_FOUND", "Knowledge base does not exist.")
+            assigned = self._position_knowledge_base_ids(position, transaction.knowledge_bases.list())
+            if knowledge_base_id in assigned:
+                return {
+                    "position": self._project_position(position, transaction.knowledge_bases.list()),
+                    "knowledge_base": deepcopy(knowledge_base),
+                }
+            assigned.append(knowledge_base_id)
+            position["knowledge_base_ids"] = sorted(set(assigned))
+            position["updated_at"] = utc_now()
+            updated = transaction.job_positions.update(
+                position,
+                expected_version=expected_position_version,
+            )
+            return {
+                "position": self._project_position(updated, transaction.knowledge_bases.list()),
+                "knowledge_base": deepcopy(knowledge_base),
+            }
 
     def list_knowledge_bases(
         self, position_id: str, organization_id: str = "org_default"
     ) -> List[Dict[str, Any]]:
         self.get_position(position_id, organization_id)
         with self.persistence.transaction(organization_id) as transaction:
+            position = transaction.job_positions.get(position_id)
+            knowledge_bases = transaction.knowledge_bases.list()
+            assigned = set(self._position_knowledge_base_ids(position, knowledge_bases))
             return [
                 item
-                for item in transaction.knowledge_bases.list()
-                if item["job_position_id"] == position_id
+                for item in knowledge_bases
+                if item["id"] in assigned
             ]
 
     def get_knowledge_base(self, knowledge_base_id: str, organization_id: str = "org_default") -> Dict[str, Any]:
@@ -122,16 +330,23 @@ class CatalogService:
         with self.persistence.transaction(organization_id) as transaction:
             item = transaction.knowledge_bases.get(knowledge_base_id)
             self._required(item, "KNOWLEDGE_BASE_NOT_FOUND", "Knowledge base does not exist.")
-            for field in ("name", "description", "language", "voice_profile_id", "status"):
+            for field in ("name", "description", "positioning", "language", "voice_profile_id", "status"):
                 if field in payload and payload[field] is not None:
                     item[field] = payload[field]
+            if payload.get("tags") is not None:
+                item["tags"] = [
+                    normalize_skill(value)
+                    for value in payload["tags"]
+                    if normalize_skill(value)
+                ]
             item["updated_at"] = utc_now()
             return transaction.knowledge_bases.update(item, expected_version=expected_version)
 
     def get_question(self, question_id: str, organization_id: str = "org_default") -> Dict[str, Any]:
         with self.persistence.transaction(organization_id) as transaction:
             item = transaction.questions.get(question_id)
-        return self._required(item, "QUESTION_NOT_FOUND", "Question does not exist.")
+            self._required(item, "QUESTION_NOT_FOUND", "Question does not exist.")
+            return self._question_projection(item, transaction)
 
     def patch_question(
         self, question_id: str, payload: Dict[str, Any], organization_id: str = "org_default"
@@ -142,6 +357,7 @@ class CatalogService:
             self._required(question, "QUESTION_NOT_FOUND", "Question does not exist.")
             if question.get("status") == "archived" and payload.get("status") not in {None, "archived"}:
                 raise ApiError("QUESTION_ARCHIVED", "Archived questions cannot be reactivated.", status_code=409)
+            original_question_text = question.get("question_text")
             speech_fields = {"question_text"}
             for field in (
                 "title",
@@ -161,23 +377,61 @@ class CatalogService:
                 question["key_points"] = self._normalize_key_points(payload["key_points"])
             self._validate_scoring_basis(question, question.get("key_points", []))
             question["content_hash"] = self._question_hash(question, question["key_points"])
-            spoken_changed = any(field in payload for field in speech_fields)
+            spoken_changed = any(
+                field in payload and payload[field] != original_question_text for field in speech_fields
+            )
+            knowledge_base = transaction.knowledge_bases.get(question["knowledge_base_id"])
+            profile = deepcopy((knowledge_base or {}).get("speech_profile"))
             if spoken_changed and question.get("status") != "archived":
-                question["speech_status"] = "pending"
+                question["speech_status"] = "pending" if profile else "configuration_required"
             question["updated_at"] = utc_now()
             updated = transaction.questions.update(question, expected_version=expected_version)
             if spoken_changed and updated.get("status") != "archived":
+                if profile is None:
+                    self._refresh_knowledge_base(transaction, updated["knowledge_base_id"])
+                    return self._question_projection(updated, transaction)
                 transaction.outbox.enqueue(
                     new_work_item(
                         organization_id=organization_id,
                         kind="question.speech.generate",
                         aggregate_id=updated["id"],
-                        idempotency_key="question.speech:%s:%s" % (updated["id"], updated["version"]),
-                        payload={"owner_type": "question", "owner_id": updated["id"], "source_version": updated["version"]},
+                        idempotency_key="question.speech:%s:%s:%s"
+                        % (updated["id"], updated["version"], profile["revision"]),
+                        payload={
+                            "owner_type": "question",
+                            "owner_id": updated["id"],
+                            "source_version": updated["version"],
+                            "knowledge_base_id": updated["knowledge_base_id"],
+                            "speech_profile": profile,
+                            "speech_profile_revision": profile["revision"],
+                        },
                     )
                 )
             self._refresh_knowledge_base(transaction, updated["knowledge_base_id"])
-            return updated
+            return self._question_projection(updated, transaction)
+
+    def delete_question(
+        self, question_id: str, *, expected_version: int, organization_id: str = "org_default"
+    ) -> Dict[str, Any]:
+        """Remove a question from the active bank while preserving historical snapshots/assets."""
+        with self.persistence.transaction(organization_id) as transaction:
+            question = transaction.questions.get(question_id)
+            self._required(question, "QUESTION_NOT_FOUND", "Question does not exist.")
+            if question.get("status") == "archived":
+                if int(question["version"]) != int(expected_version):
+                    from app.persistence.errors import ConcurrencyConflict
+
+                    raise ConcurrencyConflict(
+                        "Question %s expected version %s, found %s"
+                        % (question_id, expected_version, question["version"])
+                    )
+                return {"id": question_id, "deleted": True, "status": "archived"}
+            question["status"] = "archived"
+            question["speech_status"] = "superseded"
+            question["updated_at"] = utc_now()
+            archived = transaction.questions.update(question, expected_version=expected_version)
+            self._refresh_knowledge_base(transaction, archived["knowledge_base_id"])
+            return {"id": question_id, "deleted": True, "status": "archived"}
 
     async def regenerate_question_speech(
         self, question_id: str, *, expected_version: int, organization_id: str = "org_default"
@@ -187,6 +441,14 @@ class CatalogService:
             self._required(question, "QUESTION_NOT_FOUND", "Question does not exist.")
             if question.get("status") != "active":
                 raise ApiError("QUESTION_NOT_ACTIVE", "Only an active question can regenerate speech.", status_code=409)
+            knowledge_base = transaction.knowledge_bases.get(question["knowledge_base_id"])
+            profile = deepcopy((knowledge_base or {}).get("speech_profile"))
+            if profile is None:
+                raise ApiError(
+                    "KNOWLEDGE_BASE_SPEECH_PROFILE_REQUIRED",
+                    "Configure the knowledge base TTS model and voice before generating speech.",
+                    status_code=409,
+                )
             question["speech_status"] = "pending"
             question["updated_at"] = utc_now()
             question = transaction.questions.update(question, expected_version=expected_version)
@@ -195,11 +457,19 @@ class CatalogService:
                     organization_id=organization_id,
                     kind="question.speech.generate",
                     aggregate_id=question["id"],
-                    idempotency_key="question.speech:%s:%s" % (question["id"], question["version"]),
-                    payload={"owner_type": "question", "owner_id": question["id"], "source_version": question["version"]},
+                    idempotency_key="question.speech:%s:%s:%s"
+                    % (question["id"], question["version"], profile["revision"]),
+                    payload={
+                        "owner_type": "question",
+                        "owner_id": question["id"],
+                        "source_version": question["version"],
+                        "knowledge_base_id": question["knowledge_base_id"],
+                        "speech_profile": profile,
+                        "speech_profile_revision": profile["revision"],
+                    },
                 )
             )
-        return await self.process_speech_work(work["id"], organization_id)
+        return {**question, "job_id": work["id"], "work_item_id": work["id"]}
 
     def queue_import(
         self,
@@ -284,16 +554,35 @@ class CatalogService:
                     )
                 created = []
                 for value in normalized:
+                    generation_batch_id = value.get("generation_batch_id")
+                    generation_draft_id = value.get("generation_draft_id")
+                    if generation_batch_id and generation_draft_id:
+                        with self.persistence.transaction(organization_id) as transaction:
+                            existing = next(
+                                (
+                                    item
+                                    for item in transaction.questions.list()
+                                    if item.get("generation_batch_id") == generation_batch_id
+                                    and item.get("generation_draft_id") == generation_draft_id
+                                ),
+                                None,
+                            )
+                        if existing is not None:
+                            created.append(existing)
+                            continue
                     created.append(await self.create_question(work["aggregate_id"], value, organization_id))
             elif work["kind"] == "knowledge_base.rebuild":
                 with self.persistence.transaction(organization_id) as transaction:
+                    knowledge_base = transaction.knowledge_bases.get(work["aggregate_id"])
+                    profile = deepcopy((knowledge_base or {}).get("speech_profile"))
                     questions = [
                         item
                         for item in transaction.questions.list()
                         if item.get("knowledge_base_id") == work["aggregate_id"] and item.get("status") == "active"
                     ]
-                    speech_work_ids = []
                     for question in questions:
+                        if profile is None:
+                            continue
                         question["speech_status"] = "pending"
                         question["updated_at"] = utc_now()
                         question = transaction.questions.update(question, expected_version=question["version"])
@@ -302,34 +591,104 @@ class CatalogService:
                                 organization_id=organization_id,
                                 kind="question.speech.generate",
                                 aggregate_id=question["id"],
-                                idempotency_key="question.speech:%s:%s" % (question["id"], question["version"]),
+                                idempotency_key="question.speech:%s:%s:%s"
+                                % (question["id"], question["version"], profile["revision"]),
                                 payload={
                                     "owner_type": "question",
                                     "owner_id": question["id"],
                                     "source_version": question["version"],
+                                    "knowledge_base_id": work["aggregate_id"],
+                                    "speech_profile": deepcopy(profile),
+                                    "speech_profile_revision": profile["revision"],
+                                    "parent_build_id": work_item_id,
                                 },
                             )
                         )
-                        speech_work_ids.append(speech_work["id"])
-                for speech_work_id in speech_work_ids:
-                    await self.process_speech_work(speech_work_id, organization_id)
             else:
                 raise RuntimeError("Unsupported knowledge base build work: %s" % work["kind"])
             with self.persistence.transaction(organization_id) as transaction:
                 current = transaction.outbox.get(work_item_id)
                 self._refresh_knowledge_base(transaction, work["aggregate_id"])
+                generation_batch_id = work.get("payload", {}).get("generation_batch_id")
+                if generation_batch_id:
+                    batch = transaction.question_generation_batches.get(generation_batch_id)
+                    if batch is not None:
+                        batch["imported_question_ids"] = [
+                            item["id"]
+                            for item in transaction.questions.list()
+                            if item.get("generation_batch_id") == generation_batch_id
+                        ]
+                        if work.get("payload", {}).get("generation_import_scope") == "single":
+                            draft_id = work.get("payload", {}).get("generation_draft_id")
+                            question = next(
+                                (
+                                    item for item in transaction.questions.list()
+                                    if item.get("generation_batch_id") == generation_batch_id
+                                    and item.get("generation_draft_id") == draft_id
+                                ),
+                                None,
+                            )
+                            draft = next(
+                                (item for item in batch.get("drafts", []) if item.get("id") == draft_id),
+                                None,
+                            )
+                            if draft is not None:
+                                draft["import_status"] = "imported"
+                                draft["imported_question_id"] = (question or {}).get("id")
+                                draft["import_error"] = None
+                            batch["status"] = "reviewing"
+                            batch["phase"] = "reviewing"
+                        else:
+                            batch["status"] = "imported"
+                        batch["last_error"] = None
+                        batch["updated_at"] = utc_now()
+                        transaction.question_generation_batches.update(
+                            batch, expected_version=batch["version"]
+                        )
                 transaction.outbox.complete(work_item_id, lease_token=current["lease_token"])
             return self.get_build(work_item_id, organization_id)
         except Exception as exc:
             with self.persistence.transaction(organization_id) as transaction:
                 current = transaction.outbox.get(work_item_id)
+                failed_work = None
+                if current and current.get("status") == "running":
+                    failed_work = transaction.outbox.fail(
+                        work_item_id, str(exc), lease_token=current["lease_token"]
+                    )
                 knowledge_base = transaction.knowledge_bases.get(work["aggregate_id"])
-                if knowledge_base:
+                generation_batch_id = work.get("payload", {}).get("generation_batch_id")
+                if generation_batch_id:
+                    batch = transaction.question_generation_batches.get(generation_batch_id)
+                    if batch is not None:
+                        if work.get("payload", {}).get("generation_import_scope") == "single":
+                            draft_id = work.get("payload", {}).get("generation_draft_id")
+                            draft = next(
+                                (item for item in batch.get("drafts", []) if item.get("id") == draft_id),
+                                None,
+                            )
+                            if draft is not None:
+                                draft["import_status"] = (
+                                    "failed"
+                                    if (failed_work or {}).get("status") == "dead_letter"
+                                    else "importing"
+                                )
+                                draft["import_error"] = str(exc)[:1000]
+                            batch["status"] = "reviewing"
+                            batch["phase"] = "reviewing"
+                        else:
+                            batch["status"] = "failed"
+                            batch["last_error"] = str(exc)[:1000]
+                        batch["updated_at"] = utc_now()
+                        transaction.question_generation_batches.update(
+                            batch, expected_version=batch["version"]
+                        )
+                if knowledge_base and (
+                    work.get("payload", {}).get("generation_import_scope") != "single"
+                    or (failed_work or {}).get("status") == "dead_letter"
+                ):
                     knowledge_base["status"] = "failed"
                     knowledge_base["updated_at"] = utc_now()
                     transaction.knowledge_bases.update(knowledge_base, expected_version=knowledge_base["version"])
-                if current and current.get("status") == "running":
-                    transaction.outbox.fail(work_item_id, str(exc), lease_token=current["lease_token"])
             raise
 
     def get_build(self, work_item_id: str, organization_id: str = "org_default") -> Dict[str, Any]:
@@ -348,6 +707,7 @@ class CatalogService:
         with self.persistence.transaction(organization_id) as transaction:
             knowledge_base = transaction.knowledge_bases.get(knowledge_base_id)
             self._required(knowledge_base, "KNOWLEDGE_BASE_NOT_FOUND", "Knowledge base does not exist.")
+            profile = deepcopy(knowledge_base.get("speech_profile"))
             key_points = self._normalize_key_points(payload.get("key_points", []))
             self._validate_scoring_basis(payload, key_points)
             now = utc_now()
@@ -368,27 +728,47 @@ class CatalogService:
                     "role_families": list(payload.get("role_families", [])),
                     "status": "active",
                     "validation_status": "valid",
-                    "speech_status": "pending",
+                    "speech_status": "pending" if profile else "configuration_required",
                     "index_status": "not_required",
                     "content_hash": self._question_hash(payload, key_points),
                     "speech_asset_id": None,
+                    "generation_batch_id": payload.get("generation_batch_id"),
+                    "generation_draft_id": payload.get("generation_draft_id"),
                     "created_at": now,
                     "updated_at": now,
                 }
             )
             knowledge_base["status"] = "building"
+            if profile is None:
+                knowledge_base["speech_build_status"] = "configuration_required"
+                knowledge_base["status"] = "draft"
             knowledge_base["updated_at"] = now
             transaction.knowledge_bases.update(knowledge_base, expected_version=knowledge_base["version"])
-            work = transaction.outbox.enqueue(
-                new_work_item(
-                    organization_id=organization_id,
-                    kind="question.speech.generate",
-                    aggregate_id=question["id"],
-                    idempotency_key="question.speech:%s:%s" % (question["id"], question["version"]),
-                    payload={"owner_type": "question", "owner_id": question["id"], "source_version": question["version"]},
+            work = None
+            if profile is not None:
+                work = transaction.outbox.enqueue(
+                    new_work_item(
+                        organization_id=organization_id,
+                        kind="question.speech.generate",
+                        aggregate_id=question["id"],
+                        idempotency_key="question.speech:%s:%s:%s"
+                        % (question["id"], question["version"], profile["revision"]),
+                        payload={
+                            "owner_type": "question",
+                            "owner_id": question["id"],
+                            "source_version": question["version"],
+                            "knowledge_base_id": knowledge_base_id,
+                            "speech_profile": profile,
+                            "speech_profile_revision": profile["revision"],
+                        },
+                    )
                 )
-            )
-        return await self.process_speech_work(work["id"], organization_id)
+        return {
+            **question,
+            "job_id": work["id"] if work else None,
+            "work_item_id": work["id"] if work else None,
+            "speech_configuration_required": profile is None,
+        }
 
     async def process_speech_work(
         self, work_item_id: str, organization_id: str = "org_default"
@@ -404,15 +784,52 @@ class CatalogService:
             if owner is None:
                 raise RuntimeError("Speech owner disappeared: %s" % payload["owner_id"])
             if int(owner["version"]) != int(payload["source_version"]):
-                transaction.outbox.complete(work_item_id, lease_token=work["lease_token"])
+                transaction.outbox.complete(
+                    work_item_id, lease_token=work["lease_token"], result_status="superseded"
+                )
                 return owner
+            if owner_type == "question" and owner.get("status") != "active":
+                transaction.outbox.complete(
+                    work_item_id, lease_token=work["lease_token"], result_status="superseded"
+                )
+                return owner
+            profile = deepcopy(payload.get("speech_profile"))
+            profile_revision = payload.get("speech_profile_revision")
             if owner_type == "question":
                 knowledge_base = transaction.knowledge_bases.get(owner["knowledge_base_id"])
-                language = knowledge_base.get("language", "zh-CN") if knowledge_base else "zh-CN"
-                voice = knowledge_base.get("voice_profile_id", "voice_default_cn") if knowledge_base else "voice_default_cn"
+                if profile is None:
+                    profile = deepcopy((knowledge_base or {}).get("speech_profile"))
+                    profile_revision = (profile or {}).get("revision")
+                current_revision = ((knowledge_base or {}).get("speech_profile") or {}).get("revision")
+                if profile is not None and int(current_revision or -1) != int(profile_revision or -2):
+                    transaction.outbox.complete(
+                        work_item_id, lease_token=work["lease_token"], result_status="superseded"
+                    )
+                    return owner
+                language = (profile or {}).get("language") or (
+                    knowledge_base.get("language", "zh-CN") if knowledge_base else "zh-CN"
+                )
+                voice = (profile or {}).get("voice_profile_id") or (
+                    knowledge_base.get("voice_profile_id", "voice_default_cn") if knowledge_base else "voice_default_cn"
+                )
             else:
                 language = owner.get("language", "zh-CN")
                 voice = owner.get("voice_profile_id", "voice_default_cn")
+
+        route = None
+        if profile and profile.get("model_configuration_id"):
+            route = {
+                "id": "knowledge_base_speech_profile",
+                "organization_id": organization_id,
+                "capability": cap.TTS_SYNTHESIZE,
+                "purpose": "question_speech_generation",
+                "primary": {
+                    "model_configuration_id": profile["model_configuration_id"],
+                    "timeout_s": 30,
+                },
+                "fallbacks": [],
+                "policy": {"retry_count": 1, "retry_backoff_ms": 250},
+            }
 
         try:
             response = await self.gateway.invoke(
@@ -425,6 +842,7 @@ class CatalogService:
                     voice_profile_id=voice,
                     metadata={"owner_type": owner_type, "owner_id": owner["id"], "source_version": owner["version"]},
                 ),
+                route=route,
             )
         except Exception as exc:
             with self.persistence.transaction(organization_id) as transaction:
@@ -437,6 +855,21 @@ class CatalogService:
                     repository.update(current, expected_version=current["version"])
                 transaction.outbox.fail(work_item_id, str(exc), lease_token=work["lease_token"])
             raise
+
+        if owner_type == "question" and profile is not None:
+            with self.persistence.transaction(organization_id) as transaction:
+                current = transaction.questions.get(owner["id"])
+                knowledge_base = transaction.knowledge_bases.get(owner["knowledge_base_id"])
+                current_revision = ((knowledge_base or {}).get("speech_profile") or {}).get("revision")
+                if (
+                    current is None
+                    or int(current["version"]) != int(owner["version"])
+                    or int(current_revision or -1) != int(profile_revision or -2)
+                ):
+                    transaction.outbox.complete(
+                        work_item_id, lease_token=work["lease_token"], result_status="superseded"
+                    )
+                    return current or owner
 
         private_file = None
         try:
@@ -495,6 +928,9 @@ class CatalogService:
                     "source_version": owner["version"],
                     "language": language,
                     "voice_profile_id": voice,
+                    "speech_profile_revision": profile_revision,
+                    "model_configuration_id": (profile or {}).get("model_configuration_id"),
+                    "model_configuration_version": (profile or {}).get("model_configuration_version"),
                     "audio_uri": (
                         "private-file://%s" % file_object["id"] if file_object else response.audio_uri
                     ),
@@ -511,6 +947,8 @@ class CatalogService:
             )
             current["speech_asset_id"] = asset["id"]
             current["speech_status"] = "ready"
+            if owner_type == "question":
+                current["speech_profile_revision"] = profile_revision
             current["speech_error"] = None
             current["updated_at"] = now
             updated = repository.update(current, expected_version=current["version"])
@@ -531,10 +969,29 @@ class CatalogService:
             self._required(asset, "QUESTION_SPEECH_ASSET_NOT_FOUND", "Question speech asset does not exist.")
             file_object = transaction.file_objects.get(asset.get("file_object_id")) if asset.get("file_object_id") else None
             if file_object is None or file_object.get("status") != "ready":
+                provider_id = str((asset.get("provider") or {}).get("provider_id") or "")
+                if provider_id == "mock" or str(asset.get("audio_uri") or "").startswith(
+                    "mock-tts://"
+                ):
+                    raise ApiError(
+                        "QUESTION_SPEECH_PREVIEW_UNAVAILABLE",
+                        "这条题目语音由开发模拟模型生成，没有实际可播放的音频。请在题库顶部点击“配置语音”，选择已测试通过的语音模型和声音，然后重新生成。",
+                        status_code=409,
+                        details={
+                            "reason": "development_mock_asset",
+                            "action": "configure_knowledge_base_speech",
+                            "owner_id": asset.get("owner_id"),
+                        },
+                    )
                 raise ApiError(
                     "QUESTION_SPEECH_ASSET_NOT_PRIVATE",
-                    "Question speech is not available as a private production asset.",
+                    "这条题目语音还没有保存为可试听的私有音频。请重新生成语音；如果仍然失败，请管理员检查私有文件存储配置。",
                     status_code=409,
+                    details={
+                        "reason": "private_audio_missing",
+                        "action": "regenerate_question_speech",
+                        "owner_id": asset.get("owner_id"),
+                    },
                 )
             grant = self._private_storage().issue_read_access(file_object["object_key"], expires_seconds=300)
             transaction.audit_events.add(
@@ -557,7 +1014,133 @@ class CatalogService:
     ) -> List[Dict[str, Any]]:
         self.get_knowledge_base(knowledge_base_id, organization_id)
         with self.persistence.transaction(organization_id) as transaction:
-            return [item for item in transaction.questions.list() if item.get("knowledge_base_id") == knowledge_base_id]
+            return [
+                self._question_projection(item, transaction)
+                for item in transaction.questions.list()
+                if item.get("knowledge_base_id") == knowledge_base_id
+                and item.get("status") != "archived"
+            ]
+
+    def _default_speech_profile(
+        self, transaction: Any, payload: Dict[str, Any], now: str
+    ) -> Optional[Dict[str, Any]]:
+        route = next(
+            (
+                item
+                for item in transaction.model_routes.list()
+                if item.get("enabled", True)
+                and item.get("capability") == cap.TTS_SYNTHESIZE
+                and item.get("purpose") == "question_speech_generation"
+            ),
+            None,
+        )
+        if route is not None:
+            model_id = str((route.get("primary") or {}).get("model_configuration_id") or "")
+            model = transaction.model_configurations.get(model_id) if model_id else None
+            connection = (
+                transaction.provider_connections.get(model.get("provider_connection_id"))
+                if model
+                else None
+            )
+            if (
+                model
+                and model.get("enabled", True)
+                and model.get("status") == "ready"
+                and cap.TTS_SYNTHESIZE in model.get("supported_capabilities", [])
+                and connection
+                and connection.get("enabled", True)
+            ):
+                settings = model.get("settings") or {}
+                default_voice = str(settings.get("default_voice") or "voice_default_cn").strip()
+                requested_voice = str(payload.get("voice_profile_id") or "").strip()
+                voice_map = settings.get("voice_map") or {}
+                voice = (
+                    requested_voice
+                    if requested_voice
+                    and requested_voice != "voice_default_cn"
+                    and (requested_voice == default_voice or requested_voice in voice_map)
+                    else default_voice
+                )
+                return {
+                    "model_configuration_id": model["id"],
+                    "model_configuration_version": model["version"],
+                    "voice_profile_id": voice,
+                    "language": payload.get("language", "zh-CN"),
+                    "audio_format": "audio/wav",
+                    "speaking_rate": 1.0,
+                    "revision": 1,
+                    "source": "model_route_default",
+                    "model_route_id": route["id"],
+                    "configured_by": "model_route_default",
+                    "configured_at": now,
+                }
+
+        if os.getenv("INTERVIEWER_RUNTIME_ENV", "development").lower() == "production":
+            return None
+        return {
+            "model_configuration_id": "model_cfg_mock_tts_synthesize",
+            "model_configuration_version": 1,
+            "voice_profile_id": payload.get("voice_profile_id", "voice_default_cn"),
+            "language": payload.get("language", "zh-CN"),
+            "audio_format": "audio/wav",
+            "speaking_rate": 1.0,
+            "revision": 1,
+            "source": "development_mock",
+            "configured_by": "local_development",
+            "configured_at": now,
+        }
+
+    @staticmethod
+    def _question_projection(question: Dict[str, Any], transaction: Any) -> Dict[str, Any]:
+        item = deepcopy(question)
+        knowledge_base = transaction.knowledge_bases.get(item.get("knowledge_base_id"))
+        profile = (knowledge_base or {}).get("speech_profile") or {}
+        asset = (
+            transaction.question_speech_assets.get(item.get("speech_asset_id"))
+            if item.get("speech_asset_id")
+            else None
+        )
+        file_object = (
+            transaction.file_objects.get(asset.get("file_object_id"))
+            if asset and asset.get("file_object_id")
+            else None
+        )
+        available = bool(
+            asset
+            and asset.get("status") == "ready"
+            and asset.get("production_ready")
+            and file_object
+            and file_object.get("status") == "ready"
+        )
+        if available:
+            reason = None
+            message = "语音已生成，可以试听。"
+        elif profile.get("source") == "development_mock" or str(
+            profile.get("model_configuration_id") or ""
+        ).startswith("model_cfg_mock_"):
+            reason = "development_mock_asset"
+            message = "当前是开发模拟语音，没有实际音频。请先配置已测试通过的语音模型和声音。"
+        elif not profile:
+            reason = "speech_profile_required"
+            message = "题库还没有配置语音模型。请点击页面顶部的“配置语音”。"
+        elif item.get("speech_status") == "failed":
+            reason = "speech_generation_failed"
+            message = "读题语音生成失败，请检查题库语音配置后重试。"
+        elif item.get("speech_status") in {"pending", "rebuilding"}:
+            reason = "speech_generation_pending"
+            message = "读题语音正在生成，完成后即可试听。"
+        elif asset and not file_object:
+            reason = "private_audio_missing"
+            message = "语音文件没有保存到私有存储，请重新生成。"
+        else:
+            reason = "speech_asset_missing"
+            message = "这道题还没有可试听的语音，请重新生成。"
+        item["speech_preview"] = {
+            "available": available,
+            "reason": reason,
+            "message": message,
+        }
+        return item
 
     def search_questions(self, payload: Dict[str, Any], organization_id: str = "org_default") -> Dict[str, Any]:
         query_tokens = set(tokenize(payload.get("query", "")))
@@ -578,10 +1161,11 @@ class CatalogService:
             knowledge_bases = [transaction.knowledge_bases.get(item) for item in knowledge_base_ids]
             if any(item is None for item in knowledge_bases):
                 raise ApiError("KNOWLEDGE_BASE_NOT_FOUND", "Every selected knowledge base must exist.", status_code=404)
-            if any(item["job_position_id"] != position_id for item in knowledge_bases if item):
+            assigned = set(self._position_knowledge_base_ids(position, transaction.knowledge_bases.list()))
+            if any(item["id"] not in assigned for item in knowledge_bases if item):
                 raise ApiError(
                     "KNOWLEDGE_BASE_POSITION_MISMATCH",
-                    "Knowledge base belongs to another position.",
+                    "Knowledge base is not assigned to this position.",
                     status_code=409,
                 )
             questions = transaction.questions.search_catalog(
@@ -622,7 +1206,17 @@ class CatalogService:
             if item.get("knowledge_base_id") == knowledge_base_id and item.get("status") != "archived"
         ]
         valid = [item for item in questions if item.get("validation_status") == "valid"]
-        speech_ready = [item for item in valid if item.get("speech_status") == "ready"]
+        profile = knowledge_base.get("speech_profile")
+        current_revision = (profile or {}).get("revision")
+        speech_ready = [
+            item
+            for item in valid
+            if item.get("speech_status") == "ready"
+            and (
+                current_revision is None
+                or int(item.get("speech_profile_revision", -1)) == int(current_revision)
+            )
+        ]
         failed = [item for item in questions if item.get("validation_status") == "invalid" or item.get("speech_status") == "failed"]
         knowledge_base["readiness"] = {
             "question_count": len(questions),
@@ -630,7 +1224,18 @@ class CatalogService:
             "speech_ready_count": len(speech_ready),
             "failed_count": len(failed),
         }
-        knowledge_base["status"] = "ready" if questions and len(speech_ready) == len(questions) else ("failed" if failed else "building")
+        if profile is None:
+            knowledge_base["speech_build_status"] = "configuration_required"
+            knowledge_base["status"] = "draft"
+        elif questions and len(speech_ready) == len(questions):
+            knowledge_base["speech_build_status"] = "ready"
+            knowledge_base["status"] = "ready"
+        elif failed:
+            knowledge_base["speech_build_status"] = "failed"
+            knowledge_base["status"] = "failed"
+        else:
+            knowledge_base["speech_build_status"] = "running"
+            knowledge_base["status"] = "building"
         knowledge_base["updated_at"] = utc_now()
         transaction.knowledge_bases.update(knowledge_base, expected_version=knowledge_base["version"])
 
@@ -668,6 +1273,63 @@ class CatalogService:
             separators=(",", ":"),
         )
         return "sha256:%s" % hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _position_knowledge_base_ids(
+        position: Dict[str, Any], knowledge_bases: List[Dict[str, Any]]
+    ) -> List[str]:
+        """Read explicit assignments while preserving legacy owner-based data."""
+        assigned = {str(item) for item in position.get("knowledge_base_ids", []) if item}
+        assigned.update(
+            item["id"]
+            for item in knowledge_bases
+            if item.get("job_position_id") == position["id"]
+        )
+        return sorted(assigned)
+
+    def _project_position(
+        self, position: Dict[str, Any], knowledge_bases: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        item = deepcopy(position)
+        item["knowledge_base_ids"] = self._position_knowledge_base_ids(item, knowledge_bases)
+        return item
+
+    @staticmethod
+    def _candidate_ids_for_position(transaction: Any, position_id: str) -> List[str]:
+        """Resolve explicit and legacy evidence of Position Candidate Membership."""
+        candidate_ids = {
+            item["id"]
+            for item in transaction.candidate_profiles.list()
+            if item.get("job_position_id") == position_id
+            or position_id in item.get("job_position_ids", [])
+        }
+        candidate_ids.update(
+            item["candidate_profile_id"]
+            for item in transaction.resume_reviews.list()
+            if item.get("job_position_id") == position_id and item.get("candidate_profile_id")
+        )
+        candidate_ids.update(
+            item["candidate_profile_id"]
+            for item in transaction.interview_plans.list()
+            if item.get("job_position_id") == position_id and item.get("candidate_profile_id")
+        )
+        candidate_ids.update(
+            item["candidate_profile_id"]
+            for item in transaction.interview_appointments.list()
+            if item.get("job_position_id") == position_id and item.get("candidate_profile_id")
+        )
+        candidate_ids.update(
+            item.get("plan_snapshot", {}).get("candidate_profile_id")
+            for item in transaction.interview_sessions.list()
+            if item.get("plan_snapshot", {}).get("job_position_id") == position_id
+            and item.get("plan_snapshot", {}).get("candidate_profile_id")
+        )
+        active_ids = {
+            item["id"]
+            for item in transaction.candidate_profiles.list()
+            if item.get("status") != "retention_purged"
+        }
+        return sorted(candidate_ids.intersection(active_ids))
 
     def _required(self, item: Optional[Dict[str, Any]], code: str, message: str) -> Dict[str, Any]:
         if item is None:

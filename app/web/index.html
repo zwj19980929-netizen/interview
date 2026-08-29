@@ -6,88 +6,9 @@
     <meta name="color-scheme" content="light" />
     <meta name="theme-color" content="#f7f8f5" />
     <title>Interviewer 面试工作台</title>
-    <link rel="stylesheet" href="/web/styles.css" />
-    <script defer src="/web/vendor/lucide.min.js"></script>
-    <script defer src="/web/app.js"></script>
   </head>
   <body>
-    <div class="app-shell">
-      <div class="mobile-backdrop" id="mobile-backdrop"></div>
-
-      <aside class="sidebar" id="sidebar" aria-label="主导航">
-        <a class="brand" href="#overview" aria-label="Interviewer 首页">
-          <span class="brand-mark"><i data-lucide="messages-square" aria-hidden="true"></i></span>
-          <span>
-            <strong>Interviewer</strong>
-            <small>智能面试工作台</small>
-          </span>
-        </a>
-
-        <nav class="nav-list">
-          <button class="nav-item is-active" type="button" data-view="overview">
-            <i data-lucide="layout-dashboard" aria-hidden="true"></i><span>总览</span>
-          </button>
-          <button class="nav-item" type="button" data-view="questions">
-            <i data-lucide="library-big" aria-hidden="true"></i><span>题库</span>
-          </button>
-          <button class="nav-item" type="button" data-view="workflow">
-            <i data-lucide="waypoints" aria-hidden="true"></i><span>招聘流程</span>
-          </button>
-          <button class="nav-item" type="button" data-view="plans">
-            <i data-lucide="clipboard-list" aria-hidden="true"></i><span>面试计划</span>
-          </button>
-          <button class="nav-item" type="button" data-view="interviews">
-            <i data-lucide="video" aria-hidden="true"></i><span>面试会话</span>
-          </button>
-          <button class="nav-item" type="button" data-view="models">
-            <i data-lucide="cpu" aria-hidden="true"></i><span>模型服务</span>
-          </button>
-        </nav>
-
-        <div class="sidebar-footer">
-          <div class="storage-status">
-            <span class="status-indicator" aria-hidden="true"></span>
-            <span><strong>本地环境</strong><small>SQLite 已连接</small></span>
-          </div>
-          <div class="account-row">
-            <span class="account-avatar">管</span>
-            <span><strong>系统管理员</strong><small>org_default</small></span>
-            <button class="icon-button" type="button" title="账户设置" aria-label="账户设置">
-              <i data-lucide="settings-2" aria-hidden="true"></i>
-            </button>
-          </div>
-        </div>
-      </aside>
-
-      <main class="main-shell">
-        <header class="topbar">
-          <div class="topbar-left">
-            <button class="icon-button mobile-menu" id="mobile-menu" type="button" title="打开导航" aria-label="打开导航">
-              <i data-lucide="menu" aria-hidden="true"></i>
-            </button>
-            <div>
-              <span class="topbar-kicker">工作空间</span>
-              <strong id="topbar-title">总览</strong>
-            </div>
-          </div>
-          <div class="topbar-actions">
-            <span class="api-status"><span></span>API 在线</span>
-            <button class="button button-primary" id="quick-action" type="button">
-              <i data-lucide="plus" aria-hidden="true"></i><span>新建题目</span>
-            </button>
-          </div>
-        </header>
-
-        <div class="content" id="app-content" aria-live="polite">
-          <div class="loading-state">
-            <span class="spinner" aria-hidden="true"></span>
-            <span>正在读取工作区数据</span>
-          </div>
-        </div>
-      </main>
-    </div>
-
-    <div id="modal-root"></div>
-    <div class="toast-region" id="toast-region" aria-live="polite" aria-atomic="true"></div>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
   </body>
 </html>

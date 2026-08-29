@@ -4,8 +4,12 @@ __pycache__/
 .venv/
 .idea/
 .env
+.env.*
+!.env.example
 .DS_Store
 data/*.sqlite3
 data/*.sqlite
 data/*.db
 data/media/
+data/private-files/
+app/web/node_modules/

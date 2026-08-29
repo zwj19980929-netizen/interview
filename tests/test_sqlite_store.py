@@ -4,6 +4,7 @@ from app.repositories import provider as repository_provider
 from app.repositories.memory import InMemoryStore
 from app.repositories.sqlite import SQLiteStore
 from app.services.catalog import CatalogService
+from app.workers.outbox import OutboxWorker
 
 
 def test_sqlite_store_persists_catalog_questions_and_speech_work(tmp_path) -> None:
@@ -30,6 +31,8 @@ def test_sqlite_store_persists_catalog_questions_and_speech_work(tmp_path) -> No
             }
         )
     )
+    asyncio.run(OutboxWorker(store).run_once())
+    question = service.get_question(question["id"])
 
     assert question["index_status"] == "not_required"
     assert question["speech_status"] == "ready"

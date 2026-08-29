@@ -35,6 +35,7 @@ class PlanAssemblyRequest:
     job_position_id: Optional[str] = None
     candidate_profile_id: Optional[str] = None
     resume_review_id: Optional[str] = None
+    approve: bool = False
 
 
 @dataclass(frozen=True)
@@ -172,6 +173,10 @@ class InterviewPlanAssembly:
             current_role = transaction.role_requirements.get(role["id"])
             if current_role is None or current_role["version"] != role["version"]:
                 raise ConcurrencyConflict("RoleRequirement changed while the plan was assembled.")
+            if request.approve:
+                self._validate_canonical_plan(transaction, plan)
+                plan["status"] = "approved"
+                plan["approved_at"] = utc_now()
             return transaction.interview_plans.add(plan)
 
     def _validate_target_scope(
@@ -191,8 +196,14 @@ class InterviewPlanAssembly:
             knowledge_bases = [transaction.knowledge_bases.get(item) for item in request.knowledge_base_ids]
             if not knowledge_bases or any(item is None for item in knowledge_bases):
                 raise ApiError("KNOWLEDGE_BASE_NOT_FOUND", "Every selected knowledge base must exist.", status_code=404)
-            if any(item["job_position_id"] != request.job_position_id for item in knowledge_bases if item):
-                raise ApiError("KNOWLEDGE_BASE_POSITION_MISMATCH", "Knowledge base belongs to another position.", status_code=409)
+            assigned_ids = set(position.get("knowledge_base_ids", []))
+            assigned_ids.update(
+                item["id"]
+                for item in transaction.knowledge_bases.list()
+                if item.get("job_position_id") == request.job_position_id
+            )
+            if any(item["id"] not in assigned_ids for item in knowledge_bases if item):
+                raise ApiError("KNOWLEDGE_BASE_POSITION_MISMATCH", "Knowledge base is not assigned to this position.", status_code=409)
             if any(item["status"] != "ready" for item in knowledge_bases if item):
                 raise ApiError("KNOWLEDGE_BASE_NOT_READY", "Every selected knowledge base must be ready.", status_code=409)
             if request.candidate_profile_id and transaction.candidate_profiles.get(request.candidate_profile_id) is None:

@@ -1,10 +1,11 @@
 from typing import Any, Dict, List, Optional
 
-from app.adapters.local_media import LocalMediaRecording, LocalMediaStorage
+from app.adapters.private_media import media_recording_storage
 from app.core.errors import ApiError
 from app.core.ids import new_id
 from app.core.time import utc_now
 from app.repositories.memory import InMemoryStore
+from app.persistence.provider import persistence_for
 from app.services.interviews import InterviewService
 
 
@@ -14,8 +15,9 @@ class RealtimeInterviewSession:
         self.interview_id = interview_id
         self.participant_role = participant_role
         self.interviews = InterviewService(store)
-        self.media = LocalMediaStorage()
-        self.recording: Optional[LocalMediaRecording] = None
+        self.persistence = persistence_for(store)
+        self.media = media_recording_storage(self.persistence)
+        self.recording: Optional[Any] = None
         self.recording_turn_id: Optional[str] = None
 
     def validate_candidate_token(self, token: Optional[str]) -> None:

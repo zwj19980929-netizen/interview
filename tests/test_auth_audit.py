@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 from cryptography.fernet import Fernet
@@ -13,6 +14,7 @@ def test_production_bearer_rbac_and_request_audit(monkeypatch) -> None:
     monkeypatch.setenv("INTERVIEWER_ORGANIZATION_ID", "org_default")
     monkeypatch.setenv("INTERVIEWER_CONTACT_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
     monkeypatch.setenv("INTERVIEWER_CONTACT_LOOKUP_SECRET", "lookup-secret-at-least-thirty-two-characters")
+    monkeypatch.setenv("INTERVIEWER_WEBSOCKET_TICKET_SECRET", "websocket-ticket-secret-at-least-thirty-two")
     monkeypatch.setenv(
         "INTERVIEWER_API_TOKENS_JSON",
         json.dumps(
@@ -26,6 +28,11 @@ def test_production_bearer_rbac_and_request_audit(monkeypatch) -> None:
                     "actor_id": "admin_1",
                     "organization_id": "org_default",
                     "roles": ["admin"],
+                },
+                "reviewer-token": {
+                    "actor_id": "reviewer_1",
+                    "organization_id": "org_default",
+                    "roles": ["reviewer"],
                 },
             }
         ),
@@ -48,6 +55,49 @@ def test_production_bearer_rbac_and_request_audit(monkeypatch) -> None:
         "/api/v1/job-positions", headers={"Authorization": "Bearer interviewer-token"}
     )
     assert allowed.status_code == 200
+    session = api.get(
+        "/api/v1/auth/session", headers={"Authorization": "Bearer interviewer-token"}
+    )
+    assert session.status_code == 200
+    assert session.json()["roles"] == ["interviewer"]
+    reviewer_session = api.get(
+        "/api/v1/auth/session", headers={"Authorization": "Bearer reviewer-token"}
+    )
+    assert reviewer_session.status_code == 200
+    assert reviewer_session.json()["roles"] == ["reviewer"]
+    reviewer_interviews = api.get(
+        "/api/v1/interviews", headers={"Authorization": "Bearer reviewer-token"}
+    )
+    assert reviewer_interviews.status_code == 200
+    reviewer_catalog = api.get(
+        "/api/v1/workspace/question-catalog", headers={"Authorization": "Bearer reviewer-token"}
+    )
+    assert reviewer_catalog.status_code == 403
+    interviewer_catalog = api.get(
+        "/api/v1/workspace/question-catalog", headers={"Authorization": "Bearer interviewer-token"}
+    )
+    assert interviewer_catalog.status_code == 200
+    assert set(interviewer_catalog.json()) == {"positions", "knowledge_bases", "questions"}
+    reviewer_ticket = api.post(
+        "/api/v1/auth/websocket-ticket",
+        headers={"Authorization": "Bearer reviewer-token"},
+        json={"interview_id": "iv_browser"},
+    )
+    assert reviewer_ticket.status_code == 403
+    ticket_response = api.post(
+        "/api/v1/auth/websocket-ticket",
+        headers={"Authorization": "Bearer interviewer-token"},
+        json={"interview_id": "iv_browser"},
+    )
+    assert ticket_response.status_code == 200
+    from app.core.auth import authenticate_interviewer_websocket
+
+    websocket = SimpleNamespace(
+        headers={},
+        query_params={"ticket": ticket_response.json()["ticket"]},
+        path_params={"interview_id": "iv_browser"},
+    )
+    assert authenticate_interviewer_websocket(websocket) is None
     admin = api.get(
         "/api/v1/admin/work-items", headers={"Authorization": "Bearer admin-token"}
     )

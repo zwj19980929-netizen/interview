@@ -225,28 +225,41 @@ Report module 在生成开始时先物化唯一的 `current_evaluations` 集合�
 
 - `candidate_session_token` 由生产密钥对会话 ID/创建时间做 HMAC-SHA256 派生，数据库和后台详情不持久化/返回明文；`InterviewService.get_candidate_interview()` 使用 allow-list 构造安全投影并以常量时间比较验证 token。
 - `submit_candidate_audio_answer()` 限制录音路径到当前会话/轮次；候选人 REST 文本答案和 WebSocket `candidate.answer.text/candidate.transcript.final` 均已删除。
-- `app/web/app.js` 已实现 `/#invite/{token}` 登记页和候选人 public API 调用，生产不再依赖后台 Bearer 身份。
+- React `candidate` feature 已实现 `/#invite/{token}` 登记页和候选人 public API 调用，生产不再依赖后台 Bearer 身份。
 - `tests/test_realtime_media.py` 验证错误 token、跨会话媒体和标准答案投影均被拒绝，并完成 public 音频转写评分闭环。状态为 `closed`。
 
 ## 生产化审查问题（DOC-GAPS-001）
 
 | ID | 优先级 | 状态 | 问题 | 修复与验证 | 剩余边界 |
 | --- | --- | --- | --- | --- | --- |
-| `FILE-001` | P1 | `verified` | 简历仍依赖 `resume_text`/调用方 URI，没有 PDF、扫描和私有文件真相 | 新增 PrivateFileStorage、FileObject、multipart/URL、SSRF/隔离/扫描/PDF 解析；原件和解析文本分别私有化；旧 JSON 入口删除；本地/OSS contract 与恶意/环回/幂等测试通过 | 真实 OSS/扫描器 `environment_pending` |
+| `FILE-001` | P1 | `verified` | 简历仍依赖 `resume_text`/调用方 URI，没有 PDF、扫描和私有文件真相 | 新增 PrivateFileStorage、FileObject、multipart/URL、SSRF/隔离/扫描/PDF 解析；原件和解析文本分别私有化；旧 JSON 入口删除；官方 OSS SDK 已纳入依赖，command/clamd INSTREAM 扫描合同、本地/OSS contract 与恶意/环回/幂等测试通过；官方 ClamAV arm64 daemon 的 PING/干净样本/EICAR 集成测试已通过 | 真实 OSS bucket/RAM、目标 clamd 完整签名库更新与告警 `environment_pending` |
 | `ASYNC-001` | P1 | `verified` | 题库构建/PDF/worker 缺少退避、dead-letter、监控和重放 | import/rebuild/build 与 PDF 均返回 job；Outbox 增加最大尝试、指数退避、dead-letter、指标和审计重放；故障矩阵通过 | 外部告警平台由部署环境接入 |
-| `STREAM-001` | P1 | `verified` | 没有 `stt.streaming/open_stream`、唯一 final 和断流修复 | 新增 streaming schema、网关开流、序号/大小/唯一 final 校验、WebSocket、录音持久化和 batch repair；端到端测试通过 | 真实 STT `environment_pending` |
+| `STREAM-001` | P1 | `verified` | 没有 `stt.streaming/open_stream`、唯一 final 和断流修复 | 新增 streaming schema、网关开流、序号/大小/唯一 final 校验、WebSocket、私有录音和 batch repair；`media_http` 提供真实 multipart STT 与 batch-final stream；端到端测试通过 | 真实厂商凭据、WER/延迟 `environment_pending`；低延迟 partial 需厂商协议 |
 | `SECURITY-001` | P1 | `verified` | 联系人/凭证明文、无 RBAC/公开限流、敏感访问/失败请求无审计，URL token 可能进入日志 | 联系人 Fernet+租户 HMAC、ProviderSecretVault、生产 Bearer RBAC、Redis fail-closed 公开限流、未认证/成功请求审计、签名文件/媒体、媒体实际下载审计、URL token 脱敏；生产权限/限流测试通过 | 外部 IdP/企业 SSO 尚未选择 |
-| `DATA-001` | P1 | `in_progress` | 只有 SQLite JSON，缺少生产租户 RLS 和数据库唯一约束 | 已提供 PostgreSQL adapter/migration、CAS、RLS、Outbox/预约/槽位/凭证约束和离线 SQL 不变量测试 | 真实 PostgreSQL DSN、迁移、RLS/并发/EXPLAIN 为 `environment_pending`，完成前不改 verified |
-| `MEDIA-001` | P1 | `verified` | mock TTS URI/公开 media 不能作为生产资产 | 非 mock TTS 必须复制/校验到 PrivateFileStorage+FileObject；移除 `/media` 静态挂载；签名访问与下载审计通过 | 真实 TTS/视频数字人 `environment_pending` |
+| `DATA-001` | P1 | `in_progress` | 只有 SQLite JSON，缺少生产租户 RLS 和数据库唯一约束 | 已提供显式 owner migration 与最小权限 runtime adapter；本机 PostgreSQL 16 真实验证事务/CAS、RLS、Outbox/预约约束、题库索引 EXPLAIN，离线 SQL 不变量继续通过 | 目标生产 PostgreSQL 的角色、并发负载、备份恢复与 EXPLAIN 仍为 `environment_pending`，完成前不改 verified |
+| `MEDIA-001` | P1 | `verified` | mock TTS URI/公开 media 不能作为生产资产 | 非 mock TTS 和生产候选人录音使用 PrivateFileStorage+FileObject；移除 `/media` 静态挂载；`media_http` 支持 HTTPS audio/video 数字人；签名访问与下载审计通过 | 真实账号/媒体播放质量 `environment_pending`；WebRTC/实时口型需厂商协议 |
 | `MODEL-PROVIDER-001` | P1 | `verified（仓库）` | 只有 OpenAI-compatible LLM/Embedding，没有真实 TTS adapter；DashScope manifest 声明能力但不可执行；路由 UI 漏掉 TTS 并把 `retry_count` 误写为 `max_retries` | OpenAI-compatible 增加 Speech TTS；DashScope 增加 Qwen Chat/Embedding、Qwen3-TTS/CosyVoice adapter；路由请求改为强类型、生产缺 route 失败关闭；HTTP 合同、registry、路由与私有资产哈希测试通过 | 真实账号、区域、API Key、模型授权和音质/延迟验收为 `environment_pending`；STT/视频仍未选择供应商 |
 | `MODEL-PROVIDER-002` | P1 | `verified（仓库）` | manifest 没有可执行模型目录/默认配置语义，路由只能手输模型；DeepSeek/智谱未成为独立插件，OpenAI-compatible 厂商容易复制 runtime | 增加 defaults、predefined/customizable 与模型目录校验；DeepSeek/智谱薄 adapter 复用共享 runtime；千问目录/UI 显式化；配置默认值、目录路由约束、厂商 HTTP 合同和全量回归通过 | 三家真实 API Key、区域/账号授权、模型可用性、延迟/费用与结构化输出稳定性为 `environment_pending` |
 | `MODEL-PROVIDER-003` | P1 | `verified（仓库）` | 智谱只声明 LLM，单一 `test_model` 会把 `glm-tts` 当成 LLM；配置 UI 无编辑/按能力测试，HTTPX 初始化时缺 SOCKS 依赖会裸抛 500 | 增加 GLM-TTS adapter/模型目录、`capability + model` 测试协议、配置编辑 UI、显式环境代理开关和结构化 transport 错误；厂商 HTTP 合同、API、UI 与全量回归通过 | 真实智谱凭据、模型授权、音色、音质/延迟/费用为 `environment_pending` |
 | `MODEL-CONFIG-V2-001` | P1 | `closed` | 厂商账号、API Key、具体模型和 route target 混在 `ModelProviderConfig`，前端硬编码厂商字段，多个模型会复制凭证和参数 | 拆分 ProviderConnection/ModelConfiguration/ModelRoute；v2 manifest 提供动态表单；route 只引用 ready model；旧 API、collection 和运行时 target 已删除；显式迁移与回归测试通过 | 真实厂商模型仍需逐个测试，健康状态为部署环境事实 |
+| `QUESTION-GEN-TRUNCATION-001` | P1 | `verified（仓库）` | `finish_reason=length` 曾被归为通用 JSON 错误，网关与 Outbox 会用相同参数嵌套重试，双槽位长响应反复计费且不能保留批次进度 | 新增 `provider_output_truncated` 与失败 token 诊断；非重试工作首轮 dead-letter；生题 attempt 只调用一次 Provider；双槽位截断原子拆成两个单槽位工作；Prompt/Schema v2、Provider/网关/Memory/SQLite/工作流合同测试通过 | 未自动重放历史失败批次；目标 DeepSeek 账户的 10 题并发、费用与真实截断恢复仍为 `environment_pending` |
+| `QUESTION-SPEECH-DEFAULT-001` | P1 | `verified（仓库）` | 非生产环境创建题库时无条件绑定开发 mock，即使组织已有 ready 的真实题目 TTS route；mock 资产被标为语音 ready，点击试听只得到难理解的“非私有生产资产”错误 | 新题库优先解析并冻结 enabled/ready `question_speech_generation` route primary 与默认音色；题目投影增加 `speech_preview`；mock 试听返回专门错误和配置建议；React 明示“开发模拟语音（不可试听）”并禁用无效按钮；后端/前端合同测试通过 | 不批量改写旧题库或删除历史 mock 资产；目标 TTS 的真实音质、费用和对象存储仍为环境验收 |
 | `TEST-ISOLATION-001` | P0 | `verified` | `reset_store_for_tests()` 曾取得默认 SQLite 并执行 `reset()`，全量测试会删除本地开发数据 | helper 改为直接替换成全新 `InMemoryStore`；回归测试证明临时 SQLite 不被重置，99 项全量测试前后开发 DB SHA-256 不变 | 本轮误删前数据无法从 SQLite `.recover`/本地快照恢复；已恢复可确认的智谱非秘密配置，API Key 需管理员重填 |
-| `REALTIME-001` | P2 | `verified` | 多实例事件、断路器和心跳只在单进程 | 新增 Redis event bus adapter、DB-backed ModelCircuitState、持久心跳超时 monitor；共享断路器与超时测试通过 | Redis 双实例演练 `environment_pending`；WebRTC 需供应商选择 |
+| `REALTIME-001` | P2 | `verified` | 多实例事件、断路器和心跳只在单进程 | 新增 Redis event bus adapter、DB-backed ModelCircuitState、持久心跳超时 monitor；本机 Redis 7 真实验证跨实例 Pub/Sub、关闭语义和生产限流 | 目标 Redis 集群故障切换仍为 `environment_pending`；WebRTC 需供应商选择 |
 | `FAIRNESS-001` | P2 | `verified` | 没有可比较的抽题难度/覆盖分布 | 新增按岗位题量、难度、技能覆盖的公平性投影、阈值告警和审计 API；测试通过 | 人工金标、WER、AI/人工一致性需业务样本 |
 | `RETENTION-001` | P1 | `verified` | 敏感数据只有设计中的到期字段，没有可执行删除边界 | 新增默认 dry-run 的管理员留存服务；显式执行删除私有文件/录音并清空联系人、审阅、经历题、转写、评分/报告敏感内容，审计测试通过 | 企业实际留存天数与 legal hold 策略由部署配置决定 |
 | `COMPAT-001` | P2 | `closed` | 计划 `items`、管理员直建会话、文本答案和旧向量 QuestionService 曾同时存在 | 提供显式 v2 迁移命令；运行时旧表示、旧 schema、旧路由、旧 service/repository/worker 分支和前端 fallback 均已删除；OpenAPI/端到端测试通过 | 部署已有旧数据时必须先运行 v2 迁移；当前 SQLite 检查无计划数据 |
+| `KB-SPEECH-001` | P1 | `verified（仓库与本机）` | 题库页曾平铺全部题目，题库只能保存声音且 HTTP 会直接等待 TTS | 已实现 KnowledgeBaseSpeechProfile、voice catalog、整库 SpeechBuild、revision 防旧写、分层 React UI/API、模型引用删除保护与 Celery+DurableWorkItem；全量回归、Celery eager 和前端行为测试通过 | 真实外部 TTS、目标 Redis/PostgreSQL 属部署环境验收，不回退本项仓库状态 |
+
+### KB-SPEECH-001 修改步骤与批量重建不变量
+
+1. React `#questions` 改为只加载当前组织 KnowledgeBase 摘要；点击进入 `#questions/{knowledge_base_id}`，详情路由再加载题目、当前语音配置、TTS 模型/声音目录和构建进度。
+2. KnowledgeBase 增加 `speech_profile` 与独立 revision，绑定已 ready 的 TTS ModelConfiguration、voice、language、format 和 speaking rate；旧 `language/voice_profile_id` 通过显式迁移转成 profile，无法解析模型时标记 `configuration_required`。
+3. `PUT /knowledge-bases/{id}/speech-profile` 使用 CAS 和 Idempotency-Key；配置变化原子创建 `knowledge_base.speech.rebuild` 父工作项并立即返回 202，不在请求线程调用 Provider。
+4. 所有 Celery task 和异步执行编排放在 `app/workers/`。父 task 冻结 Question ID/version manifest、分批 fan-out 子工作项；子 task 调用显式 TTS 模型并复制到 PrivateFileStorage。
+5. 子 task 提交前验证 Question version 与 speech profile revision；旧 revision 只能成为历史资产或 superseded，不能覆盖当前指针。历史计划/会话资产保持可读。
+6. Celery 只调度 `organization_id + work_item_id`；DurableWorkItem 继续提供租约、幂等、退避、dead-letter、进度和人工重放。Beat dispatcher 补发发布失败与过期租约。
+7. 自动化验收至少覆盖：路由级加载无全量题目首屏；无效/非 TTS 模型与非法 voice 拒绝；切换模型或声音整库 fan-out；重复投递不重复资产；运行中再次切换时旧结果不覆盖；部分失败只重试失败项；worker crash 恢复；已批准计划和历史会话继续播放旧资产。
 
 ### FILE-001 修改步骤与恢复语义
 
@@ -316,6 +329,8 @@ Report module 在生成开始时先物化唯一的 `current_evaluations` 集合�
 ### DATA-001 环境验收清单
 
 `DATA-001` 只有完成以下真实数据库测试才可从 `in_progress` 改为 `verified`：
+
+本机隔离 PostgreSQL 16 已完成 migration owner/runtime role 分离、RLS 跨租户拒绝、事务回滚、CAS、Outbox 幂等、预约唯一约束、结构化题库过滤和索引 `EXPLAIN (ANALYZE, BUFFERS)`；以下清单仍需在目标生产集群按实际角色、参数和负载复验。
 
 - 在非表 owner 应用角色上运行 migration，并验证 `FORCE RLS` 对跨租户读写均拒绝。
 - 运行 Memory/SQLite 同一套 Persistence contract，再对 PostgreSQL 跑事务回滚、CAS、Outbox 租约/幂等和结构化题库过滤。

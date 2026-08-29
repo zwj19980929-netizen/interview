@@ -12,6 +12,8 @@
 - 导入、异步审阅、邀请、登记、候选人开始、答案提交和重试支持 `Idempotency-Key`。
 - 所有修改聚合的请求携带 `expected_version`；陈旧写入返回 `409 PERSISTENCE_CONFLICT`。
 - 明确建模为异步工作的接口（题库 import/rebuild/build、PDF 摄取等）返回 `202 Accepted` 和 `job_id`，通过工作项接口查询状态。
+- 创建题目、题目语音重建和题库语音配置切换不得在 HTTP 请求内调用 TTS；它们只提交 DurableWorkItem 并由 `app/workers/` 中的 Celery task 执行。
+- `GET /healthz` 只表示进程存活；`GET /readyz` 对数据库/Redis 和生产密钥、OSS bucket 鉴权、扫描器执行只读探针，未就绪返回 `503` 与不含密钥值的逐项结果。业务模型 route readiness 仍由预约准入按组织、purpose 和健康 TTL 判断。
 
 通用错误：
 
@@ -31,10 +33,13 @@
 
 - `GET /`：内置企业工作台。
 - `GET /web/*`：静态资源。
+- `GET /api/v1/auth/session`：使用现有后台 Bearer token 返回当前主体、组织和角色；不创建新的登录凭据。
+- `POST /api/v1/auth/websocket-ticket`：使用现有后台 Bearer token 为指定面试签发最长 60 秒、一次用途的浏览器 WebSocket ticket。原有 WebSocket `Authorization` header 认证继续兼容，浏览器工作台使用 ticket query，避免把长期 Bearer token 放入 URL。
 - `/#positions`、`/#knowledge-bases`、`/#candidates`、`/#plans`、`/#appointments`、`/#interviews`：后台工作区。
 - `/#invite/{invitation_token}`：公开邀请、姓名/邮箱/手机号填报、授权和设备检查。
 - start 响应首次导航可在 URL fragment 中携带 `candidate_session_token`；前端立即转存到 `sessionStorage` 并用 `history.replaceState` 清除 fragment 中的 token，随后进入 `/#candidate/{interview_id}`。
 - 候选人 HTTP 请求通过 `X-Candidate-Session-Token` header 调用 public 窄接口；WebSocket 握手使用同一短期 token。后台 Bearer API 不接受候选人 token。
+- 后台工作台只按当前角色和当前路由加载允许访问的资源；`interviewer/reviewer` 不得因为无权读取 `/admin/*` 而导致整个工作台加载失败。
 
 当前代码已实现本文主流程中的岗位/题库批量 import/rebuild/build 查询、题目更新/归档/语音重建、候选人 PATCH、PDF multipart 与 HTTPS URL 摄取、简历版本/短期访问、经历题审核与语音重建、候选人专属计划、预约 PATCH/邀请、公开填报、readiness、self-start、服务端 streaming/batch STT、企业复核、签名音频、重评和 JSON/CSV 报告导出接口。旧 JSON `resume_text` 上传已删除，非 multipart 请求返回 `415 RESUME_MULTIPART_REQUIRED`。持久 Outbox 提供状态/指标、指数退避、dead-letter 与人工重放；题库导入、重建和 PDF 摄取默认返回 `202`。
 
@@ -61,10 +66,16 @@
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/api/v1/job-positions` | 创建岗位 |
+| `POST` | `/api/v1/job-positions` | 创建岗位；工作台同时提交 `initial_requirement`，服务端在同一事务创建首版岗位要求 |
 | `GET` | `/api/v1/job-positions` | 列出岗位 |
 | `GET` | `/api/v1/job-positions/{position_id}` | 获取岗位及题库摘要 |
 | `PATCH` | `/api/v1/job-positions/{position_id}` | 修改或归档岗位 |
+| `GET` | `/api/v1/job-positions/{position_id}/deletion-impact` | 预览删除将影响的候选人、岗位要求、计划和预约数量 |
+| `DELETE` | `/api/v1/job-positions/{position_id}` | 携带 `expected_version` 和与岗位名称完全一致的 `confirmation` 删除岗位 |
+
+岗位删除必须先向操作者展示 deletion-impact 并进行名称精确确认。命令清除该岗位候选人的联系方式、简历、录音、转写、评分和报告敏感内容，归档相关岗位要求/计划、取消预约，并保留不可识别的历史面试和审计占位。组织共享的 KnowledgeBase、Question、语音配置和语音资产不随岗位删除。
+
+新建岗位请求的 `initial_requirement` 包含 `title/description/must_have_skills/nice_to_have_skills/seniority/interview_duration_minutes`。工作台必须提交该对象；服务端先完成全部字段校验和技能规范化，再在一个租户事务内写入 JobPosition 与首版 RoleRequirement。成功响应保持岗位字段，并增加 `initial_role_requirement`；任一步失败都不得留下没有首版要求的岗位。低层 API 客户端仍可省略该字段以兼容已有集成，但这条兼容路径不用于新工作台。
 
 创建示例：
 
@@ -83,9 +94,18 @@
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/api/v1/job-positions/{position_id}/knowledge-bases` | 为岗位创建题库 |
+| `POST` | `/api/v1/job-positions/{position_id}/knowledge-base-assignments` | 把组织内已有题库关联到岗位；请求携带 `knowledge_base_id + expected_position_version`，不复制题目或语音配置 |
 | `GET` | `/api/v1/job-positions/{position_id}/knowledge-bases` | 列出岗位题库 |
+| `GET` | `/api/v1/knowledge-bases` | 列出当前组织全部题库摘要；支持岗位、状态过滤，返回题目/语音计数和当前 TTS/声音摘要 |
+| `GET` | `/api/v1/workspace/question-catalog` | 后台一次读取岗位、题库与题目集合，供路由级工作台加载；不替代既有资源接口 |
+| `GET` | `/api/v1/workspace/question-overview` | 总览页只读取题目计数与最近 5 项，避免首屏下载完整题库 |
 | `GET` | `/api/v1/knowledge-bases/{knowledge_base_id}` | 查看题库、构建状态和计数 |
-| `PATCH` | `/api/v1/knowledge-bases/{knowledge_base_id}` | 修改题库配置或归档 |
+| `PATCH` | `/api/v1/knowledge-bases/{knowledge_base_id}` | 修改名称、说明或归档；语音配置使用独立命令接口 |
+| `PUT` | `/api/v1/knowledge-bases/{knowledge_base_id}/speech-profile` | 以 `expected_version` 设置 TTS 模型、声音和输出参数；变化时创建新 revision 并返回整库重建 job |
+| `GET` | `/api/v1/knowledge-bases/{knowledge_base_id}/speech-options` | `items` 返回可选择的已就绪 TTS 模型；`candidates` 同时返回已添加但未测试/失败/停用的 TTS 及不可选原因和归一化声音目录，不包含 Provider 凭据 |
+| `GET` | `/api/v1/knowledge-bases/{knowledge_base_id}/speech-builds` | 列出语音构建历史、当前进度和失败计数 |
+| `GET` | `/api/v1/knowledge-bases/{knowledge_base_id}/speech-builds/{job_id}` | 查询一次整库语音构建和题目级失败摘要 |
+| `POST` | `/api/v1/knowledge-bases/{knowledge_base_id}/speech-builds/{job_id}/retry-failed` | 只重试当前 profile revision 下的失败题目 |
 | `POST` | `/api/v1/knowledge-bases/{knowledge_base_id}/imports` | 上传或结构化导入题目 |
 | `POST` | `/api/v1/knowledge-bases/{knowledge_base_id}/rebuild` | 重建索引和缺失读题语音 |
 | `GET` | `/api/v1/knowledge-bases/{knowledge_base_id}/builds/{job_id}` | 查询构建工作项 |
@@ -101,17 +121,88 @@
 }
 ```
 
-构建工作项依次校验题目、标准答案、关键点、rubric、技能、难度和题型，写入结构化候选池，并按题库的 `language + voice_profile_id` 异步生成每道活动题的 `QuestionSpeechAsset`。部分失败时题库保持 `building` 或进入 `failed`，响应必须列出失败题目和重试入口；不能把缺少评分依据或语音的题库标为 `ready`。MVP 不生成 embedding，也不依赖向量数据库。
+新建题库可以不指定语音配置。若组织存在 enabled 的 `tts.synthesize + question_speech_generation` route，且 primary ModelConfiguration/连接均 enabled、模型为 `ready`，服务端解析模型 `default_voice` 并保存 revision 1 的明确 speech profile（`source=model_route_default + model_route_id`）；新题随后直接按该冻结配置异步生成。没有有效默认路由时返回 `speech_build_status=configuration_required`，前端引导进入题库详情选择 TTS 模型和声音。route 后续变化不自动改写已创建题库，避免静默重建和费用。
+
+招聘流程不在岗位卡片内创建或重新配置题库，而是调用 assignment 接口从题库列表选择。关联后的岗位直接复用题库现有 Question、KnowledgeBaseSpeechProfile、声音和不可变语音资产；重复关联为幂等成功，未关联题库不能进入该岗位的搜索或计划。
+
+构建工作项依次校验题目、标准答案、关键点、rubric、技能、难度和题型，写入结构化候选池，并按题库的 KnowledgeBaseSpeechProfile 异步生成每道活动题的 `QuestionSpeechAsset`。部分失败时题库保持 `building` 或进入 `failed`，响应必须列出失败题目和重试入口；不能把缺少评分依据或匹配当前 profile revision 语音的题库标为 `ready`。MVP 不生成 embedding，也不依赖向量数据库。
+
+设置语音配置请求：
+
+```json
+{
+  "expected_version": 4,
+  "model_configuration_id": "model_cfg_tts_01J...",
+  "voice_profile_id": "tongtong",
+  "language": "zh-CN",
+  "audio_format": "audio/wav",
+  "speaking_rate": 1.0
+}
+```
+
+服务端只接受已启用、状态为 `ready` 且支持 `tts.synthesize` 的 ModelConfiguration，并校验声音属于该模型的 voice catalog。模型、声音、语言、格式或语速与当前 profile 不同则原子增加 `speech_profile.revision`、把题库语音 readiness 置为 rebuilding，并创建 `knowledge_base.speech.rebuild` DurableWorkItem；完全相同的配置和 `Idempotency-Key` 返回已有 job，不重复计费。响应为 `202`：
+
+```json
+{
+  "knowledge_base_id": "kb_backend_cn",
+  "speech_profile_revision": 3,
+  "job_id": "work_kb_speech_01J...",
+  "status": "pending",
+  "question_count": 42
+}
+```
+
+父工作项在 Celery worker 中冻结活动 Question ID/version 清单并分批创建题目级工作项，进度投影至少包含 `total/pending/running/ready/failed/superseded`。切换到 revision 4 后，revision 3 的迟到结果不得成为当前资产。已批准计划或历史会话引用的旧 QuestionSpeechAsset 不删除、不覆盖。
 
 ### 题目
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/api/v1/knowledge-bases/{knowledge_base_id}/questions` | 创建题目并排队校验/语音 |
+| `POST` | `/api/v1/knowledge-bases/{knowledge_base_id}/questions` | 创建题目并排队校验/语音；返回 `202` 和工作项，不等待 TTS |
 | `GET` | `/api/v1/knowledge-bases/{knowledge_base_id}/questions` | 列出题目 |
 | `PATCH` | `/api/v1/questions/{question_id}` | 修改题目；内容变化产生新版本和新语音任务 |
-| `POST` | `/api/v1/questions/{question_id}/speech/regenerate` | 指定语言/音色重建读题语音 |
+| `DELETE` | `/api/v1/questions/{question_id}?expected_version={version}` | 从当前题库归档题目；保留历史面试快照和不可变语音资产，不再出现在活动题列表 |
+| `POST` | `/api/v1/questions/{question_id}/speech/regenerate` | 按题库当前 speech profile 重建单题语音；返回 `202`，不在请求内执行 TTS |
+| `POST` | `/api/v1/question-speech-assets/{asset_id}/content-url` | 鉴权并审计后签发五分钟题目语音试听地址；浏览器不接触存储凭据 |
+| `GET` | `/api/v1/knowledge-bases/{knowledge_base_id}/question-generation-options` | 返回题库定位/标签默认值和可用于结构化生题的 ready LLM 模型，不包含凭据 |
+| `POST` | `/api/v1/knowledge-bases/{knowledge_base_id}/question-generation-batches` | 创建智能生题批次并返回 `202 + work_item_id`；请求包含模型、数量、定位、标签和可选要求，HTTP 不执行 LLM |
+| `GET` | `/api/v1/knowledge-bases/{knowledge_base_id}/question-generation-batches` | 列出该题库最近生成批次和状态 |
+| `GET` | `/api/v1/question-generation-batches/{batch_id}` | 查看批次上下文、候选草稿、失败或导入结果 |
+| `POST` | `/api/v1/question-generation-batches/{batch_id}/stop` | 以 `expected_version + Idempotency-Key` 请求停止；取消未执行工作并让在途结果在提交前失效 |
+| `POST` | `/api/v1/question-generation-batches/{batch_id}/resume` | 以 `expected_version + Idempotency-Key` 继续 stopped 批次的未完成槽位，保留已完成分片 |
+| `POST` | `/api/v1/question-generation-batches/{batch_id}/retry-failed` | 以 `expected_version + Idempotency-Key` 重试规划、合并或全部失败分片，不重做成功分片 |
+| `POST` | `/api/v1/question-generation-batches/{batch_id}/chunks/{chunk_id}/retry` | 以 `expected_version + Idempotency-Key` 只重试一个失败分片 |
+| `PATCH` | `/api/v1/question-generation-batches/{batch_id}/drafts/{draft_id}` | 以批次 `expected_version` 修改一条候选草稿并重新校验评分依据 |
+| `DELETE` | `/api/v1/question-generation-batches/{batch_id}/drafts/{draft_id}?expected_version={version}` | 从审核批次删除候选草稿，不影响正式题库 |
+| `POST` | `/api/v1/question-generation-batches/{batch_id}/drafts/{draft_id}/import` | 以 `expected_draft_version? + Idempotency-Key` 异步导入单个候选题；兼容接收 `expected_version`，但其他草稿推进批次版本不阻塞本题；批次继续处于审核态 |
+| `POST` | `/api/v1/question-generation-batches/{batch_id}/import` | 以 `expected_version + Idempotency-Key` 冻结剩余草稿并异步批量导入正式题库 |
 | `POST` | `/api/v1/questions/search` | 后台按关键词和结构化字段查题，不用于实时抽题 |
+
+题目读取投影增加 `speech_preview={available,reason,message}`。只有 ready QuestionSpeechAsset、
+`production_ready=true` 且关联 ready FileObject 时 `available=true`；开发 mock 返回
+`reason=development_mock_asset` 和“配置语音”操作提示，不再把 `mock-tts://` 展示为可试听音频。直接请求旧 mock 资产
+返回 `409 QUESTION_SPEECH_PREVIEW_UNAVAILABLE`；真实 Provider 资产缺少私有文件时继续返回
+`409 QUESTION_SPEECH_ASSET_NOT_PRIVATE`，但消息明确提示重新生成或检查私有存储。
+
+智能生题创建体为 `model_configuration_id + target_count(1..30) + positioning + tags + requirements?`，
+必须携带 `Idempotency-Key`。只有 `enabled + ready + llm.chat_json` 模型可选。PATCH 草稿允许修改题干、答案、
+关键点、技能、难度和题型；服务端会重新校验非空答案、关键点和技能。导入接口只接受 `reviewing` 批次。
+单题导入是草稿级条件命令：服务端校验目标草稿的 `expected_draft_version`（旧客户端可只传批次
+`expected_version`），事务写入使用读取到的最新批次版本，因此另一个草稿刚提交/完成导入不会制造无关的
+`PERSISTENCE_CONFLICT`。该草稿随后标记为 `importing -> imported/failed`，成功后不能再次编辑、删除或导入；其他草稿仍可审核，
+批量导入只处理尚未导入的草稿，并拒绝与在途单题导入并发，
+生成状态依次为 `queued -> generating -> reviewing`，其中 `phase` 进一步公开
+`planning/generating/merging/refilling`；响应的 `generation_progress` 提供规划数、子任务完成数、已接受/过滤题数和
+补生成轮次。任务控制增加 `generating/queued -> stopping -> stopped -> generating`；停止不能承诺撤销已经到达
+供应商的 HTTP 请求，但会停止新调用并通过 `execution_revision` 丢弃停止前的迟到结果。批次详情返回 `tasks`、
+`available_actions`、`control_history` 和结构化错误投影，客户端无需、也不能直接调度或 replay DurableWorkItem。
+若双槽位生成以 `provider_output_truncated` 失败，服务端会把原 chunk 投影为 `superseded`，在其 `recovery` 中返回
+`strategy/reason/replacement_chunk_ids` 与不含正文的 token/finish_reason 诊断，并创建两个单槽位替代任务；
+`generation_progress.total_chunks` 只统计活动替代任务。该恢复不改变批次 ID、不重做成功分片，也不要求客户端发起
+重试。单槽位仍截断时批次进入 `failed`，错误标记为不可自动重试，但既有显式分片/失败重试命令仍可由面试官执行。
+导入状态为 `importing -> imported`；正式题目 ID 返回在
+`imported_question_ids`。生成或导入失败时批次保留 `last_error` 和关联工作项，AI 输出永远不会因为读取接口或轮询
+而自动入库。既有创建、查询、草稿审核与导入路径保持兼容。
 
 创建题目示例：
 
@@ -144,7 +235,7 @@
 }
 ```
 
-服务端验证所有题库属于 `job_position_id` 和当前组织；查询底层强制过滤 `organization_id + job_position_id + knowledge_base_ids + active + valid + speech-ready` 及技能/难度/题型条件。实时 Question Selection 不调用该搜索接口，而是直接使用批准计划冻结的题目 ID/version 候选清单。
+服务端验证所有题库属于当前组织并已显式关联到 `job_position_id`；查询底层在关联校验后强制过滤 `organization_id + knowledge_base_ids + active + valid + speech-ready` 及技能/难度/题型条件。实时 Question Selection 不调用该搜索接口，而是直接使用批准计划冻结的题目 ID/version 候选清单。
 
 ## 简历库与 AI 审阅 API
 
@@ -152,14 +243,17 @@
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `POST` | `/api/v1/candidate-profiles` | 企业创建候选人基本信息 |
-| `GET` | `/api/v1/candidate-profiles` | 搜索组织内简历库 |
-| `GET` | `/api/v1/candidate-profiles/{candidate_id}` | 查看候选人和简历版本 |
+| `POST` | `/api/v1/candidate-profiles` | 企业创建候选人基本信息；新工作台同时提交 `job_position_id` 建立岗位候选关系 |
+| `GET` | `/api/v1/candidate-profiles` | 搜索组织内简历库；返回最新岗位初筛投影、人工复核结果和清理期限 |
+| `GET` | `/api/v1/candidate-profiles/{candidate_id}` | 查看候选人及最新岗位初筛投影 |
 | `PATCH` | `/api/v1/candidate-profiles/{candidate_id}` | 更新基本信息或归档 |
+| `DELETE` | `/api/v1/candidate-profiles/{candidate_id}?expected_version={version}` | 乐观并发地逻辑归档候选人并从活动列表隐藏，保留审计事实 |
 | `POST` | `/api/v1/candidate-profiles/{candidate_id}/resumes` | 以 multipart 上传本地 PDF，创建新简历版本 |
 | `POST` | `/api/v1/candidate-profiles/{candidate_id}/resumes/import-url` | 从公开 HTTPS URL 异步导入 PDF，创建新简历版本 |
 | `GET` | `/api/v1/candidate-profiles/{candidate_id}/resumes` | 列出简历版本和摄取状态 |
 | `GET` | `/api/v1/candidate-profiles/{candidate_id}/resumes/{resume_id}` | 查看解析状态和授权元数据 |
+| `PATCH` | `/api/v1/candidate-profiles/{candidate_id}/resumes/{resume_id}` | 以 `expected_version + display_name` 修改展示文件名；不覆盖 PDF 内容 |
+| `DELETE` | `/api/v1/candidate-profiles/{candidate_id}/resumes/{resume_id}?expected_version={version}` | 删除未被计划/面试历史引用的简历版本，同时取消待处理工作并清理私有文件 |
 | `POST` | `/api/v1/candidate-profiles/{candidate_id}/resumes/{resume_id}/content-url` | 鉴权并审计后获取短期下载入口 |
 | `GET` | `/api/v1/file-ingestion-jobs/{job_id}` | 查看 PDF 摄取工作项、失败码和简历状态 |
 
@@ -176,11 +270,17 @@
 
 服务端规范化并加密邮箱和手机号；响应默认只返回脱敏值。简历只接受 PDF，限制类型和大小并做恶意文件扫描，原文件存 Private File Storage 而非数据库 BLOB。调用方不能提供可信 `storage_uri`；服务端只保存 `file_object_id` 和受控元数据。
 
+简历的“改”只作用于展示文件名，且仍须以 `.pdf` 结尾；替换 PDF 必须再次调用创建接口形成递增的 `resume_version`，不能原地改写证据来源。删除使用乐观并发：待领取的 `resume.ingest/resume.review` 工作项转为 `cancelled`，隔离文件、PDF、解析文本和未进入历史的派生资产被清理，资源留下最小 `deleted` 审计占位并从列表隐藏。工作项已经运行时返回 `409 RESUME_DOCUMENT_PROCESSING`；已被 InterviewPlan 或 InterviewSession 快照引用时返回 `409 RESUME_DOCUMENT_IN_USE`，防止破坏历史证据。
+
+候选人列表中的 `screening` 是最新 ResumeReview 的岗位维度投影：`ai_recommendation` 保留模型原建议，`effective_outcome` 优先采用人工复核结论，`matched_requirements/unmet_requirements` 用于解释入选或淘汰。该投影是辅助建议，不是自动录用决定。
+
 本地文件上传使用 `multipart/form-data`：
 
 ```text
 file=<candidate.pdf>
 display_name=张三-后端工程师简历.pdf  # 可选
+job_position_id=pos_backend           # 可选；与下一字段同时提交时，摄取成功后自动排队初筛
+role_requirement_id=role_01J...       # 可选
 ```
 
 服务端分块读取并在 10 MiB 默认硬上限内拒绝超限输入，随后计算 SHA-256；隔离文件写入 worker 管理的私有目录。响应 `202 Accepted`：
@@ -199,13 +299,15 @@ URL 导入请求：
 ```json
 {
   "url": "https://files.example.com/resumes/candidate.pdf",
-  "display_name": "候选人简历.pdf"
+  "display_name": "候选人简历.pdf",
+  "job_position_id": "pos_backend",
+  "role_requirement_id": "role_01J..."
 }
 ```
 
 URL 导入也返回 `202`，`source_type=url_import`。下载由 worker 使用受控 HTTP 客户端执行：生产默认只允许 HTTPS，限制连接/总超时、重定向次数和最大字节数；初始 URL 及每次重定向都要重新解析 DNS，并拒绝环回、私网、链路本地、保留地址、云元数据地址、非 HTTP(S) scheme 和 URL 内嵌凭证。MVP 不接收需要 Cookie、Authorization 或企业内网访问的 URL。
 
-两种入口随后执行相同流水线：`receive/download -> quarantine -> PDF signature/MIME validation -> malware scan -> private store -> parse -> ready`。外部 URL 只作为摄取来源，成功后解析、审阅和下载都读取系统托管文件；不得长期依赖原 URL，也不得把它直接返回给浏览器。相同 `Idempotency-Key` 的重试返回同一个 `ResumeDocument`，底层可按文件哈希去重物理对象，但不能覆盖已有简历版本。
+两种入口随后执行相同流水线：`receive/download -> quarantine -> PDF signature/MIME validation -> malware scan -> private store -> page-preserving parse -> ready`。同时提交岗位和要求时，摄取完成的同一事务创建 `ResumeReview + resume.review` 工作项，浏览器不轮询等待 LLM。外部 URL 只作为摄取来源；相同上传 `Idempotency-Key` 的重试返回同一个 `ResumeDocument`。不同上传命令即使 PDF 内容相同也形成不同不可变简历版本，其审阅工作幂等键按 `resume_document_id + input_hash` 隔离，不能复用另一个版本已完成或已删除的工作项。
 
 JSON `resume_text` 兼容请求已删除；开发和生产均以系统托管 PDF 为唯一简历文件真相。
 
@@ -226,20 +328,23 @@ JSON `resume_text` 兼容请求已删除；开发和生产均以系统托管 PDF
 
 ```json
 {
-  "review_id": "rr_01J...",
-  "job_id": "job_resume_01J...",
-  "status": "queued"
+  "review": {"id": "rr_01J...", "status": "queued"},
+  "job": {"id": "job_resume_01J...", "status": "pending", "kind": "resume.review"}
 }
 ```
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/api/v1/resume-reviews/{review_id}` | 返回项目/技能证据、告警和问题状态 |
+| `GET` | `/api/v1/resume-reviews/{review_id}` | 返回岗位初筛、项目/技能证据、告警和问题状态 |
+| `POST` | `/api/v1/resume-reviews/{review_id}/retry` | 以 `expected_version + reason` 将 failed/dead-letter 初筛原子恢复为 queued/pending，并记录操作者审计 |
+| `PATCH` | `/api/v1/resume-reviews/{review_id}/screening-review` | 人工复核初筛；提交 `expected_version`、`decision=qualified|unqualified` 和可选说明，保留 AI 原建议并审计 |
 | `GET` | `/api/v1/resume-reviews/{review_id}/experience-questions` | 列出 AI 生成问题 |
 | `PATCH` | `/api/v1/experience-questions/{question_id}` | 人工编辑、批准或拒绝 |
 | `POST` | `/api/v1/experience-questions/{question_id}/speech/regenerate` | 重建问题语音 |
 
-AI 问题默认为 `draft`。接口返回每个问题的 `project_ref` 和 `evaluation_focus` 供面试官核对；批准后才排队生成正式语音并允许进入计划。不得把简历中的受保护属性或无关个人信息发送给评分模型。
+创建与重试接口只验证并排队，绝不在 HTTP 请求内等待 LLM。同一 ready 简历的重复创建命令返回原 ResumeReview；若该审阅仍为 queued 但工作项缺失，命令会在同一事务补建指向当前审阅的 DurableWorkItem，并校验返回工作的 aggregate ID，避免界面永久显示排队。失败重试仅接受 `ResumeReview.status=failed` 且关联 DurableWorkItem 为 `failed/dead_letter` 的组合；源 ResumeDocument 必须仍为 `ready`，岗位和要求必须存在。命令使用审阅 version 防双击/并发覆盖，清空当前错误与分块进度、把工作 attempt 归零并增加 `replay_count`，但不创建第二份审阅。`GET` 在处理中返回 `status/processing_stage/processing_strategy/processing_progress`；完成后通过 `screening.recommendation/score/summary/matched_requirements/unmet_requirements` 给出可解释建议，证据包含 `source_pages`。服务端按 `candidate_screening_score.v1` 强制把 0–59 映射为 `unqualified`、60–74 映射为 `manual_review`、75–100 映射为 `qualified`，并返回 `screening_policy_version`；候选人列表的嵌套 screening 投影返回同值的 `score_policy_version`。模型建议与分数冲突时以分数带为准，人工 `screening-review` 决定仍可覆盖生效结论。AI 问题默认为 `draft`，批准后才生成语音。不得把简历中的受保护属性或无关个人信息发送给模型。
+
+同一候选人按岗位只取最新审阅决定留存：只要存在 `qualified` 或 `manual_review`/处理中结论，就不设置初筛清理期限；所有最新岗位结论均为 `unqualified` 时设置 `retention_reason=screening_unqualified` 和服务端时间加 7 天。Celery Beat 周期任务先按当前分数带校正存量候选人的期限，首次命中从该次运行起重新给足 7 天，再由 RetentionService 清除到期私有简历和敏感投影并写审计；列表读取或页面点击不产生隐式写入或物理删除。
 
 ## 岗位要求与面试计划 API
 
@@ -247,8 +352,10 @@ AI 问题默认为 `draft`。接口返回每个问题的 `project_ref` 和 `eval
 | --- | --- | --- |
 | `POST` | `/api/v1/job-positions/{position_id}/role-requirements` | 创建岗位要求版本 |
 | `GET` | `/api/v1/job-positions/{position_id}/role-requirements` | 列出岗位要求 |
-| `POST` | `/api/v1/interview-plans/generate` | 生成候选人专属草稿计划 |
+| `POST` | `/api/v1/interview-plans/generate` | 生成候选人专属计划；默认草稿，`approve=true` 时原子校验并批准 |
 | `GET` | `/api/v1/interview-plans` | 列出计划 |
+
+React 岗位卡片根据该岗位是否已有要求，显示“添加岗位要求”或“新增要求版本”，因此升级前已有但尚无要求的岗位无需删除重建。新建岗位路径仍优先使用原子 `initial_requirement` 合同。
 | `GET` | `/api/v1/interview-plans/{plan_id}` | 查看槽位、经历问题和就绪状态 |
 | `PATCH` | `/api/v1/interview-plans/{plan_id}` | 编辑草稿或批准/归档 |
 
@@ -261,6 +368,7 @@ AI 问题默认为 `draft`。接口返回每个问题的 `project_ref` 和 `eval
   "role_requirement_id": "role_01J...",
   "candidate_profile_id": "cand_01J...",
   "resume_review_id": "rr_01J...",
+  "approve": true,
   "position_question_count": 6,
   "experience_question_ids": ["eq_01J...", "eq_01K..."],
   "strategy": {
@@ -273,12 +381,15 @@ AI 问题默认为 `draft`。接口返回每个问题的 `project_ref` 和 `eval
 }
 ```
 
+`approve` 默认为 `false`，保留 API 客户端“生成草稿—编辑—批准”的完整流程。React 工作台在面试官点击“生成并启用计划”时显式提交 `approve=true`；Plan Assembly 必须在同一事务里完成装配、readiness 校验和批准，成功响应直接为 `approved`。校验失败时不得留下需要创建人再处理的半成品草稿。
+
 响应中的 `bank_slots` 只定义维度、难度、题型、权重和时长；计划装配通过关系库字段形成每个槽位的 `QuestionCandidatePool`，批准时冻结筛选条件、题目 ID/version 清单及哈希，岗位题由面试中的 Question Selection 在清单内随机选择。`experience_questions` 是经人工批准的固定问题，并在所有 `position_bank` 槽位之后执行。两者连同权重、阶段顺序和 `selection_policy` 构成唯一 execution v2 计划；请求、响应和持久运行时均不再包含 `items`。升级旧数据前使用 `python -m app.migrations.plan_execution_v2 --dry-run` 检查，再执行正式迁移。此过程不要求 embedding 或向量数据库。
 
 批准计划前服务端必须验证：
 
 - 岗位、题库、岗位要求、候选人和审阅同组织且关系一致。
 - 题库为 `ready`，候选池足够并已冻结题目 ID/version 与集合哈希。
+- 每个题库的 speech profile revision 和候选题对应 QuestionSpeechAsset ID 已冻结；题库后续切换模型/声音不覆盖已批准计划使用的旧资产。
 - Resume Review 为 `ready`，经历问题为 `approved` 且语音为 `ready`。
 - 权重和为 1，时长守恒；放宽去重或覆盖约束必须写入 `assembly_summary.warnings`。
 
@@ -330,6 +441,8 @@ AI 问题默认为 `draft`。接口返回每个问题的 `project_ref` 和 `eval
 }
 ```
 
+React 工作台必须在这个一次性响应弹窗中提供“复制链接”操作和成功/失败反馈，不要求用户手工选中 URL。
+
 数据库只保存 token 哈希。readiness 至少检查计划批准、题库/候选池、经历问题语音、服务端 `stt.streaming` route 健康、时间窗和录音留存策略。
 
 ### 公开邀请与填报
@@ -337,7 +450,7 @@ AI 问题默认为 `draft`。接口返回每个问题的 `project_ref` 和 `eval
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/api/v1/public/interview-invitations/{token}` | 返回岗位名、时间、告知版本和所需字段的安全摘要 |
-| `POST` | `/api/v1/public/interview-invitations/{token}/intake` | 提交姓名、邮箱、手机号与授权并匹配 |
+| `POST` | `/api/v1/public/interview-invitations/{token}/intake` | 提交姓名、邮箱、手机号与授权，匹配成功后确认预约并安排邮件提醒 |
 | `POST` | `/api/v1/public/interview-invitations/{token}/readiness` | 上报浏览器、麦克风和音频格式检查 |
 | `POST` | `/api/v1/public/interview-invitations/{token}/start` | 候选人在时间窗内幂等创建/启动会话 |
 
@@ -356,7 +469,25 @@ AI 问题默认为 `draft`。接口返回每个问题的 `project_ref` 和 `eval
 }
 ```
 
-姓名、邮箱和手机号三项均为必填。GET 邀请响应返回服务端冻结的实际隐私/录音告知正文、允许版本、`recording_required` 和内容 hash；客户端只能回传该版本，不能自定义告知。服务端只与预约绑定的 `CandidateProfile` 比较；至少邮箱或手机号之一精确匹配，姓名联合校验。成功后预约进入 `registered`，保存匹配方式、授权布尔值、告知 hash 与服务端时间，但不返回简历内容。失败响应不能说明哪个字段不匹配。
+姓名、邮箱和手机号三项均为必填。GET 邀请响应返回服务端冻结的实际隐私/录音告知正文、允许版本、`recording_required` 和内容 hash；客户端只能回传该版本，不能自定义告知。服务端只与预约绑定的 `CandidateProfile` 比较；至少邮箱或手机号之一精确匹配，姓名联合校验。成功后预约进入 `registered`，表示身份核验和预约确认已经完成，而不是面试已经开始；同时创建 `appointment.reminder.email` DurableWorkItem，`available_at=scheduled_start_at-30min`。响应返回预约时间和安全的提醒状态，不返回简历内容、内部工作项 ID 或联系方式。失败响应不能说明哪个字段不匹配。
+
+登记成功响应示例：
+
+```json
+{
+  "appointment_id": "appointment_01J...",
+  "status": "registered",
+  "matched": true,
+  "scheduled_start_at": "2026-09-01T02:00:00Z",
+  "scheduled_end_at": "2026-09-01T03:00:00Z",
+  "email_reminder": {
+    "status": "scheduled",
+    "scheduled_for": "2026-09-01T01:30:00Z"
+  }
+}
+```
+
+邀请页必须把登记与 start 拆成两次明确操作：“核验身份并确认预约”不能申请麦克风或调用 start；确认成功后显示预约时间和邮件提醒说明，到允许开始时间后才提供“检查设备并进入面试”。SMTP 使用 `INTERVIEWER_SMTP_*` 环境变量，授权码对应 `INTERVIEWER_SMTP_PASSWORD`，仓库样例保持为空。未配置或发送失败只能形成可重试/可观察状态，不能返回或记录虚假的 `sent`。
 
 候选人 start 必须再次检查 token、登记、明确同意、时间窗、未过期设备 readiness 和服务端 STT readiness。默认开始窗口为闭区间 `[scheduled_start_at, scheduled_end_at]`；提前/延后宽限只能来自创建预约时冻结的显式策略。成功时在同一事务原子把预约标为 `consumed`，创建唯一 `InterviewSession` 并冻结候选人、计划、岗位和简历版本；重复调用返回同一会话。
 
@@ -367,8 +498,8 @@ AI 问题默认为 `draft`。接口返回每个问题的 `project_ref` 和 `eval
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/api/v1/public/interviews/{interview_id}` | 返回候选人姓名、会话状态和安全轮次投影；未来题干和所有答案/rubric/候选池均隐藏 |
-| `POST` | `/api/v1/public/interviews/{interview_id}/audio-answers` | 提交当前轮次录音；媒体 URI 必须属于该会话和轮次，服务端 STT 后评分 |
-| `POST` | `/api/v1/public/interviews/{interview_id}/avatar/speak` | 读取当前安全题干并通过 avatar/TTS seam 朗读 |
+| `POST` | `/api/v1/public/interviews/{interview_id}/audio-answers` | 提交当前轮次录音；媒体 URI 必须属于该会话和轮次，服务端从受控本地媒体或 `private-file://` FileObject 读取音频并经 STT 后评分；接口不向 Provider 暴露对象存储凭据 |
+| `POST` | `/api/v1/public/interviews/{interview_id}/avatar/speak` | 读取当前安全题干并通过 avatar/TTS seam 朗读；响应兼容 `browser_speech/audio/video`，外部媒体默认必须是 HTTPS |
 
 候选人 token 由至少 32 字符的 `INTERVIEWER_CANDIDATE_TOKEN_SECRET` 对会话 ID 与创建时间做 HMAC-SHA256 派生，不明文持久化或出现在后台详情；验证使用常量时间比较，错误 token 返回 403。候选人 WebSocket 继续使用 `/interviews/{id}/live?role=candidate&token=...`，连接后只能发送设备就绪、媒体开始/分片/停止、未受信 partial 和心跳事件。
 
@@ -521,11 +652,12 @@ class ModelGateway:
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/api/v1/admin/model-providers/catalog` | 已安装插件、能力和实现状态 |
-| `POST/GET/PATCH` | `/api/v1/admin/model-provider-connections` | 管理厂商连接；凭证只写入、读取时仅返回状态 |
+| `POST/GET/PATCH/DELETE` | `/api/v1/admin/model-provider-connections[/{id}]` | 创建、列表/单项查看、修改和删除厂商连接；凭证只写入、读取时仅返回状态 |
 | `POST` | `/api/v1/admin/model-provider-connections/{id}/validate` | 通过 Provider adapter 执行真实 API Key 鉴权探针，保存 `valid` / `invalid` / `model_required` 状态 |
 | `GET` | `/api/v1/admin/model-provider-connections/{id}/model-catalog` | 返回该连接可配置的模型类型、模型目录和动态表单 schema |
-| `POST/GET/PATCH` | `/api/v1/admin/model-configurations` | 管理具体模型及其厂商参数、统一默认参数和启用状态 |
+| `POST/GET/PATCH/DELETE` | `/api/v1/admin/model-configurations[/{id}]` | 创建、列表/单项查看、修改和删除具体模型及其参数与启用状态 |
 | `POST` | `/api/v1/admin/model-configurations/{id}/test` | 以模型配置的统一能力探针进行真实调用并更新健康状态 |
+| `GET` | `/api/v1/admin/model-configurations/{id}/voices` | 返回 TTS 模型可选声音目录；静态 manifest、管理员映射或 Provider 只读目录由后端统一归一化 |
 | `POST/GET` | `/api/v1/admin/model-routes` | 管理能力/purpose 路由 |
 | `POST` | `/api/v1/admin/model-routes/{id}/test` | 测试 schema、primary 和 fallback |
 | `GET` | `/api/v1/admin/work-items` | 查看状态计数、dead-letter 指标和工作项摘要 |
@@ -534,5 +666,7 @@ class ModelGateway:
 | `GET` | `/api/v1/admin/evaluations/question-selection-fairness` | 比较同岗位抽题数量、难度和技能覆盖分布 |
 | `POST` | `/api/v1/admin/session-monitor/run` | 扫描心跳超时并通过生命周期命令暂停会话 |
 | `POST` | `/api/v1/admin/retention/run` | 默认 dry-run 预览到期候选人；显式 `dry_run=false` 才清除私有文件、联系方式和面试敏感内容并审计 |
+
+两个 `DELETE` 都必须在查询参数携带 `expected_version`，陈旧版本返回 `409`。删除 ProviderConnection 会在同一租户事务中删除它的加密凭证、全部 ModelConfiguration，以及引用这些模型的 ModelRoute 和对应断路器状态；删除单个 ModelConfiguration 只删除该模型及引用它的路由/断路器状态，同连接下其他模型和厂商连接保持不变。历史 ModelInvocationLog 作为脱敏审计事实保留。
 
 具体 Provider manifest、STT/TTS 请求响应和错误语义见 [模型供应商插件化设计](model-provider-plugins.md)。

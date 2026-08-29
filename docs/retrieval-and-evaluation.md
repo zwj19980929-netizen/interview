@@ -8,16 +8,26 @@
 
 题目上传后进入持久异步构建流水线：
 
-1. 验证 `KnowledgeBase` 属于目标 `JobPosition`，并校验题干、标准答案、关键点、rubric、技能和难度。
+1. 验证 `KnowledgeBase` 属于当前组织且已关联到目标 `JobPosition`，并校验题干、标准答案、关键点、rubric、技能和难度。
 2. 规范化技能标签和语言；内容相同的导入通过文件/条目哈希幂等处理。
 3. 校验技能、难度、题型和状态等结构化抽题字段；缺失时进入人工补全，或由 `llm.chat_json` 生成建议标签后由面试官确认。
 4. 校验标准答案、关键点权重和 rubric，确保 AI 评分输入完整。
-5. 通过 `tts.synthesize` 为 `question_text + language + voice_profile_id` 生成 `QuestionSpeechAsset`。
+5. 通过题库 KnowledgeBaseSpeechProfile 冻结的 `model_configuration_id + voice_profile_id + language + format + speaking_rate` 调用 `tts.synthesize`，为每个活动题生成 `QuestionSpeechAsset`。
 6. 分别更新 `validation_status` 和 `speech_status`，汇总题库构建状态。
 
 只有 `active + valid + speech_ready` 且评分依据完整的题目进入正式候选池。服务端即时 TTS 只用于面试期间语音资产无法播放时的受控降级，不能把缺少预生成语音的题库标为 `ready`。校验或语音生成失败不影响题目草稿保存，但会阻止题库进入 `ready`。
 
-题干、语言或音色变更必须新建语音资产，不能覆盖历史资产。内容哈希相同的资产可安全复用。
+题干或 KnowledgeBaseSpeechProfile revision 变更必须新建语音资产，不能覆盖历史资产。切换模型或声音会创建整库 KnowledgeBaseSpeechBuild，父工作项冻结活动题 ID/version manifest，再由 Celery fan-out 为每题执行独立工作项；内容哈希相同且模型配置版本/声音/输出参数完全一致的资产可安全复用。
+
+批量重建遵循以下顺序：
+
+1. API 事务以 `expected_version` 更新题库 speech profile、增加 revision、把题库从 `ready` 置为 `building`，并写入唯一 DurableWorkItem；HTTP 返回 `202`。
+2. `app/workers/knowledge_base_speech.py` 的 Celery task 领取父工作项，冻结活动题 manifest 并分批创建 `question.speech.generate` 子工作项，不在 Web 进程循环调用 TTS。
+3. 题目 worker 在数据库事务外调用 ModelGateway，使用 profile 指定的具体 TTS ModelConfiguration，不回退到另一个未声明模型。
+4. 提交结果前重新读取 Question version 和题库 speech profile revision；任一已变化时把子工作标为 `superseded`，保留不可变资产但不更新当前指针。
+5. 父工作项聚合 `ready/failed/superseded`。只有当前 revision 全部活动题 ready 才恢复题库 `ready`；失败项可单独重试。
+
+Celery delivery 可以重复，数据库幂等键、租约和内容哈希必须使重复执行得到同一当前结果。Celery broker/result backend 不是题库构建真相。
 
 ## 岗位要求解析
 
@@ -47,12 +57,17 @@ Resume Review 只能读取已完成摄取和解析的 `ResumeDocument`。本地 
 
 1. 摄取本地上传流或受控下载的公开 HTTPS URL，计算 SHA-256，并校验大小、`application/pdf` 和 PDF 文件签名。
 2. 文件先进入隔离区完成恶意文件扫描，再写入系统私有存储；外部 URL 不能成为后续解析和审阅的长期真相来源。
-3. 解析 PDF，去除页眉页脚、照片和与能力评估无关的敏感字段，并保存可追溯解析文本资产。
-4. 抽取项目、时间范围、候选人声称的职责、技术选择、量化结果和对应原文位置。
-5. 将项目证据映射到岗位技能维度，区分“简历明确写出”“模型推断”和“信息不足”。
-6. 为最相关项目生成经历核验问题，覆盖本人职责、技术权衡、困难、结果验证和复盘。
-7. 输出严格 JSON，保存 model/prompt/review revision；不得生成录用结论。
-8. 问题默认 `draft`，面试官可编辑、拒绝或批准。批准后异步生成问题语音。
+3. 解析 PDF 并以页分隔符保存全部可提取文本；调用模型前去除联系方式及照片、性别、年龄、婚育等无关字段。
+4. 估算脱敏文本 Token：预算内使用 `resume_review.v4` 单次审阅；超预算则按页贪心组块，单页仍超限时再按段落/字符安全切分，任何文本都不能静默截断。
+5. 长简历的每个 `ResumeEvidenceChunk` 通过 `resume_evidence_map.v1` 只抽取项目、职责、技能、量化结果和来源页，不允许输出岗位符合性；分块在受控并发数内执行。
+6. 合并重复证据；若证据本身超过 Reduce 预算，用 `resume_evidence_compaction.v1` 分层压缩并保留来源页。达到最大压缩轮次仍超限则结构化失败，不截断。
+7. 只有全部 Map 成功后，`resume_review_reduce.v2` 才把完整规范化证据映射到岗位能力，并形成 `qualified/unqualified/manual_review`、0–100 辅助分、命中要求和缺口。
+8. 为最相关项目生成经历核验问题，覆盖本人职责、技术权衡、困难、结果验证和复盘；输出严格 JSON，保存策略、分块进度、用量、model/prompt revision，不保存完整 Prompt/响应。
+9. 初筛和问题都进入人工审核。任一分块失败不得基于部分结果生成淘汰建议；复核人可覆盖生效符合性，但 AI 原建议和证据保持不可变。
+
+模型输入预算与结构化输出预算必须分开配置。默认单次审阅/最终 Reduce 输出上限为 6000 tokens，Map/证据压缩为 4000 tokens，可分别通过 `INTERVIEWER_RESUME_SINGLE_PASS_OUTPUT_TOKENS`、`INTERVIEWER_RESUME_MAP_OUTPUT_TOKENS`、`INTERVIEWER_RESUME_COMPACTION_OUTPUT_TOKENS`、`INTERVIEWER_RESUME_REDUCE_OUTPUT_TOKENS` 调整。Provider 以 `finish_reason=length` 截断或返回空正文时必须结构化失败，不得保存半截 JSON 或部分初筛结论。
+
+初筛仅比较简历中的明确能力证据与岗位要求。模型负责生成 0–100 匹配分和证据，服务端在写入 CandidateScreening 前用版本化策略强制归一化建议：0–59 为 `unqualified`，60–74 为 `manual_review`，75–100 为 `qualified`；模型建议与分数冲突时以该映射为准。生效结论为人工复核优先、归一化 AI 建议次之；候选人列表同时展示两者及证据，分数带只形成筛选建议，不构成自动录用决定。同一候选人在不同岗位的最新审阅分别计算；只有所有最新生效结论均为 `unqualified` 时才设置 7 天留存期限，任何符合、待复核或处理中结论都会取消该初筛期限。周期 worker 先用当前策略校正存量审阅对应的期限；首次命中从本次校正时间起完整保留 7 天，不追溯立即删除，之后再由 RetentionService 到期清理并审计。
 
 经历问题示例：
 
@@ -81,7 +96,7 @@ Resume Review 只能读取已完成摄取和解析的 `ResumeDocument`。本地 
 
 ```text
 organization_id = current_organization
-job_position_id = plan.job_position_id
+knowledge_base_id is assigned to plan.job_position_id
 knowledge_base_id IN plan.knowledge_base_ids
 question_version IN approved_candidate_manifest
 status = active
@@ -92,7 +107,7 @@ difficulty IN slot.allowed_difficulties
 type IN slot.allowed_types
 ```
 
-筛选必须在数据库查询中强制组织、岗位和题库边界，不能先查全组织再在应用层丢弃。结构化排序信号可以包括：
+服务层先在同一租户事务中验证岗位—题库关联，数据库查询再强制组织、题库、活动状态和 readiness 边界；不能先查全组织题目再在应用层丢弃。结构化排序信号可以包括：
 
 - 技能标签与槽位覆盖目标的重合。
 - 难度与岗位级别适配。
@@ -121,7 +136,7 @@ Interview Plan Assembly 接收岗位、岗位要求、岗位题库、候选人�
 1. 把必备和加分技能按默认 3:1 合并为覆盖权重。
 2. 为 `position_question_count` 分配 `bank_slots`，每个槽位包含阶段、能力维度、允许难度、权重和预计时长。
 3. 对每个槽位按岗位、题库、技能、难度、题型、状态和语音 readiness 过滤候选题，形成 `QuestionCandidatePool`；它保存筛选条件、题目 ID/version 和集合哈希，不把标准答案暴露到计划 API。
-4. 冻结所有题库版本、候选清单和集合哈希，供面试中的随机选择使用。
+4. 冻结所有题库版本、KnowledgeBaseSpeechProfile revision、候选题的 QuestionSpeechAsset ID、候选清单和集合哈希，供面试中的随机选择使用。
 5. 把面试官已批准的 `ExperienceQuestion` 固定在 `position_bank` 槽位之后。
 6. 题目权重与经历问题权重用万分单位最大余数法归一，精确合计为 1；预计时长必须守恒。
 7. 候选池不足、覆盖不足或放宽去重/难度时写入 `assembly_summary.warnings`，不能伪造完整覆盖。
@@ -143,7 +158,7 @@ Interview Plan Assembly 接收岗位、岗位要求、岗位题库、候选人�
 
 ## 题目朗读
 
-- 岗位题优先播放 `InterviewQuestionSnapshot.speech_asset_id` 指向的预生成语音。
+- 岗位题优先播放 `InterviewQuestionSnapshot.speech_asset_id` 指向的预生成语音；该资产已冻结题库 speech profile revision 和实际 TTS 模型/声音。
 - 经历问题在批准后预生成语音，计划 readiness 要求资产可用。
 - 数字人视频层可根据相同音频驱动口型；视频供应商失败时仍播放语音资产。
 - 只有预约明确允许时才能在语音资产失败后即时调用 `tts.synthesize`，该次调用和实际朗读文本必须审计。
@@ -272,6 +287,20 @@ overall_score =
 | `manual_review` | STT、评分或经历一致性存在显著待复核项 |
 
 `job_fit_evidence` 必须逐条关联岗位维度、题目、当前评分 revision 和回答证据。企业可回听语音、查看 final transcript、修正转写并重评；最终人员决定是独立业务动作，不能由报告自动写入。
+
+## AI 题目创作不参与运行时检索
+
+智能生题只扩展题库创作能力：输入题库定位、标签和面试官可选要求，先形成互斥 QuestionBlueprint，再由独立
+子工作输出并合并为可审核 GeneratedQuestionDraft。规划层用 topic/scenario/focus 互斥键控制覆盖面；合并层对活动
+正式题目和批次候选执行规范化完全匹配与高阈值文本相似去重，缺失槽位最多定向补生成两轮。该规则属于创作
+治理，不替代运行时检索、embedding 或评分语义。生成阶段不能把草稿加入 Question Catalog、候选池、计划装配或
+评分。只有人工确认导入且 Question 完成现有评分依据校验后，才取得正式 ID 并进入后续结构化候选池；因此
+Question Selection、批准计划快照和实时评分算法无需新增“AI 题目”分支。
+
+完整题目生成使用 `question_blueprint_generation.v2`：Schema 将标题、题干、标准答案、关键点、别名和技能的长度/
+数量限制在可审核范围，单槽位输出预算为 4000 tokens、双槽位为 8000 tokens。Provider 明确报告
+`finish_reason=length` 时不得保存半截 JSON，也不得在 Model Gateway 内原样重试；双槽位由创作工作流拆成两个单槽位
+工作继续，单槽位再次截断才形成需要人工处理的失败项。该恢复只改变创作子任务，不改变正式题库检索或评分规则。
 
 报告生成必须先从每个答案的 `current_evaluation_id` 物化 current evaluation 集合，`overall_score`、维度、证据、风险、`manual_review` 和 `evaluation_ids` 全部只从该集合计算。历史 revision 仅保留给引用它的历史报告，不能影响新报告。
 

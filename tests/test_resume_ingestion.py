@@ -132,6 +132,120 @@ def test_pdf_upload_rejects_type_and_worker_fails_malware(tmp_path, monkeypatch)
     assert detail.json()["processing_error"]["code"] == "FILE_MALWARE_DETECTED"
 
 
+def test_resume_document_crud_cancels_pending_ingestion_and_cleans_quarantine(tmp_path, monkeypatch) -> None:
+    private_root = tmp_path / "private"
+    quarantine_root = tmp_path / "quarantine"
+    monkeypatch.setenv("INTERVIEWER_PRIVATE_FILE_ROOT", str(private_root))
+    monkeypatch.setenv("INTERVIEWER_FILE_QUARANTINE_ROOT", str(quarantine_root))
+    from app.file_storage.provider import reset_private_file_storage_for_tests
+
+    reset_private_file_storage_for_tests()
+    reset_store_for_tests()
+    api = TestClient(create_app())
+    candidate_id = _candidate(api)
+    queued = api.post(
+        f"/api/v1/candidate-profiles/{candidate_id}/resumes",
+        files={"file": ("candidate-old.pdf", _pdf(), "application/pdf")},
+        data={"display_name": "candidate-old.pdf"},
+        headers={"Idempotency-Key": "resume-crud-1"},
+    )
+    assert queued.status_code == 202, queued.text
+    resume_id = queued.json()["resume_document_id"]
+    work_id = queued.json()["ingestion_job_id"]
+    quarantine_path = quarantine_root / f"{work_id}.upload"
+    assert quarantine_path.exists()
+
+    detail = api.get(f"/api/v1/candidate-profiles/{candidate_id}/resumes/{resume_id}")
+    assert detail.status_code == 200
+    assert detail.json()["file_name"] == "candidate-old.pdf"
+    renamed = api.patch(
+        f"/api/v1/candidate-profiles/{candidate_id}/resumes/{resume_id}",
+        json={"expected_version": detail.json()["version"], "display_name": "candidate-current.pdf"},
+        headers={"X-Actor-Id": "recruiter_1"},
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["file_name"] == "candidate-current.pdf"
+
+    stale_delete = api.delete(
+        f"/api/v1/candidate-profiles/{candidate_id}/resumes/{resume_id}",
+        params={"expected_version": detail.json()["version"]},
+    )
+    assert stale_delete.status_code == 409
+    assert stale_delete.json()["error"]["code"] == "RESUME_VERSION_CONFLICT"
+
+    deleted = api.delete(
+        f"/api/v1/candidate-profiles/{candidate_id}/resumes/{resume_id}",
+        params={"expected_version": renamed.json()["version"]},
+        headers={"X-Actor-Id": "recruiter_1"},
+    )
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["status"] == "deleted"
+    assert not quarantine_path.exists()
+    assert api.get(f"/api/v1/candidate-profiles/{candidate_id}/resumes").json()["items"] == []
+    assert api.get(f"/api/v1/candidate-profiles/{candidate_id}/resumes/{resume_id}").status_code == 404
+    with persistence_for(get_store()).transaction("org_default") as transaction:
+        raw_resume = transaction.resume_documents.get(resume_id)
+        file_object = transaction.file_objects.get(raw_resume["file_object_id"])
+        work = transaction.outbox.get(work_id)
+        actions = [item["action"] for item in transaction.audit_events.list()]
+    assert raw_resume["status"] == "deleted"
+    assert raw_resume["file_hash"] is None
+    assert file_object["status"] == "deleted"
+    assert work["status"] == "cancelled"
+    assert "resume.display_name.updated" in actions
+    assert "resume.delete.completed" in actions
+
+
+def test_resume_delete_rejects_an_interview_plan_reference(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("INTERVIEWER_PRIVATE_FILE_ROOT", str(tmp_path / "private"))
+    monkeypatch.setenv("INTERVIEWER_FILE_QUARANTINE_ROOT", str(tmp_path / "quarantine"))
+    from app.file_storage.provider import reset_private_file_storage_for_tests
+
+    reset_private_file_storage_for_tests()
+    reset_store_for_tests()
+    api = TestClient(create_app())
+    candidate_id = _candidate(api)
+    queued = api.post(
+        f"/api/v1/candidate-profiles/{candidate_id}/resumes",
+        files={"file": ("referenced.pdf", _pdf(), "application/pdf")},
+        headers={"Idempotency-Key": "resume-reference-1"},
+    )
+    resume_id = queued.json()["resume_document_id"]
+    with persistence_for(get_store()).transaction("org_default") as transaction:
+        review = transaction.resume_reviews.add(
+            {
+                "id": "review_delete_guard",
+                "organization_id": "org_default",
+                "candidate_profile_id": candidate_id,
+                "resume_document_id": resume_id,
+                "job_position_id": "position_delete_guard",
+                "status": "ready_for_review",
+                "created_at": "2026-08-28T00:00:00Z",
+            }
+        )
+        transaction.interview_plans.add(
+            {
+                "id": "plan_delete_guard",
+                "organization_id": "org_default",
+                "resume_review_id": review["id"],
+                "experience_question_ids": [],
+                "status": "draft",
+                "created_at": "2026-08-28T00:00:00Z",
+            }
+        )
+        resume = transaction.resume_documents.get(resume_id)
+    rejected = api.delete(
+        f"/api/v1/candidate-profiles/{candidate_id}/resumes/{resume_id}",
+        params={"expected_version": resume["version"]},
+    )
+    assert rejected.status_code == 409
+    assert rejected.json()["error"]["code"] == "RESUME_DOCUMENT_IN_USE"
+    assert rejected.json()["error"]["details"]["plan_ids"] == ["plan_delete_guard"]
+    with persistence_for(get_store()).transaction("org_default") as transaction:
+        assert transaction.resume_documents.get(resume_id)["status"] == "processing"
+        assert transaction.outbox.get(queued.json()["ingestion_job_id"])["status"] == "pending"
+
+
 def test_safe_pdf_downloader_rejects_loopback() -> None:
     with pytest.raises(ApiError) as captured:
         asyncio.run(SafePdfDownloader().download("http://127.0.0.1/resume.pdf"))
@@ -221,8 +335,12 @@ def test_aliyun_oss_private_storage_contract() -> None:
             assert method == "GET" and slash_safe is True and expires <= 900
             return "https://oss.example/%s?signature=test" % key
 
+        def get_bucket_info(self):
+            return {"name": "private-resumes"}
+
     bucket = Bucket()
     adapter = AliyunOssFileAdapter(bucket=bucket, bucket_name="private-resumes")
+    adapter.healthcheck()
     content = _pdf()
     stored = adapter.store(
         organization_id="org_a",

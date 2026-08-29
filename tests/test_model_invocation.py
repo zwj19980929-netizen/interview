@@ -248,6 +248,48 @@ async def test_non_retryable_auth_error_does_not_fall_back() -> None:
 
 
 @pytest.mark.anyio
+async def test_output_truncation_is_not_retried_and_failed_usage_is_audited() -> None:
+    store = configured_store()
+    adapter = ScriptedAdapter(
+        [
+            ProviderError(
+                "provider_output_truncated",
+                "structured output reached its token limit",
+                retryable=False,
+                details={
+                    "finish_reason": "length",
+                    "requested_max_output_tokens": 4400,
+                    "input_tokens": 940,
+                    "output_tokens": 4400,
+                    "total_tokens": 5340,
+                    "reasoning_tokens": 3100,
+                },
+            )
+        ]
+    )
+    gateway = ModelGateway(store, provider_clients={"openai_compatible": adapter})
+
+    with pytest.raises(ProviderError) as exc_info:
+        await gateway.invoke(
+            cap.LLM_CHAT_JSON,
+            request(),
+            route=route(retry_count=3, fallback=True),
+        )
+
+    assert exc_info.value.code == "provider_output_truncated"
+    assert exc_info.value.details["attempts"] == 1
+    assert adapter.calls == 1
+    assert len(store.model_invocations) == 1
+    failure = store.model_invocations[0]
+    assert failure["input_tokens"] == 940
+    assert failure["output_tokens"] == 4400
+    assert failure["total_tokens"] == 5340
+    assert failure["finish_reason"] == "length"
+    assert failure["requested_max_output_tokens"] == 4400
+    assert failure["reasoning_tokens"] == 3100
+
+
+@pytest.mark.anyio
 async def test_production_requires_an_explicit_model_route(monkeypatch) -> None:
     monkeypatch.setenv("INTERVIEWER_RUNTIME_ENV", "production")
     store = InMemoryStore()

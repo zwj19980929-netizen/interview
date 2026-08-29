@@ -1,10 +1,11 @@
 from typing import Any, Dict, Optional
 
 from app.core.ids import new_id
+from app.core.prompt.contracts import prompt_contract
 from app.core.time import utc_now
 from app.model_gateway.gateway import ModelGateway
 from app.model_gateway import capabilities as cap
-from app.model_gateway.schemas import ChatJSONRequest, ChatMessage
+from app.model_gateway.schemas import ChatJSONRequest
 from app.persistence.interface import Persistence
 from app.repositories.memory import InMemoryStore
 
@@ -27,51 +28,23 @@ class EvaluationService:
         question_snapshot: Dict[str, Any],
         role_requirement: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        contract = prompt_contract(
+            "answer_evaluation",
+            {
+                "question_text": question_snapshot["question_text"],
+                "standard_answer": question_snapshot["standard_answer"],
+                "rubric": question_snapshot.get("rubric", {}),
+                "role_requirement": (role_requirement or {}).get("description", ""),
+                "answer_text": answer["final_transcript"],
+            },
+        )
         response = await self.gateway.invoke(
             cap.LLM_CHAT_JSON,
             ChatJSONRequest(
                 organization_id=answer.get("organization_id", "org_default"),
                 purpose="answer_evaluation",
-                messages=[
-                    ChatMessage(role="system", content="你是严格的面试评分助手，只输出结构化评分。"),
-                    ChatMessage(
-                        role="user",
-                        content="题目：%s\n标准答案：%s\n评分标准：%s\n岗位要求：%s\n候选人回答：%s"
-                        % (
-                            question_snapshot["question_text"],
-                            question_snapshot["standard_answer"],
-                            question_snapshot.get("rubric", {}),
-                            (role_requirement or {}).get("description", ""),
-                            answer["final_transcript"],
-                        ),
-                    ),
-                ],
-                json_schema={
-                    "type": "object",
-                    "required": [
-                        "score",
-                        "confidence",
-                        "dimension_scores",
-                        "covered_key_points",
-                        "missing_key_points",
-                        "incorrect_claims",
-                        "evidence",
-                        "review_flags",
-                        "summary",
-                    ],
-                    "properties": {
-                        "score": {"type": "integer", "minimum": 0, "maximum": 100},
-                        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                        "dimension_scores": {"type": "object"},
-                        "covered_key_points": {"type": "array"},
-                        "missing_key_points": {"type": "array"},
-                        "incorrect_claims": {"type": "array"},
-                        "evidence": {"type": "array"},
-                        "review_flags": {"type": "array"},
-                        "summary": {"type": "string"},
-                        "suggested_followup": {"type": ["string", "null"]},
-                    },
-                },
+                messages=contract.messages,
+                json_schema=contract.response_schema,
                 metadata={
                     "answer_text": answer["final_transcript"],
                     "key_points": question_snapshot["key_points"],
@@ -80,6 +53,7 @@ class EvaluationService:
                     "question_type": question_snapshot.get("source_type", "position_bank"),
                     "role_requirement": role_requirement or {},
                     "stt_confidence": answer.get("stt_confidence", 1.0),
+                    "prompt_version": contract.version,
                 },
             )
         )
@@ -106,7 +80,7 @@ class EvaluationService:
                 "provider_id": response.provider.provider_id,
                 "model": response.provider.model,
                 "request_id": response.provider.request_id,
-                "prompt_version": "answer_evaluation.v1",
+                "prompt_version": contract.version,
                 "rubric_source_question_version": question_snapshot["source_question_version"],
                 "scoring_profile": "resume_experience.v1"
                 if question_snapshot.get("source_type") == "resume_experience"

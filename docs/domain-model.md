@@ -39,27 +39,79 @@
 | `name` | 岗位名称 |
 | `department` | 部门，可为空 |
 | `description` | 岗位长期说明 |
+| `knowledge_base_ids` | 岗位显式选择的组织题库 ID；旧题库的初始 `job_position_id` 作为兼容关联投影补入 |
 | `default_duration_minutes` | 默认面试时长 |
-| `status` | `active`、`archived` |
+| `status` | `active`、删除处理中 `deleting`、已删除 `archived` |
 | `created_by` | 创建人 |
+
+删除岗位是一个显式生命周期命令：先计算岗位候选关系、岗位要求、计划和预约影响，要求操作者输入完整岗位名称并携带当前 version；确认后岗位进入 `deleting`，该岗位候选人通过统一留存服务清除敏感数据，相关要求/计划归档、预约取消，最后岗位归档。历史面试和审计只保留不可识别占位；组织共享题库、题目和题库语音不属于级联删除范围。
+
+新工作台创建 JobPosition 时必须同时提交 `initial_requirement`。服务端在同一租户事务中先写岗位、再写绑定该岗位 ID 的首版 RoleRequirement，并把后者作为 `initial_role_requirement` 返回；任一步失败时整个事务回滚。兼容 API 可以只创建岗位，但不能成为新工作台路径。
 
 ### KnowledgeBase
 
-岗位知识库式题库。MVP 中每个题库必须且只能属于一个 `JobPosition`；一个岗位可以按轮次、语言或方向拥有多个题库。跨岗位复用要显式复制或发布新版本，不能在检索时隐式混用。
+组织统一维护的知识库式题库。创建时记录一个初始管理岗位，但题库可通过显式岗位关联被多个 `JobPosition` 复用；检索和计划只能使用已关联题库，不能隐式混用全组织题库。
 
 | 字段 | 说明 |
 | --- | --- |
 | `id` | 题库 ID |
 | `organization_id` | 所属组织 |
-| `job_position_id` | 所属岗位 |
+| `job_position_id` | 创建时的初始管理岗位与旧数据兼容关联；不再表示唯一可用岗位 |
 | `name` | 题库名称 |
 | `description` | 说明 |
-| `language` | 默认读题语言 |
-| `voice_profile_id` | 默认语音配置 |
+| `speech_profile` | 当前 KnowledgeBaseSpeechProfile；包含模型、声音、语言和输出参数 |
+| `speech_build_status` | `configuration_required`、`queued`、`building`、`ready`、`failed` |
 | `status` | `draft`、`building`、`ready`、`failed`、`archived` |
 | `build_summary` | 导入、结构化字段校验和题目语音构建计数及失败原因 |
 
-`ready` 表示每道活动题都有完整题干、标准答案、关键点、rubric、技能、难度和题型，并且已有与题库语言/音色匹配的可用读题语音。只有 `ready` 题库可进入正式计划；不要求 embedding 或向量索引。
+`ready` 表示每道活动题都有完整题干、标准答案、关键点、rubric、技能、难度和题型，并且已有与当前 KnowledgeBaseSpeechProfile revision 匹配的可用读题语音。只有 `ready` 题库可进入正式计划；不要求 embedding 或向量索引。
+
+JobPosition 与 KnowledgeBase 的关联只保存引用。关联命令不得复制或修改题目、speech profile、声音或语音资产；因此多个岗位选择同一题库时看到同一套题目与读题音色。题库内容或语音 revision 更新后，新计划读取新 readiness，已批准计划和历史会话继续使用冻结快照。
+
+新建题库若存在 enabled 的 `tts.synthesize + question_speech_generation` 组织路由，会把 ready primary 模型及其
+`default_voice` 解析并冻结为 revision 1 profile；route 只是创建时默认值，之后变更不会静默覆盖题库。若没有可解析且
+已确认的组织默认 TTS 模型，`speech_build_status=configuration_required`；系统不能仅凭一个声音字符串猜测具体模型。
+管理员进入题库详情完成配置后才开始首轮语音构建。
+
+### KnowledgeBaseSpeechProfile
+
+题库当前生效的可版本化读题语音选择。它解析并冻结具体 TTS ModelConfiguration，而不是只保存组织默认 ModelRoute 别名；因此同一组织的不同题库可以使用不同模型和声音，重建结果也可复现。
+
+| 字段 | 说明 |
+| --- | --- |
+| `revision` | 题库内单调递增配置版本 |
+| `model_configuration_id` | 支持 `tts.synthesize` 的具体模型配置 |
+| `model_configuration_version` | 配置时验证过的模型版本 |
+| `voice_profile_id` | 该模型 voice catalog 中的稳定声音 ID |
+| `language` | BCP 47 读题语言 |
+| `audio_format` | 统一 MIME，例如 `audio/wav` |
+| `speaking_rate` | 统一语速参数 |
+| `source/model_route_id` | `model_route_default` 或 `knowledge_base_explicit`；默认路由来源同时记录创建时 route ID |
+| `configured_by` | 操作者 |
+| `configured_at` | 服务端时间 |
+
+模型、声音、语言、格式、语速或其它影响音频输出的字段变化，必须产生新 revision 并创建 KnowledgeBaseSpeechBuild；相同值的幂等重试不增加 revision。删除仍被题库 speech profile 引用的 ModelConfiguration 时返回 `MODEL_CONFIGURATION_IN_USE`，管理员需先为受影响题库切换模型，避免题库留下悬空配置。
+
+Question 读取投影的 `speech_preview` 是试听可用性解释，不是新的资产真相。只有当前资产已经复制为 ready 私有
+FileObject 才可试听；开发 mock 即使流程状态完成，也必须投影为 `available=false/development_mock_asset`，不能把
+模拟 URI 当作真实音频。未配置、生成中、生成失败和私有文件缺失分别返回稳定 reason 与面向用户的操作提示。
+
+### KnowledgeBaseSpeechBuild
+
+整库语音重建的只读领域投影，其写入真相是 `knowledge_base.speech.rebuild` DurableWorkItem 及题目级子工作项。
+
+| 字段 | 说明 |
+| --- | --- |
+| `id` | 父工作项 ID |
+| `knowledge_base_id` | 目标题库 |
+| `speech_profile_revision` | 本次冻结的语音配置 revision |
+| `question_manifest` | 活动 Question ID/version 清单及哈希 |
+| `status` | `pending`、`running`、`completed`、`failed`、`superseded` |
+| `progress` | `total/pending/running/ready/failed/superseded` 计数 |
+| `failed_items` | 题目 ID、统一错误码和可重试标记，不含题干正文 |
+| `created_at/updated_at` | 服务端时间 |
+
+父工作项只负责冻结清单、分批 fan-out 和进度聚合；每道题拥有独立幂等子工作项。切换配置后未完成的旧 build 标记为 `superseded`，其结果不能把当前题库或 Question 标为 ready。
 
 ### Question
 
@@ -83,9 +135,58 @@
 | `created_by` | 创建人 |
 | `updated_at` | 更新时间 |
 
+后台“删除题目”采用归档命令：从活动题库、检索候选池和后续语音构建中移除 Question，
+但保留 Question 版本、历史 InterviewQuestionSnapshot 与不可变 QuestionSpeechAsset。命令必须携带
+`expected_version`；已排队但尚未执行的该题语音工作在 worker 认领后结束为 `superseded`，不得调用外部 TTS。
+
+### QuestionGenerationBatch
+
+智能生题的持久审核边界。批次冻结 KnowledgeBase/JobPosition 上下文、定位、标签、可选要求、目标数量和具体
+LLM ModelConfiguration version；模型输出只能形成 GeneratedQuestionDraft，不能直接进入 Question catalog。
+
+| 字段 | 说明 |
+| --- | --- |
+| `id/organization_id/knowledge_base_id` | 批次与租户/题库归属 |
+| `context_snapshot` | 岗位/题库名称与说明、题库定位和标签的生成时快照 |
+| `requirements` | 面试官本批次的可选补充要求 |
+| `target_count` | 目标草稿数量，范围 1–30 |
+| `model_configuration_id/version` | 本次实际使用的 ready 结构化 LLM |
+| `prompt_version` | 实际生成成功时使用的 `app/core/prompt/` 合同版本；排队时可为空 |
+| `phase` | `queued/planning/generating/merging/refilling/reviewing/failed` 细粒度执行阶段 |
+| `blueprints` | 与目标槽位一一对应的 QuestionBlueprint；包含 `slot_id/topic/scenario/focus/difficulty/dedupe_key` |
+| `generation_chunks` | 子工作快照；每项最多两个蓝图，记录 round、slot_ids、work_item_id、状态、候选和错误；截断分片可带 recovery 并由单槽位替代分片接续 |
+| `merge_work_item_ids/refill_round` | 幂等合并工作及定向补生成轮次，补生成最多两轮 |
+| `execution_revision` | 停止/恢复形成的执行代次；Worker 只允许当前 revision 的结果提交，旧结果必须 supersede |
+| `stop_requested_at/by/reason` | 持久化停止事实；停止是领域命令，不以 Celery revoke/result 作为真相 |
+| `control_history` | 停止、继续和人工重试的幂等、操作者、原因与时间摘要，不包含 Prompt 或模型原文 |
+| `rejections/generation_warning` | 重复/不合格候选的拒绝依据及最终数量不足提示 |
+| `prompt_versions/provider_runs` | 规划与生成 Prompt 版本，以及各阶段 Provider/usage 审计摘要 |
+| `drafts` | GeneratedQuestionDraft 列表；每项可带 `import_status/import_work_item_id/imported_question_id/import_error` |
+| `status` | `queued`、`generating`、`stopping`、`stopped`、`reviewing`、`importing`、`imported`、`failed` |
+| `generation_work_item_id/import_work_item_id` | 对应 DurableWorkItem |
+| `version` | 草稿编辑、删除和确认导入的 optimistic version |
+
+GeneratedQuestionDraft 使用批次内稳定 `draft_id`，字段与 Question 的可编辑评分依据一致。只有 `reviewing`
+批次内尚未开始导入的草稿允许修改/删除。单题导入通过 DurableWorkItem 将该草稿迁移为
+`importing -> imported/failed`。草稿带独立 `version`，单题导入只对目标草稿做条件校验并在最新批次版本上提交，
+不会因其他草稿的导入事实推进聚合版本而误报冲突。成功草稿保留在批次中用于审计和查看，但不能再次修改、删除或导入；同一
+`generation_batch_id + generation_draft_id` 必须复用同一正式 Question。批量确认只冻结并导入剩余草稿，
+批量导入工作再次执行同样不得重复创建。
+QuestionBlueprint 是批次内的生成约束而非正式题目：其槽位在规划后冻结，子工作必须逐槽位返回且不得改写
+`slot_id`。子工作结果只有 merge 单写者可以转换为 GeneratedQuestionDraft，因此并行 Worker 不会把半批结果暴露
+给 Question Catalog。多槽位输出截断不是普通 Schema 错误：原 chunk 保存脱敏诊断后进入 `superseded`，替代 chunk
+继续使用相同蓝图、round 与 execution revision；活动进度和 merge 忽略原 chunk。单槽位截断不得以相同请求自动循环。
+
+停止命令先递增 `execution_revision`，取消未领取的规划/分片/合并工作，并给已在途工作记录取消请求。在途
+Provider 调用无法由通用接口保证立即撤销，但 Worker 在调用前与提交前都校验批次状态和 revision，因而迟到结果
+只能结束为 `superseded`。恢复命令只为未完成蓝图创建新 revision 工作；人工失败重试保留完成分片，并把失败工作
+作为历史事实留存。React 只能消费批次 `tasks/available_actions` 投影，不能直接 replay 通用 Outbox 工作项。
+
 ### QuestionSpeechAsset
 
 题目或经历问题的可版本化读题语音。上传题库或批准经历问题后由异步工作项生成，数字人优先读取该资产。
+后台试听通过鉴权接口签发短期访问地址并记录审计，浏览器不接触对象存储凭据；不存在匹配当前题库
+speech profile revision 的 ready 资产时，试听不可用。
 
 | 字段 | 说明 |
 | --- | --- |
@@ -93,6 +194,9 @@
 | `owner_type` | `question` 或 `experience_question` |
 | `owner_id` | 题目或经历问题 ID |
 | `source_version` | 生成时的题目版本 |
+| `speech_profile_revision` | 生成时的题库语音配置 revision；经历问题可为空 |
+| `model_configuration_id` | 实际选定的 TTS ModelConfiguration |
+| `model_configuration_version` | 生成时的模型配置版本 |
 | `language` | 语言 |
 | `voice_profile_id` | 音色配置 |
 | `audio_uri` | 对象存储地址 |
@@ -101,25 +205,27 @@
 | `status` | `pending`、`ready`、`failed` |
 | `content_hash` | 题干、语言和音色的内容哈希，用于幂等 |
 
-题干、语言或音色改变后必须生成新资产；历史面试引用的资产不可原地覆盖。
+题干或 KnowledgeBaseSpeechProfile 改变后必须生成新资产；`content_hash` 至少覆盖题干、题目版本、profile revision、模型配置 ID/version、声音、语言、格式和语速。历史面试引用的资产不可原地覆盖。
 
 ### CandidateProfile
 
-企业上传到组织简历库的候选人记录，可参与多次岗位评估。它不是面试会话内的冻结快照。
+企业上传到组织简历库的候选人记录。后台录入时通过 PositionCandidateMembership 明确一个当前应聘岗位，可参与该岗位的简历审阅、计划、预约和面试；它不是面试会话内的冻结快照。
 
 | 字段 | 说明 |
 | --- | --- |
 | `id` | 候选人记录 ID |
 | `organization_id` | 所属组织 |
+| `job_position_id` | 当前应聘岗位；新 Web 录入必填，兼容旧记录时可从审阅、计划、预约或会话引用推导 |
 | `name` | 姓名 |
 | `normalized_email` | 规范化邮箱，可为空、加密存储 |
 | `normalized_phone` | E.164 或组织统一格式手机号，可为空、加密存储 |
 | `external_ref` | ATS 或企业内部 ID，可为空 |
-| `status` | `active`、`archived` |
+| `status` | `active`、`archived`、`retention_purged` |
 | `retention_expires_at` | 留存到期时间 |
+| `retention_reason` | 到期原因；岗位初筛未通过时为 `screening_unqualified` |
 | `created_by` | 上传人 |
 
-邮箱和手机号至少有一个；照片、性别、年龄、婚育等与能力无关字段不进入 AI 评估输入。
+邮箱和手机号至少有一个；照片、性别、年龄、婚育等与能力无关字段不进入 AI 评估输入。候选人显式删除采用 `archived` 逻辑归档并从活动列表隐藏。岗位删除或到期留存清理命中时进入 `retention_purged`；联系方式、简历、录音、转写、评分和报告敏感内容被清除，历史引用不做破坏性物理级联。仅当该候选人所有最新岗位初筛的生效结论均为 `unqualified` 时，设置 `screening_unqualified` 和 7 天期限；符合、待人工复核或处理中的候选人不因初筛设置期限。
 
 ### ResumeDocument
 
@@ -130,13 +236,13 @@
 | `id` | 简历版本 ID |
 | `candidate_profile_id` | 所属候选人记录 |
 | `source_type` | `local_upload`、`url_import` |
-| `original_file_name` | 清洗后的原始文件名，仅用于展示 |
+| `file_name` | 清洗后的展示文件名；可通过乐观并发改名，但不改变 PDF 内容或版本身份 |
 | `source_url_hash` | URL 导入来源的不可逆哈希，可为空；默认不保存完整 URL |
 | `file_object_id` | 系统私有文件对象 ID；业务层不保存调用方提交的 URI |
 | `file_hash` | 文件内容哈希 |
 | `mime_type` | 当前只允许 `application/pdf` |
 | `size_bytes` | 原始 PDF 字节数 |
-| `ingestion_status` | `queued`、`receiving`、`quarantined`、`scanning`、`stored`、`parsing`、`ready`、`failed` |
+| `status` | 对外为 `processing`、`ready`、`failed`；删除过程使用 `deleting`、`deleted` |
 | `scan_status` | `pending`、`clean`、`infected`、`failed` |
 | `parse_status` | `pending`、`parsed`、`failed` |
 | `parsed_text_object_id` | 脱敏解析文本的私有文件对象 ID，可为空 |
@@ -149,6 +255,8 @@
 - `url_import` 的初始 URL 和每次重定向都必须通过 SSRF 校验；源站内容变化只能创建新 `ResumeDocument`，不能覆盖旧版本。
 - Resume Review 只能引用 `ready` 的 `ResumeDocument`，并从 `file_object_id`/`parsed_text_object_id` 读取；不能回源下载外部 URL。
 - 切换本地文件系统和阿里云 OSS 只改变私有文件 adapter，不改变 `ResumeDocument` ID、状态或业务 interface。
+- PDF 字节、内容哈希和解析证据不可原地修改；更新只允许改 `file_name`，替换内容创建新 `resume_version`。
+- 删除命令先拒绝运行中的工作和 InterviewPlan/InterviewSession 历史引用，再取消尚未领取的摄取/审阅工作，清理隔离/私有对象和未进入历史的派生数据，最后写 `deleted` 最小占位与审计事实；列表和候选人最新初筛投影必须忽略 `deleting/deleted` 版本。
 
 ### FileObject
 
@@ -158,7 +266,7 @@
 | --- | --- |
 | `id` | 文件对象 ID |
 | `organization_id` | 所属组织 |
-| `purpose` | `resume_pdf`、`resume_parsed_text`、`question_speech` 等用途 |
+| `purpose` | `resume_pdf`、`resume_parsed_text`、`question_speech`、`candidate_answer_audio` 等用途 |
 | `status` | `awaiting_download`、`quarantined`、`ready`、`failed` |
 | `storage_backend` | `local_private` 或 `aliyun_oss` |
 | `object_key` | adapter 内部对象键，不作为公开 URL |
@@ -169,11 +277,11 @@
 | `source_type` | 上传、URL 导入或从可信 PDF 派生 |
 | `source_reference` | 脱敏来源路径/资源 ID，不含 query、fragment 或凭据 |
 
-PDF 原件扫描为 clean 后存为一个 FileObject；解析文本使用另一个 `resume_parsed_text` FileObject，`ResumeDocument` 只保存两者 ID。API projection 不返回解析正文、对象键或本地路径。
+PDF 原件扫描为 clean 后存为一个 FileObject；解析文本使用另一个 `resume_parsed_text` FileObject，`ResumeDocument` 只保存两者 ID。生产候选人录音使用 `candidate_answer_audio`，额外绑定 `interview_id + turn_id`；`CandidateAnswer.audio_uri` 保存内部 `private-file://{file_id}` 引用，Provider 调用前由服务端读取字节，API projection 不返回对象键或存储凭据。
 
 ### ResumeReview
 
-指定简历版本面向指定岗位的一次 AI 异步审阅结果。审阅提取可追溯的项目、职责和技能证据，并生成过往经历问题，不直接给出录用决定。
+指定简历版本面向指定岗位的一次 AI 异步审阅结果。审阅形成可解释岗位初筛，提取可追溯的项目、职责和技能证据，并生成过往经历问题，不直接给出录用决定。
 
 | 字段 | 说明 |
 | --- | --- |
@@ -183,14 +291,29 @@ PDF 原件扫描为 clean 后存为一个 FileObject；解析文本使用另一�
 | `resume_document_id` | 使用的简历版本 |
 | `job_position_id` | 目标岗位 |
 | `role_requirement_id` | 使用的岗位要求版本 |
-| `status` | `queued`、`processing`、`ready`、`failed` |
+| `status` | `queued`、`processing`、`ready_for_review`、`failed` |
+| `processing_stage` | `queued/preparing/extracting_evidence/aggregating_review/completed/failed` |
+| `processing_strategy` | `single_pass` 或 `map_reduce` |
+| `processing_progress` | 已完成/总分块数；长任务可观察状态 |
+| `evidence_chunks` | ResumeEvidenceChunk 的页范围、预算、状态、证据数量和脱敏调用元数据；不保存正文 |
 | `project_evidence` | 项目名、职责、技术、结果和简历证据位置 |
 | `skill_evidence` | 与岗位能力维度的对应证据 |
+| `screening_recommendation` | 服务端按匹配分归一化的 AI 建议：`qualified`、`unqualified`、`manual_review` |
+| `screening_score` | 0–100 的辅助匹配分；0–59 为不符合，60–74 为待人工复核，75–100 为符合 |
+| `screening_policy_version` | 分数带策略版本；当前为 `candidate_screening_score.v1` |
+| `screening_summary` | 对当前岗位的简短解释 |
+| `matched_requirements` | 有简历证据支持的岗位要求 |
+| `unmet_requirements` | 缺失或信息不足的岗位要求 |
+| `human_decision` | 人工复核结论：`qualified`、`unqualified`，为空时使用 AI 建议 |
+| `human_review_status/note` | `pending` 或 `reviewed`，以及人工复核说明 |
+| `reviewed_by/at` | 复核人和服务端时间 |
 | `warnings` | 内容缺失、解析置信度低等提示 |
 | `model_info` | 模型、prompt 版本和 invocation ID |
 | `created_at` | 创建时间 |
 
-同一 `(resume_document_id, job_position_id, role_requirement_version, prompt_version)` 可幂等复用。输入变更产生新审阅，旧结果不覆盖。
+同一 `(resume_document_id, job_position_id, role_requirement_version, prompt_version)` 可幂等复用。输入变更产生新审阅，旧结果不覆盖。模型生成分数和解释，CandidateScreening 领域策略在写入前按 `candidate_screening_score.v1` 强制把分数映射为建议；模型给出的枚举与分数冲突时以分数带为准，不能把一致性责任留给 Provider。人工复核是带 `expected_version` 的领域命令，只改变生效结论与留存期限，AI 分数、按策略归一化的建议和证据必须保持不变并写入审计。失败恢复也是 ResumeReview 领域命令：仅允许 `failed + (failed|dead_letter work)` 迁移回 `queued + pending`，要求源简历仍 ready、岗位配置仍存在，重置本轮进度/attempt 但保留 replay 历史和 `resume.review.retried` 审计；运行中、已完成或 version 过期的请求必须拒绝。
+
+`ResumeEvidenceChunk` 是 ResumeReview implementation 内部证据单元，不是独立候选人结论。每个分块覆盖连续来源页且不超过配置输入预算；分块只允许返回项目/技能证据和告警。全部分块成功并完成必要压缩后，最终 Reduce 才能写入 CandidateScreening。任何分块失败、聚合预算仍超限或 Schema 校验失败都使审阅失败，不能用部分证据生成 `unqualified`。
 
 ### ExperienceQuestion
 
@@ -251,6 +374,8 @@ AI 生成内容默认为 `draft`，未经面试官批准不得进入正式计划
 
 `bank_slots + question_candidate_pools + experience_question_ids + selection_policy` 是计划唯一的 execution v2 representation。请求、响应和运行时持久化不得包含固定 `items`；升级旧数据只能在应用启动前运行显式一次性迁移，把固定题目转换为单候选槽位并写入 `execution_schema_version=2`。会话只能由预约 start 通过 Plan Assembly interface 读取该表示。
 
+Plan Assembly 支持两种显式命令语义：API 客户端可以先产生 `draft` 再编辑/批准；React 工作台的“生成并启用”是面试官对当前输入的一次明确确认，在同一事务中完成装配与批准。后者不得先持久化草稿、再让同一创建人执行一次没有新信息的“自审批”。
+
 `bank_slots` 示例：
 
 ```json
@@ -287,12 +412,13 @@ AI 生成内容默认为 `draft`，未经面试官批准不得进入正式计划
 | `status` | `draft`、`scheduled`、`invited`、`registered`、`consumed`、`cancelled`、`expired` |
 | `invitation_token_hash` | 一次性邀请 token 哈希 |
 | `invitation_expires_at` | 邀请过期时间 |
+| `email_reminder` | `{status, scheduled_for, work_item_id, sent_at, last_error_code}`；内部投影可追踪持久提醒，公开投影不得返回工作项 ID/错误细节 |
 | `settings` | 录音、数字人、语言和音色策略 |
 | `admission_policy` | 冻结的提前/延后宽限、设备检查有效期和服务端 readiness 要求 |
 | `readiness_facts` | 最近一次浏览器、麦克风和音频格式检查结果、服务端检查时间及失效时间 |
 | `created_by` | 创建人 |
 
-只有计划、题库、经历问题语音和生产 STT 路由通过 readiness gate 后才能从 `scheduled` 进入 `invited`。token 只能被一次候选人登记消费，可撤销、不可明文持久化。邀请过期和预约 start 窗口是两个独立条件；默认允许开始的窗口为 `[scheduled_start_at, scheduled_end_at]`，任何宽限都必须显式冻结在 `admission_policy` 中。
+只有计划、题库、经历问题语音和生产 STT 路由通过 readiness gate 后才能从 `scheduled` 进入 `invited`。token 只能被一次候选人登记消费，可撤销、不可明文持久化。`registered` 表示候选人身份与同意已核验、预约已确认；该事务同时幂等创建面试前 30 分钟的 `appointment.reminder.email` 工作项，但不得自动设备检查或 start。邀请过期和预约 start 窗口是两个独立条件；默认允许开始的窗口为 `[scheduled_start_at, scheduled_end_at]`，任何宽限都必须显式冻结在 `admission_policy` 中。
 
 ### CandidateIntake
 
@@ -328,7 +454,7 @@ AI 生成内容默认为 `draft`，未经面试官批准不得进入正式计划
 | `source_plan_version` | 来源计划版本 |
 | `job_position` | 岗位快照 |
 | `role_requirement` | 岗位要求快照 |
-| `knowledge_base_revisions` | 题库版本及候选池哈希 |
+| `knowledge_base_revisions` | 题库版本、speech profile revision、题目语音资产 manifest 及候选池哈希 |
 | `bank_slots` | 抽题槽位与规则 |
 | `question_candidate_pools` | 每个槽位冻结的 QuestionCandidatePool |
 | `experience_questions` | 已批准经历问题快照 |
@@ -453,7 +579,7 @@ AI 生成内容默认为 `draft`，未经面试官批准不得进入正式计划
 | --- | --- |
 | `id` | 回答 ID |
 | `turn_id` | 轮次 ID |
-| `audio_uri` | 原始回答音频地址 |
+| `audio_uri` | 原始回答音频的受控内部引用；生产为绑定当前面试/轮次的 `private-file://` FileObject |
 | `transcript_status` | `streaming`、`final`、`repair_pending`、`failed`、`manually_corrected` |
 | `raw_transcript` | 服务端 STT 原始 final |
 | `final_transcript` | 当前用于评分的最终文本 |
@@ -518,7 +644,9 @@ AI 生成内容默认为 `draft`，未经面试官批准不得进入正式计划
 
 ### ProviderConnection、ModelConfiguration、ModelRoute 与 ModelInvocationLog
 
-`ProviderPluginDefinition` 是安装期声明，不是租户聚合：它定义厂商连接表单、凭证表单、模型类型、模型目录、模型配置表单和 runtime entrypoint。`ProviderConnection` 保存组织级连接参数与 `credential_ref`，不选择具体模型；未发送 credentials 表示保留现有密钥。`ModelConfiguration` 属于一个 ProviderConnection，保存 `model_type`、`provider_model_id`、厂商专属 `settings`、统一 `default_parameters`、支持能力及健康状态。两者更新都携带 `expected_version`。
+`ProviderPluginDefinition` 是安装期声明，不是租户聚合：它定义厂商连接表单、凭证表单、模型类型、模型目录、模型配置表单和 runtime entrypoint。`ProviderConnection` 保存组织级连接参数与 `credential_ref`，不选择具体模型；未发送 credentials 表示保留现有密钥。`ModelConfiguration` 属于一个 ProviderConnection，保存 `model_type`、`provider_model_id`、厂商专属 `settings`、统一 `default_parameters`、支持能力及健康状态。两者更新和删除都携带 `expected_version`。
+
+ProviderConnection 是其 ModelConfiguration 生命周期的所有者：删除连接会在同一事务删除凭证、全部子模型和引用这些模型的 ModelRoute/断路器状态。单独删除 ModelConfiguration 只终止该模型及其引用路由，不删除 ProviderConnection 或同连接下其他模型。历史 ModelInvocationLog 是脱敏、追加式审计事实，不随配置删除。
 
 `ModelRoute` 按 `organization_id + capability + purpose` 选择 primary、fallback、超时、重试和断路器策略；route target 仅包含 `model_configuration_id/timeout_s/pricing`，不再复制 provider 或模型名。创建路由时模型必须已启用、健康且支持目标 capability。`ModelInvocationLog` 对每个 attempt 追加连接 ID、模型配置 ID、provider、模型、延迟、成本、统一错误码和脱敏请求哈希。
 
@@ -538,7 +666,7 @@ AI 生成内容默认为 `draft`，未经面试官批准不得进入正式计划
 
 ## 聚合版本与并发
 
-所有可变聚合根使用整数 `version` 做乐观并发，包括 `JobPosition`、`KnowledgeBase`、`Question`、`CandidateProfile`、`ResumeDocument`、`ResumeReview`、`ExperienceQuestion`、`RoleRequirement`、`InterviewPlan`、`InterviewAppointment`、`InterviewSession`、`ProviderConnection`、`ModelConfiguration` 和 `ModelRoute`。
+所有可变聚合根使用整数 `version` 做乐观并发，包括 `JobPosition`、`KnowledgeBase`、`Question`、`CandidateProfile`、`ResumeDocument`、`ResumeReview`、`ExperienceQuestion`、`RoleRequirement`、`InterviewPlan`、`InterviewAppointment`、`InterviewSession`、`ProviderConnection`、`ModelConfiguration` 和 `ModelRoute`。KnowledgeBaseSpeechProfile revision 随 KnowledgeBase 的一次 CAS 更新原子递增。
 
 - 新聚合从 `version=1` 开始；写入必须匹配组织、ID 和旧 version。
 - 陈旧写入返回明确冲突，调用方重新读取并重新执行领域判断，不能静默覆盖。
@@ -546,6 +674,7 @@ AI 生成内容默认为 `draft`，未经面试官批准不得进入正式计划
 - `QuestionSelection` 通过 `(interview_id, slot_id)` 唯一约束防止断线后重复抽题。
 - `InterviewCandidate`、计划/题目快照、轮次、回答、评分和生命周期事件由 `InterviewSession.version` 保护。
 - 语音资产、模型调用、审计、Outbox、评分和报告 revision 采用追加式或内容哈希幂等写入。
+- 题目语音子工作项幂等键固定为 `question.speech:{question_id}:{question_version}:{speech_profile_revision}`；worker 提交前再次核对 Question version 和题库 profile revision，旧结果不得抢占当前指针。
 
 ## 状态机
 
@@ -554,7 +683,7 @@ AI 生成内容默认为 `draft`，未经面试官批准不得进入正式计划
 ```mermaid
 stateDiagram-v2
   [*] --> draft
-  draft --> building
+  draft --> building: configure speech / add question
   building --> ready
   building --> failed
   failed --> building
@@ -562,6 +691,8 @@ stateDiagram-v2
   ready --> archived
   failed --> archived
 ```
+
+KnowledgeBase 只有在所有活动题的评分依据有效，且 `speech_build_status=ready`、当前 profile revision 的题目语音全部 ready 时才能进入 `ready`。配置切换立即执行 `ready -> building`；部分题目失败时进入 `failed`，只重试失败项后可以回到 `building -> ready`。旧 build 变为 `superseded` 不改变新 revision 的状态。
 
 ### ResumeDocument.ingestion_status
 
@@ -572,7 +703,7 @@ stateDiagram-v2
   processing --> failed
 ```
 
-`ResumeDocument.status` 对调用方暴露 `processing/ready/failed`；细粒度阶段由 `FileObject.status/scan_status`、`DurableWorkItem.status` 和失败码共同表达。`local_upload` 先写隔离文件，`url_import` 由 worker 安全下载后进入同一处理器。失败重试复用同一工作项/简历版本；感染文件不得进入正式 FileObject，达到最大尝试后进入 dead-letter，只有审计后的人工重放才能继续。
+`ResumeDocument.status` 对调用方暴露 `processing/ready/failed`；删除命令内部另有 `deleting -> deleted`，其中 `deleting` 允许持有最新 version 的调用方重试完成清理。细粒度阶段由 `FileObject.status/scan_status`、`DurableWorkItem.status` 和失败码共同表达。解析文本以 form-feed 保留页边界，供证据来源页追踪；旧版无页分隔文本仍全量覆盖，但审阅会写明无法精确恢复页码的告警。失败重试复用同一工作项/简历版本。
 
 ### InterviewAppointment.status
 
@@ -592,7 +723,7 @@ stateDiagram-v2
 ```
 
 - `scheduled -> invited` 必须通过计划、题库、经历问题语音和 STT readiness gate。
-- `invited -> registered` 必须成功匹配候选人填报并保存可验证的隐私/录音同意记录。
+- `invited -> registered` 必须成功匹配候选人填报、保存可验证的隐私/录音同意记录并安排预约邮件提醒；该迁移不请求媒体权限、不创建面试会话。
 - `registered -> consumed` 必须位于预约允许的 start 窗口，且设备和服务端 readiness fact 均未过期；准入判断、状态消费、创建/启动唯一 `InterviewSession` 在同一事务提交，重复 start 返回同一会话。
 
 ### InterviewSession.status
@@ -663,13 +794,13 @@ stateDiagram-v2
 
 计划批准时冻结满足岗位、题库、状态、技能、难度、题型和语音条件的题目 ID/version 清单及集合哈希。Question Selection 只能从该清单随机选择。
 
-未来如果题库规模或后台自然语言查题确实需要，可以为 Question 增加可重建的可选语义索引；它不是领域真相，删除后不影响计划、预约、随机抽题、评分或历史报告。Resume Review 默认直接把已解析简历和岗位要求交给 LLM；只有超长简历/附件集合需要 RAG 时才建立候选人私有的短期索引。
+未来如果题库规模或后台自然语言查题确实需要，可以为 Question 增加可重建的可选语义索引；它不是领域真相。Resume Review 当前对短简历单次调用、对长简历采用页感知 Map/Reduce，不建立向量索引；只有附件集合跨文档检索成为明确需求时才考虑候选人私有短期索引。
 
 ## 审计事件
 
 以下行为必须记录主体、组织、资源、时间和结果：
 
-- 创建或归档岗位，上传、编辑、发布题库，重建候选池或题目语音。
+- 创建或归档岗位，上传、编辑、发布题库，切换题库 TTS 模型/声音，重建候选池或题目语音，以及批量重建失败/重放。
 - 上传本地简历、提交 URL 导入、URL 拉取失败、扫描/解析、查看、下载或删除简历，触发 AI 审阅，编辑或批准经历问题。
 - 生成、修改、批准计划，创建、邀请、撤销、过期或消费预约。
 - 候选人填报、匹配成功/失败、同意隐私和录音告知。

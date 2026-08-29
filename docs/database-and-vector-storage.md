@@ -20,17 +20,23 @@
 INTERVIEWER_DB_BACKEND=sqlite
 INTERVIEWER_SQLITE_PATH=data/interviewer.sqlite3
 INTERVIEWER_MEDIA_PATH=data/media
+INTERVIEWER_MEDIA_RECORDING_BACKEND=local
 INTERVIEWER_FILE_STORAGE_BACKEND=local
 INTERVIEWER_PRIVATE_FILE_ROOT=data/private-files
 INTERVIEWER_FILE_QUARANTINE_ROOT=data/file-quarantine
 INTERVIEWER_FILE_MAX_BYTES=10485760
 INTERVIEWER_FILE_SIGNING_SECRET=replace-with-32-plus-random-characters
+INTERVIEWER_FILE_SCANNER_CLAMD_HOST=clamd.internal
+INTERVIEWER_FILE_SCANNER_CLAMD_PORT=3310
+INTERVIEWER_CELERY_BROKER_URL=redis://redis.internal:6379/1
+INTERVIEWER_CELERY_QUEUE=interviewer
 ```
 
-`INTERVIEWER_DB_BACKEND=memory` 只用于单元测试和临时演示。`INTERVIEWER_FILE_STORAGE_BACKEND=local` 只用于本地开发，目录不能挂载为公开静态资源。阿里云 OSS adapter 计划使用以下部署配置，密钥值必须来自密钥管理器或部署 Secret，不能进入普通配置文档或日志：
+`INTERVIEWER_DB_BACKEND=memory` 只用于单元测试和临时演示。`INTERVIEWER_MEDIA_RECORDING_BACKEND=local` 与 `INTERVIEWER_FILE_STORAGE_BACKEND=local` 只用于本地开发，目录不能挂载为公开静态资源。生产录音必须设置 `INTERVIEWER_MEDIA_RECORDING_BACKEND=private`，并通过同一个 PrivateFileStorage seam 写入对象存储。阿里云 OSS adapter 使用以下部署配置，密钥值必须来自密钥管理器或部署 Secret，不能进入普通配置文档或日志：
 
 ```bash
 INTERVIEWER_FILE_STORAGE_BACKEND=aliyun_oss
+INTERVIEWER_MEDIA_RECORDING_BACKEND=private
 INTERVIEWER_OSS_ENDPOINT=oss-cn-hangzhou.aliyuncs.com
 INTERVIEWER_OSS_BUCKET=interviewer-private
 INTERVIEWER_OSS_ACCESS_KEY_ID=from-deployment-secret
@@ -38,7 +44,7 @@ INTERVIEWER_OSS_ACCESS_KEY_SECRET=from-deployment-secret
 INTERVIEWER_OSS_SSE=AES256
 ```
 
-PostgreSQL 使用 `INTERVIEWER_DB_BACKEND=postgresql` 与 `INTERVIEWER_POSTGRES_DSN`；Redis 跨实例事件使用 `INTERVIEWER_REDIS_URL`。生产还必须提供联系人/Provider 凭证加密密钥、媒体签名密钥和 `INTERVIEWER_FILE_SCANNER_COMMAND`，不能复用开发默认值、公开本地目录或把 OSS bucket 设为公开读。
+PostgreSQL schema 必须先由 `INTERVIEWER_POSTGRES_MIGRATION_DSN` 对应的 migration owner 执行 `python -m app.migrations.postgresql`；Web/worker 使用 `INTERVIEWER_DB_BACKEND=postgresql` 与最小权限 `INTERVIEWER_POSTGRES_DSN`，启动时只读校验 schema，不自动执行 DDL。Redis 跨实例事件使用 `INTERVIEWER_REDIS_URL`，Celery broker 使用独立的 `INTERVIEWER_CELERY_BROKER_URL`/逻辑 DB 或命名空间，不能和领域状态混为一体。生产还必须提供联系人/Provider 凭证加密密钥、媒体签名密钥，以及 `INTERVIEWER_FILE_SCANNER_COMMAND` 或内部 `INTERVIEWER_FILE_SCANNER_CLAMD_HOST/PORT`；clamd TCP 无认证/加密，只能部署在受信网络。不能复用开发默认值、公开本地目录或把 OSS bucket 设为公开读。
 
 ## 当前代码边界
 
@@ -64,9 +70,9 @@ migrations/001_postgresql_persistence.sql
 
 当前事务工作区已有 `JobPositionRepository`、`KnowledgeBaseRepository`、`QuestionRepository`、`QuestionSpeechAssetRepository`、`CandidateProfileRepository`、`ResumeDocumentRepository`、`FileObjectRepository`、`AuditEventRepository`、`ResumeReviewRepository`、`ExperienceQuestionRepository`、`RoleRequirementRepository`、`InterviewPlanRepository`、`InterviewAppointmentRepository`、`CandidateIntakeRepository`、`InterviewSessionRepository`、`ModelCircuitStateRepository`、模型配置/路由/调用、加密凭证和 Outbox repository。它们通过同一个 versioned document interface 暴露，Memory、SQLite 与 PostgreSQL adapter 共用事务语义；Question Catalog 的租户、岗位、题库、状态/readiness、技能、难度和题型条件由 backend contract 执行。旧 `VectorDocumentRepository` 与 Memory/SQLite 向量集合已删除，关系型题库查询不持久化向量 projection。
 
-联系人在写入前使用 Fernet 加密并以租户绑定 HMAC 查找，API 只返回掩码；Provider 凭证也在 repository seam 密封。`ResumeDocument` 只接受 PDF，引用原件与解析文本两个私有 FileObject；SQLite JSON 不再保存新简历正文。回答音频仍由本地媒体 adapter 保存，但不再静态挂载，只能用短期签名 token 回读并记录授权/下载审计。SQLite 仍只用于开发/测试；生产租户边界由 PostgreSQL `organization_id + FORCE RLS` 提供第二道防线。
+联系人在写入前使用 Fernet 加密并以租户绑定 HMAC 查找，API 只返回掩码；Provider 凭证也在 repository seam 密封。`ResumeDocument` 只接受 PDF，引用原件与解析文本两个私有 FileObject；SQLite JSON 不再保存新简历正文。开发模式可用受控本地媒体 adapter；生产回答音频写入 `candidate_answer_audio` FileObject，绑定组织、面试与轮次，并通过短期签名 token 回读和记录授权/下载审计。SQLite 仍只用于开发/测试；生产租户边界由 PostgreSQL `organization_id + FORCE RLS` 提供第二道防线。
 
-PostgreSQL 首版迁移采用受约束 JSONB documents，以保持现有聚合事务语义，并增加 `(organization_id, idempotency_key)` Outbox 唯一约束、预约单会话唯一索引、选择槽位唯一检查、Provider 凭证复合主键和全部表的强制 RLS。它是可运行 adapter，不等同于下文完全规范化关系表的最终形态；真实数据库上的迁移、隔离、并发和 `EXPLAIN` 仍必须在部署环境执行，不能由离线 SQL 文本检查替代。
+PostgreSQL 首版迁移采用受约束 JSONB documents，以保持现有聚合事务语义，并增加 `(organization_id, idempotency_key)` Outbox 唯一约束、预约单会话唯一索引、选择槽位唯一检查、Provider 凭证复合主键和全部表的强制 RLS。显式迁移入口使用事务级 advisory lock；本机隔离 PostgreSQL 16 已验证非 owner runtime role 的跨租户读写、事务回滚、CAS、Outbox/预约约束和题库索引 `EXPLAIN`。它是可运行 adapter，不等同于下文完全规范化关系表的最终形态；目标生产集群仍必须重复迁移、并发和查询计划验收。
 
 SQLite 当前用通用 JSON documents 表保存业务对象。`InterviewSession` 以单一聚合文档保存候选人、计划/题目快照、轮次、回答、评分/报告 revision、中断上下文和生命周期事件。生命周期命令产生的聚合、领域事件和 Outbox 工作项原子提交；这属于带事件日志的状态持久化，不是完整 event sourcing。
 
@@ -136,7 +142,18 @@ knowledge_bases(
   organization_id text not null,
   job_position_id text not null references job_positions(id),
   status text not null,
+  speech_profile jsonb,
+  speech_profile_revision integer not null default 0,
+  speech_build_status text not null default 'configuration_required',
   version integer not null
+)
+
+job_position_knowledge_bases(
+  organization_id text not null,
+  job_position_id text not null references job_positions(id),
+  knowledge_base_id text not null references knowledge_bases(id),
+  created_at timestamptz not null,
+  primary key (organization_id, job_position_id, knowledge_base_id)
 )
 
 questions(
@@ -154,18 +171,21 @@ question_speech_assets(
   owner_type text not null,
   owner_id text not null,
   source_version integer not null,
+  speech_profile_revision integer,
+  model_configuration_id text,
+  model_configuration_version integer,
   language text not null,
   voice_profile_id text not null,
   content_hash text not null,
   audio_uri text not null,
   status text not null,
-  unique (organization_id, owner_type, owner_id, source_version, language, voice_profile_id, content_hash)
+  unique (organization_id, owner_type, owner_id, source_version, speech_profile_revision, model_configuration_id, model_configuration_version, language, voice_profile_id, content_hash)
 )
 
-candidate_profiles(..., organization_id text not null, version integer not null)
+candidate_profiles(..., organization_id text not null, status text not null, retention_reason text, retention_expires_at timestamptz, version integer not null)
 file_objects(..., organization_id text not null, category text not null, backend text not null, object_key text not null, content_hash text not null, size_bytes bigint not null, unique(organization_id, backend, object_key))
-resume_documents(..., candidate_profile_id text not null references candidate_profiles(id), source_type text not null, file_object_id text references file_objects(id), file_hash text, ingestion_status text not null, scan_status text not null, parse_status text not null, version integer not null)
-resume_reviews(..., resume_document_id text not null references resume_documents(id), job_position_id text not null references job_positions(id), version integer not null)
+resume_documents(..., candidate_profile_id text not null references candidate_profiles(id), resume_version integer not null, file_name text not null, file_object_id text references file_objects(id), parsed_text_file_object_id text references file_objects(id), file_hash text, status text not null, deleted_at timestamptz, version integer not null)
+resume_reviews(..., resume_document_id text not null references resume_documents(id), job_position_id text not null references job_positions(id), status text, processing_stage text, processing_strategy text, processing_progress jsonb, evidence_chunks jsonb, screening_recommendation text, screening_score integer, screening_policy_version text, matched_requirements jsonb, unmet_requirements jsonb, human_decision text, human_review_status text, human_review_note text, reviewed_by text, reviewed_at timestamptz, version integer not null)
 experience_questions(..., resume_review_id text not null references resume_reviews(id), version integer not null)
 role_requirements(..., job_position_id text not null references job_positions(id), version integer not null)
 
@@ -196,6 +216,18 @@ outbox_work_items(...)
 audit_events(...)
 ```
 
+当前 JSON document adapter 把同一关系存为 `JobPosition.knowledge_base_ids`，并把历史 `KnowledgeBase.job_position_id` 投影为初始关联。规范化 PostgreSQL 使用 `job_position_knowledge_bases`；两种存储都只引用题库，不复制 Question、KnowledgeBaseSpeechProfile 或 QuestionSpeechAsset。
+
+PositionCandidateMembership 当前由 `CandidateProfile.job_position_id` 表达；旧 document 没有该字段时，可从同组织的 ResumeReview、InterviewPlan、InterviewAppointment 和 InterviewSession 岗位引用推导删除影响，但新工作台录入必须显式写入。岗位删除不对历史聚合做数据库物理级联：候选人复用 RetentionService 删除私有 FileObject/媒体并清空敏感投影，岗位、要求和计划归档，预约取消；共享题库引用只从已归档岗位清空，题库实体及语音资产保留。
+
+兼容既有数据时不批量猜测或回填 TTS 模型：缺少 `speech_profile` 的旧题库在读取投影中视为
+`configuration_required`，历史语音资产不再计入当前就绪数。管理员首次显式保存题库语音配置时，
+系统在同一持久化事务中写入 profile revision 和整库构建清单，完成按需迁移，避免部署迁移阶段触发外部 TTS 成本。
+新建题库则可从创建时已存在的精确 `question_speech_generation` route 解析并保存
+`source=model_route_default/model_route_id`；这是新聚合初始化，不对存量题库做批量回填。Question 的
+`speech_preview` 仅由 QuestionSpeechAsset/FileObject 读取时投影，不新增持久列；`production_ready=false` 或缺少 ready
+FileObject 的资产永远不能签发试听地址。
+
 所有包含 `organization_id` 的外键操作还要验证同组织。PostgreSQL 可使用复合外键或 repository 内的同事务检查，并以租户级 Row Level Security 作为第二道防线。
 
 ## 联系方式、邀请与匹配存储
@@ -205,6 +237,7 @@ audit_events(...)
 - 高熵 `invitation_token` 只在签发响应中出现一次；数据库保存 SHA-256 token hash、过期时间和消费时间，不保存明文。
 - `candidate_session_token` 由 `INTERVIEWER_CANDIDATE_TOKEN_SECRET` 对 `interview_id + created_at` 做 HMAC-SHA256 派生，数据库和后台 API 均不保存/返回明文；生产缺少签名密钥时会话签发失败关闭。
 - Candidate Intake 的匹配事务锁定预约记录，验证 token 和时间窗，比较预约绑定候选人的 email/phone 哈希，保存同意版本并把预约推进到 `registered`。
+- 同一登记事务以 `appointment.reminder.email:{appointment_id}` 幂等键创建 DurableWorkItem，`available_at` 为开始前 30 分钟；payload 只含 `appointment_id`。Worker 执行时才从 CandidateProfile 解密邮箱，SMTP 凭据不进入数据库、Outbox、审计或日志。未配置 SMTP 时工作保持 retryable，面试已开始、预约取消/消费或邮箱已清理时显式完成为 skipped。
 - start 事务通过 `UNIQUE(interviews.appointment_id)` 保证一个预约只创建一个会话，同时把预约推进到 `consumed`；幂等重试返回已有会话。
 - 匹配失败日志只保存预约、原因枚举和请求哈希，不保存提交的明文联系方式。
 
@@ -223,8 +256,11 @@ transcript-artifacts/{organization_id}/{interview_id}/{turn_id}/{revision}.json
 - 企业回听接口在鉴权和审计后签发分钟级 URL；候选人页面只能访问自己当前会话所需资源。
 - 数据库保存 `content_hash`、字节数、MIME、加密 key/version、留存到期和删除状态。
 - 简历、回答音频和转写按组织策略级联到期；题目语音可按题目版本保留，但被历史面试引用的资产在对应面试留存期内不能删除。
+- 最新岗位初筛的生效结论全部为 `unqualified` 时，CandidateProfile 写入 `retention_reason=screening_unqualified` 和 7 天后的 `retention_expires_at`；人工复核或新审阅使任一岗位符合/待复核时在同一事务取消该期限。
 - Provider 返回的临时 TTS URL 必须复制到系统对象存储后才可标记资产 `ready`。
 - `POST /api/v1/admin/retention/run` 默认 dry-run；显式执行时先删除私有对象/本地录音，再清空候选人密文与关联简历、审阅、经历题、转写、评分和报告敏感内容，最后写 `retention.purge.completed` 审计。失败不能伪标完成。
+- `app.workers.retention.run_screening_retention` 由 Celery Beat 周期唤醒，只处理已到期的 `screening_unqualified` 候选人并复用相同删除顺序；完成写 `retention.screening_auto_purge.completed`，符合或待复核候选人不会进入该扫描结果。
+- 单份简历显式删除采用两阶段清理：同一事务做 version 校验、历史引用保护、取消尚未运行的摄取/审阅 Outbox 并写 `deleting`；事务外删除隔离文件和 Private File Storage 对象；随后把 FileObject/ResumeReview/派生经历题标为删除或归档、清空敏感证据并把 ResumeDocument 写为 `deleted`。已进入 InterviewPlan 或 InterviewSession 快照的版本拒绝删除，运行中工作不做强制终止。
 
 简历本地上传与 URL 导入共用同一持久工作流：
 
@@ -232,8 +268,8 @@ transcript-artifacts/{organization_id}/{interview_id}/{turn_id}/{revision}.json
 2. multipart 请求流或 URL 下载流进入隔离临时文件，边读边限制大小并计算 SHA-256；不得把整个 PDF 放进内存或数据库。
 3. URL 下载只允许生产 HTTPS，初始地址和每次重定向都重新解析 DNS 并拒绝环回、RFC1918 私网、链路本地、保留网段、云元数据端点、非 HTTP(S) scheme 和 URL 用户信息；限制重定向、连接/总超时、响应大小和低速连接。
 4. 校验响应 MIME、PDF magic bytes 和文件结构，执行恶意文件扫描；失败或感染文件留在隔离区并按策略删除，不能写入正式 key。
-5. 通过当前 `PrivateFileStorage` adapter 写入正式 key，创建 `file_objects` 记录，再解析 PDF 并把脱敏文本写成独立私有对象。
-6. 只有文件存储、扫描和解析全部成功才把 `ResumeDocument` 标为 `ready`；Resume Review 只能读取 `ready` 版本。
+5. 通过当前 `PrivateFileStorage` adapter 写入正式 key，创建 `file_objects` 记录，再逐页解析 PDF，以 form-feed 保存页边界并把文本写成独立私有对象。
+6. 只有文件存储、扫描和解析全部成功才把 `ResumeDocument` 标为 `ready`；若上传命令携带岗位/要求，完成事务同时幂等创建 `ResumeReview + resume.review` 工作项，避免“简历 ready 但审阅未排队”的崩溃窗口。
 
 URL 原文可能包含候选人标识或临时签名参数，数据库默认只保存 `source_url_hash` 和审计所需的脱敏 host，不保存 query/fragment。系统不会把外部 URL 当作永久 `file_uri`，也不会让 OSS 直接回源任意 URL。
 
@@ -245,8 +281,11 @@ URL 原文可能包含候选人标识或临时签名参数，数据库默认只�
 SELECT q.id, q.version, q.skills, q.difficulty, q.type
 FROM questions q
 JOIN knowledge_bases kb ON kb.id = q.knowledge_base_id
+JOIN job_position_knowledge_bases pkb
+  ON pkb.organization_id = q.organization_id
+ AND pkb.knowledge_base_id = kb.id
 WHERE q.organization_id = $1
-  AND kb.job_position_id = $2
+  AND pkb.job_position_id = $2
   AND q.knowledge_base_id = ANY($3)
   AND q.status = 'active'
   AND q.validation_status = 'valid'
@@ -258,23 +297,42 @@ WHERE q.organization_id = $1
 
 计划批准后把结果中的题目 ID/version 清单、筛选条件和集合哈希保存为每个槽位的 `QuestionCandidatePool`。面试中的 Question Selection 只读取该清单，并用会话种子计算稳定随机值；它不再查询全题库，更不执行向量相似度。
 
-可选向量表如果未来启用，应放在独立、可重建的 projection 中，例如 `optional_question_embeddings(question_id, question_version, model, embedding)`。删除该表或 Provider 不可用不能影响题库、计划、预约、面试和报告。Resume Review 默认不建向量；只有超长简历附件需要分段 RAG 时才使用候选人私有、短期 projection。
+可选向量表如果未来启用，应放在独立、可重建的 projection 中，例如 `optional_question_embeddings(question_id, question_version, model, embedding)`。删除该表或 Provider 不可用不能影响题库、计划、预约、面试和报告。Resume Review 当前使用页感知 Map/Reduce，不为单份长简历建立向量 projection。
 
 ## 异步工作项与事务
 
-外部 LLM、STT、TTS、文件解析和数字人调用不得占用数据库事务；可选 Embedding 任务遵守同一规则。流程拆成短事务并以 Outbox 记录事实：
+外部 LLM、STT、TTS、文件解析和数字人调用不得占用数据库事务；可选 Embedding 任务遵守同一规则。流程拆成短事务并以 Outbox 记录事实，Celery 负责调度和唤醒：
+
+- Resume Review 的业务重试在同一短事务内把 `resume_reviews.failed -> queued` 与对应 DurableWorkItem `failed/dead_letter -> pending` 一并提交，attempt 归零、`replay_count` 递增并写审计，避免界面显示处理中但 Worker 没有任务，或任务已重放但候选人仍显示失败。
+- Resume Review 工作的 Outbox 幂等键使用 `resume.review:{resume_document_id}:{input_hash}`：同一简历版本的重复排队仍复用一个工作项，不同简历版本即使内容和岗位配置完全相同也不会命中旧版本工作。排队入口发现 queued 审阅没有任何关联工作时必须补建，并拒绝接受 aggregate ID 指向其他审阅的幂等命中。
+- Resume Review 领取工作时使用 330 秒租约，覆盖 Celery 默认 300 秒 hard time limit；不能沿用通用 60 秒租约，否则合法的长模型调用会被 Beat 当成 Worker 丢失并并发补发。任务硬超时后最多等待剩余租约窗口再恢复，避免双执行。
 
 1. 首个事务保存领域状态和工作项，例如题目 `validation_status=pending`、语音 `pending`、Resume Review `queued` 或轮次 `transcribing`。
-2. worker 按租约领取工作项，在事务外调用 Provider 或处理文件。
-3. 后续事务验证租约和目标 version，保存结果、领域事件和下一个工作项。
-4. 重复投递通过 `(organization_id, idempotency_key)`、内容哈希和业务唯一约束返回同一结果。
+2. 事务提交后向 Celery 发布只含 `organization_id + work_item_id` 的小消息；发布失败不回滚已提交领域事实，由 Celery Beat dispatcher 扫描待执行/租约过期工作项补发。
+3. `app/workers/` 中的 Celery task 按租约领取工作项，在事务外调用 Provider 或处理文件。
+4. 后续事务验证租约和目标 version，保存结果、领域事件和下一个工作项。
+5. 重复投递通过 `(organization_id, idempotency_key)`、内容哈希和业务唯一约束返回同一结果；幂等键必须包含正确的聚合身份，不能只用可跨聚合重复的内容哈希。
 
-工作项至少包含 type、aggregate ID/version、payload reference、idempotency key、attempt、next attempt、lease token/expiry 和最终错误。消息队列只能唤醒 worker，数据库仍是任务真相来源。
+`DurableWorkItem.error_retryable=false` 是终止语义：即使 `attempt_count < max_attempts` 也立即进入 `dead_letter`，并从
+自动 claimable 集合排除；人工 replay 仍可显式把它恢复为 pending。智能生题的多槽位输出截断由领域服务完成自适应
+拆分，因此原工作以 `split_into_single_slot_chunks` 完成，原 chunk 进入 superseded，两个替代工作与批次更新在同一
+事务提交；单槽位截断才使用上述非重试 dead-letter 语义。
+
+工作项至少包含 type、aggregate ID/version、payload reference、idempotency key、attempt、next attempt、lease token/expiry、父/子关系、进度计数和最终错误。Celery broker/result backend 只能唤醒 worker，数据库仍是任务真相来源；管理员查询、重放和业务 readiness 不读取 Celery result。
+
+Celery 部署合同：
+
+- `app/workers/celery_app.py`：唯一 Celery app、序列化白名单、queue、`acks_late=true`、`task_reject_on_worker_lost=true`、soft/hard time limit。
+- `app/workers/dispatcher.py`：将 DurableWorkItem 映射到 task，并由 Celery Beat 周期补发 due/expired lease；不包含业务处理。
+- `app/workers/knowledge_base_speech.py`：整库 manifest、题目 fan-out、TTS 调用、私有资产落盘、revision 防旧写和进度聚合。
+- 其它异步执行入口继续按领域放在 `app/workers/`；API/service 只验证命令、提交聚合与 DurableWorkItem，不直接执行长任务。
+- Celery 自带 retry 只用于发布/进程级瞬时故障；业务退避、最大次数、dead-letter 和人工 replay 继续由 DurableWorkItem 控制，避免两套重试计数。
 
 典型链路：
 
 - 题库导入：`parse -> validate structured fields -> persist candidate pool -> speech generate -> build summary`。
-- 简历审阅：`scan/parse -> redact -> review -> experience questions -> approved question speech`。
+- 题库语音切换：`speech profile CAS -> parent rebuild -> freeze question manifest -> child speech fan-out -> current revision guard -> progress aggregate`。
+- 简历审阅：`scan/page-preserving parse -> atomic review enqueue -> redact/budget -> single-pass 或 evidence Map/compact/final Reduce -> experience questions -> approved question speech`。
 - 回答：`audio persist + turn.transcribing -> streaming final`；失败后 `batch repair -> answer final -> evaluate -> next question/report`。
 
 STT 流本身是长连接，不持有数据库事务。开始时保存 stream attempt 元数据，final 或 error 到达后用短事务提交；所有音频 chunk 只流向媒体/STT adapter，不逐 chunk 写领域表。
@@ -298,6 +356,24 @@ WHERE organization_id = $2 AND id = $3 AND version = $4;
 - 生命周期事件、会话状态和 `evaluation.requested` / `report.requested` 工作项原子提交。
 
 Memory、SQLite 和 PostgreSQL adapter 必须通过同一套租户隔离、并发、幂等和 revision contract tests。
+
+`question_generation_batches` 是通用 versioned document collection；PostgreSQL 复用带 organization_id/RLS 的
+`documents` 表，SQLite/Memory 使用同名 collection，因此无需新增专用表。批次保存上下文快照、草稿、状态、
+生成/导入工作项 ID 和导入后的 Question ID；草稿更新、删除与确认导入使用批次 version CAS。正式 Question
+保存 `generation_batch_id/generation_draft_id`，但历史 Question 不要求这两个可空字段。生成任务和导入任务分别
+使用唯一 idempotency key，Celery/Redis 不持有草稿或导入结果。
+
+任务工作台扩展字段仍保存在同一 versioned document：`execution_revision`、停止事实和受限 `control_history`。
+规划、分片与合并 DurableWorkItem payload 冻结 execution revision；停止时 pending/failed/dead-letter 工作转为
+cancelled，running 工作仅记录 cancel request 并保留 lease，待 Worker 通过 revision guard 以 superseded 收尾。
+恢复或人工重试创建新的幂等工作项，不删除旧工作记录，也不依赖 Celery result backend。
+双槽位截断恢复同样保留原工作与 chunk：原工作完成态记录拆分结果，原 chunk 保存 replacement IDs 和脱敏
+finish/token 诊断；活动进度、后续 merge 和停止/恢复只处理替代 chunk，避免旧失败同时阻塞合并或重复计数。
+单题导入继续复用 `knowledge_base.import` DurableWorkItem；payload 额外冻结 `generation_import_scope=single` 与
+`generation_draft_id`。批次草稿保存独立 `version` 以及 `import_status/import_work_item_id/imported_question_id/import_error`，
+正式 Question 仍以 `generation_batch_id + generation_draft_id` 去重。单题成功不会冻结整批，批量导入只携带
+剩余未导入草稿。单题命令在事务内读取最新批次 version，仅对目标草稿 version 做条件校验；因此连续导入
+不同草稿不会被无关聚合版本阻塞，而同一草稿被编辑后的过期确认仍会冲突。重试和单题/批量组合都不会创建重复 Question。
 
 ## 可选向量能力的启用门槛
 

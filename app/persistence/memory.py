@@ -9,6 +9,7 @@ from app.repositories.memory import InMemoryStore
 
 DOCUMENT_COLLECTIONS = (
     "questions",
+    "question_generation_batches",
     "job_positions",
     "knowledge_bases",
     "question_speech_assets",
@@ -79,7 +80,6 @@ class _MemoryTransactionBackend(TransactionBackend):
             deepcopy(item)
             for item in self.documents["questions"].values()
             if item.get("organization_id") == organization_id
-            and item.get("job_position_id") == job_position_id
             and item.get("knowledge_base_id") in allowed_knowledge_bases
             and item.get("status") == "active"
             and item.get("validation_status") == "valid"
@@ -106,6 +106,9 @@ class _MemoryTransactionBackend(TransactionBackend):
 
     def replace_secret(self, organization_id: str, item_id: str, secret: Document) -> None:
         self.secrets[item_id] = deepcopy(secret)
+
+    def delete_secret(self, organization_id: str, item_id: str) -> None:
+        self.secrets.pop(item_id, None)
 
     def list_invocations(self) -> List[Document]:
         return deepcopy(self.invocations)

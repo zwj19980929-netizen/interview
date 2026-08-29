@@ -23,6 +23,10 @@ class AliyunOssFileAdapter:
         access_key_secret = os.environ["INTERVIEWER_OSS_ACCESS_KEY_SECRET"]
         self.bucket = oss2.Bucket(oss2.Auth(access_key_id, access_key_secret), endpoint, self.bucket_name)
 
+    def healthcheck(self) -> None:
+        """Perform a read-only bucket/authentication probe."""
+        self.bucket.get_bucket_info()
+
     def store(
         self,
         *,

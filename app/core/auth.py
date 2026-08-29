@@ -1,7 +1,10 @@
+import base64
+import hashlib
 import hmac
 import json
 import os
 import re
+import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from typing import FrozenSet, Optional, Union
@@ -100,7 +103,7 @@ def authenticate_request(request: Request) -> Union[Principal, Response]:
             "This deployment is not configured for the token organization.",
             403,
         )
-    required = _required_roles(request.url.path)
+    required = _required_roles(request.url.path, request.method)
     if required and not principal.roles.intersection(required):
         return _auth_error("AUTHORIZATION_FORBIDDEN", "The principal lacks the required role.", 403)
     return principal
@@ -112,9 +115,74 @@ def authenticate_interviewer_websocket(websocket: WebSocket) -> Optional[Respons
     authorization = websocket.headers.get("Authorization", "")
     scheme, _, supplied = authorization.partition(" ")
     principal = _principal_for_token(supplied) if scheme.lower() == "bearer" else None
+    if principal is None:
+        principal = _principal_for_websocket_ticket(
+            websocket.query_params.get("ticket", ""),
+            websocket.path_params.get("interview_id", ""),
+        )
     if principal is None or not principal.roles.intersection({"admin", "interviewer"}):
         return _auth_error("AUTHORIZATION_FORBIDDEN", "Interviewer WebSocket authorization failed.", 403)
     return None
+
+
+def issue_interviewer_websocket_ticket(interview_id: str, ttl_seconds: int = 60) -> dict:
+    principal = current_principal()
+    if not principal.roles.intersection({"admin", "interviewer"}):
+        raise PermissionError("Interviewer role is required for a realtime ticket.")
+    expires_at = int(time.time()) + max(1, min(ttl_seconds, 60))
+    payload = {
+        "actor_id": principal.actor_id,
+        "organization_id": principal.organization_id,
+        "roles": sorted(principal.roles),
+        "interview_id": interview_id,
+        "expires_at": expires_at,
+    }
+    encoded = _urlsafe_encode(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8"))
+    signature = hmac.new(_websocket_ticket_secret(), encoded.encode("ascii"), hashlib.sha256).digest()
+    return {"ticket": "%s.%s" % (encoded, _urlsafe_encode(signature)), "expires_at": expires_at}
+
+
+def _principal_for_websocket_ticket(ticket: str, interview_id: str) -> Optional[Principal]:
+    encoded, separator, supplied_signature = ticket.partition(".")
+    if not separator or not encoded or not supplied_signature:
+        return None
+    try:
+        expected = hmac.new(_websocket_ticket_secret(), encoded.encode("ascii"), hashlib.sha256).digest()
+        supplied = _urlsafe_decode(supplied_signature)
+        if not hmac.compare_digest(expected, supplied):
+            return None
+        payload = json.loads(_urlsafe_decode(encoded).decode("utf-8"))
+        if payload.get("interview_id") != interview_id or int(payload.get("expires_at", 0)) < int(time.time()):
+            return None
+        configured_org = os.getenv("INTERVIEWER_ORGANIZATION_ID", "org_default")
+        if payload.get("organization_id") != configured_org:
+            return None
+        return Principal(
+            actor_id=str(payload.get("actor_id") or "unknown"),
+            organization_id=str(payload.get("organization_id") or ""),
+            roles=frozenset(str(item) for item in payload.get("roles", [])),
+            authenticated=True,
+        )
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _websocket_ticket_secret() -> bytes:
+    secret = os.getenv("INTERVIEWER_WEBSOCKET_TICKET_SECRET") or os.getenv("INTERVIEWER_CANDIDATE_TOKEN_SECRET", "")
+    runtime = os.getenv("INTERVIEWER_RUNTIME_ENV", "development").lower()
+    if runtime != "production" and len(secret) < 32:
+        secret = "local-development-websocket-ticket-secret"
+    if len(secret) < 32:
+        raise RuntimeError("INTERVIEWER_WEBSOCKET_TICKET_SECRET must contain at least 32 characters.")
+    return secret.encode("utf-8")
+
+
+def _urlsafe_encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+def _urlsafe_decode(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
 
 
 def _principal_for_token(supplied: str) -> Optional[Principal]:
@@ -138,11 +206,17 @@ def _principal_for_token(supplied: str) -> Optional[Principal]:
     return None
 
 
-def _required_roles(path: str) -> FrozenSet[str]:
+def _required_roles(path: str, method: str = "GET") -> FrozenSet[str]:
+    if path == "/api/v1/auth/session":
+        return frozenset({"admin", "interviewer", "reviewer"})
     if path.startswith("/api/v1/admin/"):
         return frozenset({"admin"})
+    if path in {"/api/v1/workspace/question-catalog", "/api/v1/workspace/question-overview"}:
+        return frozenset({"admin", "interviewer"})
     if any(marker in path for marker in ("/review", "/audio-url", "/transcript", "/report/export")):
         return frozenset({"admin", "reviewer"})
+    if method == "GET" and (path == "/api/v1/interviews" or path.startswith("/api/v1/interviews/")):
+        return frozenset({"admin", "interviewer", "reviewer"})
     return frozenset({"admin", "interviewer"})
 
 
@@ -153,6 +227,7 @@ def _is_public_path(path: str) -> bool:
             "/api/v1/private-files/",
             "/api/v1/private-media/",
             "/healthz",
+            "/readyz",
         )
     )
 

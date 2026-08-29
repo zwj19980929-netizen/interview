@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 from app.core.errors import ApiError
 from app.core.ids import new_id
 from app.core.time import utc_now
+from app.domain.candidate_screening import effective_screening_outcome
 from app.file_storage.interface import PrivateFileStorage
 from app.file_storage.provider import private_file_storage
 from app.persistence.interface import Persistence
@@ -74,6 +75,93 @@ class RetentionService:
             "audit_event_id": event["id"],
         }
 
+    def purge_candidate(self, candidate_id: str, organization_id: str = "org_default") -> None:
+        """Purge one candidate through the same privacy boundary used by scheduled retention."""
+        self._purge_candidate(candidate_id, organization_id)
+
+    def run_screening_retention(
+        self,
+        *,
+        actor_id: str = "system:screening-retention",
+        now: Optional[str] = None,
+        organization_id: str = "org_default",
+    ) -> Dict[str, Any]:
+        """Automatically purge only candidates whose seven-day screening deadline elapsed."""
+        cutoff = self._parse_time(now or utc_now())
+        with self.persistence.transaction(organization_id) as transaction:
+            reconciled_candidate_ids = self._reconcile_screening_deadlines(transaction, cutoff)
+            candidates = [
+                item
+                for item in transaction.candidate_profiles.list()
+                if item.get("status") != "retention_purged"
+                and item.get("retention_reason") == "screening_unqualified"
+                and item.get("retention_expires_at")
+                and self._parse_time(str(item["retention_expires_at"])) <= cutoff
+            ]
+        candidate_ids = [item["id"] for item in candidates]
+        for candidate_id in candidate_ids:
+            self._purge_candidate(candidate_id, organization_id)
+        with self.persistence.transaction(organization_id) as transaction:
+            event = transaction.audit_events.add(
+                {
+                    "id": new_id("audit"),
+                    "organization_id": organization_id,
+                    "actor_id": actor_id,
+                    "action": "retention.screening_auto_purge.completed",
+                    "resource_type": "candidate_profile",
+                    "resource_id": "screening_retention_batch",
+                    "metadata": {
+                        "candidate_count": len(candidate_ids),
+                        "candidate_ids": candidate_ids,
+                        "reconciled_candidate_ids": reconciled_candidate_ids,
+                        "cutoff": cutoff.isoformat(),
+                    },
+                    "created_at": utc_now(),
+                }
+            )
+        return {
+            "cutoff": cutoff.isoformat(),
+            "candidate_count": len(candidate_ids),
+            "candidate_ids": candidate_ids,
+            "reconciled_candidate_ids": reconciled_candidate_ids,
+            "audit_event_id": event["id"],
+        }
+
+    def _reconcile_screening_deadlines(self, transaction: Any, now: datetime) -> List[str]:
+        """Apply the current score policy to legacy reviews before selecting expired candidates."""
+        reconciled_candidate_ids: List[str] = []
+        for candidate in transaction.candidate_profiles.list():
+            if candidate.get("status") in {"archived", "retention_purged"}:
+                continue
+            latest_by_position: Dict[str, Dict[str, Any]] = {}
+            for review in transaction.resume_reviews.list():
+                if review.get("candidate_profile_id") != candidate["id"]:
+                    continue
+                if review.get("status") in {"deleted", "retention_purged"}:
+                    continue
+                position_id = str(review.get("job_position_id") or "")
+                previous = latest_by_position.get(position_id)
+                if previous is None or str(review.get("created_at") or "") > str(previous.get("created_at") or ""):
+                    latest_by_position[position_id] = review
+            outcomes = [effective_screening_outcome(review) for review in latest_by_position.values()]
+            changed = False
+            if outcomes and all(outcome == "unqualified" for outcome in outcomes):
+                if candidate.get("retention_reason") != "screening_unqualified":
+                    candidate["retention_reason"] = "screening_unqualified"
+                    changed = True
+                if not candidate.get("retention_expires_at"):
+                    candidate["retention_expires_at"] = (now + timedelta(days=7)).astimezone(timezone.utc).isoformat()
+                    changed = True
+            elif candidate.get("retention_reason") == "screening_unqualified":
+                candidate["retention_reason"] = None
+                candidate["retention_expires_at"] = None
+                changed = True
+            if changed:
+                candidate["updated_at"] = now.astimezone(timezone.utc).isoformat()
+                transaction.candidate_profiles.update(candidate, expected_version=candidate["version"])
+                reconciled_candidate_ids.append(candidate["id"])
+        return reconciled_candidate_ids
+
     def _purge_candidate(self, candidate_id: str, organization_id: str) -> None:
         with self.persistence.transaction(organization_id) as transaction:
             candidate = transaction.candidate_profiles.get(candidate_id)
@@ -113,7 +201,16 @@ class RetentionService:
                 self.storage.delete(str(file_object["object_key"]))
         for interview in interviews:
             for answer in interview.get("answers", []):
-                self._delete_local_audio(answer.get("audio_uri"))
+                audio_uri = answer.get("audio_uri")
+                if isinstance(audio_uri, str) and audio_uri.startswith("private-file://"):
+                    file_ids.add(audio_uri.removeprefix("private-file://"))
+                else:
+                    self._delete_local_audio(audio_uri)
+        with self.persistence.transaction(organization_id) as transaction:
+            private_audio_files = [transaction.file_objects.get(file_id) for file_id in file_ids]
+        for file_object in private_audio_files:
+            if file_object and file_object.get("purpose") == "candidate_answer_audio" and file_object.get("object_key"):
+                self.storage.delete(str(file_object["object_key"]))
         with self.persistence.transaction(organization_id) as transaction:
             current = transaction.candidate_profiles.get(candidate_id)
             now = utc_now()
@@ -155,6 +252,10 @@ class RetentionService:
                         "skill_evidence": [],
                         "warnings": [],
                         "summary": None,
+                        "screening_summary": None,
+                        "matched_requirements": [],
+                        "unmet_requirements": [],
+                        "human_review_note": None,
                         "updated_at": now,
                     }
                 )

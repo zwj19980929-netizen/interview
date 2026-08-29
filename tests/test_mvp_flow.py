@@ -1,8 +1,11 @@
+import asyncio
+
 from fastapi.testclient import TestClient
 from datetime import datetime, timedelta, timezone
 
 from app.main import create_app
-from app.repositories.provider import reset_store_for_tests
+from app.repositories.provider import get_store, reset_store_for_tests
+from app.workers.outbox import OutboxWorker
 
 
 def client() -> TestClient:
@@ -39,9 +42,11 @@ def test_web_console_and_static_assets() -> None:
     assert stylesheet.status_code == 200
     assert "text/css" in stylesheet.headers["content-type"]
 
-    script = api.get("/web/app.js")
-    assert script.status_code == 200
-    assert "javascript" in script.headers["content-type"]
+    assert "/web/bundles/" in console.text
+    web_console = api.get("/web/")
+    assert web_console.status_code == 200
+    assert "Interviewer" in web_console.text
+    assert api.get("/web/app.js").status_code == 404
 
     icon_library = api.get("/web/vendor/lucide.min.js")
     assert icon_library.status_code == 200
@@ -277,7 +282,7 @@ def test_question_to_report_mvp_flow() -> None:
             "rubric": {"semantic_correctness": 1.0},
         },
     )
-    assert q1.status_code == 200, q1.text
+    assert q1.status_code == 202, q1.text
 
     q2 = api.post(
         "/api/v1/knowledge-bases/%s/questions" % knowledge_base["id"],
@@ -292,7 +297,8 @@ def test_question_to_report_mvp_flow() -> None:
             "rubric": {"semantic_correctness": 1.0},
         },
     )
-    assert q2.status_code == 200, q2.text
+    assert q2.status_code == 202, q2.text
+    asyncio.run(OutboxWorker(get_store()).run_once())
 
     search = api.post(
         "/api/v1/questions/search",

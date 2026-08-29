@@ -14,6 +14,10 @@ class LocalPrivateFileAdapter:
         self.root.mkdir(parents=True, exist_ok=True)
         self.signer = signer or FileAccessSigner()
 
+    def healthcheck(self) -> None:
+        if not self.root.is_dir():
+            raise RuntimeError("Local private file root is unavailable.")
+
     def store(
         self,
         *,

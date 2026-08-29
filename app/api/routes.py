@@ -1,5 +1,5 @@
 import json
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response
@@ -10,6 +10,7 @@ from app.schemas.api import (
     AvatarSpeakCommand,
     CandidateIntakeCreate,
     CandidateProfilePatch,
+    CandidateScreeningReview,
     CandidateReadinessCreate,
     CandidateProfileCreate,
     ExperienceQuestionPatch,
@@ -20,9 +21,13 @@ from app.schemas.api import (
     InterviewPlanGenerateRequest,
     InterviewPlanPatch,
     JobPositionCreate,
+    JobPositionDeleteCommand,
     KnowledgeBaseCreate,
+    KnowledgeBaseAssignmentCreate,
     KnowledgeBaseImport,
     KnowledgeBaseRebuild,
+    KnowledgeBaseSpeechProfileUpdate,
+    KnowledgeBaseSpeechRetry,
     ModelConfigurationCreate,
     ModelConfigurationPatch,
     ModelConfigurationTest,
@@ -30,22 +35,37 @@ from app.schemas.api import (
     OutboxReplay,
     ProviderConnectionCreate,
     ProviderConnectionPatch,
+    GeneratedQuestionDraftImport,
+    GeneratedQuestionDraftPatch,
     QuestionCreate,
+    QuestionGenerationCreate,
+    QuestionGenerationControl,
+    QuestionGenerationImport,
     QuestionPatch,
     QuestionSearchRequest,
     RetentionRun,
     ResumeUrlImport,
+    ResumeDocumentPatch,
     ResumeReviewCreate,
+    ResumeReviewRetry,
     ReviewComplete,
     RoleRequirementCreate,
     TranscriptCorrection,
     VersionedPatch,
+    WebSocketTicketCreate,
 )
 from app.core.errors import ApiError
-from app.core.auth import authenticate_interviewer_websocket
+from app.core.readiness import deployment_readiness
+from app.core.auth import (
+    authenticate_interviewer_websocket,
+    current_principal,
+    issue_interviewer_websocket_ticket,
+)
 from app.services.avatar import AvatarService
 from app.services.appointments import AppointmentService
 from app.services.catalog import CatalogService
+from app.services.knowledge_base_speech import KnowledgeBaseSpeechService
+from app.services.question_generation import QuestionGenerationService
 from app.services.interviews import InterviewService
 from app.services.model_admin import ModelAdminService
 from app.services.operations import OperationsService
@@ -71,19 +91,38 @@ from app.realtime_bus import realtime_event_bus
 router = APIRouter()
 
 
+@router.get("/api/v1/auth/session")
+async def get_auth_session() -> Dict[str, Any]:
+    principal = current_principal()
+    return {
+        "actor_id": principal.actor_id,
+        "organization_id": principal.organization_id,
+        "roles": sorted(principal.roles),
+        "authenticated": principal.authenticated,
+    }
+
+
+@router.post("/api/v1/auth/websocket-ticket")
+async def create_websocket_ticket(payload: WebSocketTicketCreate) -> Dict[str, Any]:
+    try:
+        return issue_interviewer_websocket_ticket(payload.interview_id)
+    except PermissionError as exc:
+        raise ApiError("AUTHORIZATION_FORBIDDEN", str(exc), status_code=403) from exc
+
+
 class LiveConnectionManager:
     def __init__(self) -> None:
-        self.connections: Dict[str, Set[WebSocket]] = {}
+        self.connections: Dict[str, Dict[WebSocket, str]] = {}
         self.bus = realtime_event_bus()
 
-    def connect(self, interview_id: str, websocket: WebSocket) -> None:
-        self.connections.setdefault(interview_id, set()).add(websocket)
+    def connect(self, interview_id: str, websocket: WebSocket, role: str) -> None:
+        self.connections.setdefault(interview_id, {})[websocket] = role
 
     def disconnect(self, interview_id: str, websocket: WebSocket) -> None:
         interview_connections = self.connections.get(interview_id)
         if not interview_connections:
             return
-        interview_connections.discard(websocket)
+        interview_connections.pop(websocket, None)
         if not interview_connections:
             self.connections.pop(interview_id, None)
 
@@ -94,14 +133,27 @@ class LiveConnectionManager:
 
     async def _broadcast_local(self, interview_id: str, events: List[Dict[str, Any]]) -> None:
         disconnected: List[WebSocket] = []
-        for websocket in list(self.connections.get(interview_id, set())):
+        for websocket, role in list(self.connections.get(interview_id, {}).items()):
             try:
                 for event in events:
-                    await websocket.send_json(event)
+                    await websocket.send_json(self._project_event(event, role))
             except (RuntimeError, WebSocketDisconnect):
                 disconnected.append(websocket)
         for websocket in disconnected:
             self.disconnect(interview_id, websocket)
+
+    @staticmethod
+    def _project_event(event: Dict[str, Any], role: str) -> Dict[str, Any]:
+        if role != "candidate" or event.get("type") != "evaluation.completed":
+            return event
+        payload = event.get("payload") or {}
+        return {
+            **event,
+            "payload": {
+                "turn_id": payload.get("turn_id"),
+                "status": "completed",
+            },
+        }
 
     async def consume_remote(self) -> None:
         await self.bus.subscribe(
@@ -122,6 +174,8 @@ class ServiceLocator:
         factories = {
             "model_admin": ModelAdminService,
             "catalog": CatalogService,
+            "knowledge_base_speech": KnowledgeBaseSpeechService,
+            "question_generation": QuestionGenerationService,
             "talent": TalentService,
             "roles": RoleRequirementService,
             "plan_assembly": InterviewPlanAssembly,
@@ -157,6 +211,12 @@ async def healthz() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+@router.get("/readyz")
+async def readyz() -> Response:
+    result = await deployment_readiness(get_store())
+    return JSONResponse(result, status_code=200 if result["ready"] else 503)
+
+
 @router.get("/api/v1/admin/model-providers/catalog")
 async def model_provider_catalog() -> Dict[str, Any]:
     return {"items": services()["model_admin"].catalog()}
@@ -172,9 +232,19 @@ async def list_model_provider_connections() -> Dict[str, Any]:
     return {"items": services()["model_admin"].list_provider_connections(), "next_cursor": None}
 
 
+@router.get("/api/v1/admin/model-provider-connections/{connection_id}")
+async def get_model_provider_connection(connection_id: str) -> Dict[str, Any]:
+    return services()["model_admin"].get_provider_connection(connection_id)
+
+
 @router.patch("/api/v1/admin/model-provider-connections/{connection_id}")
 async def patch_model_provider_connection(connection_id: str, payload: ProviderConnectionPatch) -> Dict[str, Any]:
     return services()["model_admin"].patch_provider_connection(connection_id, payload.model_dump(exclude_unset=True))
+
+
+@router.delete("/api/v1/admin/model-provider-connections/{connection_id}")
+async def delete_model_provider_connection(connection_id: str, expected_version: int) -> Dict[str, Any]:
+    return services()["model_admin"].delete_provider_connection(connection_id, expected_version)
 
 
 @router.post("/api/v1/admin/model-provider-connections/{connection_id}/validate")
@@ -197,11 +267,26 @@ async def list_model_configurations() -> Dict[str, Any]:
     return {"items": services()["model_admin"].list_model_configurations(), "next_cursor": None}
 
 
+@router.get("/api/v1/admin/model-configurations/{configuration_id}")
+async def get_model_configuration(configuration_id: str) -> Dict[str, Any]:
+    return services()["model_admin"].get_model_configuration(configuration_id)
+
+
+@router.get("/api/v1/admin/model-configurations/{configuration_id}/voices")
+async def get_model_configuration_voices(configuration_id: str) -> Dict[str, Any]:
+    return services()["model_admin"].voice_catalog(configuration_id)
+
+
 @router.patch("/api/v1/admin/model-configurations/{configuration_id}")
 async def patch_model_configuration(configuration_id: str, payload: ModelConfigurationPatch) -> Dict[str, Any]:
     return services()["model_admin"].patch_model_configuration(
         configuration_id, payload.model_dump(exclude_unset=True)
     )
+
+
+@router.delete("/api/v1/admin/model-configurations/{configuration_id}")
+async def delete_model_configuration(configuration_id: str, expected_version: int) -> Dict[str, Any]:
+    return services()["model_admin"].delete_model_configuration(configuration_id, expected_version)
 
 
 @router.post("/api/v1/admin/model-configurations/{configuration_id}/test")
@@ -287,6 +372,16 @@ async def list_job_positions() -> Dict[str, Any]:
     return {"items": services()["catalog"].list_positions(), "next_cursor": None}
 
 
+@router.get("/api/v1/workspace/question-catalog")
+async def get_workspace_question_catalog() -> Dict[str, Any]:
+    return services()["catalog"].workspace_question_catalog()
+
+
+@router.get("/api/v1/workspace/question-overview")
+async def get_workspace_question_overview() -> Dict[str, Any]:
+    return services()["catalog"].workspace_question_overview()
+
+
 @router.get("/api/v1/job-positions/{position_id}")
 async def get_job_position(position_id: str) -> Dict[str, Any]:
     return services()["catalog"].get_position(position_id)
@@ -297,14 +392,49 @@ async def patch_job_position(position_id: str, payload: VersionedPatch) -> Dict[
     return services()["catalog"].patch_position(position_id, payload.model_dump(exclude_unset=True))
 
 
+@router.get("/api/v1/job-positions/{position_id}/deletion-impact")
+async def get_job_position_deletion_impact(position_id: str) -> Dict[str, Any]:
+    return services()["catalog"].position_deletion_impact(position_id)
+
+
+@router.delete("/api/v1/job-positions/{position_id}")
+async def delete_job_position(
+    position_id: str,
+    payload: JobPositionDeleteCommand,
+    x_actor_id: str = Header(default="admin_local", alias="X-Actor-Id"),
+) -> Dict[str, Any]:
+    return services()["catalog"].delete_position(
+        position_id,
+        expected_version=payload.expected_version,
+        confirmation=payload.confirmation,
+        actor_id=x_actor_id,
+    )
+
+
 @router.post("/api/v1/job-positions/{position_id}/knowledge-bases")
 async def create_position_knowledge_base(position_id: str, payload: KnowledgeBaseCreate) -> Dict[str, Any]:
     return services()["catalog"].create_knowledge_base(position_id, payload.model_dump())
 
 
+@router.post("/api/v1/job-positions/{position_id}/knowledge-base-assignments")
+async def assign_position_knowledge_base(
+    position_id: str, payload: KnowledgeBaseAssignmentCreate
+) -> Dict[str, Any]:
+    return services()["catalog"].assign_knowledge_base(
+        position_id,
+        payload.knowledge_base_id,
+        expected_position_version=payload.expected_position_version,
+    )
+
+
 @router.get("/api/v1/job-positions/{position_id}/knowledge-bases")
 async def list_position_knowledge_bases(position_id: str) -> Dict[str, Any]:
     return {"items": services()["catalog"].list_knowledge_bases(position_id), "next_cursor": None}
+
+
+@router.get("/api/v1/knowledge-bases")
+async def list_knowledge_bases() -> Dict[str, Any]:
+    return {"items": services()["knowledge_base_speech"].list_knowledge_bases(), "next_cursor": None}
 
 
 @router.get("/api/v1/knowledge-bases/{knowledge_base_id}")
@@ -317,6 +447,208 @@ async def patch_knowledge_base(knowledge_base_id: str, payload: VersionedPatch) 
     return services()["catalog"].patch_knowledge_base(
         knowledge_base_id, payload.model_dump(exclude_unset=True)
     )
+
+
+@router.put("/api/v1/knowledge-bases/{knowledge_base_id}/speech-profile")
+async def set_knowledge_base_speech_profile(
+    knowledge_base_id: str,
+    payload: KnowledgeBaseSpeechProfileUpdate,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    x_actor_id: str = Header(default="admin_local", alias="X-Actor-Id"),
+) -> JSONResponse:
+    result = services()["knowledge_base_speech"].set_profile(
+        knowledge_base_id,
+        payload.model_dump(),
+        idempotency_key=idempotency_key or "",
+        actor_id=x_actor_id,
+    )
+    return JSONResponse(result, status_code=202)
+
+
+@router.get("/api/v1/knowledge-bases/{knowledge_base_id}/speech-options")
+async def get_knowledge_base_speech_options(knowledge_base_id: str) -> Dict[str, Any]:
+    return services()["knowledge_base_speech"].speech_options(knowledge_base_id)
+
+
+@router.get("/api/v1/knowledge-bases/{knowledge_base_id}/question-generation-options")
+async def get_question_generation_options(knowledge_base_id: str) -> Dict[str, Any]:
+    return services()["question_generation"].options(knowledge_base_id)
+
+
+@router.post("/api/v1/knowledge-bases/{knowledge_base_id}/question-generation-batches")
+async def create_question_generation_batch(
+    knowledge_base_id: str,
+    payload: QuestionGenerationCreate,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    x_actor_id: str = Header(default="admin_local", alias="X-Actor-Id"),
+) -> JSONResponse:
+    result = services()["question_generation"].queue(
+        knowledge_base_id,
+        payload.model_dump(),
+        idempotency_key=idempotency_key or "",
+        actor_id=x_actor_id,
+    )
+    return JSONResponse(result, status_code=202)
+
+
+@router.get("/api/v1/knowledge-bases/{knowledge_base_id}/question-generation-batches")
+async def list_question_generation_batches(knowledge_base_id: str) -> Dict[str, Any]:
+    return {
+        "items": services()["question_generation"].list_batches(knowledge_base_id),
+        "next_cursor": None,
+    }
+
+
+@router.get("/api/v1/question-generation-batches/{batch_id}")
+async def get_question_generation_batch(batch_id: str) -> Dict[str, Any]:
+    return services()["question_generation"].get_batch(batch_id)
+
+
+@router.post("/api/v1/question-generation-batches/{batch_id}/stop")
+async def stop_question_generation_batch(
+    batch_id: str,
+    payload: QuestionGenerationControl,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    x_actor_id: str = Header(default="admin_local", alias="X-Actor-Id"),
+) -> Dict[str, Any]:
+    return services()["question_generation"].stop(
+        batch_id,
+        expected_version=payload.expected_version,
+        reason=payload.reason,
+        idempotency_key=idempotency_key or "",
+        actor_id=x_actor_id,
+    )
+
+
+@router.post("/api/v1/question-generation-batches/{batch_id}/resume")
+async def resume_question_generation_batch(
+    batch_id: str,
+    payload: QuestionGenerationControl,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    x_actor_id: str = Header(default="admin_local", alias="X-Actor-Id"),
+) -> JSONResponse:
+    result = services()["question_generation"].resume(
+        batch_id,
+        expected_version=payload.expected_version,
+        reason=payload.reason,
+        idempotency_key=idempotency_key or "",
+        actor_id=x_actor_id,
+    )
+    return JSONResponse(result, status_code=202)
+
+
+@router.post("/api/v1/question-generation-batches/{batch_id}/retry-failed")
+async def retry_failed_question_generation_batch(
+    batch_id: str,
+    payload: QuestionGenerationControl,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    x_actor_id: str = Header(default="admin_local", alias="X-Actor-Id"),
+) -> JSONResponse:
+    result = services()["question_generation"].retry_failed(
+        batch_id,
+        expected_version=payload.expected_version,
+        reason=payload.reason,
+        idempotency_key=idempotency_key or "",
+        actor_id=x_actor_id,
+    )
+    return JSONResponse(result, status_code=202)
+
+
+@router.post("/api/v1/question-generation-batches/{batch_id}/chunks/{chunk_id}/retry")
+async def retry_question_generation_chunk(
+    batch_id: str,
+    chunk_id: str,
+    payload: QuestionGenerationControl,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    x_actor_id: str = Header(default="admin_local", alias="X-Actor-Id"),
+) -> JSONResponse:
+    result = services()["question_generation"].retry_chunk(
+        batch_id,
+        chunk_id,
+        expected_version=payload.expected_version,
+        reason=payload.reason,
+        idempotency_key=idempotency_key or "",
+        actor_id=x_actor_id,
+    )
+    return JSONResponse(result, status_code=202)
+
+
+@router.patch("/api/v1/question-generation-batches/{batch_id}/drafts/{draft_id}")
+async def patch_generated_question_draft(
+    batch_id: str, draft_id: str, payload: GeneratedQuestionDraftPatch
+) -> Dict[str, Any]:
+    return services()["question_generation"].patch_draft(
+        batch_id, draft_id, payload.model_dump(exclude_unset=True)
+    )
+
+
+@router.delete("/api/v1/question-generation-batches/{batch_id}/drafts/{draft_id}")
+async def delete_generated_question_draft(
+    batch_id: str, draft_id: str, expected_version: int
+) -> Dict[str, Any]:
+    return services()["question_generation"].delete_draft(
+        batch_id, draft_id, expected_version=expected_version
+    )
+
+
+@router.post("/api/v1/question-generation-batches/{batch_id}/drafts/{draft_id}/import")
+async def import_generated_question_draft(
+    batch_id: str,
+    draft_id: str,
+    payload: GeneratedQuestionDraftImport,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+) -> JSONResponse:
+    result = services()["question_generation"].confirm_draft_import(
+        batch_id,
+        draft_id,
+        expected_version=payload.expected_version,
+        expected_draft_version=payload.expected_draft_version,
+        idempotency_key=idempotency_key or "",
+    )
+    return JSONResponse(result, status_code=202)
+
+
+@router.post("/api/v1/question-generation-batches/{batch_id}/import")
+async def import_question_generation_batch(
+    batch_id: str,
+    payload: QuestionGenerationImport,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+) -> JSONResponse:
+    result = services()["question_generation"].confirm_import(
+        batch_id,
+        expected_version=payload.expected_version,
+        idempotency_key=idempotency_key or "",
+    )
+    return JSONResponse(result, status_code=202)
+
+
+@router.get("/api/v1/knowledge-bases/{knowledge_base_id}/speech-builds")
+async def list_knowledge_base_speech_builds(knowledge_base_id: str) -> Dict[str, Any]:
+    return {
+        "items": services()["knowledge_base_speech"].list_builds(knowledge_base_id),
+        "next_cursor": None,
+    }
+
+
+@router.get("/api/v1/knowledge-bases/{knowledge_base_id}/speech-builds/{job_id}")
+async def get_knowledge_base_speech_build(knowledge_base_id: str, job_id: str) -> Dict[str, Any]:
+    return services()["knowledge_base_speech"].get_build(knowledge_base_id, job_id)
+
+
+@router.post("/api/v1/knowledge-bases/{knowledge_base_id}/speech-builds/{job_id}/retry-failed")
+async def retry_knowledge_base_speech_build(
+    knowledge_base_id: str,
+    job_id: str,
+    payload: KnowledgeBaseSpeechRetry,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+) -> JSONResponse:
+    result = services()["knowledge_base_speech"].retry_failed(
+        knowledge_base_id,
+        job_id,
+        expected_version=payload.expected_version,
+        idempotency_key=idempotency_key or "",
+    )
+    return JSONResponse(result, status_code=202)
 
 
 @router.post("/api/v1/knowledge-bases/{knowledge_base_id}/imports")
@@ -363,7 +695,7 @@ async def get_knowledge_base_build(knowledge_base_id: str, job_id: str) -> Dict[
     return build
 
 
-@router.post("/api/v1/knowledge-bases/{knowledge_base_id}/questions")
+@router.post("/api/v1/knowledge-bases/{knowledge_base_id}/questions", status_code=202)
 async def create_knowledge_base_question(knowledge_base_id: str, payload: QuestionCreate) -> Dict[str, Any]:
     return await services()["catalog"].create_question(knowledge_base_id, payload.model_dump())
 
@@ -393,6 +725,19 @@ async def patch_candidate_profile(candidate_id: str, payload: CandidateProfilePa
     return services()["talent"].patch_candidate(candidate_id, payload.model_dump(exclude_unset=True))
 
 
+@router.delete("/api/v1/candidate-profiles/{candidate_id}")
+async def delete_candidate_profile(
+    candidate_id: str,
+    expected_version: int,
+    x_actor_id: str = Header(default="interviewer_local", alias="X-Actor-Id"),
+) -> Dict[str, Any]:
+    return services()["talent"].archive_candidate(
+        candidate_id,
+        expected_version=expected_version,
+        actor_id=x_actor_id,
+    )
+
+
 @router.post("/api/v1/candidate-profiles/{candidate_id}/resumes")
 async def create_resume_document(
     candidate_id: str,
@@ -417,12 +762,18 @@ async def create_resume_document(
             if byte_count > limit:
                 raise ApiError("PDF_FILE_TOO_LARGE", "PDF exceeds the configured size limit.", status_code=413)
         display_name = str(form.get("display_name") or upload.filename)
+        job_position_id = str(form.get("job_position_id") or "").strip() or None
+        role_requirement_id = str(form.get("role_requirement_id") or "").strip() or None
         result = services()["resume_ingestion"].queue_upload(
             candidate_id,
             file_name=display_name,
             content_type=getattr(upload, "content_type", None) or "application/octet-stream",
             content=b"".join(chunks),
             idempotency_key=idempotency_key or "",
+            review_request={
+                "job_position_id": job_position_id,
+                "role_requirement_id": role_requirement_id,
+            } if job_position_id or role_requirement_id else None,
         )
         return JSONResponse(
             {
@@ -451,6 +802,10 @@ async def import_resume_url(
         source_url=payload.url,
         file_name=payload.display_name,
         idempotency_key=idempotency_key or "",
+        review_request={
+            "job_position_id": payload.job_position_id,
+            "role_requirement_id": payload.role_requirement_id,
+        } if payload.job_position_id or payload.role_requirement_id else None,
     )
     return JSONResponse(
         {
@@ -471,6 +826,36 @@ async def list_resume_documents(candidate_id: str) -> Dict[str, Any]:
 @router.get("/api/v1/candidate-profiles/{candidate_id}/resumes/{resume_id}")
 async def get_resume_document(candidate_id: str, resume_id: str) -> Dict[str, Any]:
     return services()["talent"].get_resume(candidate_id, resume_id)
+
+
+@router.patch("/api/v1/candidate-profiles/{candidate_id}/resumes/{resume_id}")
+async def patch_resume_document(
+    candidate_id: str,
+    resume_id: str,
+    payload: ResumeDocumentPatch,
+    x_actor_id: str = Header(default="interviewer_local", alias="X-Actor-Id"),
+) -> Dict[str, Any]:
+    return services()["resume_ingestion"].patch_resume(
+        candidate_id,
+        resume_id,
+        payload.model_dump(),
+        actor_id=x_actor_id,
+    )
+
+
+@router.delete("/api/v1/candidate-profiles/{candidate_id}/resumes/{resume_id}")
+async def delete_resume_document(
+    candidate_id: str,
+    resume_id: str,
+    expected_version: int,
+    x_actor_id: str = Header(default="interviewer_local", alias="X-Actor-Id"),
+) -> Dict[str, Any]:
+    return services()["resume_ingestion"].delete_resume(
+        candidate_id,
+        resume_id,
+        expected_version=expected_version,
+        actor_id=x_actor_id,
+    )
 
 
 @router.post("/api/v1/candidate-profiles/{candidate_id}/resumes/{resume_id}/content-url")
@@ -506,13 +891,40 @@ async def get_question_speech_content_url(
 
 
 @router.post("/api/v1/candidate-profiles/{candidate_id}/resume-reviews")
-async def create_resume_review(candidate_id: str, payload: ResumeReviewCreate) -> Dict[str, Any]:
-    return await services()["talent"].request_review(candidate_id, payload.model_dump())
+async def create_resume_review(candidate_id: str, payload: ResumeReviewCreate) -> JSONResponse:
+    result = await services()["talent"].request_review(candidate_id, payload.model_dump())
+    return JSONResponse(result, status_code=202)
 
 
 @router.get("/api/v1/resume-reviews/{review_id}")
 async def get_resume_review(review_id: str) -> Dict[str, Any]:
     return services()["talent"].get_review(review_id)
+
+
+@router.post("/api/v1/resume-reviews/{review_id}/retry", status_code=202)
+async def retry_resume_review(
+    review_id: str,
+    payload: ResumeReviewRetry,
+    x_actor_id: str = Header(default="interviewer_local", alias="X-Actor-Id"),
+) -> Dict[str, Any]:
+    return services()["talent"].retry_review(
+        review_id,
+        payload.model_dump(),
+        actor_id=x_actor_id,
+    )
+
+
+@router.patch("/api/v1/resume-reviews/{review_id}/screening-review")
+async def review_candidate_screening(
+    review_id: str,
+    payload: CandidateScreeningReview,
+    x_actor_id: str = Header(default="interviewer_local", alias="X-Actor-Id"),
+) -> Dict[str, Any]:
+    return services()["talent"].review_screening(
+        review_id,
+        payload.model_dump(),
+        actor_id=x_actor_id,
+    )
 
 
 @router.get("/api/v1/resume-reviews/{review_id}/experience-questions")
@@ -547,7 +959,12 @@ async def patch_question(question_id: str, payload: QuestionPatch) -> Dict[str, 
     return services()["catalog"].patch_question(question_id, payload.model_dump(exclude_unset=True))
 
 
-@router.post("/api/v1/questions/{question_id}/speech/regenerate")
+@router.delete("/api/v1/questions/{question_id}")
+async def delete_question(question_id: str, expected_version: int) -> Dict[str, Any]:
+    return services()["catalog"].delete_question(question_id, expected_version=expected_version)
+
+
+@router.post("/api/v1/questions/{question_id}/speech/regenerate", status_code=202)
 async def regenerate_question_speech(question_id: str, payload: VersionedPatch) -> Dict[str, Any]:
     return await services()["catalog"].regenerate_question_speech(
         question_id, expected_version=payload.expected_version
@@ -596,6 +1013,7 @@ async def generate_interview_plan(payload: InterviewPlanGenerateRequest) -> Dict
             job_position_id=payload.job_position_id,
             candidate_profile_id=payload.candidate_profile_id,
             resume_review_id=payload.resume_review_id,
+            approve=payload.approve,
         )
     )
 
@@ -689,11 +1107,21 @@ async def submit_public_candidate_audio_answer(
     payload: AudioAnswerSubmit,
     x_candidate_session_token: str = Header(alias="X-Candidate-Session-Token"),
 ) -> Dict[str, Any]:
-    return await services()["interviews"].submit_candidate_audio_answer(
+    result = await services()["interviews"].submit_candidate_audio_answer(
         interview_id,
         x_candidate_session_token,
         payload.model_dump(),
     )
+    return {
+        "status": result["status"],
+        "next_turn_id": result.get("next_turn_id"),
+        "answer": {
+            "id": result.get("answer", {}).get("id"),
+            "turn_id": result.get("answer", {}).get("turn_id"),
+            "evaluation_status": result.get("answer", {}).get("evaluation_status"),
+        },
+        "evaluation": {"status": "completed"},
+    }
 
 
 @router.post("/api/v1/public/interviews/{interview_id}/avatar/speak")
@@ -890,7 +1318,7 @@ async def interview_live(websocket: WebSocket, interview_id: str) -> None:
             )
             await websocket.close(code=4403 if exc.status_code == 403 else 4404)
             return
-        live_connections.connect(interview_id, websocket)
+        live_connections.connect(interview_id, websocket, role)
         for event in initial_events:
             await websocket.send_json(event)
         while True:

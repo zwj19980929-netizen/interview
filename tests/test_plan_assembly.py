@@ -24,7 +24,7 @@ async def add_question(
     difficulty: str,
     key_points: list,
 ) -> dict:
-    return await catalog.create_question(
+    question = await catalog.create_question(
         knowledge_base_id,
         {
             "knowledge_base_id": knowledge_base_id,
@@ -37,6 +37,8 @@ async def add_question(
             "rubric": {"semantic_correctness": 1.0},
         }
     )
+    await catalog.process_speech_work(question["job_id"])
+    return catalog.get_question(question["id"])
 
 
 def create_scope(store: InMemoryStore, title: str, skills: list, duration: int) -> tuple:
@@ -114,6 +116,7 @@ async def test_plan_assembly_balances_coverage_deduplication_curve_weights_and_t
                 max_same_skill_questions=1,
                 deduplication_threshold=0.6,
             ),
+            approve=True,
         )
     )
 
@@ -133,6 +136,8 @@ async def test_plan_assembly_balances_coverage_deduplication_curve_weights_and_t
     assert plan["assembly_summary"]["uncovered_dimensions"] == []
     assert plan["assembly_summary"]["selected_question_count"] == 3
     assert plan["assembly_policy"]["max_same_skill_questions"] == 1
+    assert plan["status"] == "approved"
+    assert plan["approved_at"]
 
 
 @pytest.mark.anyio

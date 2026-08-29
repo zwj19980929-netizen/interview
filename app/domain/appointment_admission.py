@@ -100,6 +100,21 @@ class AppointmentAdmission:
                 "mode": "mock_development" if local_mode else "real_provider_required",
             }
         )
+        file_backend = os.getenv("INTERVIEWER_FILE_STORAGE_BACKEND", "local").lower()
+        recording_backend = os.getenv("INTERVIEWER_MEDIA_RECORDING_BACKEND", "").lower() or (
+            "private" if not local_mode else "local"
+        )
+        private_media_ready = recording_backend in {"private", "file_storage"} and file_backend in {
+            "aliyun", "aliyun_oss", "oss"
+        }
+        checks.append(
+            {
+                "name": "candidate_audio_storage",
+                "ready": local_mode or private_media_ready,
+                "production_ready": private_media_ready,
+                "mode": "local_development" if local_mode else "private_object_storage_required",
+            }
+        )
         local_ready = all(item["ready"] for item in checks)
         production_ready = all(item.get("production_ready", item["ready"]) for item in checks)
         checked_at = ensure_utc(now)

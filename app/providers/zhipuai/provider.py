@@ -1,7 +1,8 @@
 from typing import Any, Dict
 
+from app.core.prompt.contracts import prompt_contract
 from app.model_gateway.errors import ProviderError
-from app.model_gateway.schemas import ChatMessage, ChatTextRequest, TTSSynthesizeRequest, TTSSynthesizeResponse
+from app.model_gateway.schemas import ChatTextRequest, TTSSynthesizeRequest, TTSSynthesizeResponse
 from app.providers.openai_compatible.provider import OpenAICompatibleProvider
 
 
@@ -14,10 +15,11 @@ class ZhipuAIProvider(OpenAICompatibleProvider):
     async def validate_credentials(
         self, config: Dict[str, Any], credentials: Dict[str, Any], *, timeout_s: int = 10
     ) -> Dict[str, str]:
+        contract = prompt_contract("provider_credential_probe", {})
         await self.chat_text(
             ChatTextRequest(
                 purpose="provider_credential_validation",
-                messages=[ChatMessage(role="user", content="ping")],
+                messages=contract.messages,
                 temperature=0,
                 max_output_tokens=1,
             ),

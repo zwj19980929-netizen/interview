@@ -12,7 +12,10 @@
     "llm": {"label": "大语言模型", "selection_mode": "predefined", "capabilities": ["llm.chat_json", "llm.chat_text"], "configuration_form": {"fields": []}},
     "embedding": {"label": "Embedding", "selection_mode": "predefined", "capabilities": ["embedding.text"], "configuration_form": {"fields": []}},
     "stt": {"label": "语音识别", "selection_mode": "predefined", "capabilities": ["stt.streaming", "stt.batch"], "configuration_form": {"fields": []}},
-    "tts": {"label": "语音合成", "selection_mode": "predefined", "capabilities": ["tts.synthesize"], "configuration_form": {"fields": []}},
+    "tts": {"label": "语音合成", "selection_mode": "predefined", "capabilities": ["tts.synthesize"], "configuration_form": {"fields": [
+      {"name": "default_voice", "label": "默认音色", "control": "text", "required": true, "default": "voice_default_cn"},
+      {"name": "voice_map", "label": "音色映射", "control": "key_value", "required": false}
+    ]}},
     "avatar": {"label": "数字人", "selection_mode": "predefined", "capabilities": ["avatar.speak"], "configuration_form": {"fields": []}}
   },
   "models": [
