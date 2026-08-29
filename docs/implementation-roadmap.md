@@ -4,9 +4,9 @@
 
 ## 当前完成快照
 
-里程碑 0-13 的仓库内实现已经落地并持续通过自动化测试。当前闭环包括 React Web 工作台、题库批量构建、PDF/URL 简历安全摄取与私有文件、脱敏 Resume Review、可解释岗位初筛/人工复核/7 天差异化留存、候选人 CRUD、候选人专属计划、预约邀请页/明确同意/准入、候选人 token 安全投影、HMAC 稳定随机抽题、服务端 streaming/batch STT、逐题评分、报告导出、企业复核、RBAC/审计/公开限流、到期数据清理、PostgreSQL/RLS adapter、Outbox dead-letter、Redis 实时事件、心跳监控、抽题公平性评估，以及 OpenAI-compatible、DeepSeek、智谱 Chat/GLM-TTS 与 DashScope/千问模型 adapter。
+里程碑 0-13 的仓库内实现已经落地并持续通过自动化测试。当前闭环包括 React Web 工作台、题库批量构建、PDF/URL 简历安全摄取与私有文件、脱敏 Resume Review、可解释岗位初筛/人工复核/7 天差异化留存、候选人 CRUD、候选人专属计划、预约邀请页/明确同意/准入、候选人 token 安全投影、HMAC 稳定随机抽题、服务端 streaming/batch STT、逐题评分、报告导出、企业复核、RBAC/审计/公开限流、到期数据清理、PostgreSQL/RLS adapter、Outbox dead-letter、Redis 实时事件、心跳监控、抽题与评分公平性评估，以及 OpenAI-compatible、DeepSeek、智谱 Chat/GLM-TTS、DashScope/千问和腾讯云数智人 adapter。
 
-状态必须分成“仓库 verified”“本机集成 verified”和“目标环境 pending”：OpenAI-compatible、DeepSeek、智谱、DashScope/千问和通用 `media_http` adapter 已在仓库完成，但没有真实账号/凭据/区域/端点时不能完成生产联调；PostgreSQL 16、Redis 7 和官方 ClamAV daemon 已通过本机隔离集成测试，目标集群、阿里云 OSS、完整病毒库更新与告警仍保留外部边界。`INTERVIEWER_RUNTIME_ENV=production` 要求私有对象存储、显式非 mock 且近期健康的语音/评分 route、扫描器和生产密钥，否则邀请/start 失败关闭。邮件/短信、厂商专属低延迟 partial STT、WebRTC 和实时口型同步仍需要外部通道或协议。
+状态必须分成“仓库 verified”“本机集成 verified”和“目标环境 pending”：国内实时媒体已选定并实现 DashScope/Qwen ASR 与腾讯云智能数智人 WebRTC/SFU，但没有真实账号、Workspace、形象资产、并发、路由健康和测试样本时不能完成生产联调；PostgreSQL 16、Redis 7 和官方 ClamAV daemon 已通过本机隔离集成测试，目标集群、阿里云 OSS、完整病毒库更新与告警仍保留外部边界。`INTERVIEWER_RUNTIME_ENV=production` 要求私有对象存储、显式非 mock 且近期健康的语音/评分 route、扫描器和生产密钥，否则邀请/start 失败关闭。
 
 ## 里程碑状态标记
 
@@ -14,12 +14,12 @@
 | --- | --- | --- | --- |
 | 0 项目骨架 | ✅ verified | FastAPI、`healthz/readyz`、测试、启动和 worker 命令 | 观测平台由部署环境选择 |
 | 1 题库管理 | ✅ verified | CRUD/归档、JSON import、rebuild/build job、语音重建 | 无仓库阻塞 |
-| 2 模型网关和供应商配置 | ✅ verified | chat/embedding/STT/TTS/avatar schema、invoke/open_stream、加密凭证、共享断路器、manifest 模型目录；OpenAI-compatible、DeepSeek、智谱与 DashScope/千问 adapter | 真实凭据/区域/模型健康测试 `environment_pending`；STT/数字人待选型 |
+| 2 模型网关和供应商配置 | ✅ verified | chat/embedding/STT/TTS/avatar schema、invoke/open_stream、加密凭证、共享断路器、manifest 模型目录；DashScope ASR 与腾讯云数智人 adapter | 真实凭据/区域/模型/形象授权和健康测试 `environment_pending` |
 | 3 题库查询和候选池 | ✅ closed | Question Catalog，Memory/SQLite/PostgreSQL 查询实现，本机 PostgreSQL 16 RLS/索引 `EXPLAIN`，旧向量题库 interface 已删除 | 目标生产集群需复验 |
 | 4 岗位要求和面试计划 | ✅ closed | execution v2 canonical 槽位、显式迁移、冻结候选池、API 草稿编辑/审批、React 一次确认原子生成并启用、统一物化 | 部署旧数据须先运行迁移命令 |
-| 5 面试会话和实时事件 | ✅ verified | 生命周期、持久事件、WebSocket、Redis bus、心跳超时 | WebRTC `external_choice_required` |
-| 6 数字人和语音能力 | ✅ verified（TTS adapter/语音协议） | streaming/batch STT、OpenAI-compatible/智谱 GLM-TTS/DashScope TTS、私有复制、avatar seam、batch 修复 | TTS 外部联调 `environment_pending`；STT/视频 adapter 待选型 |
-| 7 评分和报告 | ✅ verified | 解释性评分、current-only revision、JSON/CSV 导出 | 金标校准需要业务样本 |
+| 5 面试会话和实时事件 | ✅ verified（仓库） | 生命周期、持久事件、WebSocket、Redis bus、心跳超时、16k PCM 实时 ASR、腾讯 WebRTC/SFU 播放/回收 | 目标网络和厂商并发 `environment_pending` |
+| 6 数字人和语音能力 | ✅ verified（仓库） | DashScope streaming/batch STT、真实 TTS、腾讯云数智人 WebRTC、私有复制、batch 修复 | 阿里/腾讯真实账号与指标验收 `environment_pending` |
+| 7 评分和报告 | ✅ verified（仓库） | 解释性评分、current-only revision、JSON/CSV 导出、脱敏人工金标校准 API | 真实金标 `data_pending` |
 | 8 岗位与岗位题库构建 | ✅ verified | import/rebuild/build、Outbox、语音版本/readiness | 真实 TTS `environment_pending` |
 | 9 企业简历库、岗位初筛与 AI 经历问题 | ✅ verified | PDF/URL、SSRF/扫描/解析、私有原件与解析文本、候选人及简历版本 CRUD、受控简历展示、可解释初筛/人工复核、7 天自动留存、加密联系人、本地/OSS contract | OSS/扫描器与真实简历校准 `environment_pending` |
 | 10 候选人专属计划、预约与填报匹配 | ✅ verified | 哈希 token、邀请 UI、强匹配、确认预约、提前 30 分钟 SMTP 提醒、同意、时间/设备/model gate、原子 start、候选人窄接口与安全投影、RBAC/审计/PG 约束 | SMTP 凭据/发件域名 `environment_pending`；短信 `external_choice_required` |
@@ -143,8 +143,8 @@
 - 定义 `stt.streaming`、`stt.batch`、`tts.synthesize`、`avatar.speak` 统一请求/响应。
 - 实现语音和数字人 provider 插件接口，通过模型网关调用。
 - 实现 mock 数字人：先返回 TTS 音频或读题文本。
-- 在真实厂商端点/凭据验收前保留 mock；生产只能启用已健康的 `media_http` 或其它 implemented STT route。
-- 设计 WebRTC 信令或供应商会话映射。
+- 在真实厂商端点/凭据验收前保留 mock；生产只启用测试通过的 DashScope streaming/batch route。
+- 腾讯云数智人负责云渲染和 SFU；adapter 以 HTTPS 管理会话、以签名 WSS 长连接发送文本驱动，候选人端 TCPlayerLite 拉取 WebRTC 并在离场关闭。
 
 验收：
 
@@ -308,7 +308,7 @@
 - 13B：本地私有 adapter、阿里云 OSS adapter、SSE/header、短期签名和同 interface contract 完成；真实 bucket/RAM/区域为 `environment_pending`。
 - 13C：`stt.streaming` schema/open_stream/WebSocket、唯一 final、断流 batch 修复、OpenAI-compatible/智谱 GLM-TTS/DashScope TTS、`media_http` 真实 STT/HTTPS 数字人、候选人录音 FileObject、非 mock 私有复制和生产 readiness TTL 完成；外部凭据/区域/音质/延迟验收为 `environment_pending`。
 - 13D：PostgreSQL/RLS migration、RBAC、HTTP/敏感访问审计、联系人/凭证加密、到期数据 dry-run/显式清理、Outbox 指数退避/dead-letter/指标/重放、共享断路器、Redis bus 和心跳监控完成。
-- 13E：报告导出、复核签名媒体、实际下载审计和抽题公平性 API 完成；邮件/短信、WebRTC、视频数字人和真实金标评估需要外部通道、厂商与业务样本。
+- 13E：报告导出、复核签名媒体、实际下载审计、抽题公平性 API、脱敏评分校准 API、腾讯 WebRTC 数智人控制/播放链路完成；邮件/短信送达、真实数智人联调和真实金标结论需要外部通道、凭据、授权资产与业务样本。
 - 13F：模型配置完成 ProviderConnection/ModelConfiguration/ModelRoute 分层，插件后端动态表单、模型健康探针、单向数据迁移和旧接口删除均完成；真实厂商联调保持 `environment_pending`。
 
 仓库验收：
@@ -383,7 +383,7 @@
 1. 在目标 PostgreSQL/Redis 上执行迁移、RLS 跨租户、并发/故障恢复和多实例广播测试。
 2. 在私有阿里云 OSS bucket 与真实扫描器上执行上传、SSE、签名过期、感染文件和迁移演练。
 3. 为 OpenAI-compatible、DashScope 或 `media_http` 提供真实凭据、区域、模型和端点，验证 LLM schema、TTS/数字人音质、STT WER、final 延迟/费用、私有资产复制和 readiness 失效；若目标要求实时 partial，再在现有 provider seam 内实现其专属流协议。
-4. 为已实现的 SMTP 提醒配置目标服务授权码、发件域名并完成退信/送达率/合规验收；选择短信通道、WebRTC/SFU 和实时口型数字人供应商后，再实现其专属模板、信令/会话映射和合规验收。普通 HTTPS 数字人视频已经由 `media_http` 支持。
+4. 为已实现的 SMTP 提醒配置目标服务授权码、发件域名并完成退信/送达率/合规验收；为已选定的腾讯云 WebRTC/SFU 数智人配置 AppKey、AccessToken、形象资产与并发，在目标浏览器完成建流、口型、回收、费用和合规验收；短信通道仍待选择。普通 HTTPS 数字人视频继续由 `media_http` 支持。
 5. 用企业人工金标建立题目难度、Resume Review 证据准确率及 AI/人工评分一致性基线；录用结果不能直接当作无偏标签。
 
-正式服务端 STT 是生产预约的必要能力；WebRTC/视频数字人不阻塞已验证的 WebSocket 音频闭环。向量数据库也不属于必做项，只有题库治理出现可测量需求后再单独立项。
+正式服务端 STT 是生产预约的必要能力；DashScope STT 与腾讯 WebRTC 数智人已有仓库实现，但在真实凭据、授权资产、目标网络和指标验收前仍不能视为生产就绪。向量数据库不属于必做项，只有题库治理出现可测量需求后再单独立项。

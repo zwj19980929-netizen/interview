@@ -167,6 +167,8 @@ class AvatarSpeakRequest(BaseModel):
     avatar_id: str = "avatar_default_cn"
     voice: str = "default"
     language: str = "zh-CN"
+    operation: Literal["speak", "close"] = "speak"
+    session_id: Optional[str] = None
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -177,6 +179,8 @@ class AvatarSpeakResponse(BaseModel):
     text: str
     stream_url: Optional[str] = None
     audio_uri: Optional[str] = None
+    session_id: Optional[str] = None
+    player_kind: Literal["native_url", "whep", "tencent_web_player"] = "native_url"
     visemes: List[Dict[str, Any]] = Field(default_factory=list)
     provider: ProviderMeta
 

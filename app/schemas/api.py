@@ -339,10 +339,37 @@ class OutboxReplay(BaseModel):
     reason: str = Field(min_length=1)
 
 
+class ScoreCalibrationLabel(BaseModel):
+    """A human gold label linked to an existing evaluation, never raw candidate data."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    evaluation_id: str = Field(min_length=1, max_length=128)
+    human_score: float = Field(ge=0, le=100)
+    fairness_cohort: Optional[str] = Field(
+        default=None, pattern=r"^cohort_[a-z0-9_]{1,32}$"
+    )
+
+
+class ScoreCalibrationRun(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    labels: List[ScoreCalibrationLabel] = Field(min_length=2, max_length=5000)
+    dataset_version: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
+
+
 class AvatarSpeakCommand(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     turn_id: Optional[str] = None
     language: str = "zh-CN"
     voice: str = "default"
+
+
+class AvatarSessionClose(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str = Field(min_length=1, max_length=256)
 
 
 class ProviderConnectionCreate(BaseModel):

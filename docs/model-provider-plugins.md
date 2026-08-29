@@ -72,8 +72,9 @@ Provider adapter 负责把统一请求转换成厂商协议、注入厂商鉴权
 | `azure_openai` | `llm.chat_json`、`llm.chat_text`、`embedding.text` | 企业 Azure 部署场景 |
 | `anthropic` | `llm.chat_json`、`llm.chat_text` | 可作为评分和总结模型 |
 | `gemini` | `llm.chat_json`、`llm.chat_text`、`embedding.text` | 可作为通用 LLM 和 embedding |
-| `dashscope` | `llm.chat_json`、`llm.chat_text`、`embedding.text`、`tts.synthesize` | 阿里云百炼 Qwen LLM/Embedding 与 Qwen-TTS/CosyVoice HTTP 服务 |
+| `dashscope` | `llm.chat_json`、`llm.chat_text`、`embedding.text`、`stt.streaming`、`stt.batch`、`tts.synthesize` | 阿里云百炼 Qwen LLM/Embedding/TTS、Qwen-Audio 3.0 实时 ASR 与 Qwen3-ASR batch |
 | `media_http` | `stt.streaming`、`stt.batch`、`avatar.speak` | 通用 HTTPS 媒体网关；multipart 音频转写和 JSON 音频/视频数字人响应，模型 ID 可配置 |
+| `tencent_cloud_avatar` | `avatar.speak` | 腾讯云智能数智人云渲染；HTTPS create/stat/start/close + WSS SEND_TEXT，媒体面为腾讯云 WebRTC/SFU |
 | `volcengine` | `llm.chat_json`、`llm.chat_text`、`embedding.text`、`stt.streaming`、`tts.synthesize`、`avatar.speak` | 国内模型、语音和数字人场景 |
 | `azure_speech` | `stt.streaming`、`stt.batch`、`tts.synthesize` | 语音识别和合成 |
 | `tencent_cloud_speech` | `stt.streaming`、`stt.batch`、`tts.synthesize` | 国内语音识别和合成 |
@@ -91,14 +92,15 @@ Provider adapter 负责把统一请求转换成厂商协议、注入厂商鉴权
 - `mock` provider 已实现 `avatar.speak` 的浏览器语音驱动响应，用于本地数字人演示；它不生成真人视频，也不应标记为生产数字人能力。
 - `openai_compatible` provider 已支持真实 HTTP 调用：`llm.chat_json`、`llm.chat_text`、`embedding.text` 和 `tts.synthesize`。TTS 使用 `/audio/speech`，支持 `wav/mp3/opus/aac/flac/pcm`，二进制响应会转为 data URI 后交给私有资产复制层校验和落盘。
 - `deepseek` 与 `zhipuai` provider 复用 `OpenAICompatibleProvider` 的 HTTP、Bearer 鉴权、用量解析、错误映射和响应归一化；两者的 `llm.chat_json` 使用厂商支持的 `json_object` 并在 system message 注入目标 JSON Schema，避免假定支持 OpenAI `json_schema` 扩展。智谱 adapter 另在 TTS seam 校验 `glm-tts`、官方 WAV/PCM 格式、1024 字符上限和默认音色 `tongtong`，再复用共享二进制响应归一化。
-- `dashscope` provider 已支持 OpenAI-compatible Qwen Chat/Embedding，并按模型路由 Qwen3-TTS 的 multimodal-generation HTTP 接口或 CosyVoice/Qwen-Audio 的 `SpeechSynthesizer` HTTP 接口。供应商返回的临时音频 URL 会强制升级为 HTTPS（可配置）并复制到 PrivateFileStorage；落盘文件的真实 SHA-256 是最终资产哈希。
+- `dashscope` provider 已支持 OpenAI-compatible Qwen Chat/Embedding、Qwen3-ASR batch、Qwen-Audio-3.0-ASR-Flash-Streaming duplex WebSocket，并按模型路由 Qwen3-TTS 的 multimodal-generation HTTP 接口或 CosyVoice/Qwen-Audio 的 `SpeechSynthesizer` HTTP 接口。实时流使用 workspace 地域域名、Bearer 握手、run-task/task-started、二进制 PCM、result-generated 和 finish-task/task-finished；只投影一个 authoritative final。Batch 只接收服务端解析的私有音频字节并以 Base64 data URL 调用，不把对象存储凭据交给厂商。供应商返回的临时 TTS URL 会复制到 PrivateFileStorage。
+- `tencent_cloud_avatar` provider 使用 AppKey/AccessToken HMAC-SHA256 query 签名，按官方会话管理接口执行 HTTPS create-by-asset/stat/start/close，并在 start 后用携带 `requestid=SessionId` 的 WSS command channel 发送 `SEND_TEXT`、等待对应 ReqId 的播报状态确认。响应 `mode=webrtc`，包含 `webrtc://` 拉流地址、不透明 session ID 与 `tencent_web_player` 类型；候选人页用同源 TCPlayerLite 页面拉流，换流/离场调用关闭接口释放并发。供应商云渲染/SFU 承担视频媒体面，业务 WebSocket 不传视频帧。
 - `media_http` provider 已实现真实 HTTP 媒体调用：健康探针使用 Bearer API Key；`stt.batch` 把服务端读取的私有音频作为 multipart 上传并归一化 text/confidence/segments；`stt.streaming` 在统一流接口内安全缓存分片并在 finish 时调用同一真实转写端点，产出唯一 authoritative final；`avatar.speak` 发送 JSON 并接受 HTTPS `audio/video` 媒体。它是可部署的协议 adapter，不代表任何具体厂商账号已经验收，也不宣称提供低延迟 partial。
 - `stt.streaming` 已有 `StreamingSTTRequest/Event`、`ModelGateway.open_stream()`、有序 chunk/final 校验、建立前 fallback、硬超时、断流 batch 修复和独立 WebSocket 端到端测试；`stt.batch` 与 `tts.synthesize` 也有统一 schema、网关校验和调用审计。浏览器 SpeechRecognition 只用于本地展示/开发输入，不满足正式面试 readiness。
 - 路由的 retry、fallback_on、硬超时、数据库共享断路器、输出 schema 校验和成本上限在统一管线执行；每个 attempt 形成追加日志。多实例进程通过 Persistence 共用 `ModelCircuitState`，不再依赖进程内全局状态。
-- 除 `mock`、`openai_compatible`、`deepseek`、`zhipuai`、`dashscope` 和 `media_http` 外，其它 provider 目前只有 `implemented=false` 的 manifest 和配置 schema，可展示和保存配置，但不能创建活动路由，也不应视为已接入真实厂商 API。
+- 除 `mock`、`openai_compatible`、`deepseek`、`zhipuai`、`dashscope`、`media_http` 和 `tencent_cloud_avatar` 外，其它 provider 目前只有 `implemented=false` 的 manifest 和配置 schema，可展示和保存配置，但不能创建活动路由，也不应视为已接入真实厂商 API。
 - Provider credentials 通过 `ProviderSecretVault` 在 repository seam 使用 Fernet 密封；API 只返回 `credential_ref`。生产未配置 `INTERVIEWER_PROVIDER_SECRET_ENCRYPTION_KEY` 或遇到旧未密封值时失败关闭。
 
-仓库内 OpenAI-compatible/DashScope 的 LLM、Embedding、TTS HTTP 合同、`media_http` 的 STT/数字人合同以及私有资产复制与 readiness 逻辑已验证；真实外部调用仍需要对应账号、区域、模型授权、端点和 API Key 后才能标记健康。`azure_speech`、`tencent_cloud_speech`、`volcengine` 等厂商专属 STT/数字人 manifest 仍为 `implemented=false`。`media_http` 已可播放供应商返回的 HTTPS 视频；厂商专属 WebRTC 信令、低延迟 partial 与实时口型同步仍留在 provider seam 内扩展，不改变面试编排。
+仓库内 DashScope ASR/TTS 与腾讯云数智人 WebRTC 的鉴权、请求、事件归一化、会话关闭、React 播放和离线合同均已验证；真实外部调用仍需要对应账号、workspace/区域、模型授权、API Key、腾讯数智人形象资产/并发和目标浏览器网络后才能标记健康。`azure_speech`、`tencent_cloud_speech`、`volcengine` 仍为 `implemented=false`。当前国内选型不阻止继续在同一 provider seam 增加讯飞、火山或自建 WHEP/SFU。
 
 ## 目录建议
 
@@ -438,12 +440,14 @@ Model Invocation 校验 content type、最大大小、非空音频和 duration�
   "status": "ready",
   "mode": "webrtc",
   "text": "请解释 Python GIL 对多线程性能的影响。",
-  "stream_url": "https://vendor.example/avatar/session/01J",
+  "stream_url": "webrtc://liveplay.ivh.qq.com/live/session_01J",
   "audio_uri": null,
+  "session_id": "session_01J",
+  "player_kind": "tencent_web_player",
   "visemes": [],
   "provider": {
-    "provider_id": "volcengine",
-    "model": "avatar_default",
+    "provider_id": "tencent_cloud_avatar",
+    "model": "tencent-cloud-avatar-webrtc",
     "request_id": "vendor_req_102",
     "latency_ms": 1100
   }
@@ -459,7 +463,7 @@ Model Invocation 校验 content type、最大大小、非空音频和 duration�
 
 所有模式必须返回实际朗读的 `text` 和 Provider 元数据。数字人失败时依次降级到 `tts.synthesize`、`browser_speech` 和纯文字题干。
 
-`media_http` 默认调用 `POST {base_url}/avatar/speak`，JSON 包含 `model/text/avatar_id/voice/language/request_id`。响应至少提供 `mode` 与对应的 `audio_uri` 或 `stream_url`；公网媒体默认强制 HTTPS，拒绝嵌入用户名/密码的 URL。React 候选人房间直接处理 `audio` 与 `video`；`webrtc` 仍需要厂商专属信令 adapter 和前端会话实现后才能用于生产。
+`media_http` 默认调用 `POST {base_url}/avatar/speak`，JSON 包含 `model/text/avatar_id/voice/language/request_id`。响应至少提供 `mode` 与对应的 `audio_uri` 或 `stream_url`；公网 HTTP 媒体默认强制 HTTPS。腾讯实现返回 `webrtc://` 并由专属 TCPlayerLite 播放页处理，候选人业务组件不解析厂商信令。任何 WebRTC 会话都要提供关闭路径；若 create/stat/start/drive 中途失败，adapter 也会 best-effort close。
 
 ## 配置模型
 

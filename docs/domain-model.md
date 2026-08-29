@@ -650,6 +650,10 @@ ProviderConnection 是其 ModelConfiguration 生命周期的所有者：删除�
 
 `ModelRoute` 按 `organization_id + capability + purpose` 选择 primary、fallback、超时、重试和断路器策略；route target 仅包含 `model_configuration_id/timeout_s/pricing`，不再复制 provider 或模型名。创建路由时模型必须已启用、健康且支持目标 capability。`ModelInvocationLog` 对每个 attempt 追加连接 ID、模型配置 ID、provider、模型、延迟、成本、统一错误码和脱敏请求哈希。
 
+`AvatarSpeakResponse` 是瞬时媒体合同，不新增持久聚合：`mode=webrtc` 时额外返回不透明 `session_id` 与 `player_kind`，候选人换流或离场用同一 `avatar.speak` capability 的 `operation=close` 回收供应商会话。腾讯厂商会话 ID 不进入候选人或评分领域对象；只有脱敏 ModelInvocationLog 保留调用事实。
+
+评分校准同样不是 CandidateProfile 字段。管理员上传的金标只包含当前 `evaluation_id`、0–100 人工分和可选不透明 `cohort_*`；服务即时关联当前 AnswerEvaluation 与已有题型/语言/STT 置信度，生成指标并写最小 AuditEvent，不持久化姓名、转写、简历或自动改分规则。
+
 正式面试流程至少需要以下 purpose：
 
 - `question_speech_generation`

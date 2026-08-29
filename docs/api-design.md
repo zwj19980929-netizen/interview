@@ -499,9 +499,12 @@ React 工作台必须在这个一次性响应弹窗中提供“复制链接”�
 | --- | --- | --- |
 | `GET` | `/api/v1/public/interviews/{interview_id}` | 返回候选人姓名、会话状态和安全轮次投影；未来题干和所有答案/rubric/候选池均隐藏 |
 | `POST` | `/api/v1/public/interviews/{interview_id}/audio-answers` | 提交当前轮次录音；媒体 URI 必须属于该会话和轮次，服务端从受控本地媒体或 `private-file://` FileObject 读取音频并经 STT 后评分；接口不向 Provider 暴露对象存储凭据 |
-| `POST` | `/api/v1/public/interviews/{interview_id}/avatar/speak` | 读取当前安全题干并通过 avatar/TTS seam 朗读；响应兼容 `browser_speech/audio/video`，外部媒体默认必须是 HTTPS |
+| `POST` | `/api/v1/public/interviews/{interview_id}/avatar/speak` | 读取当前安全题干并通过 avatar/TTS seam 朗读；响应兼容 `browser_speech/audio/video/webrtc`，WebRTC 响应带不透明 `session_id/player_kind` |
+| `POST` | `/api/v1/public/interviews/{interview_id}/avatar/session/close` | 关闭当前候选人已取得的数智人会话，释放云渲染/SFU 并发；要求候选人 token |
 
 候选人 token 由至少 32 字符的 `INTERVIEWER_CANDIDATE_TOKEN_SECRET` 对会话 ID 与创建时间做 HMAC-SHA256 派生，不明文持久化或出现在后台详情；验证使用常量时间比较，错误 token 返回 403。候选人 WebSocket 继续使用 `/interviews/{id}/live?role=candidate&token=...`，连接后只能发送设备就绪、媒体开始/分片/停止、未受信 partial 和心跳事件。
+
+真实流式转写使用 `/api/v1/interviews/{interview_id}/stt-stream?token=...`：客户端先发送 `stream.open`（正式 Web 端为 `audio/pcm + 16000 Hz + mono`），随后发送二进制 PCM chunk，最后发送 `stream.finish`。服务端返回 `stream.ready/transcript.partial/transcript.final/stream.closed`，且只有唯一 `transcript.final` 可创建 CandidateAnswer；连接或 Provider 失败后使用已保存录音走 `stt.batch`，不信任浏览器 SpeechRecognition。
 
 ## 面试会话、逐题评分与企业复核 API
 
@@ -535,6 +538,8 @@ React 工作台必须在这个一次性响应弹窗中提供“复制链接”�
 | `GET` | `/api/v1/interviews/{interview_id}/reports` | 列出报告 revision |
 | `GET` | `/api/v1/interviews/{interview_id}/report/export?format=csv|json` | 生成带权限与审计的报告导出 |
 | `POST` | `/api/v1/interviews/{interview_id}/review-complete` | 记录企业复核完成，不代表录用决定 |
+
+管理员可调用 `POST /api/v1/admin/evaluations/score-calibration` 提交 `dataset_version` 与 2–5000 条 `{evaluation_id, human_score, fairness_cohort?}`。Schema 拒绝额外字段，接口只解析本组织当前 evaluation revision，不接收候选人姓名、联系方式、转写或简历。响应给出 MAE/RMSE/偏差、±5/±10 一致率、题型/语言/STT 质量/不透明 cohort 分层和仅供人工评审的线性校准候选；样本少于 30 或 cohort 少于 10 时明确告警，校准不会自动写回评分或作录用决定。
 
 复核响应示例：
 

@@ -12,7 +12,7 @@ from app.model_gateway.forms import validate_form_values
 from app.model_gateway.errors import ProviderError
 from app.model_gateway.gateway import ModelGateway
 from app.model_gateway.registry import get_provider_manifest
-from app.model_gateway.schemas import ChatJSONResponse, ProviderMeta, Usage
+from app.model_gateway.schemas import AvatarSpeakResponse, ChatJSONResponse, ProviderMeta, Usage
 from app.repositories.provider import get_store, reset_store_for_tests
 from app.services.model_admin import ModelAdminService
 
@@ -240,6 +240,60 @@ async def test_untested_model_can_run_probe_and_receives_saved_defaults() -> Non
         "connection_config": {"base_url": "https://models.example.com/v1", "use_environment_proxy": False},
         "model_settings": {"structured_output_mode": "json_object"},
     }
+    assert service.list_model_configurations()[0]["status"] == "ready"
+
+
+@pytest.mark.anyio
+async def test_avatar_model_probe_closes_created_vendor_session() -> None:
+    store = reset_store_for_tests()
+    service = ModelAdminService(store)
+    connection = service.create_provider_connection(
+        {
+            "provider_id": "tencent_cloud_avatar",
+            "display_name": "Avatar probe",
+            "connection_config": {
+                "base_url": "https://gw.tvs.qq.com",
+                "asset_virtualman_key": "asset_test",
+            },
+            "credentials": {"app_key": "app-key", "access_token": "access-token"},
+        }
+    )
+    model = service.create_model_configuration(
+        {
+            "provider_connection_id": connection["id"],
+            "model_type": "avatar",
+            "provider_model_id": "tencent-cloud-avatar-webrtc",
+            "display_name": "Tencent avatar",
+        }
+    )
+    operations = []
+
+    class Adapter:
+        provider_id = "tencent_cloud_avatar"
+
+        async def invoke(self, capability, request, context):
+            operations.append((request.operation, request.session_id, context.fallback_index))
+            return AvatarSpeakResponse(
+                speech_id="speech_probe",
+                status="closed" if request.operation == "close" else "ready",
+                mode="webrtc",
+                text=request.text,
+                stream_url=None if request.operation == "close" else "webrtc://example.test/live",
+                session_id=request.session_id or "session_probe",
+                player_kind="tencent_web_player",
+                provider=ProviderMeta(
+                    provider_id=self.provider_id,
+                    model=context.model,
+                    request_id="probe",
+                    latency_ms=1,
+                ),
+            )
+
+    service.gateway = ModelGateway(store, provider_clients={"tencent_cloud_avatar": Adapter()})
+    result = await service.test_model_configuration(model["id"])
+
+    assert result["session_id"] == "session_probe"
+    assert operations == [("speak", None, 0), ("close", "session_probe", 0)]
     assert service.list_model_configurations()[0]["status"] == "ready"
 
 

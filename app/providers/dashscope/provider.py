@@ -1,20 +1,91 @@
+import asyncio
+import base64
 import hashlib
-from typing import Any, Dict, Optional
+import json
+import uuid
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
+import websockets
+
+from app.model_gateway import capabilities as cap
 from app.model_gateway.errors import ProviderError
 from app.model_gateway.schemas import (
+    BatchSTTRequest,
+    BatchSTTResponse,
     ProviderContext,
     ProviderMeta,
+    StreamingSTTEvent,
+    StreamingSTTRequest,
     TTSSynthesizeRequest,
     TTSSynthesizeResponse,
+    TranscriptSegment,
 )
 from app.providers.openai_compatible.provider import OpenAICompatibleProvider
 
 
 class DashScopeProvider(OpenAICompatibleProvider):
-    """DashScope adapter: OpenAI-compatible Qwen calls plus native HTTP TTS."""
+    """DashScope adapter for Qwen LLM/TTS and authoritative Chinese ASR."""
 
     provider_id = "dashscope"
+
+    def __init__(self, client_factory: Any = None, websocket_connect: Any = None) -> None:
+        super().__init__(client_factory=client_factory) if client_factory is not None else super().__init__()
+        self.websocket_connect = websocket_connect or websockets.connect
+
+    async def invoke(self, capability: str, request: Any, context: ProviderContext) -> Any:
+        if capability == cap.STT_BATCH and isinstance(request, BatchSTTRequest):
+            return await self._transcribe_batch(request, context)
+        return await super().invoke(capability, request, context)
+
+    async def open_stream(self, request: StreamingSTTRequest, context: ProviderContext) -> Any:
+        if context.capability != cap.STT_STREAMING:
+            raise ProviderError("provider_capability_missing", "DashScope stream capability is invalid.", retryable=False)
+        return await DashScopeSTTStream.open(self, request, context)
+
+    async def _transcribe_batch(self, request: BatchSTTRequest, context: ProviderContext) -> BatchSTTResponse:
+        audio = request.audio_bytes
+        if not audio:
+            raise ProviderError(
+                "provider_audio_unavailable",
+                "DashScope batch ASR requires server-resolved private audio bytes.",
+                retryable=False,
+            )
+        if len(audio) > int(context.config.get("batch_max_bytes", 10 * 1024 * 1024)):
+            raise ProviderError("provider_audio_stream_too_large", "DashScope batch ASR audio exceeds the configured limit.", retryable=False)
+        endpoint = _asr_batch_endpoint(context.config)
+        data_uri = "data:%s;base64,%s" % (request.content_type.split(";", 1)[0], base64.b64encode(audio).decode("ascii"))
+        payload = {
+            "model": context.model,
+            "messages": [{"role": "user", "content": [{"type": "input_audio", "input_audio": {"data": data_uri}}]}],
+            "stream": False,
+            "asr_options": {"language": _language_hint(request.language), "enable_itn": True},
+        }
+        vendor_response = await self._post(
+            endpoint,
+            payload,
+            api_key=_api_key(context.credentials),
+            timeout_s=max(1, int(context.timeout_s)),
+            use_environment_proxy=bool(context.config.get("use_environment_proxy", False)),
+        )
+        choices = vendor_response.get("choices") or []
+        message = choices[0].get("message") if choices and isinstance(choices[0], dict) else {}
+        text = str((message or {}).get("content") or "").strip()
+        if not text:
+            raise ProviderError("provider_final_transcript_missing", "DashScope batch ASR returned no transcript.", retryable=True)
+        return BatchSTTResponse(
+            text=text,
+            language=request.language,
+            confidence=1.0,
+            segments=[TranscriptSegment(text=text, confidence=1.0)],
+            source="server_batch_repair" if request.purpose == "candidate_answer_repair" else "server_batch",
+            provider=ProviderMeta(
+                provider_id=self.provider_id,
+                model=context.model,
+                request_id=str(vendor_response.get("request_id") or vendor_response.get("id") or ""),
+                latency_ms=0,
+            ),
+        )
 
     async def synthesize_speech(
         self,
@@ -98,6 +169,239 @@ def _api_key(credentials: Dict[str, Any]) -> str:
     if not api_key:
         raise ProviderError("provider_auth_failed", "DashScope api_key is required.", retryable=False)
     return api_key
+
+
+class DashScopeSTTStream:
+    """Maps DashScope duplex ASR WebSocket events to the single-final stream interface."""
+
+    def __init__(self, provider: DashScopeProvider, request: StreamingSTTRequest, context: ProviderContext, socket: Any) -> None:
+        self.provider = provider
+        self.request = request
+        self.context = context
+        self.socket = socket
+        self.task_id = str(uuid.uuid4())
+        self.stream_id = "stt_stream_%s" % self.task_id.replace("-", "")
+        self.sequence = 1
+        self.closed = False
+        self.committed: List[TranscriptSegment] = []
+        self.partial_text = ""
+        self.request_id = ""
+        self.ready_events = [self._event("stream.ready")]
+
+    @classmethod
+    async def open(cls, provider: DashScopeProvider, request: StreamingSTTRequest, context: ProviderContext) -> "DashScopeSTTStream":
+        audio_format = _stream_audio_format(request.audio.content_type)
+        url = _asr_stream_endpoint(context.config)
+        headers = {"Authorization": "Bearer %s" % _api_key(context.credentials), "User-Agent": "Interviewer/0.1"}
+        workspace_id = str(context.config.get("workspace_id") or "").strip()
+        if workspace_id:
+            headers["X-DashScope-WorkSpace"] = workspace_id
+        try:
+            socket = await provider.websocket_connect(
+                url,
+                additional_headers=headers,
+                open_timeout=max(1, float(context.timeout_s)),
+                max_size=int(context.config.get("websocket_max_message_bytes", 4 * 1024 * 1024)),
+            )
+        except TypeError:
+            # Injectable test clients and websockets<14 use extra_headers.
+            socket = await provider.websocket_connect(url, extra_headers=headers)
+        except asyncio.TimeoutError as exc:
+            raise ProviderError("provider_stream_open_failed", "DashScope ASR WebSocket timed out.", retryable=True) from exc
+        except Exception as exc:
+            raise ProviderError("provider_stream_open_failed", "DashScope ASR WebSocket could not be opened.", retryable=True) from exc
+        stream = cls(provider, request, context, socket)
+        parameters: Dict[str, Any] = {
+            "format": audio_format,
+            "sample_rate": request.audio.sample_rate_hz,
+            "language_hints": [_language_hint(request.language)],
+            "semantic_punctuation_enabled": False,
+            "max_sentence_silence": int(context.config.get("max_sentence_silence_ms", 800)),
+            "heartbeat": True,
+        }
+        vocabulary_id = str(context.config.get("vocabulary_id") or "").strip()
+        if vocabulary_id:
+            parameters["vocabulary_id"] = vocabulary_id
+        await socket.send(json.dumps({
+            "header": {"action": "run-task", "task_id": stream.task_id, "streaming": "duplex"},
+            "payload": {
+                "task_group": "audio", "task": "asr", "function": "recognition", "model": context.model,
+                "parameters": parameters, "input": {},
+            },
+        }, ensure_ascii=False))
+        first = await stream._receive_one(timeout=max(1, float(context.timeout_s)))
+        if first != "task-started":
+            await stream.abort()
+            raise ProviderError("provider_stream_open_failed", "DashScope ASR did not acknowledge task start.", retryable=True)
+        return stream
+
+    async def send_audio(self, chunk: bytes) -> List[StreamingSTTEvent]:
+        if self.closed:
+            raise ProviderError("provider_stream_closed", "DashScope ASR stream is already closed.", retryable=False)
+        await self.socket.send(chunk)
+        return await self._drain(timeout=0.001)
+
+    async def finish(self) -> List[StreamingSTTEvent]:
+        if self.closed:
+            return []
+        await self.socket.send(json.dumps({
+            "header": {"action": "finish-task", "task_id": self.task_id, "streaming": "duplex"},
+            "payload": {"input": {}},
+        }))
+        deadline = asyncio.get_running_loop().time() + max(1, float(self.context.timeout_s))
+        events: List[StreamingSTTEvent] = []
+        while asyncio.get_running_loop().time() < deadline:
+            vendor_event = await self._receive_one(timeout=max(0.01, deadline - asyncio.get_running_loop().time()))
+            if vendor_event == "task-finished":
+                break
+            events.extend(self._project_result())
+        else:
+            await self.abort()
+            raise ProviderError("provider_timeout", "DashScope ASR final transcript timed out.", retryable=True)
+        text = "".join(item.text for item in self.committed).strip() or self.partial_text.strip()
+        if not text:
+            await self.abort()
+            raise ProviderError("provider_final_transcript_missing", "DashScope ASR returned no final transcript.", retryable=True)
+        events.append(self._event("transcript.final", text=text, is_final=True, segments=self.committed or [TranscriptSegment(text=text)]))
+        events.append(self._event("stream.closed"))
+        self.closed = True
+        await self.socket.close()
+        return events
+
+    async def abort(self) -> None:
+        if not self.closed:
+            self.closed = True
+            await self.socket.close()
+
+    async def _drain(self, timeout: float) -> List[StreamingSTTEvent]:
+        events: List[StreamingSTTEvent] = []
+        while True:
+            try:
+                vendor_event = await self._receive_one(timeout=timeout)
+            except asyncio.TimeoutError:
+                break
+            if vendor_event == "result-generated":
+                events.extend(self._project_result())
+            elif vendor_event == "task-finished":
+                break
+            timeout = 0.001
+        return events
+
+    async def _receive_one(self, timeout: float) -> str:
+        raw = await asyncio.wait_for(self.socket.recv(), timeout=timeout)
+        try:
+            payload = json.loads(raw)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ProviderError("provider_schema_invalid", "DashScope ASR returned an invalid event.", retryable=True) from exc
+        header = payload.get("header") or {}
+        event = str(header.get("event") or "")
+        self.request_id = str(header.get("task_id") or self.request_id)
+        if event == "task-failed":
+            raise ProviderError(
+                "provider_server_error",
+                "DashScope ASR task failed: %s" % str(header.get("error_code") or "unknown"),
+                retryable=True,
+            )
+        if event == "result-generated":
+            sentence = ((payload.get("payload") or {}).get("output") or {}).get("sentence") or {}
+            if not sentence.get("heartbeat"):
+                text = str(sentence.get("text") or "")
+                self.partial_text = text
+                if sentence.get("sentence_end") and text.strip():
+                    self.committed.append(TranscriptSegment(
+                        text=text.strip(),
+                        start_ms=max(0, int(sentence.get("begin_time") or 0)),
+                        end_ms=max(0, int(sentence.get("end_time") or 0)),
+                        confidence=1.0,
+                    ))
+                    self.partial_text = ""
+        return event
+
+    def _project_result(self) -> List[StreamingSTTEvent]:
+        text = ("".join(item.text for item in self.committed) + self.partial_text).strip()
+        if not text or not self.request.enable_partial:
+            return []
+        return [self._event("transcript.partial", text=text)]
+
+    def _event(self, event_type: str, *, text: str = "", is_final: bool = False, segments: Optional[List[TranscriptSegment]] = None) -> StreamingSTTEvent:
+        event = StreamingSTTEvent(
+            stream_id=self.stream_id,
+            sequence=self.sequence,
+            type=event_type,
+            text=text,
+            language=self.request.language,
+            confidence=1.0 if text else 0.0,
+            segments=segments or [],
+            is_final=is_final,
+            provider=ProviderMeta(provider_id=self.provider.provider_id, model=self.context.model, request_id=self.request_id, latency_ms=0),
+        )
+        self.sequence += 1
+        return event
+
+
+def _asr_batch_endpoint(config: Dict[str, Any]) -> str:
+    configured = str(config.get("asr_batch_endpoint") or "").strip()
+    if configured:
+        return configured
+    workspace_id = str(config.get("workspace_id") or "").strip()
+    if workspace_id:
+        return "https://%s.%s.maas.aliyuncs.com/compatible-mode/v1/chat/completions" % (
+            workspace_id, _workspace_region(config)
+        )
+    base_url = str(config.get("base_url") or "").rstrip("/")
+    if not base_url.endswith("/compatible-mode/v1"):
+        raise ProviderError("provider_bad_request", "DashScope ASR requires a workspace compatible-mode base_url.", retryable=False)
+    return "%s/chat/completions" % base_url
+
+
+def _asr_stream_endpoint(config: Dict[str, Any]) -> str:
+    configured = str(config.get("asr_websocket_url") or "").strip()
+    if configured:
+        parsed = urlparse(configured)
+        if parsed.scheme != "wss" or not parsed.hostname or parsed.username or parsed.password:
+            raise ProviderError("provider_bad_request", "DashScope ASR WebSocket URL must be secure.", retryable=False)
+        return configured
+    workspace_id = str(config.get("workspace_id") or "").strip()
+    if workspace_id:
+        return "wss://%s.%s.maas.aliyuncs.com/api-ws/v1/inference" % (
+            workspace_id, _workspace_region(config)
+        )
+    base_url = str(config.get("base_url") or "").rstrip("/")
+    parsed = urlparse(base_url)
+    if parsed.scheme != "https" or not parsed.hostname:
+        raise ProviderError("provider_bad_request", "DashScope base_url must be HTTPS.", retryable=False)
+    return "wss://%s/api-ws/v1/inference" % parsed.hostname
+
+
+def _workspace_region(config: Dict[str, Any]) -> str:
+    region = str(config.get("workspace_region") or "cn-beijing").strip()
+    if region not in {"cn-beijing", "ap-southeast-1"}:
+        raise ProviderError("provider_bad_request", "DashScope workspace_region is not supported.", retryable=False)
+    return region
+
+
+def _stream_audio_format(content_type: str) -> str:
+    normalized = content_type.split(";", 1)[0].lower()
+    result = {
+        "audio/wav": "wav", "audio/x-wav": "wav", "audio/mpeg": "mp3", "audio/mp3": "mp3",
+        "audio/ogg": "opus", "audio/opus": "opus", "audio/aac": "aac", "audio/pcm": "pcm",
+    }.get(normalized)
+    if not result:
+        raise ProviderError(
+            "provider_audio_format_unsupported",
+            "DashScope real-time ASR requires PCM/WAV/MP3/Ogg-Opus/AAC; WebM must use batch repair or browser PCM capture.",
+            retryable=False,
+        )
+    return result
+
+
+def _language_hint(language: str) -> str:
+    normalized = language.lower()
+    if normalized.startswith("zh"):
+        return "zh"
+    if normalized.startswith("en"):
+        return "en"
+    return normalized.split("-", 1)[0]
 
 
 def _tts_endpoint(config: Dict[str, Any], model: str) -> str:

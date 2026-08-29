@@ -1,0 +1,47 @@
+{
+  "provider_id": "tencent_cloud_avatar",
+  "display_name": "腾讯云智能数智人",
+  "version": "0.1.0",
+  "schema_version": "1",
+  "capabilities": ["avatar.speak"],
+  "implemented": true,
+  "model_selection": "predefined",
+  "connection_form": {
+    "schema_version": "1",
+    "fields": [
+      {"name": "base_url", "label": "服务地址", "control": "text", "required": true, "default": "https://gw.tvs.qq.com"},
+      {"name": "asset_virtualman_key", "label": "数智人资产 Key", "control": "text", "required": true},
+      {"name": "timbre_key", "label": "默认音色 Key", "control": "text", "required": false},
+      {"name": "player_kind", "label": "WebRTC 播放器协议", "control": "select", "required": true, "default": "tencent_web_player", "options": [{"label": "腾讯 WebRTC 播放器", "value": "tencent_web_player"}]},
+      {"name": "ready_poll_attempts", "label": "就绪轮询次数", "control": "number", "required": false, "default": 20},
+      {"name": "ready_poll_interval_s", "label": "轮询间隔（秒）", "control": "number", "required": false, "default": 0.5}
+    ]
+  },
+  "credential_form": {
+    "schema_version": "1",
+    "fields": [
+      {"name": "app_key", "label": "AppKey", "control": "secret", "required": true, "secret": true},
+      {"name": "access_token", "label": "AccessToken", "control": "secret", "required": true, "secret": true}
+    ]
+  },
+  "model_types": {
+    "avatar": {
+      "label": "实时数智人",
+      "selection_mode": "predefined",
+      "capabilities": ["avatar.speak"],
+      "configuration_form": {"schema_version": "1", "fields": []}
+    }
+  },
+  "models": [
+    {
+      "model_id": "tencent-cloud-avatar-webrtc",
+      "label": "腾讯云智能数智人 WebRTC",
+      "model_type": "avatar",
+      "capabilities": ["avatar.speak"],
+      "default": true,
+      "configuration_form": {"schema_version": "1", "fields": []},
+      "properties": {"protocol": "webrtc", "media_plane": "tencent_cloud_sfu", "real_time": true}
+    }
+  ],
+  "entrypoint": "app.providers.tencent_cloud_avatar.provider:TencentCloudAvatarProvider"
+}

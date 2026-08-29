@@ -20,9 +20,11 @@ from app.model_gateway.registry import (
 )
 from app.model_gateway.schemas import (
     AvatarSpeakRequest,
+    AvatarSpeakResponse,
     BatchSTTRequest,
     ChatJSONRequest,
     ChatTextRequest,
+    StreamingAudioConfig,
     StreamingSTTRequest,
     TextEmbeddingRequest,
     TTSSynthesizeRequest,
@@ -456,7 +458,9 @@ class ModelAdminService:
                 events.extend(await stream.finish())
                 result = {"stream_id": stream.stream_id, "events": [item.model_dump() for item in events]}
             else:
-                result = (await self.gateway.invoke(capability, request, route=route)).model_dump()
+                response = await self.gateway.invoke(capability, request, route=route)
+                result = response.model_dump()
+                await self._close_avatar_probe(response, route, organization_id)
         except Exception as exc:
             self._record_model_health(configuration_id, organization_id, "failed", str(exc))
             raise
@@ -509,17 +513,45 @@ class ModelAdminService:
             if route["capability"] == cap.STT_STREAMING:
                 stream = await self.gateway.open_stream(request, route=route)
                 events = list(stream.ready_events)
-                events.extend(await stream.send_audio(b"connection-test-audio"))
+                events.extend(await stream.send_audio(_probe_wav()))
                 events.extend(await stream.finish())
                 result = {"stream_id": stream.stream_id, "events": [item.model_dump() for item in events]}
             else:
                 response = await self.gateway.invoke(route["capability"], request, route=route)
                 result = response.model_dump()
+                await self._close_avatar_probe(response, route, organization_id)
         except Exception as exc:
             self._record_route_health(route_id, organization_id, status="failed", error=str(exc))
             raise
         self._record_route_health(route_id, organization_id, status="healthy", error=None)
         return result
+
+    async def _close_avatar_probe(
+        self,
+        response: Any,
+        route: Dict[str, Any],
+        organization_id: str,
+    ) -> None:
+        if not isinstance(response, AvatarSpeakResponse) or not response.session_id:
+            return
+        cleanup_route = deepcopy(route)
+        cleanup_route["fallbacks"] = []
+        cleanup_route["policy"] = {
+            **cleanup_route.get("policy", {}),
+            "retry_count": 0,
+        }
+        await self.gateway.invoke(
+            cap.AVATAR_SPEAK,
+            AvatarSpeakRequest(
+                organization_id=organization_id,
+                purpose=str(route.get("purpose") or "model_configuration_test"),
+                text="close avatar probe session",
+                operation="close",
+                session_id=response.session_id,
+                metadata={"probe": True},
+            ),
+            route=cleanup_route,
+        )
 
     def _connection(self, connection_id: str, organization_id: str) -> Dict[str, Any]:
         with self.persistence.transaction(organization_id) as transaction:
@@ -652,7 +684,14 @@ class ModelAdminService:
                 audio_bytes=_probe_wav(),
             )
         if capability == cap.STT_STREAMING:
-            return StreamingSTTRequest(organization_id=organization_id, interview_id="connection_test", turn_id="connection_test_turn", purpose=purpose, metadata={"development_transcript": "连接测试", "confidence": 1.0})
+            return StreamingSTTRequest(
+                organization_id=organization_id,
+                interview_id="connection_test",
+                turn_id="connection_test_turn",
+                purpose=purpose,
+                audio=StreamingAudioConfig(content_type="audio/wav", sample_rate_hz=16000, channels=1),
+                metadata={"development_transcript": "连接测试", "confidence": 1.0},
+            )
         raise ApiError("MODEL_CAPABILITY_NOT_IMPLEMENTED", "Capability has no unified local test schema.", status_code=409)
     def _require_model_capability(self, model: Optional[Dict[str, Any]], capability: str) -> None:
         if model is None:

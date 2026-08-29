@@ -8,6 +8,7 @@ from app.repositories.provider import get_store
 from app.schemas.api import (
     AudioAnswerSubmit,
     AvatarSpeakCommand,
+    AvatarSessionClose,
     CandidateIntakeCreate,
     CandidateProfilePatch,
     CandidateScreeningReview,
@@ -44,6 +45,7 @@ from app.schemas.api import (
     QuestionPatch,
     QuestionSearchRequest,
     RetentionRun,
+    ScoreCalibrationRun,
     ResumeUrlImport,
     ResumeDocumentPatch,
     ResumeReviewCreate,
@@ -341,6 +343,16 @@ async def evaluate_question_selection_fairness(
 ) -> Dict[str, Any]:
     return services()["fairness"].selection_distribution(
         job_position_id, actor_id=x_actor_id
+    )
+
+
+@router.post("/api/v1/admin/evaluations/score-calibration")
+async def evaluate_score_calibration(
+    payload: ScoreCalibrationRun,
+    x_actor_id: str = Header(default="admin_local", alias="X-Actor-Id"),
+) -> Dict[str, Any]:
+    return services()["fairness"].score_calibration(
+        payload.model_dump(), actor_id=x_actor_id
     )
 
 
@@ -1132,6 +1144,16 @@ async def speak_public_candidate_question(
 ) -> Dict[str, Any]:
     services()["interviews"].validate_candidate_token(interview_id, x_candidate_session_token)
     return await services()["avatar"].speak(interview_id, payload.model_dump())
+
+
+@router.post("/api/v1/public/interviews/{interview_id}/avatar/session/close")
+async def close_public_candidate_avatar_session(
+    interview_id: str,
+    payload: AvatarSessionClose,
+    x_candidate_session_token: str = Header(alias="X-Candidate-Session-Token"),
+) -> Dict[str, Any]:
+    services()["interviews"].validate_candidate_token(interview_id, x_candidate_session_token)
+    return await services()["avatar"].close(interview_id, payload.session_id)
 
 
 @router.get("/api/v1/interviews")

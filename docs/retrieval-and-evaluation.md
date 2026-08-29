@@ -306,7 +306,9 @@ Question Selection、批准计划快照和实时评分算法无需新增“AI �
 
 ## 质量与公平性评估
 
-当前 `FairnessEvaluationService` 和 `/api/v1/admin/evaluations/question-selection-fairness` 已按岗位输出样本量、每会话题量、平均难度、技能覆盖计数和分布差异告警，并记录审计；它不读取或生成录用结论。该实现用于发现抽题条件差异，不替代人工金标数据集、真实 STT WER 或 AI/人工评分一致性校准。
+当前 `FairnessEvaluationService` 和 `/api/v1/admin/evaluations/question-selection-fairness` 已按岗位输出样本量、每会话题量、平均难度、技能覆盖计数和分布差异告警。`POST /api/v1/admin/evaluations/score-calibration` 另接收现有 current evaluation 的脱敏人工金标，计算 MAE、RMSE、平均有符号误差、±5/±10 一致率、线性校准候选，以及题型、语言、STT 质量和不透明 cohort 分层。两者都记录最小审计，不读取或生成录用结论；线性拟合永不自动写回生产分数。
+
+校准样本不得携带姓名、邮箱、手机号、简历、音频或转写；API 的 `extra=forbid` 会拒绝这些字段。少于 30 条的整体样本、少于 10 条的 cohort 和 cohort MAE 差超过 5 分都会告警。仓库测试只验证计算和隐私边界，真实一致性/公平性结论必须等企业提供已脱敏且经人工复核的候选人金标；在此之前不能宣称已完成校准。
 
 - 每个岗位维护人工标注的题目、答案和经历问题评分样本。
 - 比较 AI 与人工评分一致性，按题型、语言、STT 置信度和 Provider 监控漂移。

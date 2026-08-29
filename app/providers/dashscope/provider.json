@@ -2,8 +2,8 @@
   "schema_version": "2",
   "provider_id": "dashscope",
   "display_name": "阿里云百炼（千问 / Qwen）",
-  "version": "0.2.0",
-  "capabilities": ["llm.chat_json", "llm.chat_text", "embedding.text", "tts.synthesize"],
+  "version": "0.3.0",
+  "capabilities": ["llm.chat_json", "llm.chat_text", "embedding.text", "stt.streaming", "stt.batch", "tts.synthesize"],
   "model_selection": "customizable",
   "defaults": {
     "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -13,6 +13,8 @@
     "schema_version": "2",
     "fields": [
       {"name": "base_url", "label": "Base URL", "control": "text", "required": true, "default": "https://dashscope.aliyuncs.com/compatible-mode/v1"},
+      {"name": "workspace_id", "label": "百炼业务空间 ID", "control": "text", "required": false},
+      {"name": "workspace_region", "label": "业务空间地域", "control": "select", "required": true, "default": "cn-beijing", "options": [{"label": "华北 2（北京）", "value": "cn-beijing"}, {"label": "新加坡", "value": "ap-southeast-1"}]},
       {"name": "use_environment_proxy", "label": "使用环境代理", "control": "switch", "required": false, "default": false}
     ]
   },
@@ -27,6 +29,13 @@
     "embedding": {"label": "Embedding", "selection_mode": "customizable", "capabilities": ["embedding.text"], "configuration_form": {"fields": [
       {"name": "dimensions", "label": "期望向量维度", "control": "number", "required": false, "min": 1}
     ]}},
+    "stt": {"label": "语音识别", "selection_mode": "predefined", "capabilities": ["stt.streaming", "stt.batch"], "configuration_form": {"fields": [
+      {"name": "asr_websocket_url", "label": "实时 ASR WebSocket", "control": "text", "required": false},
+      {"name": "asr_batch_endpoint", "label": "批量 ASR Endpoint", "control": "text", "required": false},
+      {"name": "max_sentence_silence_ms", "label": "断句静音阈值（毫秒）", "control": "number", "required": false, "default": 800, "min": 200, "max": 6000},
+      {"name": "vocabulary_id", "label": "面试术语热词表 ID", "control": "text", "required": false},
+      {"name": "batch_max_bytes", "label": "批量音频最大字节", "control": "number", "required": false, "default": 10485760, "min": 1024, "max": 10485760}
+    ]}},
     "tts": {"label": "语音合成", "selection_mode": "customizable", "capabilities": ["tts.synthesize"], "configuration_form": {"fields": [
       {"name": "tts_endpoint", "label": "TTS Endpoint", "control": "text", "required": false},
       {"name": "default_voice", "label": "默认音色", "control": "text", "required": true, "default": "Cherry"},
@@ -40,6 +49,8 @@
     "required": ["base_url"],
     "properties": {
       "base_url": {"type": "string"},
+      "workspace_id": {"type": "string"},
+      "workspace_region": {"type": "string", "enum": ["cn-beijing", "ap-southeast-1"]},
       "test_model": {"type": "string"},
       "test_models": {"type": "object"},
       "tts_endpoint": {"type": "string"},
@@ -47,6 +58,11 @@
       "voice_map": {"type": "object"},
       "sample_rate_hz": {"type": "integer"},
       "force_https_assets": {"type": "boolean"},
+      "asr_websocket_url": {"type": "string"},
+      "asr_batch_endpoint": {"type": "string"},
+      "max_sentence_silence_ms": {"type": "integer"},
+      "vocabulary_id": {"type": "string"},
+      "batch_max_bytes": {"type": "integer"},
       "use_environment_proxy": {"type": "boolean"}
     }
   },
@@ -74,6 +90,19 @@
       "label": "通义文本向量 V4",
       "capabilities": ["embedding.text"],
       "default": true
+    },
+    {
+      "model_id": "qwen-audio-3.0-asr-flash-streaming",
+      "label": "Qwen Audio 3.0 实时语音识别",
+      "model_type": "stt",
+      "capabilities": ["stt.streaming"],
+      "default": true
+    },
+    {
+      "model_id": "qwen3-asr-flash",
+      "label": "Qwen3 ASR 批量修复",
+      "model_type": "stt",
+      "capabilities": ["stt.batch"]
     },
     {
       "model_id": "qwen3-tts-flash",

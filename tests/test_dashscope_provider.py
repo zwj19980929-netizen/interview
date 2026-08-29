@@ -1,4 +1,5 @@
 import json
+import asyncio
 
 import httpx
 import pytest
@@ -7,7 +8,10 @@ from app.model_gateway import capabilities as cap
 from app.model_gateway.schemas import (
     ChatJSONRequest,
     ChatMessage,
+    BatchSTTRequest,
     ProviderContext,
+    StreamingAudioConfig,
+    StreamingSTTRequest,
     TTSSynthesizeRequest,
 )
 from app.providers.dashscope.provider import DashScopeProvider
@@ -29,7 +33,7 @@ def context(capability: str, model: str, *, config=None) -> ProviderContext:
         route_id="route_test",
         provider_connection_id="provider_conn_dashscope",
         model_configuration_id="model_cfg_dashscope",
-        model_type="tts" if capability == cap.TTS_SYNTHESIZE else "llm",
+        model_type="tts" if capability == cap.TTS_SYNTHESIZE else "stt" if capability.startswith("stt.") else "llm",
         capability=capability,
         purpose="provider_test",
         model=model,
@@ -176,3 +180,86 @@ async def test_dashscope_cosyvoice_uses_speech_synthesizer_contract() -> None:
         "rate": 1.25,
     }
     assert response.audio_uri.endswith("/cosy.wav")
+
+
+@pytest.mark.anyio
+async def test_dashscope_batch_asr_sends_private_audio_as_data_url() -> None:
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["url"] = str(request.url)
+        seen["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(200, json={"id": "asr_1", "choices": [{"message": {"content": "欢迎使用实时面试。"}}]})
+
+    response = await make_provider(handler).invoke(
+        cap.STT_BATCH,
+        BatchSTTRequest(audio_uri="private-media://answer.wav", content_type="audio/wav", audio_bytes=b"RIFF-test"),
+        context(
+            cap.STT_BATCH,
+            "qwen3-asr-flash",
+            config={"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "workspace_id": "ws123"},
+        ),
+    )
+
+    assert seen["url"] == "https://ws123.cn-beijing.maas.aliyuncs.com/compatible-mode/v1/chat/completions"
+    assert seen["payload"]["messages"][0]["content"][0]["input_audio"]["data"].startswith("data:audio/wav;base64,")
+    assert response.text == "欢迎使用实时面试。"
+    assert response.provider.request_id == "asr_1"
+
+
+class FakeDashScopeSocket:
+    def __init__(self) -> None:
+        self.received = asyncio.Queue()
+        self.sent = []
+        self.closed = False
+        self.received.put_nowait(json.dumps({"header": {"event": "task-started", "task_id": "vendor_task"}, "payload": {}}))
+
+    async def send(self, value):
+        self.sent.append(value)
+        if isinstance(value, bytes):
+            self.received.put_nowait(json.dumps({
+                "header": {"event": "result-generated", "task_id": "vendor_task"},
+                "payload": {"output": {"sentence": {"text": "实时转", "sentence_end": False, "begin_time": 0}}},
+            }))
+        elif json.loads(value)["header"]["action"] == "finish-task":
+            self.received.put_nowait(json.dumps({
+                "header": {"event": "result-generated", "task_id": "vendor_task"},
+                "payload": {"output": {"sentence": {"text": "实时转写完成。", "sentence_end": True, "begin_time": 0, "end_time": 800}}},
+            }))
+            self.received.put_nowait(json.dumps({"header": {"event": "task-finished", "task_id": "vendor_task"}, "payload": {}}))
+
+    async def recv(self):
+        return await self.received.get()
+
+    async def close(self):
+        self.closed = True
+
+
+@pytest.mark.anyio
+async def test_dashscope_stream_maps_duplex_events_to_one_authoritative_final() -> None:
+    socket = FakeDashScopeSocket()
+
+    async def connect(url, **kwargs):
+        assert url == "wss://ws123.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference"
+        assert kwargs["additional_headers"]["Authorization"] == "Bearer dashscope-key"
+        return socket
+
+    provider = DashScopeProvider(websocket_connect=connect)
+    stream = await provider.open_stream(
+        StreamingSTTRequest(
+            interview_id="iv_1", turn_id="turn_1",
+            audio=StreamingAudioConfig(content_type="audio/pcm", sample_rate_hz=16000, channels=1),
+        ),
+        context(
+            cap.STT_STREAMING,
+            "qwen-audio-3.0-asr-flash-streaming",
+            config={"base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1", "workspace_id": "ws123"},
+        ),
+    )
+    partial = await stream.send_audio(b"\x00\x01")
+    finished = await stream.finish()
+
+    assert partial[0].type == "transcript.partial"
+    assert [item.type for item in finished].count("transcript.final") == 1
+    assert next(item for item in finished if item.type == "transcript.final").text == "实时转写完成。"
+    assert socket.closed is True
