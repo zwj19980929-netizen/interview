@@ -1,5 +1,11 @@
 # 开发进度
 
+## 2026-08-31：流式模型健康探针与 Qwen Realtime 协议校正
+
+- 模型配置和路由测试现已覆盖 `stt.streaming` 与 `speech.dialogue_realtime`：两者复用统一 stream handshake probe，在真实 Provider 确认端点、凭据、模型访问和 session 后置为 ready，不再要求静音样本产生 final transcript。
+- DashScope Qwen 3.5 Omni Realtime 已同步当前 session 结构、`qwen3-asr-flash-realtime` 输入转写模型和 `Tina` 默认音色；历史配置在 adapter seam 内兼容归一化，管理员不需要先迁移数据库记录。
+- 健康探针只证明连接与 session 初始化；真实 WER、final 延迟、首音、打断、音质和费用仍属于部署环境的脱敏样本验收，不因本项自动标记完成。
+
 ## 2026-08-30：受控实时语音追问与异步评分
 
 - 实际面试已形成两条可选表达链路：`cascade` 保留服务端 STT → 受控追问 → TTS/本地或云数字人的兼容路径；`s2s` 使用统一 `speech.dialogue_realtime` stream，把已经由服务端规则批准的追问通过 OpenAI Realtime 或阿里云百炼 Qwen Realtime 以 PCM delta 尽快下发。两条路径复用同一 Interview Lifecycle、追问决策、题目快照、事件和前端播放状态机。

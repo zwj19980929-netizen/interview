@@ -808,6 +808,42 @@ describe("React workbench shell", () => {
     await act(async () => root.unmount());
   });
 
+  it("shows dynamic model field help beside the label", async () => {
+    window.history.replaceState(null, "", "#models/dash_conn");
+    const connection = { id: "dash_conn", provider_id: "dashscope", display_name: "阿里云百炼", enabled: true, credential_status: "valid", version: 1 };
+    globalThis.fetch = async (path) => {
+      const url = String(path);
+      if (url.endsWith("/auth/session")) return new Response(JSON.stringify({ actor_id: "admin_1", organization_id: "org_1", roles: ["admin"], authenticated: true }));
+      if (url.endsWith("/model-providers/catalog")) return new Response(JSON.stringify({ items: [] }));
+      if (url.endsWith("/model-provider-connections")) return new Response(JSON.stringify({ items: [connection] }));
+      if (url.endsWith("/model-configurations") || url.endsWith("/model-routes")) return new Response(JSON.stringify({ items: [] }));
+      if (url.endsWith("/dash_conn/model-catalog")) return new Response(JSON.stringify({
+        model_types: {
+          realtime_speech: {
+            label: "实时语音对话（S2S）",
+            selection_mode: "predefined",
+            configuration_form: { fields: [{ name: "realtime_websocket_url", label: "Realtime WebSocket", control: "text", required: false, help: "Qwen Realtime 的服务端 WebSocket 地址；连接里填写业务空间 ID 时可留空。" }] },
+          },
+        },
+        models: [{ model_id: "qwen3.5-omni-plus-realtime", model_type: "realtime_speech", label: "Qwen 3.5 Omni Plus Realtime", default: true }],
+        parameter_forms: { realtime_speech: { fields: [] } },
+      }));
+      return new Response(JSON.stringify({ items: [] }));
+    };
+    const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+    await act(async () => root.render(<App />));
+    for (let attempt = 0; attempt < 30 && !host.textContent.includes("阿里云百炼"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    await act(async () => [...host.querySelectorAll("button")].find((node) => node.textContent === "添加模型").click());
+    for (let attempt = 0; attempt < 30 && !document.body.textContent.includes("Realtime WebSocket"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    const trigger = document.querySelector('.field-help-trigger[aria-label="Realtime WebSocket说明"]');
+    expect(trigger).not.toBeNull();
+    expect(trigger.textContent).toBe("?");
+    expect(trigger.getAttribute("title")).toContain("Qwen Realtime");
+    expect(document.getElementById(trigger.getAttribute("aria-describedby"))?.getAttribute("role")).toBe("tooltip");
+    expect(document.body.textContent).toContain("连接里填写业务空间 ID 时可留空");
+    await act(async () => root.unmount());
+  });
+
   it("derives route capability from purpose and filters incompatible models", async () => {
     window.history.replaceState(null, "", "#models");
     const connection = { id: "provider_1", provider_id: "mock", display_name: "模型连接", enabled: true, credential_status: "valid", version: 1 };

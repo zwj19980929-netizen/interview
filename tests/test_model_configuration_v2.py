@@ -240,6 +240,45 @@ async def test_untested_model_can_run_probe_and_receives_saved_defaults() -> Non
         "connection_config": {"base_url": "https://models.example.com/v1", "use_environment_proxy": False},
         "model_settings": {"structured_output_mode": "json_object"},
     }
+
+
+@pytest.mark.anyio
+async def test_streaming_model_probes_validate_handshake_without_silent_final() -> None:
+    store = reset_store_for_tests()
+    service = ModelAdminService(store)
+    connection = service.create_provider_connection(
+        {"provider_id": "mock", "display_name": "Streaming probes"}
+    )
+    stt = service.create_model_configuration(
+        {
+            "provider_connection_id": connection["id"],
+            "model_type": "stt",
+            "provider_model_id": "mock-stt",
+            "display_name": "Streaming STT",
+        }
+    )
+    dialogue = service.create_model_configuration(
+        {
+            "provider_connection_id": connection["id"],
+            "model_type": "realtime_speech",
+            "provider_model_id": "mock-dialogue",
+            "display_name": "Realtime dialogue",
+        }
+    )
+
+    stt_result = await service.test_model_configuration(
+        stt["id"], {"capability": "stt.streaming"}
+    )
+    dialogue_result = await service.test_model_configuration(
+        dialogue["id"], {"capability": "speech.dialogue_realtime"}
+    )
+
+    assert stt_result["probe_mode"] == "handshake"
+    assert [item["type"] for item in stt_result["events"]] == ["stream.ready"]
+    assert dialogue_result["probe_mode"] == "handshake"
+    assert [item["type"] for item in dialogue_result["events"]] == ["dialogue.ready"]
+    assert service.get_model_configuration(stt["id"])["status"] == "ready"
+    assert service.get_model_configuration(dialogue["id"])["status"] == "ready"
     assert service.list_model_configurations()[0]["status"] == "ready"
 
 

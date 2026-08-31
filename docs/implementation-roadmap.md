@@ -75,6 +75,7 @@
 - 建立 Model Invocation deep module：单一 `invoke` interface、provider manifest entrypoint、能力枚举、mock adapter。
 - 实现 `ProviderConnection`、`ModelConfiguration`、`ModelRoute`、`ModelInvocationLog`。
 - 实现 provider catalog、动态表单、厂商连接、分类模型配置、路由配置和模型测试 API。
+- 模型测试按能力分层：请求/响应能力执行最小真实调用；流式 STT 与实时语音对话验证鉴权、模型访问和 session 握手，质量、WER、首音与打断由真实脱敏样本单独验收。
 - 实现可执行的 `mock`、`openai_compatible`、`deepseek`、`zhipuai` 和 `dashscope` provider adapter；共享 OpenAI-compatible runtime 吸收 HTTP/鉴权/错误/结构化输出，manifest 驱动默认配置和模型目录。
 - 定义 `llm.chat_json`、`llm.chat_text` 的统一请求/响应；`embedding.text` 只作为可选实验能力。
 
@@ -83,6 +84,7 @@
 - 后台可以看到已安装 provider 插件。
 - 管理员可以配置一个 provider，并为 `answer_evaluation` 配置路由。
 - 业务代码只调用 `ModelGateway.invoke`，不直接 import provider；route 中的重试、fallback、超时、断路器和 schema 校验必须实际生效。
+- `stt.streaming` 与 `speech.dialogue_realtime` 的模型配置及 route 均可用同一握手探针验证，不会因静音没有 final 而误报失败。
 
 ## 里程碑 3：题库查询和候选池
 

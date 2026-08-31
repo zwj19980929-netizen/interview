@@ -4,7 +4,7 @@ import { Empty, Field, ModalForm, Status } from "../../core/ui.jsx";
 
 const CAPABILITY_LABELS = {
   "llm.chat_json": "结构化文本模型", "llm.chat_text": "文本生成模型", "embedding.text": "文本向量模型",
-  "stt.streaming": "实时语音识别", "stt.batch": "录音转写修复", "tts.synthesize": "语音合成", "avatar.speak": "数字人播报",
+  "stt.streaming": "实时语音识别", "stt.batch": "录音转写修复", "speech.dialogue_realtime": "实时语音对话", "tts.synthesize": "语音合成", "avatar.speak": "数字人播报",
 };
 const ROUTE_PURPOSES = [
   ["question_speech_generation", "题目语音生成", "tts.synthesize", true, "生成岗位题和经历问题的读题语音"],
@@ -19,7 +19,7 @@ const ROUTE_PURPOSES = [
 ].map(([value, label, capability, required, impact]) => ({ value, label, capability, required, impact }));
 const routeKey = (capability, purpose) => `${capability}::${purpose}`;
 const capabilityLabel = (value) => CAPABILITY_LABELS[value] || value;
-const MODEL_TYPE_LABELS = { llm: "大语言模型", embedding: "向量模型", stt: "语音识别", tts: "语音合成", avatar: "数字人" };
+const MODEL_TYPE_LABELS = { llm: "大语言模型", embedding: "向量模型", stt: "语音识别", realtime_speech: "实时语音对话", tts: "语音合成", avatar: "数字人" };
 const modelTypeLabel = (value) => MODEL_TYPE_LABELS[value] || value;
 
 export default function ModelsPage() {

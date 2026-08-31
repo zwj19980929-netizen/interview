@@ -6,6 +6,27 @@
 
 每个工作项必须包含：日期、ID、目标、关联问题、状态、实际修改文件、验证命令与结果、未完成事项或恢复说明。
 
+## 2026-08-31 · MODEL-STREAM-PROBE-001
+
+- 目标：修复 DashScope `stt.streaming` 模型配置测试把静音样本误判为模型故障，以及 `speech.dialogue_realtime` 缺少统一测试协议的问题；同步校正 Qwen 3.5 Omni Realtime 当前官方 session 事件结构。
+- 关联问题：`qwen-audio-3.0-asr-flash-streaming` 已完成鉴权和 `task-started` 仍因静音没有 final transcript 而失败；`qwen3.5-omni-flash-realtime` 在发起厂商调用前直接返回 `MODEL_CAPABILITY_NOT_IMPLEMENTED`。旧 Qwen session payload 还使用兼容字段、旧输入转写模型名和不适用于 Qwen 3.5 的默认音色。
+- 状态：`verified（仓库与本机）`。
+- 设计边界：模型配置/路由测试验证真实端点、凭据、模型授权及 session 握手，返回 `probe_mode=handshake` 后主动关闭，不把静音伪装成识别质量样本；WER、final、首音、音质和打断仍由真实录音/面试端到端验收。Realtime Prompt 继续由 `app/core/prompt/` 提供，Provider 只转换厂商协议。
+- 实际修改文件：`app/services/model_admin.py`、`app/providers/realtime_speech.py`、`app/providers/dashscope/provider.py`、`app/providers/dashscope/provider.json`、`tests/test_model_configuration_v2.py`、`tests/test_dashscope_provider.py`、`docs/api-design.md`、`docs/model-provider-plugins.md`、`docs/known-issues-and-remediation.md`、`docs/development-progress.md`、`docs/implementation-roadmap.md`、本日志。
+- 实际实现：模型配置测试和 route 测试共享 `_probe_stream_handshake`，`stt.streaming` 与 `speech.dialogue_realtime` 只消费统一 ready 事件并安全 abort；补齐实时语音对话探针请求。DashScope Qwen 3.5 session 改为嵌套 PCM format，输入转写默认 `qwen3-asr-flash-realtime`、音色默认 `Tina`，历史 `qwen3-asr-flash`/`Cherry` 在 Provider seam 兼容；每个受控追问先更新 session instruction，再提交音频并创建 response。
+- 验证命令与结果：定向 Realtime/DashScope/模型配置回归 `23 passed`；`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q` 为 `221 passed, 5 skipped`；`cd app/web && npm test -- --run` 为 `33 passed`；`npm run build` 通过并生成 `index-DPD89s-E.js/index-cXhBMl4B.css`；`git diff --check` 通过。重启 API 后，对 `model_cfg_47b17fd770184f74` 的真实 DashScope 测试返回 `probe_mode=handshake + stream.ready`，对 `model_cfg_4b6f183ae80c44e3` 返回 `probe_mode=handshake + dialogue.ready`；两项 ModelConfiguration 均已保存为 `ready`。
+- 未完成事项或恢复说明：本次真实探针只确认百炼端点、当前 API Key、模型授权和 session 参数可用，不声称已完成 WER、真实 final/首音延迟、打断、音质、长连接稳定性或费用验收；这些仍需脱敏语音样本和候选人端到端压测。既有 API Key 未输出、未改写。
+
+## 2026-08-31 · MODEL-FORM-HELP-UX-001
+
+- 目标：在模型服务动态表单的字段标签旁增加圆形问号帮助入口；为阿里云百炼实时语音对话 WebSocket 等容易误填的模型配置字段提供鼠标悬停/键盘聚焦说明，降低管理员配置成本。
+- 关联问题：用户在添加 DashScope `realtime_speech` 模型时不知道 `Realtime WebSocket` 字段用途和填写规则。
+- 状态：`verified`。
+- 实际修改文件：`app/web/src/core/ui.jsx`、`app/web/styles.css`、`app/web/src/features/models/Page.jsx`、`app/providers/dashscope/provider.json`、`app/web/src/App.test.jsx`、重建后的 `app/web/dist/index.html` 与 `app/web/dist/bundles/index-DPD89s-E.js/index-cXhBMl4B.css`、本日志。
+- 实际实现：`Field` 的 `hint` 统一渲染为标签旁可聚焦圆形 `?`，hover/focus 时显示 tooltip，并保留 `title/aria-describedby/role=tooltip`。DashScope `workspace_id` 与 `realtime_speech` 模型配置字段补充面向管理员的填写说明，明确 `Realtime WebSocket` 是 Qwen Realtime 服务端地址、何时可留空、北京/新加坡地址格式以及系统会自动追加模型参数。模型服务页同步把 `speech.dialogue_realtime` 和 `realtime_speech` 显示为中文能力/类型名称。
+- 验证命令与结果：`cd app/web && npm test -- --run`：`33 passed`；`cd app/web && npm run build`：通过，生成 `index-DPD89s-E.js/index-cXhBMl4B.css`；浏览器实测 `http://127.0.0.1:5173/web/#models/provider_conn_42860516bcdd45a0` 添加 realtime 模型时，`Realtime WebSocket` 标签旁出现 `?`，tooltip 从隐藏变为可见并展示新说明；`curl /api/v1/admin/model-provider-connections/provider_conn_42860516bcdd45a0/model-catalog` 已返回 `help` 文案；`PYTHONPYCACHEPREFIX=/private/tmp/interviewer_model_form_help_pycache .venv/bin/python -m compileall -q app` 通过；`git diff --check` 通过。
+- 未完成事项或恢复说明：无。此变更只影响动态表单展示文案和生产 bundle，不新增 API、数据结构、模型路由或供应商调用逻辑，因此无需更新接口、领域模型或路线图状态。
+
 ## 2026-08-30 · REALTIME-SPEECH-DIALOGUE-001
 
 - 目标：在保留现有固定题、流式/批量 STT、TTS、自研/云数字人和完整评分链路的前提下，新增供应商无关的实时语音对话（S2S/STS）能力；接入 OpenAI Realtime 和阿里云百炼千问 Realtime，评估火山引擎豆包实时语音并在无法完整实现其官方二进制协议时保留明确 TODO；实现低延迟、受预算约束、可审计的动态澄清追问，并修复候选人实际面试中的 PCM 录音、断线修复、自动播题、状态同步、心跳、媒体权限和重复提交问题。

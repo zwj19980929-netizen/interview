@@ -329,9 +329,23 @@ async def test_dashscope_qwen_realtime_maps_s2s_audio_events() -> None:
         )
     )
 
-    session = next(item for item in socket.sent if item["type"] == "session.update")
+    session_updates = [item for item in socket.sent if item["type"] == "session.update"]
+    session = session_updates[0]
     assert session["session"]["turn_detection"] is None
-    assert session["session"]["input_audio_format"] == "pcm16"
+    assert session["session"]["model"] == "qwen3.5-omni-flash-realtime"
+    assert session["session"]["audio"] == {
+        "input": {"format": {"type": "pcm", "sample_rate": 16000}},
+        "output": {"format": {"type": "pcm", "sample_rate": 24000}},
+    }
+    assert session["session"]["voice"] == "Tina"
+    assert session["session"]["input_audio_transcription"]["model"] == (
+        "qwen3-asr-flash-realtime"
+    )
+    assert session_updates[1]["session"] == {
+        "instructions": "只逐字朗读：请补充说明恢复点。"
+    }
+    response_create = next(item for item in socket.sent if item["type"] == "response.create")
+    assert "instructions" not in response_create["response"]
     assert [item.type for item in events] == [
         "output.transcript.final",
         "output.audio.delta",

@@ -27,6 +27,7 @@ class OpenAIStyleRealtimeSpeechStream:
         vendor_input_rate: int,
         vendor_output_rate: int,
         response_payload: Dict[str, Any],
+        response_instruction_mode: str = "response",
     ) -> None:
         self.provider_id = provider_id
         self.request = request
@@ -35,6 +36,7 @@ class OpenAIStyleRealtimeSpeechStream:
         self.vendor_input_rate = vendor_input_rate
         self.vendor_output_rate = vendor_output_rate
         self.response_payload = response_payload
+        self.response_instruction_mode = response_instruction_mode
         self.stream_id = new_id("dialogue_stream")
         self.sequence = 1
         self.closed = False
@@ -55,6 +57,7 @@ class OpenAIStyleRealtimeSpeechStream:
         vendor_input_rate: int,
         vendor_output_rate: int,
         response_payload: Dict[str, Any],
+        response_instruction_mode: str = "response",
     ) -> "OpenAIStyleRealtimeSpeechStream":
         try:
             socket = await connector(
@@ -85,6 +88,7 @@ class OpenAIStyleRealtimeSpeechStream:
             vendor_input_rate=vendor_input_rate,
             vendor_output_rate=vendor_output_rate,
             response_payload=response_payload,
+            response_instruction_mode=response_instruction_mode,
         )
         try:
             await stream._wait_for({"session.created"})
@@ -124,13 +128,24 @@ class OpenAIStyleRealtimeSpeechStream:
     ) -> List[RealtimeSpeechDialogueEvent]:
         if self.closed:
             return []
+        if self.response_instruction_mode == "session_update":
+            await self._send(
+                {
+                    "event_id": new_id("vendor_event"),
+                    "type": "session.update",
+                    "session": {"instructions": command.response_instructions},
+                },
+                ensure_ascii=False,
+            )
+            await self._wait_for({"session.updated"})
         await self._send(
             {"event_id": new_id("vendor_event"), "type": "input_audio_buffer.commit"}
         )
         response = {
             **self.response_payload,
-            "instructions": command.response_instructions,
         }
+        if self.response_instruction_mode == "response":
+            response["instructions"] = command.response_instructions
         await self._send(
             {
                 "event_id": new_id("vendor_event"),

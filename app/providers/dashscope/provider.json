@@ -13,7 +13,7 @@
     "schema_version": "2",
     "fields": [
       {"name": "base_url", "label": "Base URL", "control": "text", "required": true, "default": "https://dashscope.aliyuncs.com/compatible-mode/v1"},
-      {"name": "workspace_id", "label": "百炼业务空间 ID", "control": "text", "required": false},
+      {"name": "workspace_id", "label": "百炼业务空间 ID", "control": "text", "required": false, "help": "阿里云百炼业务空间的 WorkspaceId。填写后系统会按地域自动拼接实时 ASR 和 Qwen Realtime WebSocket 地址；留空时，需要在具体模型配置里填写完整端点。"},
       {"name": "workspace_region", "label": "业务空间地域", "control": "select", "required": true, "default": "cn-beijing", "options": [{"label": "华北 2（北京）", "value": "cn-beijing"}, {"label": "新加坡", "value": "ap-southeast-1"}]},
       {"name": "use_environment_proxy", "label": "使用环境代理", "control": "switch", "required": false, "default": false}
     ]
@@ -44,10 +44,10 @@
       {"name": "force_https_assets", "label": "仅接受 HTTPS 音频资产", "control": "switch", "required": false, "default": true}
     ]}},
     "realtime_speech": {"label": "实时语音对话（S2S）", "selection_mode": "predefined", "capabilities": ["speech.dialogue_realtime"], "configuration_form": {"fields": [
-      {"name": "realtime_websocket_url", "label": "Realtime WebSocket", "control": "text", "required": false},
-      {"name": "dialogue_input_transcription_model", "label": "输入转写模型", "control": "text", "required": false, "default": "qwen3-asr-flash"},
-      {"name": "dialogue_default_voice", "label": "实时对话音色", "control": "text", "required": false, "default": "Cherry"},
-      {"name": "voice_map", "label": "音色映射", "control": "key_value", "required": false}
+      {"name": "realtime_websocket_url", "label": "Realtime WebSocket", "control": "text", "required": false, "help": "Qwen Realtime 的服务端 WebSocket 地址。已在厂商连接填写业务空间 ID 时可留空；否则填 wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime 或新加坡 ap-southeast-1 地址。系统会自动追加 ?model=当前模型。"},
+      {"name": "dialogue_input_transcription_model", "label": "输入转写模型", "control": "text", "required": false, "default": "qwen3-asr-flash-realtime", "help": "S2S 会话内用于把候选人输入音频转成文字的模型；Qwen 3.5 Omni 通常保持 qwen3-asr-flash-realtime。历史值 qwen3-asr-flash 会由系统自动兼容。"},
+      {"name": "dialogue_default_voice", "label": "实时对话音色", "control": "text", "required": false, "default": "Tina", "help": "Qwen Realtime 播报受控追问时使用的音色。Qwen 3.5 Omni 默认 Tina，Qwen Audio 3.0 默认 longanqian；它只影响实时追问声音，不影响权威 STT 或评分。"},
+      {"name": "voice_map", "label": "音色映射", "control": "key_value", "required": false, "help": "可选 JSON 对象，用系统 voice_profile_id 映射厂商音色；没有多音色需求可留空。"}
     ]}}
   },
   "config_schema": {

@@ -91,12 +91,13 @@ Provider adapter 负责把统一请求转换成厂商协议、注入厂商鉴权
 - `mock-tts://` 只证明异步工作流和 revision guard，不代表存在音频字节。题目投影必须标记试听不可用，试听接口返回 `QUESTION_SPEECH_PREVIEW_UNAVAILABLE` 并引导配置真实模型；不得用通用“非私有生产资产”错误让普通用户自行推断。
 - 题库 `speech-options` 同时投影可保存的 `ready` TTS 与已添加但 `untested/failed/disabled` 的候选模型。后者只用于解释不可选原因和触发管理员显式测试；只有测试成功、启用且具有声音目录的模型才能写入 KnowledgeBaseSpeechProfile。
 - 管理员模型探针沿用 Model Invocation pipeline，对 Provider 明确标记为 retryable 的错误执行最多 2 次退避重试（总尝试最多 3 次），并保留统一错误码与 invocation ID；`provider_rate_limited` 对 HTTP 调用方返回 429。重试耗尽仍不得把模型标记为 ready。
+- `stt.streaming` 与 `speech.dialogue_realtime` 的模型/路由探针只验证真实 WebSocket 鉴权、模型访问和 session 初始化，成功返回 `probe_mode=handshake` 后主动关闭。静音没有 final transcript 是合法结果，不能把它误判为模型故障；WER、final 延迟、首音、音质与打断属于带真实脱敏录音的环境验收。
 - `mock` provider 已实现 `avatar.speak` 的浏览器语音驱动响应，用于本地数字人演示；它不生成真人视频，也不应标记为生产数字人能力。
 - `openai_compatible` provider 已支持真实 HTTP 调用：`llm.chat_json`、`llm.chat_text`、`embedding.text` 和 `tts.synthesize`。TTS 使用 `/audio/speech`，支持 `wav/mp3/opus/aac/flac/pcm`，二进制响应会转为 data URI 后交给私有资产复制层校验和落盘。
 - 官方 `openai` provider 复用 HTTP Chat/Embedding/TTS runtime，并独立实现 multipart `/audio/transcriptions` 与 Realtime WebSocket。`gpt-realtime-*` 会话关闭 vendor turn detection，由面试状态机提交回合；24 kHz PCM delta、输入/输出 transcript 和中断事件统一映射到 `RealtimeSpeechDialogueEvent`。
 - `deepseek` 与 `zhipuai` provider 复用 `OpenAICompatibleProvider` 的 HTTP、Bearer 鉴权、用量解析、错误映射和响应归一化；两者的 `llm.chat_json` 使用厂商支持的 `json_object` 并在 system message 注入目标 JSON Schema，避免假定支持 OpenAI `json_schema` 扩展。智谱 adapter 另在 TTS seam 校验 `glm-tts`、官方 WAV/PCM 格式、1024 字符上限和默认音色 `tongtong`，再复用共享二进制响应归一化。
 - `dashscope` provider 已支持 OpenAI-compatible Qwen Chat/Embedding、Qwen3-ASR batch、Qwen-Audio-3.0-ASR-Flash-Streaming duplex WebSocket，并按模型路由 Qwen3-TTS 的 multimodal-generation HTTP 接口或 CosyVoice/Qwen-Audio 的 `SpeechSynthesizer` HTTP 接口。实时流使用 workspace 地域域名、Bearer 握手、run-task/task-started、二进制 PCM、result-generated 和 finish-task/task-finished；只投影一个 authoritative final。Batch 只接收服务端解析的私有音频字节并以 Base64 data URL 调用，不把对象存储凭据交给厂商。供应商返回的临时 TTS URL 会复制到 PrivateFileStorage。
-- 同一 `dashscope` adapter 还把 Qwen 3.5 Omni/Audio Realtime 映射到 `speech.dialogue_realtime`：连接由 workspace/region 解析，输入固定 16 kHz PCM、输出 24 kHz PCM；业务先选定追问，再通过受控指令要求逐字播报。S2S 出错只关闭表达轨，权威 STT 和级联播报继续工作。
+- 同一 `dashscope` adapter 还把 Qwen 3.5 Omni/Audio Realtime 映射到 `speech.dialogue_realtime`：连接由 workspace/region 解析，输入固定 16 kHz PCM、输出 24 kHz PCM；Qwen 3.5 使用当前嵌套 `audio.input/output.format` session 结构、`qwen3-asr-flash-realtime` 输入转写和默认音色 `Tina`，历史 `qwen3-asr-flash`/`Cherry` 配置在 adapter 边界兼容归一化。每个已批准追问先通过 `session.update` 固定指令，再提交音频并创建 response，避免依赖不受支持的 response 级 instructions。S2S 出错只关闭表达轨，权威 STT 和级联播报继续工作。
 - `tencent_cloud_avatar` provider 使用 AppKey/AccessToken HMAC-SHA256 query 签名，按官方会话管理接口执行 HTTPS create-by-asset/stat/start/close，并在 start 后用携带 `requestid=SessionId` 的 WSS command channel 发送 `SEND_TEXT`、等待对应 ReqId 的播报状态确认。响应 `mode=webrtc`，包含 `webrtc://` 拉流地址、不透明 session ID 与 `tencent_web_player` 类型；候选人页用同源 TCPlayerLite 页面拉流，换流/离场调用关闭接口释放并发。供应商云渲染/SFU 承担视频媒体面，业务 WebSocket 不传视频帧。
 - `media_http` provider 已实现真实 HTTP 媒体调用：健康探针使用 Bearer API Key；`stt.batch` 把服务端读取的私有音频作为 multipart 上传并归一化 text/confidence/segments；`stt.streaming` 在统一流接口内安全缓存分片并在 finish 时调用同一真实转写端点，产出唯一 authoritative final；`avatar.speak` 发送 JSON 并接受 HTTPS `audio/video` 媒体。它是可部署的协议 adapter，不代表任何具体厂商账号已经验收，也不宣称提供低延迟 partial。
 - `stt.streaming` 已有 `StreamingSTTRequest/Event`、`ModelGateway.open_stream()`、有序 chunk/final 校验、建立前 fallback、硬超时、断流 batch 修复和独立 WebSocket 端到端测试；`stt.batch` 与 `tts.synthesize` 也有统一 schema、网关校验和调用审计。浏览器 SpeechRecognition 只用于本地展示/开发输入，不满足正式面试 readiness。
@@ -598,7 +599,7 @@ readiness 是带检查时间和有效期的事实，不是永久布尔值；超�
 | `POST` | `/api/v1/admin/model-provider-connections/{id}/validate` | 通过 Provider adapter 执行真实凭证鉴权探针 |
 | `GET` | `/api/v1/admin/model-provider-connections/{id}/model-catalog` | 获取模型类型、目录和动态表单 |
 | `POST/GET/PATCH/DELETE` | `/api/v1/admin/model-configurations[/{id}]` | 具体模型 CRUD；单模型删除不影响兄弟模型 |
-| `POST` | `/api/v1/admin/model-configurations/{id}/test` | 对具体模型执行能力探针 |
+| `POST` | `/api/v1/admin/model-configurations/{id}/test` | 对具体模型执行能力探针；流式能力返回 session 握手结果，不以静音 final 代替质量测试 |
 | `GET` | `/api/v1/admin/model-configurations/{id}/voices` | 获取归一化 TTS 声音目录，不返回凭据 |
 | `POST` | `/api/v1/admin/model-routes` | 配置能力路由 |
 | `GET` | `/api/v1/admin/model-routes` | 查看路由 |

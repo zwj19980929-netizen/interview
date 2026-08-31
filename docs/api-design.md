@@ -699,7 +699,7 @@ class ModelGateway:
 | `POST` | `/api/v1/admin/model-provider-connections/{id}/validate` | 通过 Provider adapter 执行真实 API Key 鉴权探针，保存 `valid` / `invalid` / `model_required` 状态 |
 | `GET` | `/api/v1/admin/model-provider-connections/{id}/model-catalog` | 返回该连接可配置的模型类型、模型目录和动态表单 schema |
 | `POST/GET/PATCH/DELETE` | `/api/v1/admin/model-configurations[/{id}]` | 创建、列表/单项查看、修改和删除具体模型及其参数与启用状态 |
-| `POST` | `/api/v1/admin/model-configurations/{id}/test` | 以模型配置的统一能力探针进行真实调用并更新健康状态 |
+| `POST` | `/api/v1/admin/model-configurations/{id}/test` | 以模型配置的统一能力探针进行真实调用并更新健康状态；流式 STT/实时语音对话验证真实 session 握手，不用静音伪造识别质量样本 |
 | `GET` | `/api/v1/admin/model-configurations/{id}/voices` | 返回 TTS 模型可选声音目录；静态 manifest、管理员映射或 Provider 只读目录由后端统一归一化 |
 | `POST/GET` | `/api/v1/admin/model-routes` | 管理能力/purpose 路由 |
 | `POST` | `/api/v1/admin/model-routes/{id}/test` | 测试 schema、primary 和 fallback |
@@ -711,5 +711,7 @@ class ModelGateway:
 | `POST` | `/api/v1/admin/retention/run` | 默认 dry-run 预览到期候选人；显式 `dry_run=false` 才清除私有文件、联系方式和面试敏感内容并审计 |
 
 两个 `DELETE` 都必须在查询参数携带 `expected_version`，陈旧版本返回 `409`。删除 ProviderConnection 会在同一租户事务中删除它的加密凭证、全部 ModelConfiguration，以及引用这些模型的 ModelRoute 和对应断路器状态；删除单个 ModelConfiguration 只删除该模型及引用它的路由/断路器状态，同连接下其他模型和厂商连接保持不变。历史 ModelInvocationLog 作为脱敏审计事实保留。
+
+流式能力的管理员测试采用分层语义：`stt.streaming` 和 `speech.dialogue_realtime` 在收到 Provider 的 ready/session-created/session-updated 确认后返回 `probe_mode=handshake`，证明端点、凭据、模型访问和 session 参数可用，并立即主动关闭连接。探针不要求静音产生 final transcript，也不生成自由回答；WER、真实 final、首音、音质和打断必须继续用脱敏语音样本及候选人端到端链路验收。模型路由测试复用相同握手合同。
 
 具体 Provider manifest、STT/TTS 请求响应和错误语义见 [模型供应商插件化设计](model-provider-plugins.md)。

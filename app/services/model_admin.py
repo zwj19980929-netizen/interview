@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 from app.core.errors import ApiError
 from app.core.ids import new_id
 from app.core.prompt.contracts import prompt_contract
+from app.core.prompt.realtime_dialogue import session_instruction
 from app.core.time import utc_now
 from app.model_gateway import capabilities as cap
 from app.model_gateway.forms import apply_form_defaults, validate_form_values
@@ -24,6 +25,7 @@ from app.model_gateway.schemas import (
     BatchSTTRequest,
     ChatJSONRequest,
     ChatTextRequest,
+    RealtimeSpeechDialogueRequest,
     StreamingAudioConfig,
     StreamingSTTRequest,
     TextEmbeddingRequest,
@@ -451,12 +453,8 @@ class ModelAdminService:
         }
         try:
             request = self._probe_request(capability, organization_id, "model_configuration_test")
-            if capability == cap.STT_STREAMING:
-                stream = await self.gateway.open_stream(request, route=route)
-                events = list(stream.ready_events)
-                events.extend(await stream.send_audio(_probe_wav()))
-                events.extend(await stream.finish())
-                result = {"stream_id": stream.stream_id, "events": [item.model_dump() for item in events]}
+            if capability in {cap.STT_STREAMING, cap.SPEECH_DIALOGUE_REALTIME}:
+                result = await self._probe_stream_handshake(capability, request, route)
             else:
                 response = await self.gateway.invoke(capability, request, route=route)
                 result = response.model_dump()
@@ -510,12 +508,10 @@ class ModelAdminService:
             raise ApiError("MODEL_ROUTE_NOT_FOUND", "Model route does not exist.", status_code=404)
         request = self._probe_request(route["capability"], organization_id, route["purpose"])
         try:
-            if route["capability"] == cap.STT_STREAMING:
-                stream = await self.gateway.open_stream(request, route=route)
-                events = list(stream.ready_events)
-                events.extend(await stream.send_audio(_probe_wav()))
-                events.extend(await stream.finish())
-                result = {"stream_id": stream.stream_id, "events": [item.model_dump() for item in events]}
+            if route["capability"] in {cap.STT_STREAMING, cap.SPEECH_DIALOGUE_REALTIME}:
+                result = await self._probe_stream_handshake(
+                    route["capability"], request, route
+                )
             else:
                 response = await self.gateway.invoke(route["capability"], request, route=route)
                 result = response.model_dump()
@@ -525,6 +521,34 @@ class ModelAdminService:
             raise
         self._record_route_health(route_id, organization_id, status="healthy", error=None)
         return result
+
+    async def _probe_stream_handshake(
+        self,
+        capability: str,
+        request: Any,
+        route: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Verify remote authorization/model/session setup without inventing speech input."""
+        if capability == cap.STT_STREAMING:
+            stream = await self.gateway.open_stream(request, route=route)
+        elif capability == cap.SPEECH_DIALOGUE_REALTIME:
+            stream = await self.gateway.open_speech_dialogue(request, route=route)
+        else:
+            raise ApiError(
+                "MODEL_CAPABILITY_NOT_IMPLEMENTED",
+                "Capability has no streaming handshake probe.",
+                status_code=409,
+            )
+        try:
+            events = [item.model_dump() for item in stream.ready_events]
+            return {
+                "probe_mode": "handshake",
+                "stream_id": stream.stream_id,
+                "events": events,
+                "message": "Provider endpoint, credentials, model access, and session setup succeeded.",
+            }
+        finally:
+            await stream.abort()
 
     async def _close_avatar_probe(
         self,
@@ -691,6 +715,24 @@ class ModelAdminService:
                 purpose=purpose,
                 audio=StreamingAudioConfig(content_type="audio/wav", sample_rate_hz=16000, channels=1),
                 metadata={"development_transcript": "连接测试", "confidence": 1.0},
+            )
+        if capability == cap.SPEECH_DIALOGUE_REALTIME:
+            return RealtimeSpeechDialogueRequest(
+                organization_id=organization_id,
+                interview_id="connection_test",
+                turn_id="connection_test_turn",
+                purpose=purpose,
+                input_audio=StreamingAudioConfig(
+                    content_type="audio/pcm", sample_rate_hz=16000, channels=1
+                ),
+                output_audio=StreamingAudioConfig(
+                    content_type="audio/pcm", sample_rate_hz=24000, channels=1
+                ),
+                language="zh-CN",
+                voice="default",
+                turn_detection="manual",
+                session_instructions=session_instruction("zh-CN"),
+                metadata={"probe": True},
             )
         raise ApiError("MODEL_CAPABILITY_NOT_IMPLEMENTED", "Capability has no unified local test schema.", status_code=409)
     def _require_model_capability(self, model: Optional[Dict[str, Any]], capability: str) -> None:

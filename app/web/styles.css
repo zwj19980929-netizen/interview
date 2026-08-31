@@ -928,15 +928,72 @@ svg {
   min-width: 0;
 }
 
-.field label {
+.field-label-row {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
   font-size: 12px;
   font-weight: 750;
+  line-height: 17px;
 }
 
-.field-hint {
-  color: var(--ink-muted);
+.field-help {
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.field-help-trigger {
+  display: grid;
+  width: 18px;
+  height: 18px;
+  place-items: center;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  color: var(--green-dark);
+  background: #f7fbf8;
+  cursor: help;
   font-size: 11px;
-  line-height: 17px;
+  font-weight: 850;
+  line-height: 1;
+  outline: none;
+}
+
+.field-help-trigger:hover,
+.field-help-trigger:focus-visible {
+  border-color: var(--green);
+  background: var(--green-soft);
+  box-shadow: 0 0 0 3px rgba(23, 100, 72, 0.12);
+}
+
+.field-help-popover {
+  position: absolute;
+  top: calc(100% + 7px);
+  left: 0;
+  z-index: 12;
+  width: min(320px, 100%);
+  padding: 10px 12px;
+  border: 1px solid var(--line-strong);
+  border-radius: 7px;
+  color: var(--ink);
+  background: var(--surface);
+  box-shadow: var(--shadow);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 18px;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-2px);
+  transition: opacity 120ms ease, transform 120ms ease;
+  white-space: normal;
+}
+
+.field-help:hover .field-help-popover,
+.field-help:focus-within .field-help-popover {
+  opacity: 1;
+  transform: translateY(0);
 }
 
 .form-grid {

@@ -62,36 +62,51 @@ class DashScopeProvider(OpenAICompatibleProvider):
         separator = "&" if "?" in base else "?"
         url = "%s%s%s" % (base, separator, urlencode({"model": context.model}))
         voice_map = context.config.get("voice_map") or {}
-        voice = str(
+        configured_voice = str(
             voice_map.get(request.voice)
             or context.config.get("dialogue_default_voice")
             or context.config.get("default_voice")
             or request.voice
         )
-        if voice == "default":
-            voice = "Cherry"
+        voice = _dialogue_voice(context.model, configured_voice)
         transcription_model = str(
             context.config.get("dialogue_input_transcription_model")
-            or "qwen3-asr-flash"
+            or "qwen3-asr-flash-realtime"
         )
-        session = {
+        if transcription_model == "qwen3-asr-flash":
+            transcription_model = "qwen3-asr-flash-realtime"
+        session: Dict[str, Any] = {
             "modalities": ["text", "audio"],
             "instructions": request.session_instructions,
             "voice": voice,
-            "input_audio_format": "pcm16",
-            "output_audio_format": "pcm24",
-            "input_audio_transcription": {
-                "model": transcription_model,
-                "language": _language_hint(request.language),
-            },
             # The interviewer owns turn boundaries. Vendor VAD is deliberately
             # disabled so a premature endpoint cannot become scoring evidence.
             "turn_detection": None,
         }
+        if context.model.startswith("qwen3.5-omni-"):
+            session.update(
+                {
+                    "model": context.model,
+                    "audio": {
+                        "input": {"format": {"type": "pcm", "sample_rate": 16000}},
+                        "output": {"format": {"type": "pcm", "sample_rate": 24000}},
+                    },
+                    "input_audio_transcription": {
+                        "model": transcription_model,
+                        "language": _language_hint(request.language),
+                    },
+                }
+            )
+        else:
+            session.update(
+                {
+                    "input_audio_format": "pcm",
+                    "output_audio_format": "pcm",
+                }
+            )
         response_payload = {
             "modalities": ["text", "audio"],
             "voice": voice,
-            "output_audio_format": "pcm24",
         }
         headers = {
             "Authorization": "Bearer %s" % api_key,
@@ -111,6 +126,7 @@ class DashScopeProvider(OpenAICompatibleProvider):
             vendor_input_rate=16000,
             vendor_output_rate=24000,
             response_payload=response_payload,
+            response_instruction_mode="session_update",
         )
 
     async def _transcribe_batch(self, request: BatchSTTRequest, context: ProviderContext) -> BatchSTTResponse:
@@ -528,6 +544,20 @@ def _default_voice(model: str) -> str:
     if normalized.startswith("qwen-audio-"):
         return "longanhuan_v3.6"
     return "Cherry"
+
+
+def _dialogue_voice(model: str, configured: str) -> str:
+    value = configured.strip()
+    normalized = model.lower()
+    if normalized.startswith("qwen3.5-omni-") and value in {"", "default", "Cherry"}:
+        return "Tina"
+    if normalized.startswith("qwen-audio-3.0-realtime-") and value in {
+        "",
+        "default",
+        "Cherry",
+    }:
+        return "longanqian"
+    return value or "Cherry"
 
 
 def _language_type(language: str) -> str:

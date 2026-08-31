@@ -1,3 +1,6 @@
+import { useId, useState } from "react";
+import { useWorkbench } from "./WorkbenchProvider.jsx";
+
 export const splitComma = (value) => String(value || "").split(/[,，]/).map((item) => item.trim()).filter(Boolean);
 export const splitLines = (value) => String(value || "").split(/\r?\n/).map((item) => item.trim()).filter(Boolean);
 export const formatDate = (value) => value ? new Intl.DateTimeFormat("zh-CN", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)) : "-";
@@ -36,7 +39,9 @@ const statusLabels = {
 };
 
 export function Field({ label, children, full = false, hint }) {
-  return <label className={`field${full ? " field-full" : ""}`}><span>{label}</span>{children}{hint && <small className="field-hint">{hint}</small>}</label>;
+  const helpId = useId();
+  const labelText = typeof label === "string" ? label : "字段";
+  return <label className={`field${full ? " field-full" : ""}`}><span className="field-label-row"><span>{label}</span>{hint && <span className="field-help"><span className="field-help-trigger" tabIndex={0} aria-label={`${labelText}说明`} aria-describedby={helpId} title={hint}>?</span><span className="field-help-popover" id={helpId} role="tooltip">{hint}</span></span>}</span>{children}</label>;
 }
 
 export function Empty({ title, copy }) {
@@ -67,5 +72,3 @@ export function ModalForm({ onSubmit, children, submitLabel = "保存", submitVa
   };
   return <form onSubmit={handle}><div className="form-grid">{children}</div><div className="modal-footer"><button className={`button button-${submitVariant}`} type="submit" disabled={busy || submitDisabled}>{busy ? "处理中…" : submitLabel}</button></div></form>;
 }
-import { useState } from "react";
-import { useWorkbench } from "./WorkbenchProvider.jsx";
