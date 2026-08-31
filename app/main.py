@@ -4,11 +4,19 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from app.api.routes import live_connections, router
-from app.core.errors import ApiError, api_error_handler, persistence_error_handler, provider_error_handler
+from app.transport.realtime import live_connections
+from app.api.routes import router
+from app.core.errors import (
+    ApiError,
+    api_error_handler,
+    persistence_error_handler,
+    provider_error_handler,
+    request_validation_error_handler,
+)
 from app.core.auth import AuthAuditMiddleware
 from app.core.rate_limit import public_rate_limiter
 from app.model_gateway.errors import ProviderError
@@ -44,6 +52,7 @@ def create_app() -> FastAPI:
     app.add_exception_handler(ApiError, api_error_handler)
     app.add_exception_handler(ProviderError, provider_error_handler)
     app.add_exception_handler(PersistenceError, persistence_error_handler)
+    app.add_exception_handler(RequestValidationError, request_validation_error_handler)
     app.add_middleware(AuthAuditMiddleware)
     app.include_router(router)
     media_dir = Path(os.getenv("INTERVIEWER_MEDIA_PATH", "data/media"))

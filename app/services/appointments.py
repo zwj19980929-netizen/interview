@@ -515,6 +515,7 @@ class AppointmentService:
             "record_audio": True,
             "record_video": False,
             "avatar_mode": default_avatar_mode,
+            "speech_dialogue_mode": "cascade",
             "avatar_id": "avatar_default_cn",
             "language": "zh-CN",
             **deepcopy(current or {}),
@@ -524,6 +525,11 @@ class AppointmentService:
             raise ApiError(
                 "APPOINTMENT_AVATAR_MODE_INVALID",
                 "Appointment avatar mode must be local or cloud.",
+            )
+        if settings.get("speech_dialogue_mode") not in {"cascade", "s2s"}:
+            raise ApiError(
+                "APPOINTMENT_SPEECH_DIALOGUE_MODE_INVALID",
+                "Appointment speech dialogue mode must be cascade or s2s.",
             )
         return settings
 

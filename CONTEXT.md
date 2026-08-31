@@ -32,6 +32,14 @@ _Avoid_: BrowserSpeech、TemporaryTTS、AudioURL
 按 InterviewAppointment 冻结的 `avatar_mode` 把当前轮次题干交付给候选人的统一边界；LocalAvatarDelivery 复用 QuestionSpeechAsset 和浏览器形象，CloudAvatarDelivery 复用模型路由与 WebRTC/SFU，两者共享响应与播放/关闭合同。
 _Avoid_: AvatarProviderSwitch、ReactAudioFallback、TencentService
 
+**RealtimeSpeechDialogue**:
+面试实时表达轨的供应商无关语音到语音流；它与权威 STT 并行接收候选人 PCM，只能逐字播报业务策略批准的追问，输出音频和 transcript 不构成评分证据。
+_Avoid_: ScoringS2S、ProviderConversation、AudioTruth
+
+**FollowUpTurn**:
+针对一个根 InterviewTurn 缺失关键点形成的深度 1、权重 0 澄清子轮次；有严格的每题/全场/时间预算，不能递归，也不能改变批准计划分值。
+_Avoid_: NewPlanQuestion、LLMFreeQuestion、SecondScore
+
 **QuestionGenerationBatch**:
 一次面向指定 KnowledgeBase、基于题库定位、标签和可选要求形成的候选题生成与人工审核集合；确认导入前不属于正式题库。
 _Avoid_: AutoImport、PromptResult、QuestionList
@@ -73,7 +81,7 @@ _Avoid_: StaticMediaDirectory、OSSHelper、FileURLBuilder
 _Avoid_: UploadHandler、URLParser、ResumeTextImport
 
 **ResumeReview**:
-一个 ResumeDocument 面向一个 JobPosition 和 RoleRequirement version 的异步 AI 审阅，产出可追溯项目/技能证据、CandidateScreening 建议与 ExperienceQuestion 草稿，不直接作出录用决定。
+一个 ResumeDocument 面向一个 JobPosition 和 RoleRequirement version 的异步 AI 审阅，只产出可追溯项目/技能证据与 CandidateScreening 建议，不直接作出录用决定。只有生效结论为符合时，后续独立工作才可生成 ExperienceQuestion 草稿。
 _Avoid_: ResumeScore、HiringDecision、GenericSummary
 
 **ResumeEvidenceChunk**:
@@ -84,9 +92,13 @@ _Avoid_: PartialScreening、PageDecision、TruncatedResume
 ResumeReview 基于脱敏简历与岗位能力要求形成的可解释初筛建议，包含匹配分、分数带结论、命中项和缺口；0–59 分为不符合、60–74 分为待人工复核、75–100 分为符合，人工复核可以覆盖生效结论但必须保留 AI 原始建议与审计。
 _Avoid_: HiringDecision、AutoReject、ResumeRank
 
+**CandidateQuestionBank**:
+一个 CandidateProfile 的简历问答集合视图，只在生效初筛结论为符合时汇总 AI/人工 ExperienceQuestion；每题必须绑定并点名 ResumeReview 中真实存在的证据快照。它不复制岗位题库，也不是第二套可执行题目实体。
+_Avoid_: PersonalKnowledgeBase、CandidateKnowledgeBase、CopiedQuestionBank
+
 **ExperienceQuestion**:
-ResumeReview 依据候选人项目证据生成、经面试官批准后用于核验过往经历的问题。
-_Avoid_: FollowUp、ResumeGuess、AutoApprovedQuestion
+绑定 CandidateProfile，由符合资格后的独立生成工作或面试官基于该候选人简历证据创建，经批准后用于核验过往经历的问题；没有证据快照或题干未点名证据标签的题不得展示或组卷。
+_Avoid_: FollowUp、ResumeGuess、AutoApprovedQuestion、PersonalQuestion
 
 **InterviewPlanAssembly**:
 依据岗位要求、岗位题库候选池和 ResumeReview 形成候选人专属 InterviewPlan 草稿的结果，包含抽题槽位、冻结候选池、经历问题、覆盖、权重、时长与告警。

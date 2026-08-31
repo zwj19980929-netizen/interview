@@ -14,12 +14,15 @@ from app.services.question_generation import QuestionGenerationService
 from app.services.talent import TalentService
 from app.services.resume_ingestion import ResumeIngestionService
 from app.services.appointment_reminders import AppointmentReminderService
+from app.transport.realtime import live_connections, realtime_event
+from app.services.realtime import RealtimeInterviewSession
 
 
 class OutboxWorker:
     """Dispatches durable work; the database remains the source of truth."""
 
     def __init__(self, store: InMemoryStore, *, persistence: Optional[Persistence] = None) -> None:
+        self.store = store
         self.persistence = persistence or persistence_for(store)
         self.catalog = CatalogService(store, persistence=self.persistence)
         self.knowledge_base_speech = KnowledgeBaseSpeechService(store, persistence=self.persistence)
@@ -78,18 +81,53 @@ class OutboxWorker:
             self.knowledge_base_speech.process_build_work(item["id"], organization_id)
         elif item["kind"] == "resume.review":
             await self.talent.process_review_work(item["id"], organization_id)
+        elif item["kind"] == "resume.experience_questions.generate":
+            await self.talent.process_experience_question_generation_work(item["id"], organization_id)
         elif item["kind"] == "resume.ingest":
             await self.resume_ingestion.process(item["id"], organization_id)
         elif item["kind"] in {"knowledge_base.import", "knowledge_base.rebuild"}:
             await self.catalog.process_build_work(item["id"], organization_id)
         elif item["kind"] in {"answer.evaluate", "interview.report.generate"}:
-            await self.interviews.process_outbox_work(item["id"], organization_id)
+            result = await self.interviews.process_outbox_work(item["id"], organization_id)
+            await self._publish_interview_work(item, result)
         elif item["kind"] == "appointment.reminder.email":
             self.appointment_reminders.process_work_item(item["id"], organization_id)
         else:
             self._fail_unsupported(item, organization_id)
         with self.persistence.transaction(organization_id) as transaction:
             return transaction.outbox.get(work_item_id) or {"id": work_item_id, "status": "missing"}
+
+    async def _publish_interview_work(
+        self,
+        item: Dict[str, Any],
+        result: Dict[str, Any],
+    ) -> None:
+        interview_id = str((item.get("payload") or {}).get("interview_id") or item.get("aggregate_id") or "")
+        if not interview_id:
+            return
+        events: List[Dict[str, Any]] = []
+        if item["kind"] == "answer.evaluate":
+            session = self.interviews.get_interview(interview_id, item.get("organization_id", "org_default"))
+            answer_id = str(result.get("answer_id") or (item.get("payload") or {}).get("answer_id") or "")
+            answer = next((value for value in session.get("answers", []) if value.get("id") == answer_id), {})
+            events.append(
+                realtime_event(
+                    interview_id,
+                    "evaluation.completed",
+                    {
+                        "answer_id": answer_id,
+                        "turn_id": answer.get("turn_id"),
+                        "evaluation_id": result.get("id"),
+                        "score": result.get("score"),
+                        "confidence": result.get("confidence"),
+                        "status": "completed",
+                    },
+                    turn_id=answer.get("turn_id"),
+                )
+            )
+        projection = RealtimeInterviewSession(self.store, interview_id)
+        events.extend(projection.state_change_events())
+        await live_connections.broadcast(interview_id, events)
 
     async def run_forever(
         self,

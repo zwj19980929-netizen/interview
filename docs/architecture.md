@@ -5,7 +5,7 @@
 系统围绕“岗位”组织招聘知识与面试执行，目标闭环如下：
 
 1. 企业创建岗位，并为岗位维护一个或多个知识库式题库；题目入库后校验结构化字段、形成候选池并异步预生成读题语音。
-2. 企业把候选人基本信息和 PDF 简历上传到组织级简历库；简历可来自浏览器本地文件或公开 HTTPS URL，但都要先进入系统私有存储，再由 AI 按指定岗位异步形成可解释初筛、提取项目/职责/技能证据并生成可审核的过往经历问题。
+2. 企业把候选人基本信息和 PDF 简历上传到组织级简历库；简历可来自浏览器本地文件或公开 HTTPS URL，但都要先进入系统私有存储，再由 AI 按指定岗位异步形成可解释初筛并提取项目/职责/技能证据。只有生效结论符合时才独立生成与这些证据严格绑定的过往经历问题；AI 草稿和面试官人工创建的问题共同组成候选人的简历问答。
 3. 面试官基于岗位、岗位题库、候选人简历审阅结果确认生成面试计划；React 工作台在这一命令内原子完成装配与批准，随后创建预约和一次性邀请链接。
 4. 候选人打开链接，填写姓名、邮箱、手机号码并完成隐私告知与授权；系统与预约绑定的简历库记录匹配后确认预约、安排面试前 30 分钟邮件提醒，到预约时间后才允许进入设备检查和面试。
 5. 面试中，数字人在已批准计划和已冻结题目池内进行可审计的随机检索，播放预生成题目语音；服务端识别候选人回答并逐题评分，然后进入下一题。
@@ -81,7 +81,8 @@ flowchart LR
 | 简历库 | 保存企业上传的候选人基本信息、不可变 `ResumeDocument` 和岗位初筛投影 | 候选人支持增查改删；简历只接受 PDF，本地上传与 URL 导入形成相同资源和状态语义，并通过短期受控地址展示 |
 | Resume Ingestion | 接收 multipart PDF 或拉取公开 HTTPS PDF，执行限流、哈希、类型校验、恶意文件扫描和解析 | URL 每次重定向都做 SSRF 防护；成功前文件处于隔离区，不直接交给 AI |
 | Private File Storage | 统一保存、读取、签发受控访问和删除私有文件 | 深模块；本地开发使用文件系统 adapter，部署后通过配置切换阿里云 OSS adapter，业务 module 不感知厂商 SDK |
-| Resume Review | 异步形成岗位初筛、提取项目/职责/技能证据并生成经历问题 | 深模块；短简历单次调用，长简历按页和输入预算执行证据 Map/分层压缩/最终 Reduce；分块只提证据，全部成功前不形成筛选结论 |
+| Resume Review | 异步形成岗位初筛并提取项目/职责/技能证据 | 深模块；短简历优先单次调用，输出截断时自动改用页感知 Map/Reduce，长简历直接按页和输入预算执行证据 Map/分层压缩/最终 Reduce；分块只提证据，全部成功前不形成筛选结论，也不生成问题 |
+| Candidate Question Bank | 只为生效结论符合的候选人聚合 AI/人工简历问题，提供增查改、批准/拒绝和归档 | `resume.experience_questions.generate` 在符合后独立排队；每题必须绑定不可变证据快照且题干点名证据标签。它是 `ExperienceQuestion` 投影而非第二套题库实体，批准且语音 ready 后复用 `resume_experience` 链路 |
 | 候选人匹配 | 把邀请填报与预约绑定的候选人记录匹配 | 使用规范化邮箱或手机号强匹配；姓名只作联合校验，禁止仅按姓名模糊匹配 |
 | Interview Plan Assembly | 从岗位要求、岗位题库和简历审阅形成计划 | 产出抽题槽位、结构化 `QuestionCandidatePool`、经历问题、阶段顺序、权重和解释 |
 | 计划审批与预约 | 批准计划，绑定岗位、候选人、题库、时间窗和邀请 | 计划、题库、简历审阅和语音资产未就绪时不得发出正式邀请 |
@@ -94,6 +95,8 @@ flowchart LR
 | Model Invocation | 统一执行模型能力调用 | 吸收路由、凭证、schema、重试、回退、超时、断路器、审计和成本 |
 | 逐题评分 | 使用冻结题目、服务端最终转写和岗位要求输出可解释评分 | 保存命中点、缺失点、证据、置信度与 revision |
 | 报告与企业复核 | 汇总岗位维度、经历问题和风险提示，提供答案与音频复核 | 报告使用“匹配度/需复核”，最终决定由企业人员完成 |
+
+路由声明与 transport implementation 分离：`app/api/routes.py` 是仅负责 include 的总装入口，具体路径按 `system/admin/catalog/talent/plans/interviews/realtime` 放在 `app/api/routers/`；`app/transport/service_locator.py` 按需构造路由调用的 deep module，`app/transport/realtime.py` 独占本机 WebSocket、跨实例事件 fan-out 和按角色裁剪，`app/transport/http/responses.py + fields/` 独占 JSON 编码、集合/异步/错误格式与声明式字段 allow-list。路由不维护这些 implementation，transport fields 也不反向进入业务 module。成功资源保持既有顶层形状，集合统一为 `items + next_cursor`，从而在提高 locality 的同时避免一次性破坏 React 和外部客户端。
 
 内置 Web 工作台以 React 19 + Vite 构建，FastAPI 只托管生产 bundle、图片和 vendor 资产；浏览器仍与后端同源，不新增 BFF 或复制领域规则。`WorkbenchProvider` 统一持有 hash 路由、认证会话、角色重定向、资源缓存、弹窗、toast 和可取消请求；Workspace Query 按角色与路由加载资源。题库一级路由只加载全组织 KnowledgeBase 摘要，`/#questions/{knowledge_base_id}` 详情路由才加载该题库的 Question、KnowledgeBaseSpeechProfile、可选 TTS 模型/声音和最近构建，避免继续把所有题目平铺在题库首页；总览仍只读取 `/workspace/question-overview`。Candidate Interview Runtime 独占候选人媒体、WebSocket、本地完整录音和失败恢复；Avatar Delivery Runtime 以同一个 `play/stop` interface 处理冻结音频、浏览器语音、云视频/WebRTC 和云会话关闭。业务组件与命令 hooks 已按 `questions/workflow/plans/interviews/models/candidate` 分区，React feature registry 声明导航和角色，旧全局 DOM/controller 已物理删除。浏览器 WebSocket 使用后台 Bearer 换取的短期面试范围 ticket，后端仍兼容非浏览器客户端直接提供 `Authorization` header。
 
@@ -119,8 +122,11 @@ sequenceDiagram
   R->>W: 摄取、扫描、私有存储并解析
   W-->>R: ResumeDocument ready
   R->>W: 指定岗位的简历审阅
-  W-->>R: 初筛建议 + 项目证据 + 经历问题 + 问题语音
+  W-->>R: 初筛建议 + 项目/技能证据
   I->>R: 查看简历与初筛依据并人工复核
+  R->>W: 生效结论符合后排队生成简历问答
+  W-->>R: 与简历证据严格绑定的问题草稿
+  I->>R: 从候选人外层入口查看简历问答，人工增删改并批准/拒绝问题
   I->>P: 审核计划并创建预约
   P-->>C: 一次性邀请链接
   C->>M: 姓名 + 邮箱 + 手机号 + 授权并确认预约
@@ -158,7 +164,7 @@ sequenceDiagram
 - 新建题库时若组织已经配置 enabled 的 `tts.synthesize + question_speech_generation` route，Question Catalog 会解析其 ready primary ModelConfiguration 和模型默认音色，并立即冻结为题库 revision 1 profile；后续 route 变化不会静默改写既有题库。没有有效默认路由时生产环境保持 `configuration_required`；开发 mock 只用于离线流程，必须在投影中明确标为不可试听。
 - 上传题目后，结构化字段校验和题目语音异步完成。正式计划只能引用 `ready` 的题库版本，且每道活动题必须有完整评分依据和匹配当前 speech profile revision 的可用语音资产；服务端即时 TTS 只作为面试期间播放故障的受控降级。
 - 旧 speech build 完成时若题库已切换到新 revision，只能保存为历史资产或幂等结束，不能回写当前 `speech_asset_id` 或把题库误标为 ready。已批准计划和历史 InterviewQuestionSnapshot 继续引用原不可变资产。
-- Resume Review 对调用方只暴露“排队审阅、读取状态”。字符/Token 估算、分页分块、并发 Map、证据去重/压缩、最终 Reduce、按简历版本隔离的工作幂等和 queued 孤儿自愈都封装在 module 内；只读取系统托管简历，初筛不使用受保护属性，人工覆盖保留 AI 原结论。
+- Resume Review 对调用方只暴露“排队审阅、读取状态”。字符/Token 估算、最终响应数量/长度边界、单次输出截断后的 Map/Reduce 降级、分页分块、并发 Map、证据去重/压缩、最终 Reduce、按简历版本隔离的工作幂等和 queued 孤儿自愈都封装在 module 内；只读取系统托管简历，初筛不使用受保护属性，人工覆盖保留 AI 原结论。
 - `InterviewAppointment` 必须绑定已批准计划、候选人记录、岗位、题库版本和时间窗。候选人填报至少用邮箱或手机号与该记录精确匹配，不能通过查询接口枚举简历库。
 - 随机抽题不是无约束随机。计划批准时冻结可选题目版本和抽题规则；会话保存随机种子、候选集合哈希、选择原因和题目快照，保证可审计且历史不受题库编辑影响。
 - 一个轮次只有服务端 streaming/batch STT 的 authoritative final 可以形成 `CandidateAnswer`。partial 只用于界面显示；客户端文本和浏览器 final 不是领域输入。
@@ -229,7 +235,9 @@ sequenceDiagram
 - 候选人专属计划以 execution v2 槽位、冻结 `QuestionCandidatePool` 和经历题快照为唯一执行表示；会话只能由预约创建。预约使用服务端告知与明确授权、哈希 token、强匹配、带 TTL 的准入事实、时间窗、原子消费和并发幂等 self-start。
 - `QuestionSelection` 使用会话种子与 HMAC-SHA256 在批准候选池内稳定随机，选择事实与题目快照保存在会话聚合中；岗位题完成后生命周期进入 `resume_experience`。
 - 音频回答会先进入 `transcribing`；React 候选人端把麦克风重采样为 16 kHz 单声道 PCM，经独立 `stt-stream` WebSocket 交给 `ModelGateway.open_stream()`，校验有序 partial/final，并只把唯一服务端 final 交给评分；浏览器 WebM 完整录音链路仍作为建流失败时的 batch 修复路径。本地 mock 允许显式开发转写输入，生产配置禁止该输入。
-- 国内实时媒体实现仍保持 provider seam：DashScope adapter 把 PCM 映射为 Qwen-Audio 3.0 duplex WebSocket、把私有录音映射为 Qwen3-ASR batch；Avatar Delivery 在该 seam 上方按预约选择 adapter，自研模式复用 `QuestionSpeechAsset + PrivateFileStorage`，云模式继续由腾讯云数智人 adapter 用 HTTPS 管理 create/stat/start/close、用签名 WSS command channel 发送 SEND_TEXT，媒体由腾讯云 WebRTC/SFU 承载，React 通过 TCPlayerLite 播放 `webrtc://`。切换模式或厂商不改变 InterviewSession 状态机；离场、换流和异常必须关闭数智人会话释放并发。
+- 实时面试采用“双轨单真相”：同一 PCM 可并行进入权威 `stt.streaming` 和可选 `speech.dialogue_realtime`。前者形成 CandidateAnswer 并驱动异步评分；后者只负责低延迟语音表达，必须等待确定性策略批准追问文本后逐字播报，输出音频分片不能写入评分证据。回答请求在 `answer.evaluate` 入 Outbox 后立即返回，追问/下一题不等待评分模型；worker 完成评分和报告后再广播安全状态。
+- 动态追问是 root turn 的深度 1、权重 0 子轮次；每个 root 最多 1 次、全场默认最多 2 次，并受回答长度和剩余时间约束。判定只使用当前权威转写与冻结关键点，候选人投影不暴露缺失关键点或内部原因。
+- 国内实时媒体实现仍保持 provider seam：DashScope adapter 把 PCM 映射为 Qwen-Audio 3.0 duplex ASR、把私有录音映射为 Qwen3-ASR batch，并把 Qwen Omni/Audio Realtime 映射为统一 `speech.dialogue_realtime`；官方 OpenAI adapter 提供 Realtime、批量转写及常用 Chat/Embedding/TTS 模型。Avatar Delivery 在该 seam 上方按预约选择 adapter，自研模式复用 `QuestionSpeechAsset + PrivateFileStorage`，云模式继续由腾讯云数智人 adapter 用 HTTPS 管理 create/stat/start/close、用签名 WSS command channel发送 SEND_TEXT，媒体由腾讯云 WebRTC/SFU 承载，React 通过 TCPlayerLite 播放 `webrtc://`。切换模式或厂商不改变 InterviewSession 状态机；离场、换流和异常必须关闭数智人会话释放并发。
 - 企业复核 projection、五分钟签名音频访问、实际下载审计、append-only 转写修正、重评、报告 revision、JSON/CSV 导出和复核完成记录已实现。
 - 后台 Bearer RBAC、候选人 token 窄接口与 allow-list 安全投影、Redis fail-closed 公开限流、HTTP 元数据审计、联系人/Provider 凭证加密、显式到期数据清理、Outbox 退避/dead-letter/监控/重放、数据库共享断路器、Redis 跨实例事件 adapter、心跳超时监控、抽题公平性分布及脱敏评分金标校准已实现。
 - PostgreSQL adapter 与显式 `python -m app.migrations.postgresql` 部署迁移已实现，包含租户 RLS、预约单会话、选择槽位和 Outbox 幂等约束；迁移 owner 与最小权限 runtime role 分离，应用启动只读校验 schema、从不执行 DDL。Memory/SQLite 仍用于本地测试。
@@ -237,6 +245,8 @@ sequenceDiagram
 - `app.operations.production_config` 把生产配置生成和静态检查收敛在一个运维 module：生成入口原子创建 `0600`、Git 忽略且不可覆盖的 shell 配置，检查入口只解析变量名/格式、不导出环境、不连接外部依赖；真正运行状态仍以 `/readyz` 为准。调用方不需要自行拼接 token JSON、Fernet 或 HMAC 密钥。
 
 仓库内能力已完成本地验证，并已有 `openai_compatible`、`deepseek`、`zhipuai` 与 `dashscope` 的 LLM HTTP adapter，OpenAI-compatible、智谱 GLM-TTS 与 DashScope 的 TTS/实时及批量 ASR，以及 `media_http` 的通用媒体协议和 `tencent_cloud_avatar` 的云渲染 WebRTC adapter。Model Invocation 仍是单一 deep module：插件 manifest 声明连接/凭证表单和按 `llm/embedding/tts/stt/avatar` 分类的模型表单，`ProviderConnection`、`ModelConfiguration` 与 `ModelRoute` 分别承载连接、具体模型和业务选择；registry 负责校验和加载，前端只通用渲染 schema。网关从 `model_configuration_id` 解析连接、凭证和 adapter，业务 module 不感知厂商差异。没有账号、凭据、数智人资产、并发额度和真实模型探针时仍不能把模型标记为健康。本机隔离 PostgreSQL 16/Redis 7 已通过最小权限 RLS、事务/CAS、约束、索引查询计划、跨实例事件和限流集成验收；官方 ClamAV arm64 daemon 已用本地 EICAR 验收库完成真实 TCP PING/INSTREAM/FOUND 协议测试。目标生产集群、阿里云 OSS、生产 clamd、真实 ASR WER/延迟、腾讯 WebRTC 可用性及外部模型音质/费用仍需部署联调。`INTERVIEWER_RUNTIME_ENV=production` 要求私有对象存储、显式非 mock 且近期健康的模型路由、扫描器和生产密钥；缺失时 `/readyz`、邀请或 start 按职责失败关闭。旧向量题库、管理员直建/直接 start、客户端文本答案、运行时计划 `items` 和旧模型 provider config interface 已删除。
+
+补充的实时语音实现沿用同一 Model Invocation deep module：官方 `openai` 与 `dashscope` 新增 `realtime_speech` 模型类型和 `speech.dialogue_realtime` capability，候选人端按 PCM delta 排队播放。火山豆包 S2S 已确认产品能力，但当前二进制会话协议不能冒充 OpenAI-style adapter，继续以 `implemented=false` TODO 保留，待按官方完整协议实现并验证“批准文本约束”后再开放路由。
 
 ### 已验证的核心架构修复
 

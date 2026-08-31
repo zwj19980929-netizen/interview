@@ -2,8 +2,8 @@
   "schema_version": "2",
   "provider_id": "dashscope",
   "display_name": "阿里云百炼（千问 / Qwen）",
-  "version": "0.3.0",
-  "capabilities": ["llm.chat_json", "llm.chat_text", "embedding.text", "stt.streaming", "stt.batch", "tts.synthesize"],
+  "version": "0.4.0",
+  "capabilities": ["llm.chat_json", "llm.chat_text", "embedding.text", "speech.dialogue_realtime", "stt.streaming", "stt.batch", "tts.synthesize"],
   "model_selection": "customizable",
   "defaults": {
     "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
@@ -42,6 +42,12 @@
       {"name": "voice_map", "label": "音色映射", "control": "key_value", "required": false},
       {"name": "sample_rate_hz", "label": "采样率", "control": "number", "required": false, "default": 24000, "min": 8000, "max": 48000},
       {"name": "force_https_assets", "label": "仅接受 HTTPS 音频资产", "control": "switch", "required": false, "default": true}
+    ]}},
+    "realtime_speech": {"label": "实时语音对话（S2S）", "selection_mode": "predefined", "capabilities": ["speech.dialogue_realtime"], "configuration_form": {"fields": [
+      {"name": "realtime_websocket_url", "label": "Realtime WebSocket", "control": "text", "required": false},
+      {"name": "dialogue_input_transcription_model", "label": "输入转写模型", "control": "text", "required": false, "default": "qwen3-asr-flash"},
+      {"name": "dialogue_default_voice", "label": "实时对话音色", "control": "text", "required": false, "default": "Cherry"},
+      {"name": "voice_map", "label": "音色映射", "control": "key_value", "required": false}
     ]}}
   },
   "config_schema": {
@@ -63,6 +69,9 @@
       "max_sentence_silence_ms": {"type": "integer"},
       "vocabulary_id": {"type": "string"},
       "batch_max_bytes": {"type": "integer"},
+      "realtime_websocket_url": {"type": "string"},
+      "dialogue_input_transcription_model": {"type": "string"},
+      "dialogue_default_voice": {"type": "string"},
       "use_environment_proxy": {"type": "boolean"}
     }
   },
@@ -114,6 +123,31 @@
       "model_id": "cosyvoice-v3-flash",
       "label": "CosyVoice V3 Flash",
       "capabilities": ["tts.synthesize"]
+    },
+    {
+      "model_id": "qwen3.5-omni-plus-realtime",
+      "label": "Qwen 3.5 Omni Plus Realtime",
+      "model_type": "realtime_speech",
+      "capabilities": ["speech.dialogue_realtime"],
+      "default": true
+    },
+    {
+      "model_id": "qwen3.5-omni-flash-realtime",
+      "label": "Qwen 3.5 Omni Flash Realtime",
+      "model_type": "realtime_speech",
+      "capabilities": ["speech.dialogue_realtime"]
+    },
+    {
+      "model_id": "qwen-audio-3.0-realtime-plus",
+      "label": "Qwen Audio 3.0 Realtime Plus",
+      "model_type": "realtime_speech",
+      "capabilities": ["speech.dialogue_realtime"]
+    },
+    {
+      "model_id": "qwen-audio-3.0-realtime-flash",
+      "label": "Qwen Audio 3.0 Realtime Flash",
+      "model_type": "realtime_speech",
+      "capabilities": ["speech.dialogue_realtime"]
     }
   ],
   "entrypoint": "app.providers.dashscope.provider:DashScopeProvider",

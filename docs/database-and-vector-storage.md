@@ -76,6 +76,8 @@ PostgreSQL 首版迁移采用受约束 JSONB documents，以保持现有聚合�
 
 SQLite 当前用通用 JSON documents 表保存业务对象。`InterviewSession` 以单一聚合文档保存候选人、计划/题目快照、轮次、回答、评分/报告 revision、中断上下文和生命周期事件。生命周期命令产生的聚合、领域事件和 Outbox 工作项原子提交；这属于带事件日志的状态持久化，不是完整 event sourcing。
 
+候选人个人题库不新增 repository 或复制题目文档：`CandidateQuestionBank` 由 `ExperienceQuestionRepository` 按 `candidate_profile_id` 投影。人工题仍必须引用同一候选人的 `ResumeReview`，从该审阅继承岗位范围；`source_type` 区分 `ai_generated/manual`，逻辑删除写入 `status=archived` 和操作者/时间。新计划忽略 archived，历史计划与面试只读其已冻结快照，因此本次字段扩展不需要新增物理集合或破坏性迁移。
+
 本地候选人录音由 `app/adapters/local_media.py` 写入：
 
 ```text
@@ -186,7 +188,7 @@ candidate_profiles(..., organization_id text not null, status text not null, ret
 file_objects(..., organization_id text not null, category text not null, backend text not null, object_key text not null, content_hash text not null, size_bytes bigint not null, unique(organization_id, backend, object_key))
 resume_documents(..., candidate_profile_id text not null references candidate_profiles(id), resume_version integer not null, file_name text not null, file_object_id text references file_objects(id), parsed_text_file_object_id text references file_objects(id), file_hash text, status text not null, deleted_at timestamptz, version integer not null)
 resume_reviews(..., resume_document_id text not null references resume_documents(id), job_position_id text not null references job_positions(id), status text, processing_stage text, processing_strategy text, processing_progress jsonb, evidence_chunks jsonb, screening_recommendation text, screening_score integer, screening_policy_version text, matched_requirements jsonb, unmet_requirements jsonb, human_decision text, human_review_status text, human_review_note text, reviewed_by text, reviewed_at timestamptz, version integer not null)
-experience_questions(..., resume_review_id text not null references resume_reviews(id), version integer not null)
+experience_questions(..., resume_review_id text not null references resume_reviews(id), candidate_profile_id text not null references candidate_profiles(id), job_position_id text not null references job_positions(id), source_type text not null, status text not null, speech_status text not null, archived_at timestamptz, version integer not null)
 role_requirements(..., job_position_id text not null references job_positions(id), version integer not null)
 
 interview_plans(..., job_position_id text not null, candidate_profile_id text not null, resume_review_id text not null, version integer not null)
@@ -215,6 +217,8 @@ model_invocation_logs(...)
 outbox_work_items(...)
 audit_events(...)
 ```
+
+`speech_dialogue_mode`、`followup_policy` 和追问 parent/root/depth/weight 进入现有预约/会话/轮次 document/JSONB 表达，不新增第二套“实时对话表”。追问仍是 `interview_turns`，其 CandidateAnswer 与 AnswerEvaluation 使用同一唯一约束。答案提交与 `answer.evaluate:{answer_id}:{revision}` Outbox 幂等键原子提交；请求线程不执行评分。S2S 音频 delta 是瞬时传输数据，不持久化为评分证据；原始候选人录音、权威 STT final 和 Provider invocation 脱敏元数据继续按既有表保存。
 
 当前 JSON document adapter 把同一关系存为 `JobPosition.knowledge_base_ids`，并把历史 `KnowledgeBase.job_position_id` 投影为初始关联。规范化 PostgreSQL 使用 `job_position_knowledge_bases`；两种存储都只引用题库，不复制 Question、KnowledgeBaseSpeechProfile 或 QuestionSpeechAsset。
 
@@ -332,7 +336,7 @@ Celery 部署合同：
 
 - 题库导入：`parse -> validate structured fields -> persist candidate pool -> speech generate -> build summary`。
 - 题库语音切换：`speech profile CAS -> parent rebuild -> freeze question manifest -> child speech fan-out -> current revision guard -> progress aggregate`。
-- 简历审阅：`scan/page-preserving parse -> atomic review enqueue -> redact/budget -> single-pass 或 evidence Map/compact/final Reduce -> experience questions -> approved question speech`。
+- 简历审阅与问答：`scan/page-preserving parse -> atomic review enqueue -> redact/budget -> single-pass 或 evidence Map/compact/final Reduce -> effective qualified gate -> resume.experience_questions.generate -> approved question speech`；非符合结论在 gate 停止，问题持久化不可变证据快照。
 - 回答：`audio persist + turn.transcribing -> streaming final`；失败后 `batch repair -> answer final -> evaluate -> next question/report`。
 
 STT 流本身是长连接，不持有数据库事务。开始时保存 stream attempt 元数据，final 或 error 到达后用短事务提交；所有音频 chunk 只流向媒体/STT adapter，不逐 chunk 写领域表。

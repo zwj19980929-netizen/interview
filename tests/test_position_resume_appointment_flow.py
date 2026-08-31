@@ -156,6 +156,17 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
     assert ready_review.status_code == 200, ready_review.text
     assert ready_review.json()["status"] == "ready_for_review"
 
+    qualified_review = api.patch(
+        f"/api/v1/resume-reviews/{review_id}/screening-review",
+        json={
+            "expected_version": ready_review.json()["version"],
+            "decision": "qualified",
+            "note": "测试中人工确认简历项目证据符合岗位要求",
+        },
+    )
+    assert qualified_review.status_code == 200, qualified_review.text
+    asyncio.run(OutboxWorker(get_store()).run_once())
+
     experience = api.get(f"/api/v1/resume-reviews/{review_id}/experience-questions")
     assert experience.status_code == 200
     experience_question = experience.json()["items"][0]
@@ -370,6 +381,26 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
         )
         assert answer.status_code == 200, answer.text
         assert answer.json()["answer"]["transcript_source"] == "server_batch"
+        assert answer.json()["evaluation"]["status"] == "pending"
+        asyncio.run(OutboxWorker(get_store()).run_once())
+        after_root = api.get(f"/api/v1/interviews/{interview_id}").json()
+        if after_root.get("current_turn_id"):
+            followup = next(
+                item for item in after_root["turns"]
+                if item["id"] == after_root["current_turn_id"]
+            )
+            if followup.get("is_followup"):
+                followup_answer = api.post(
+                    f"/api/v1/interviews/{interview_id}/audio-answers",
+                    json={
+                        "turn_id": followup["id"],
+                        "audio_uri": f"/media/{interview_id}/{followup['id']}.webm",
+                        "development_transcript": followup["question_snapshot"]["standard_answer"],
+                        "duration_seconds": 8,
+                    },
+                )
+                assert followup_answer.status_code == 200, followup_answer.text
+                asyncio.run(OutboxWorker(get_store()).run_once())
 
     report = api.get(f"/api/v1/interviews/{interview_id}/report")
     assert report.status_code == 200, report.text

@@ -57,6 +57,36 @@ def test_candidate_recording_uses_private_storage_and_signed_review_access(tmp_p
     assert opened == {"content": b"candidate-audio", "content_type": "audio/webm;codecs=opus"}
 
 
+def test_browser_pcm_recording_is_persisted_as_valid_pcm16_wav(tmp_path) -> None:
+    store = InMemoryStore()
+    persistence = persistence_for(store)
+    storage = LocalPrivateFileAdapter(
+        tmp_path / "private-pcm",
+        signer=FileAccessSigner("private-media-pcm-test-secret-at-least-32"),
+    )
+    recording = PrivateMediaStorage(persistence, storage=storage).start_recording(
+        "interview_pcm",
+        "turn_pcm",
+        "audio/pcm",
+        sample_rate_hz=16000,
+        channels=1,
+    )
+    pcm_samples = b"\x00\x00\xff\x7f\x00\x80"
+    recording.append(pcm_samples)
+
+    result = recording.finish()
+    content = read_managed_audio(persistence, "org_default", result.audio_uri, storage)
+
+    assert result.mime_type == "audio/wav"
+    assert result.byte_count == 44 + len(pcm_samples)
+    assert content[:4] == b"RIFF"
+    assert content[8:12] == b"WAVE"
+    assert int.from_bytes(content[24:28], "little") == 16000
+    assert int.from_bytes(content[22:24], "little") == 1
+    assert int.from_bytes(content[40:44], "little") == len(pcm_samples)
+    assert content[44:] == pcm_samples
+
+
 def test_production_recording_refuses_local_backend(monkeypatch) -> None:
     monkeypatch.setenv("INTERVIEWER_RUNTIME_ENV", "production")
     monkeypatch.setenv("INTERVIEWER_MEDIA_RECORDING_BACKEND", "local")

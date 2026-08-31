@@ -193,7 +193,11 @@ def test_evaluation_and_report_revisions_are_append_only() -> None:
     answer = audio_answer(api, interview, "避免长事务，并用 Outbox 分阶段提交。")
     assert answer.status_code == 200, answer.text
     answer_id = answer.json()["answer"]["id"]
-    first_evaluation_id = answer.json()["evaluation"]["id"]
+    assert answer.json()["evaluation"]["status"] == "pending"
+    asyncio.run(OutboxWorker(get_store()).run_once())
+    first_evaluation_id = api.get(
+        "/api/v1/interviews/%s/answers/%s/evaluations" % (interview["id"], answer_id)
+    ).json()["items"][0]["id"]
 
     completed = api.post("/api/v1/interviews/%s/complete" % interview["id"])
     assert completed.status_code == 200, completed.text
@@ -354,18 +358,22 @@ def test_failed_evaluation_work_reenters_lifecycle_before_worker_retry() -> None
     async def fail_evaluation(*args, **kwargs):
         raise RuntimeError("evaluation provider unavailable")
 
-    service.evaluation.evaluate_answer = fail_evaluation
+    accepted = asyncio.run(
+        service.submit_audio_answer(
+            interview["id"],
+            {
+                "turn_id": interview["current_turn_id"],
+                "audio_uri": "private-test://failure.webm",
+                "content_type": "audio/webm",
+                "development_transcript": "等待恢复评分",
+            },
+        )
+    )
+    worker = OutboxWorker(get_store())
+    worker.interviews.evaluation.evaluate_answer = fail_evaluation
     with pytest.raises(RuntimeError, match="evaluation provider unavailable"):
         asyncio.run(
-            service.submit_audio_answer(
-                interview["id"],
-                {
-                    "turn_id": interview["current_turn_id"],
-                    "audio_uri": "private-test://failure.webm",
-                    "content_type": "audio/webm",
-                    "development_transcript": "等待恢复评分",
-                },
-            )
+            worker.run_item(accepted["evaluation_work_id"])
         )
 
     failed = service.get_interview(interview["id"])
@@ -375,7 +383,23 @@ def test_failed_evaluation_work_reenters_lifecycle_before_worker_retry() -> None
     result = asyncio.run(OutboxWorker(get_store()).run_once())
     assert result[-1]["status"] == "completed"
     recovered = service.get_interview(interview["id"])
-    assert recovered["status"] == "report_ready"
+    assert recovered["status"] == "in_progress"
+    followup = next(item for item in recovered["turns"] if item["id"] == recovered["current_turn_id"])
+    assert followup["is_followup"] is True
     event_types = [item["type"] for item in recovered["lifecycle_events"]]
     assert event_types.index("evaluation.failed") < event_types.index("evaluation.retry_started")
     assert event_types.index("evaluation.retry_started") < event_types.index("evaluation.completed")
+
+    asyncio.run(
+        service.submit_audio_answer(
+            interview["id"],
+            {
+                "turn_id": followup["id"],
+                "audio_uri": "private-test://followup.webm",
+                "content_type": "audio/webm",
+                "development_transcript": "应避免长事务，并通过 Outbox 分阶段提交。",
+            },
+        )
+    )
+    asyncio.run(OutboxWorker(get_store()).run_once())
+    assert service.get_interview(interview["id"])["status"] == "report_ready"

@@ -25,6 +25,7 @@ class LifecycleCommandType(str, Enum):
     TRANSCRIPTION_STARTED = "transcription_started"
     TRANSCRIPTION_FAILED = "transcription_failed"
     ANSWER_SUBMITTED = "answer_submitted"
+    FOLLOWUP_REQUESTED = "followup_requested"
     REGRADE_REQUESTED = "regrade_requested"
     EVALUATION_SUCCEEDED = "evaluation_succeeded"
     EVALUATION_FAILED = "evaluation_failed"
@@ -81,6 +82,7 @@ class InterviewSessionLifecycle:
             LifecycleCommandType.TRANSCRIPTION_STARTED: self._transcription_started,
             LifecycleCommandType.TRANSCRIPTION_FAILED: self._transcription_failed,
             LifecycleCommandType.ANSWER_SUBMITTED: self._answer_submitted,
+            LifecycleCommandType.FOLLOWUP_REQUESTED: self._followup_requested,
             LifecycleCommandType.REGRADE_REQUESTED: self._regrade_requested,
             LifecycleCommandType.EVALUATION_SUCCEEDED: self._evaluation_succeeded,
             LifecycleCommandType.EVALUATION_FAILED: self._evaluation_failed,
@@ -252,6 +254,18 @@ class InterviewSessionLifecycle:
             {"turn_id": turn["id"], "reason": payload.get("reason", "interviewer_skipped")},
             now,
         )
+        if mutable_turn.get("is_followup"):
+            self._emit(
+                session,
+                events,
+                "followup.completed",
+                {
+                    "turn_id": turn["id"],
+                    "root_turn_id": mutable_turn.get("root_turn_id"),
+                    "outcome": "skipped",
+                },
+                now,
+            )
         self._activate_next_or_report(session, now, events, effects)
 
     def _complete(
@@ -300,6 +314,11 @@ class InterviewSessionLifecycle:
             self._invalid("The active turn already has an answer.")
         session.setdefault("answers", []).append(answer)
         mutable_turn["status"] = "evaluating"
+        if session.get("current_turn_id") == turn["id"]:
+            # The accepted answer closes the input gate immediately. A bounded
+            # follow-up command may install a new current turn in the same
+            # transaction; otherwise the client waits for the worker to advance.
+            session["current_turn_id"] = None
         self._emit(
             session,
             events,
@@ -308,6 +327,85 @@ class InterviewSessionLifecycle:
             now,
         )
         self._request_evaluation(session, answer, 1, payload.get("trigger_reason", "initial_scoring"), now, events, effects)
+
+    def _followup_requested(
+        self,
+        session: Document,
+        payload: Document,
+        now: str,
+        events: List[Document],
+        effects: List[Document],
+    ) -> None:
+        root_turn_id = str(payload.get("root_turn_id") or "")
+        root = self._turn(session, root_turn_id)
+        existing = next(
+            (
+                item
+                for item in session.get("turns", [])
+                if item.get("is_followup") and item.get("root_turn_id") == root_turn_id
+            ),
+            None,
+        )
+        if existing is not None:
+            return
+        if session.get("status") != "in_progress" or root.get("status") != "evaluating":
+            self._invalid("A follow-up can only be selected while its root answer is awaiting evaluation.")
+        if root.get("is_followup") or int(root.get("followup_depth", 0)) != 0:
+            self._invalid("A follow-up cannot create another follow-up.")
+        if not root.get("allow_followup", False):
+            self._invalid("The approved root turn does not allow a follow-up.")
+
+        policy = session.get("followup_policy") or {}
+        max_total = max(0, int(policy.get("max_total", 2)))
+        max_per_root = min(1, max(0, int(policy.get("max_per_root", 1))))
+        all_followups = [item for item in session.get("turns", []) if item.get("is_followup")]
+        if len(all_followups) >= max_total or max_per_root < 1:
+            self._invalid("The InterviewSession follow-up budget is exhausted.")
+
+        followup = deepcopy(payload.get("followup_turn") or {})
+        if not followup.get("id") or not str(followup.get("question_spoken_text") or "").strip():
+            self._invalid("A selected follow-up requires an id and a non-empty probe.")
+        if int(followup.get("followup_depth", 0)) != 1:
+            self._invalid("A selected follow-up must have depth one.")
+        if followup.get("parent_turn_id") != root["id"] or followup.get("root_turn_id") != root["id"]:
+            self._invalid("A selected follow-up must be a child of its root turn.")
+        if float(followup.get("weight", 0.0)) != 0.0:
+            self._invalid("A follow-up cannot change the approved plan score weight.")
+
+        insertion_order = int(root.get("order", 0)) + 1
+        for turn in session.get("turns", []):
+            if int(turn.get("order", 0)) >= insertion_order:
+                turn["order"] = int(turn["order"]) + 1
+        followup["order"] = insertion_order
+        followup["status"] = "asking"
+        followup["started_at"] = followup.get("started_at") or now
+        followup["completed_at"] = None
+        followup["allow_followup"] = False
+        followup["weight"] = 0.0
+        session.setdefault("turns", []).append(followup)
+        session.setdefault("turn_ids", []).append(followup["id"])
+        session["current_turn_id"] = followup["id"]
+        session["phase"] = followup.get("phase", root.get("phase", session.get("phase")))
+        requested_payload = {
+            "root_turn_id": root["id"],
+            "parent_turn_id": root["id"],
+            "answer_id": payload.get("answer_id"),
+            "reason": followup.get("followup_reason"),
+            "target_key_points": deepcopy(followup.get("target_key_points", [])),
+        }
+        self._emit(session, events, "followup.requested", requested_payload, now)
+        self._emit(
+            session,
+            events,
+            "followup.selected",
+            {
+                **requested_payload,
+                "turn_id": followup["id"],
+                "followup_depth": 1,
+                "question_text": followup["question_spoken_text"],
+            },
+            now,
+        )
 
     def _transcription_started(
         self,
@@ -424,7 +522,33 @@ class InterviewSessionLifecycle:
             turn["status"] = "completed"
             turn["completed_at"] = now
             self._emit(session, events, "turn.completed", {"turn_id": turn["id"]}, now)
-            if session["status"] == "in_progress":
+            if turn.get("is_followup"):
+                self._emit(
+                    session,
+                    events,
+                    "followup.completed",
+                    {
+                        "turn_id": turn["id"],
+                        "root_turn_id": turn.get("root_turn_id"),
+                        "answer_id": answer["id"],
+                        "evaluation_id": evaluation["id"],
+                        "outcome": "answered",
+                    },
+                    now,
+                )
+            if session.get("current_turn_id") == turn["id"]:
+                session["current_turn_id"] = None
+            active_child = next(
+                (
+                    item
+                    for item in session.get("turns", [])
+                    if item.get("is_followup")
+                    and item.get("root_turn_id") == turn["id"]
+                    and item.get("status") in {"asking", "transcribing", "evaluating"}
+                ),
+                None,
+            )
+            if session["status"] == "in_progress" and active_child is None and not self._has_unresolved_evaluations(session):
                 self._activate_next_or_report(session, now, events, effects)
         elif previous_id and session.get("current_report_id"):
             self._request_report(session, "answer_regraded", now, events, effects, force=True)
@@ -597,6 +721,8 @@ class InterviewSessionLifecycle:
         events: List[Document],
         effects: List[Document],
     ) -> None:
+        if self._has_unresolved_evaluations(session):
+            return
         next_turn = self._first_turn_with_status(session, ("pending",))
         if next_turn is not None:
             previous_phase = session.get("phase")
@@ -620,6 +746,10 @@ class InterviewSessionLifecycle:
         session["completed_at"] = session.get("completed_at") or now
         self._emit(session, events, "interview.completed", {"reason": "questions_completed"}, now)
         self._request_report(session, "interview_completed", now, events, effects)
+
+    @staticmethod
+    def _has_unresolved_evaluations(session: Document) -> bool:
+        return any(turn.get("status") == "evaluating" for turn in session.get("turns", []))
 
     def _emit(
         self,

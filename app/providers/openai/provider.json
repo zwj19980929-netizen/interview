@@ -1,0 +1,48 @@
+{
+  "schema_version": "2",
+  "provider_id": "openai",
+  "display_name": "OpenAI",
+  "version": "1.0.0",
+  "capabilities": ["embedding.text", "llm.chat_json", "llm.chat_text", "speech.dialogue_realtime", "stt.batch", "tts.synthesize"],
+  "model_selection": "predefined",
+  "defaults": {
+    "base_url": "https://api.openai.com/v1",
+    "realtime_websocket_url": "wss://api.openai.com/v1/realtime",
+    "use_environment_proxy": false
+  },
+  "connection_form": {
+    "schema_version": "2",
+    "fields": [
+      {"name": "base_url", "label": "API Base URL", "control": "text", "required": true, "default": "https://api.openai.com/v1"},
+      {"name": "realtime_websocket_url", "label": "Realtime WebSocket URL", "control": "text", "required": true, "default": "wss://api.openai.com/v1/realtime"},
+      {"name": "organization", "label": "Organization", "control": "text", "required": false},
+      {"name": "use_environment_proxy", "label": "使用环境代理", "control": "switch", "required": false, "default": false}
+    ]
+  },
+  "credential_form": {
+    "schema_version": "2",
+    "fields": [
+      {"name": "api_key", "label": "API Key", "control": "secret", "required": true, "write_only": true}
+    ]
+  },
+  "model_types": {
+    "llm": {"label": "大语言模型", "selection_mode": "predefined", "capabilities": ["llm.chat_json", "llm.chat_text"], "configuration_form": {"fields": [{"name": "structured_output_mode", "label": "结构化输出模式", "control": "select", "required": false, "default": "json_schema", "options": [{"label": "JSON Schema", "value": "json_schema"}, {"label": "JSON Object", "value": "json_object"}]}]}},
+    "embedding": {"label": "Embedding", "selection_mode": "predefined", "capabilities": ["embedding.text"], "configuration_form": {"fields": [{"name": "dimensions", "label": "向量维度", "control": "number", "required": false, "min": 1}]}},
+    "stt": {"label": "语音识别", "selection_mode": "predefined", "capabilities": ["stt.batch"], "configuration_form": {"fields": []}},
+    "tts": {"label": "语音合成", "selection_mode": "predefined", "capabilities": ["tts.synthesize"], "configuration_form": {"fields": [{"name": "default_voice", "label": "默认音色", "control": "text", "required": true, "default": "marin"}, {"name": "voice_map", "label": "音色映射", "control": "key_value", "required": false}]}},
+    "realtime_speech": {"label": "Realtime S2S", "selection_mode": "predefined", "capabilities": ["speech.dialogue_realtime"], "configuration_form": {"fields": [{"name": "input_transcription_model", "label": "输入转写模型", "control": "text", "required": false, "default": "gpt-4o-mini-transcribe"}, {"name": "default_voice", "label": "默认音色", "control": "text", "required": false, "default": "marin"}, {"name": "voice_map", "label": "音色映射", "control": "key_value", "required": false}]}}
+  },
+  "models": [
+    {"model_id": "gpt-4.1", "label": "GPT-4.1", "model_type": "llm", "capabilities": ["llm.chat_json", "llm.chat_text"], "default": true},
+    {"model_id": "gpt-4.1-mini", "label": "GPT-4.1 Mini", "model_type": "llm", "capabilities": ["llm.chat_json", "llm.chat_text"]},
+    {"model_id": "text-embedding-3-large", "label": "Text Embedding 3 Large", "model_type": "embedding", "capabilities": ["embedding.text"], "default": true},
+    {"model_id": "text-embedding-3-small", "label": "Text Embedding 3 Small", "model_type": "embedding", "capabilities": ["embedding.text"]},
+    {"model_id": "gpt-4o-mini-transcribe", "label": "GPT-4o Mini Transcribe", "model_type": "stt", "capabilities": ["stt.batch"], "default": true},
+    {"model_id": "gpt-4o-mini-tts", "label": "GPT-4o Mini TTS", "model_type": "tts", "capabilities": ["tts.synthesize"], "default": true},
+    {"model_id": "gpt-realtime-2.1", "label": "GPT Realtime 2.1", "model_type": "realtime_speech", "capabilities": ["speech.dialogue_realtime"], "default": true},
+    {"model_id": "gpt-realtime-2.1-mini", "label": "GPT Realtime 2.1 Mini", "model_type": "realtime_speech", "capabilities": ["speech.dialogue_realtime"]},
+    {"model_id": "gpt-realtime-1.5", "label": "GPT Realtime 1.5", "model_type": "realtime_speech", "capabilities": ["speech.dialogue_realtime"]}
+  ],
+  "entrypoint": "app.providers.openai.provider:OpenAIProvider",
+  "implemented": true
+}

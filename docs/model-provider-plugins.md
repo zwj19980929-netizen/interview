@@ -53,6 +53,7 @@ Provider adapter 负责把统一请求转换成厂商协议、注入厂商鉴权
 | `embedding.text` | 文本向量 | 可选的相似题发现、超大题库自然语言搜索；不用于实时抽题或评分 |
 | `stt.streaming` | 流式语音识别 | 实时面试 |
 | `stt.batch` | 批量音频转写 | 流式失败修复、历史音频补转写 |
+| `speech.dialogue_realtime` | 实时语音到语音对话 | 低延迟受控追问播报；不作为评分真相源 |
 | `tts.synthesize` | 文本转音频 | 岗位题/经历问题语音预生成、数字人降级读题 |
 | `avatar.speak` | 数字人读题 | 实时面试 |
 | `moderation.text` | 内容安全检查 | 可选，候选人输入和报告输出 |
@@ -65,14 +66,15 @@ Provider adapter 负责把统一请求转换成厂商协议、注入厂商鉴权
 
 | provider_id | 能力 | 说明 |
 | --- | --- | --- |
-| `mock` | `llm.chat_json`、`llm.chat_text`、`embedding.text`、`stt.streaming`、`stt.batch`、`tts.synthesize`、`avatar.speak` | 本地测试 adapter；语音结果明确不具备生产 readiness |
+| `mock` | `llm.chat_json`、`llm.chat_text`、`embedding.text`、`speech.dialogue_realtime`、`stt.streaming`、`stt.batch`、`tts.synthesize`、`avatar.speak` | 本地测试 adapter；语音结果明确不具备生产 readiness |
+| `openai` | `llm.chat_json`、`llm.chat_text`、`embedding.text`、`speech.dialogue_realtime`、`stt.batch`、`tts.synthesize` | OpenAI 官方 HTTP + Realtime adapter；Realtime 输入/输出统一为 PCM 事件 |
 | `openai_compatible` | `llm.chat_json`、`llm.chat_text`、`embedding.text`、`tts.synthesize` | 兼容 OpenAI Chat/Embedding/Speech API 风格的模型服务，通过 `base_url` 配置切换 |
 | `deepseek` | `llm.chat_json`、`llm.chat_text` | DeepSeek 官方 OpenAI-compatible Chat API；模型由 manifest 目录约束 |
 | `zhipuai` | `llm.chat_json`、`llm.chat_text`、`tts.synthesize` | 智谱 BigModel OpenAI-compatible Chat 与官方 GLM-TTS `/audio/speech`；模型由 manifest 按能力约束 |
 | `azure_openai` | `llm.chat_json`、`llm.chat_text`、`embedding.text` | 企业 Azure 部署场景 |
 | `anthropic` | `llm.chat_json`、`llm.chat_text` | 可作为评分和总结模型 |
 | `gemini` | `llm.chat_json`、`llm.chat_text`、`embedding.text` | 可作为通用 LLM 和 embedding |
-| `dashscope` | `llm.chat_json`、`llm.chat_text`、`embedding.text`、`stt.streaming`、`stt.batch`、`tts.synthesize` | 阿里云百炼 Qwen LLM/Embedding/TTS、Qwen-Audio 3.0 实时 ASR 与 Qwen3-ASR batch |
+| `dashscope` | `llm.chat_json`、`llm.chat_text`、`embedding.text`、`speech.dialogue_realtime`、`stt.streaming`、`stt.batch`、`tts.synthesize` | 阿里云百炼 Qwen LLM/Embedding/TTS、Qwen Realtime、实时 ASR 与 batch ASR |
 | `media_http` | `stt.streaming`、`stt.batch`、`avatar.speak` | 通用 HTTPS 媒体网关；multipart 音频转写和 JSON 音频/视频数字人响应，模型 ID 可配置 |
 | `tencent_cloud_avatar` | `avatar.speak` | 腾讯云智能数智人云渲染；HTTPS create/stat/start/close + WSS SEND_TEXT，媒体面为腾讯云 WebRTC/SFU |
 | `volcengine` | `llm.chat_json`、`llm.chat_text`、`embedding.text`、`stt.streaming`、`tts.synthesize`、`avatar.speak` | 国内模型、语音和数字人场景 |
@@ -91,16 +93,18 @@ Provider adapter 负责把统一请求转换成厂商协议、注入厂商鉴权
 - 管理员模型探针沿用 Model Invocation pipeline，对 Provider 明确标记为 retryable 的错误执行最多 2 次退避重试（总尝试最多 3 次），并保留统一错误码与 invocation ID；`provider_rate_limited` 对 HTTP 调用方返回 429。重试耗尽仍不得把模型标记为 ready。
 - `mock` provider 已实现 `avatar.speak` 的浏览器语音驱动响应，用于本地数字人演示；它不生成真人视频，也不应标记为生产数字人能力。
 - `openai_compatible` provider 已支持真实 HTTP 调用：`llm.chat_json`、`llm.chat_text`、`embedding.text` 和 `tts.synthesize`。TTS 使用 `/audio/speech`，支持 `wav/mp3/opus/aac/flac/pcm`，二进制响应会转为 data URI 后交给私有资产复制层校验和落盘。
+- 官方 `openai` provider 复用 HTTP Chat/Embedding/TTS runtime，并独立实现 multipart `/audio/transcriptions` 与 Realtime WebSocket。`gpt-realtime-*` 会话关闭 vendor turn detection，由面试状态机提交回合；24 kHz PCM delta、输入/输出 transcript 和中断事件统一映射到 `RealtimeSpeechDialogueEvent`。
 - `deepseek` 与 `zhipuai` provider 复用 `OpenAICompatibleProvider` 的 HTTP、Bearer 鉴权、用量解析、错误映射和响应归一化；两者的 `llm.chat_json` 使用厂商支持的 `json_object` 并在 system message 注入目标 JSON Schema，避免假定支持 OpenAI `json_schema` 扩展。智谱 adapter 另在 TTS seam 校验 `glm-tts`、官方 WAV/PCM 格式、1024 字符上限和默认音色 `tongtong`，再复用共享二进制响应归一化。
 - `dashscope` provider 已支持 OpenAI-compatible Qwen Chat/Embedding、Qwen3-ASR batch、Qwen-Audio-3.0-ASR-Flash-Streaming duplex WebSocket，并按模型路由 Qwen3-TTS 的 multimodal-generation HTTP 接口或 CosyVoice/Qwen-Audio 的 `SpeechSynthesizer` HTTP 接口。实时流使用 workspace 地域域名、Bearer 握手、run-task/task-started、二进制 PCM、result-generated 和 finish-task/task-finished；只投影一个 authoritative final。Batch 只接收服务端解析的私有音频字节并以 Base64 data URL 调用，不把对象存储凭据交给厂商。供应商返回的临时 TTS URL 会复制到 PrivateFileStorage。
+- 同一 `dashscope` adapter 还把 Qwen 3.5 Omni/Audio Realtime 映射到 `speech.dialogue_realtime`：连接由 workspace/region 解析，输入固定 16 kHz PCM、输出 24 kHz PCM；业务先选定追问，再通过受控指令要求逐字播报。S2S 出错只关闭表达轨，权威 STT 和级联播报继续工作。
 - `tencent_cloud_avatar` provider 使用 AppKey/AccessToken HMAC-SHA256 query 签名，按官方会话管理接口执行 HTTPS create-by-asset/stat/start/close，并在 start 后用携带 `requestid=SessionId` 的 WSS command channel 发送 `SEND_TEXT`、等待对应 ReqId 的播报状态确认。响应 `mode=webrtc`，包含 `webrtc://` 拉流地址、不透明 session ID 与 `tencent_web_player` 类型；候选人页用同源 TCPlayerLite 页面拉流，换流/离场调用关闭接口释放并发。供应商云渲染/SFU 承担视频媒体面，业务 WebSocket 不传视频帧。
 - `media_http` provider 已实现真实 HTTP 媒体调用：健康探针使用 Bearer API Key；`stt.batch` 把服务端读取的私有音频作为 multipart 上传并归一化 text/confidence/segments；`stt.streaming` 在统一流接口内安全缓存分片并在 finish 时调用同一真实转写端点，产出唯一 authoritative final；`avatar.speak` 发送 JSON 并接受 HTTPS `audio/video` 媒体。它是可部署的协议 adapter，不代表任何具体厂商账号已经验收，也不宣称提供低延迟 partial。
 - `stt.streaming` 已有 `StreamingSTTRequest/Event`、`ModelGateway.open_stream()`、有序 chunk/final 校验、建立前 fallback、硬超时、断流 batch 修复和独立 WebSocket 端到端测试；`stt.batch` 与 `tts.synthesize` 也有统一 schema、网关校验和调用审计。浏览器 SpeechRecognition 只用于本地展示/开发输入，不满足正式面试 readiness。
 - 路由的 retry、fallback_on、硬超时、数据库共享断路器、输出 schema 校验和成本上限在统一管线执行；每个 attempt 形成追加日志。多实例进程通过 Persistence 共用 `ModelCircuitState`，不再依赖进程内全局状态。
-- 除 `mock`、`openai_compatible`、`deepseek`、`zhipuai`、`dashscope`、`media_http` 和 `tencent_cloud_avatar` 外，其它 provider 目前只有 `implemented=false` 的 manifest 和配置 schema，可展示和保存配置，但不能创建活动路由，也不应视为已接入真实厂商 API。
+- 除 `mock`、`openai`、`openai_compatible`、`deepseek`、`zhipuai`、`dashscope`、`media_http` 和 `tencent_cloud_avatar` 外，其它 provider 目前只有 `implemented=false` 的 manifest 和配置 schema，可展示和保存配置，但不能创建活动路由，也不应视为已接入真实厂商 API。豆包端到端实时语音虽有官方产品能力，但当前仓库尚未实现其二进制 StartConnection/StartSession 协议，也未证明能逐字保持批准追问，因此 `volcengine` 继续是显式 TODO。
 - Provider credentials 通过 `ProviderSecretVault` 在 repository seam 使用 Fernet 密封；API 只返回 `credential_ref`。生产未配置 `INTERVIEWER_PROVIDER_SECRET_ENCRYPTION_KEY` 或遇到旧未密封值时失败关闭。
 
-仓库内 DashScope ASR/TTS 与腾讯云数智人 WebRTC 的鉴权、请求、事件归一化、会话关闭、React 播放和离线合同均已验证；真实外部调用仍需要对应账号、workspace/区域、模型授权、API Key、腾讯数智人形象资产/并发和目标浏览器网络后才能标记健康。`azure_speech`、`tencent_cloud_speech`、`volcengine` 仍为 `implemented=false`。当前国内选型不阻止继续在同一 provider seam 增加讯飞、火山或自建 WHEP/SFU。
+仓库内 OpenAI/DashScope Realtime、DashScope ASR/TTS 与腾讯云数智人 WebRTC 的鉴权、请求、事件归一化、会话关闭、React PCM 播放和离线合同均已验证；真实外部调用仍需要对应账号、workspace/区域、模型授权、API Key、腾讯数智人形象资产/并发和目标浏览器网络后才能标记健康。`azure_speech`、`tencent_cloud_speech`、`volcengine` 仍为 `implemented=false`。当前国内选型不阻止继续在同一 provider seam 增加讯飞、火山或自建 WHEP/SFU。
 
 ## 目录建议
 
@@ -523,8 +527,8 @@ ProviderConnection 拥有其凭证和 ModelConfiguration 生命周期。删除�
 | capability | purpose | 数据边界 |
 | --- | --- | --- |
 | `tts.synthesize` | `question_speech_generation` | 岗位题或已批准经历问题文本 |
-| `llm.chat_json` | `resume_review` | 脱敏简历和岗位要求；返回可解释初筛、项目/技能证据与经历题草稿，不接收受保护属性 |
-| `llm.chat_json` | `resume_experience_question_generation` | 项目证据和岗位维度 |
+| `llm.chat_json` | `resume_review` | 脱敏简历和岗位要求；只返回可解释初筛与项目/技能证据，不接收受保护属性或生成问题 |
+| `llm.chat_json` | `resume_experience_question_generation` | 仅在生效结论符合后接收项目/技能证据；每题必须精确回引并点名输入证据标签 |
 | `stt.streaming` | `candidate_answer_transcription` | 候选人实时回答音频 |
 | `stt.batch` | `candidate_answer_repair` | 失败轮次的完整私有音频 |
 | `llm.chat_json` | `answer_evaluation` | 冻结题目和最终转写 |
@@ -696,7 +700,9 @@ OpenAI-compatible 的 JSON Object fallback 强化指令也由该目录提供，a
 和仅空白字符串；失败转换为不包含完整响应内容的 `provider_schema_invalid`，按 route policy 决定重试或 fallback，
 且失败结果不能写入领域模型。业务 module 可在此之后继续执行去重、权重归一化、证据归属等领域规则。
 
-Resume Review 统一复用 `llm.chat_json + purpose=resume_review` 的同一模型路由，`metadata.resume_review_phase` 只用于区分内部阶段，不要求管理员配置四条路由：`resume_review.v4` 处理预算内简历；`resume_evidence_map.v1` 只抽证据；`resume_evidence_compaction.v1` 合并证据并强制保留 `source_pages`；`resume_review_reduce.v2` 基于全部证据输出最终结构。最终 Schema 的推荐枚举仅允许 `qualified/unqualified/manual_review`，分数限定 0–100；Prompt 要求 0–59/60–74/75–100 分别对应三个枚举，CandidateScreening 领域边界会再次强制归一化，Provider adapter 不复制这项业务策略。所有阶段都经 Model Gateway 严格校验；Provider adapter 不实现分块策略，也不得决定录用/淘汰。
+Resume Review 统一复用 `llm.chat_json + purpose=resume_review` 的同一模型路由，`metadata.resume_review_phase` 只用于区分内部阶段，不要求管理员配置四条路由：`resume_review.v6` 处理预算内简历；`resume_evidence_map.v1` 只抽证据；`resume_evidence_compaction.v1` 合并证据并强制保留 `source_pages`；`resume_review_reduce.v4` 基于全部证据输出最终结构。最终 Schema 的推荐枚举仅允许 `qualified/unqualified/manual_review`，分数限定 0–100，并限制证据/要求的数量和文本长度，不再耦合问题输出；Prompt 要求 0–59/60–74/75–100 分别对应三个枚举，CandidateScreening 领域边界会再次强制归一化。生效结论符合后，Talent module 通过独立 `resume_experience_question_generation.v1` 合同生成问题，Schema 强制 1–3 题、1–4 个核验点和 1–3 个精确证据标签，领域校验再要求题干点名标签并冻结证据快照。所有阶段都经 Model Gateway 严格校验；Provider adapter 不实现资格、分块或证据归属策略，也不得决定录用/淘汰。
+
+短简历单次阶段如果收到 `provider_output_truncated`，Resume Review module 不保存半截 JSON，也不把相同请求交给 Gateway 嵌套重试；它会改用页感知 evidence Map 和 final Reduce，成功后把 `processing.strategy=map_reduce_after_output_truncation` 与 `fallback_reason=provider_output_truncated` 保存为脱敏运行事实。Map 或最终 Reduce 本身截断时仍结构化失败，避免无界成本与不完整结论。
 
 ## 智能生题模型调用
 
@@ -726,5 +732,10 @@ token；ModelInvocationLog 在失败 attempt 也保存这些诊断，不记录�
 - DeepSeek 官方 OpenAI-compatible API：<https://api-docs.deepseek.com/>
 - 智谱 BigModel OpenAI SDK 兼容说明：<https://docs.bigmodel.cn/cn/guide/develop/openai/introduction>
 - 阿里云百炼千问文本生成说明：<https://help.aliyun.com/zh/model-studio/text-generation>
+- OpenAI Realtime API 与 `gpt-realtime` 模型：<https://developers.openai.com/api/docs/models/gpt-realtime>
+- OpenAI Realtime client events：<https://platform.openai.com/docs/api-reference/realtime-client-events/session>
+- 阿里云百炼千问 Realtime API：<https://help.aliyun.com/zh/model-studio/realtime>
+- 阿里云 Qwen Audio Realtime：<https://help.aliyun.com/zh/model-studio/qwen-audio-realtime-user-guides>
+- 火山引擎豆包端到端实时语音产品说明（当前仅作为后续 adapter 依据）：<https://www.volcengine.com/docs/6561/1594360?lang=zh>
 
 外部文档只决定 adapter 的厂商协议转换；领域能力、route、日志、隐私和 readiness 仍以本仓库统一 schema 为准。

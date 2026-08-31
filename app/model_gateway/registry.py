@@ -283,6 +283,7 @@ def _model_type_label(model_type: str) -> str:
         cap.MODEL_TYPE_STT: "语音识别",
         cap.MODEL_TYPE_TTS: "语音合成",
         cap.MODEL_TYPE_AVATAR: "数字人",
+        cap.MODEL_TYPE_REALTIME_SPEECH: "实时语音对话（S2S / STS）",
         cap.MODEL_TYPE_MODERATION: "内容审核",
     }.get(model_type, model_type)
 

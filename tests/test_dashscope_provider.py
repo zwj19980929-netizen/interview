@@ -1,5 +1,6 @@
 import json
 import asyncio
+import base64
 
 import httpx
 import pytest
@@ -10,6 +11,8 @@ from app.model_gateway.schemas import (
     ChatMessage,
     BatchSTTRequest,
     ProviderContext,
+    RealtimeSpeechDialogueRequest,
+    RealtimeSpeechResponseCommand,
     StreamingAudioConfig,
     StreamingSTTRequest,
     TTSSynthesizeRequest,
@@ -33,7 +36,7 @@ def context(capability: str, model: str, *, config=None) -> ProviderContext:
         route_id="route_test",
         provider_connection_id="provider_conn_dashscope",
         model_configuration_id="model_cfg_dashscope",
-        model_type="tts" if capability == cap.TTS_SYNTHESIZE else "stt" if capability.startswith("stt.") else "llm",
+        model_type="tts" if capability == cap.TTS_SYNTHESIZE else "realtime_speech" if capability == cap.SPEECH_DIALOGUE_REALTIME else "stt" if capability.startswith("stt.") else "llm",
         capability=capability,
         purpose="provider_test",
         model=model,
@@ -262,4 +265,77 @@ async def test_dashscope_stream_maps_duplex_events_to_one_authoritative_final() 
     assert partial[0].type == "transcript.partial"
     assert [item.type for item in finished].count("transcript.final") == 1
     assert next(item for item in finished if item.type == "transcript.final").text == "实时转写完成。"
+    assert socket.closed is True
+
+
+class FakeQwenRealtimeSocket:
+    def __init__(self) -> None:
+        self.received = asyncio.Queue()
+        self.sent = []
+        self.closed = False
+        self.received.put_nowait(json.dumps({"type": "session.created", "event_id": "evt_1"}))
+
+    async def send(self, value):
+        payload = json.loads(value)
+        self.sent.append(payload)
+        if payload["type"] == "session.update":
+            self.received.put_nowait(json.dumps({"type": "session.updated", "event_id": "evt_2"}))
+        elif payload["type"] == "response.create":
+            self.received.put_nowait(json.dumps({"type": "response.audio_transcript.done", "transcript": "请补充说明恢复点。"}))
+            self.received.put_nowait(json.dumps({"type": "response.audio.delta", "delta": base64.b64encode(b"\x00\x00" * 20).decode("ascii")}))
+            self.received.put_nowait(json.dumps({"type": "response.audio.done"}))
+            self.received.put_nowait(json.dumps({"type": "response.done", "event_id": "evt_3"}))
+
+    async def recv(self):
+        return await self.received.get()
+
+    async def close(self):
+        self.closed = True
+
+
+@pytest.mark.anyio
+async def test_dashscope_qwen_realtime_maps_s2s_audio_events() -> None:
+    socket = FakeQwenRealtimeSocket()
+
+    async def connect(url, **kwargs):
+        assert url == "wss://ws123.cn-beijing.maas.aliyuncs.com/api-ws/v1/realtime?model=qwen3.5-omni-flash-realtime"
+        assert kwargs["additional_headers"]["Authorization"] == "Bearer dashscope-key"
+        return socket
+
+    provider = DashScopeProvider(websocket_connect=connect)
+    stream = await provider.open_dialogue(
+        RealtimeSpeechDialogueRequest(
+            interview_id="iv_1",
+            turn_id="turn_1",
+            input_audio=StreamingAudioConfig(
+                content_type="audio/pcm", sample_rate_hz=16000, channels=1
+            ),
+            session_instructions="只播报受控追问",
+        ),
+        context(
+            cap.SPEECH_DIALOGUE_REALTIME,
+            "qwen3.5-omni-flash-realtime",
+            config={
+                "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                "workspace_id": "ws123",
+            },
+        ),
+    )
+    await stream.send_audio(b"\x00\x00" * 160)
+    events = await stream.commit(
+        RealtimeSpeechResponseCommand(
+            spoken_text="请补充说明恢复点。",
+            response_instructions="只逐字朗读：请补充说明恢复点。",
+        )
+    )
+
+    session = next(item for item in socket.sent if item["type"] == "session.update")
+    assert session["session"]["turn_detection"] is None
+    assert session["session"]["input_audio_format"] == "pcm16"
+    assert [item.type for item in events] == [
+        "output.transcript.final",
+        "output.audio.delta",
+        "output.audio.done",
+        "dialogue.closed",
+    ]
     assert socket.closed is True

@@ -14,6 +14,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+from app.transport.http.responses import error_response
 from app.core.ids import new_id
 from app.core.rate_limit import public_rate_limiter
 from app.core.time import utc_now
@@ -267,8 +268,9 @@ def _safe_route_resource(path: str) -> str:
 
 
 def _auth_error(code: str, message: str, status_code: int) -> JSONResponse:
-    return JSONResponse(
+    return error_response(
+        code,
+        message,
         status_code=status_code,
-        content={"error": {"code": code, "message": message, "details": {}}},
         headers={"WWW-Authenticate": "Bearer"} if status_code == 401 else None,
     )

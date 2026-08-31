@@ -171,9 +171,10 @@ class InterviewService:
                 snapshot_entry = deepcopy(blueprint)
                 snapshot_entry["question_snapshot_id"] = question_snapshot["id"]
                 question_snapshots.append(snapshot_entry)
+                turn_id = new_id("turn")
                 turns.append(
                     {
-                        "id": new_id("turn"),
+                        "id": turn_id,
                         "interview_id": interview_id,
                         "turn_blueprint_id": blueprint["id"],
                         "question_id": question["id"],
@@ -181,6 +182,15 @@ class InterviewService:
                         "question_snapshot": question_snapshot,
                         "order": blueprint["order"],
                         "phase": source_type,
+                        "is_followup": False,
+                        "parent_turn_id": None,
+                        "root_turn_id": turn_id,
+                        "followup_depth": 0,
+                        "followup_reason": None,
+                        "target_key_points": [],
+                        "allow_followup": bool(blueprint.get("allow_followup", True)),
+                        "weight": float(blueprint.get("weight", 0.0)),
+                        "expected_minutes": int(blueprint.get("expected_minutes", 0)),
                         "status": "pending",
                         "question_spoken_text": question_snapshot["spoken_text"],
                         "started_at": None,
@@ -223,6 +233,7 @@ class InterviewService:
                 "session_seed": session_seed,
                 "question_selections": deepcopy(question_selections),
                 "settings": deepcopy(payload.get("settings", {})),
+                "followup_policy": self._followup_policy(plan),
                 "scheduled_at": payload.get("scheduled_at"),
                 "current_turn_id": None,
                 "turn_ids": [turn["id"] for turn in turns],
@@ -390,6 +401,10 @@ class InterviewService:
                 "id": turn["id"],
                 "order": turn["order"],
                 "status": turn["status"],
+                "is_followup": bool(turn.get("is_followup", False)),
+                "parent_turn_id": turn.get("parent_turn_id"),
+                "root_turn_id": turn.get("root_turn_id") or turn["id"],
+                "followup_depth": int(turn.get("followup_depth", 0)),
             }
             if turn["id"] == current_turn_id or turn["status"] in {"completed", "skipped"}:
                 projection["question_spoken_text"] = turn.get("question_spoken_text", "")
@@ -399,6 +414,10 @@ class InterviewService:
             "status": session["status"],
             "phase": session.get("phase"),
             "avatar_mode": session.get("settings", {}).get("avatar_mode", "cloud"),
+            "record_video": bool(session.get("settings", {}).get("record_video", False)),
+            "speech_dialogue_mode": session.get("settings", {}).get(
+                "speech_dialogue_mode", "cascade"
+            ),
             "current_turn_id": current_turn_id,
             "candidate": {"name": session.get("candidate", {}).get("name", "候选人")},
             "turns": turns,
@@ -583,6 +602,12 @@ class InterviewService:
                 "created_at": now,
                 "updated_at": now,
             }
+            followup_decision = self.evaluation.decide_followup(
+                session,
+                turn,
+                answer,
+                now=now,
+            )
             decision, work_items = self._decide_and_persist(
                 transaction,
                 session,
@@ -592,19 +617,54 @@ class InterviewService:
                 ),
                 organization_id,
             )
+            if followup_decision.get("selected"):
+                followup_turn = self._build_followup_turn(
+                    decision.session,
+                    turn,
+                    answer,
+                    followup_decision,
+                    now=now,
+                )
+                decision, followup_work = self._decide_and_persist(
+                    transaction,
+                    decision.session,
+                    LifecycleCommand(
+                        LifecycleCommandType.FOLLOWUP_REQUESTED,
+                        {
+                            "answer_id": answer["id"],
+                            "root_turn_id": turn["id"],
+                            "followup_turn": followup_turn,
+                            "decision": deepcopy(followup_decision),
+                        },
+                    ),
+                    organization_id,
+                )
+                work_items.extend(followup_work)
 
         evaluation_work = self._work_by_kind(work_items, "answer.evaluate")
         if evaluation_work is None:
             raise RuntimeError("Lifecycle did not request evaluation for a submitted answer.")
-        evaluation = await self._process_evaluation_work(evaluation_work["id"], organization_id)
         session = self.get_interview(interview_id, organization_id)
         persisted_answer = self._answer_by_id(session, answer["id"])
+        selected_followup = next(
+            (
+                item
+                for item in session.get("turns", [])
+                if item.get("is_followup") and item.get("root_turn_id") == turn["id"]
+            ),
+            None,
+        )
         return {
             "answer": persisted_answer,
-            "evaluation": evaluation,
+            "evaluation": {
+                "status": "pending",
+                "work_item_id": evaluation_work["id"],
+            },
+            "evaluation_work_id": evaluation_work["id"],
             "next_turn_id": session.get("current_turn_id"),
             "status": session["status"],
             "report": self._current_report(session),
+            "followup": self._followup_projection(selected_followup),
             "events": [
                 deepcopy(item)
                 for item in session.get("lifecycle_events", [])
@@ -1071,11 +1131,103 @@ class InterviewService:
             "standard_answer": question["standard_answer"],
             "key_points": deepcopy(question["key_points"]),
             "rubric": deepcopy(question.get("rubric", {})),
+            "followup_probes": deepcopy(
+                question.get("followup_probes")
+                or question.get("rubric", {}).get("followup_probes", [])
+            ),
             "difficulty": question.get("difficulty", "mid"),
             "type": question.get("type", "resume_experience"),
             "skills": deepcopy(question.get("skills", [])),
             "speech_asset_id": question.get("speech_asset_id"),
             "created_at": created_at,
+        }
+
+    def _followup_policy(self, plan: Dict[str, Any]) -> Dict[str, Any]:
+        source = plan.get("selection_policy") or plan.get("assembly_policy") or {}
+        return {
+            "max_depth": 1,
+            "max_total": max(0, int(source.get("max_followups_total", 2))),
+            "max_per_root": min(1, max(0, int(source.get("max_followups_per_root", 1)))),
+            "min_answer_chars": max(1, int(source.get("followup_min_answer_chars", 24))),
+            "max_answer_chars": max(1, int(source.get("followup_max_answer_chars", 1200))),
+            "min_remaining_seconds": max(0, int(source.get("followup_min_remaining_seconds", 45))),
+            "max_probe_chars": min(300, max(40, int(source.get("followup_max_probe_chars", 180)))),
+        }
+
+    def _build_followup_turn(
+        self,
+        session: Dict[str, Any],
+        root_turn: Dict[str, Any],
+        answer: Dict[str, Any],
+        decision: Dict[str, Any],
+        *,
+        now: str,
+    ) -> Dict[str, Any]:
+        stable_key = "%s:%s:%s" % (session["id"], root_turn["id"], answer["id"])
+        digest = hashlib.sha256(stable_key.encode("utf-8")).hexdigest()[:24]
+        question_id = "followup_question_%s" % digest
+        snapshot_id = "followup_snapshot_%s" % digest
+        target_texts = set(decision.get("target_key_points", []))
+        root_snapshot = root_turn["question_snapshot"]
+        target_points = [
+            deepcopy(item)
+            for item in root_snapshot.get("key_points", [])
+            if str(item.get("text") if isinstance(item, dict) else item).strip() in target_texts
+        ]
+        question_snapshot = {
+            "id": snapshot_id,
+            "source_question_id": question_id,
+            "source_question_version": 1,
+            "source_type": "followup",
+            "parent_question_snapshot_id": root_snapshot["id"],
+            "title": "澄清追问",
+            "question_text": decision["question_text"],
+            "spoken_text": decision["question_text"],
+            "standard_answer": root_snapshot["standard_answer"],
+            "key_points": target_points,
+            "rubric": deepcopy(root_snapshot.get("rubric", {})),
+            "difficulty": root_snapshot.get("difficulty", "mid"),
+            "type": "clarification_probe",
+            "skills": deepcopy(root_snapshot.get("skills", [])),
+            "speech_asset_id": None,
+            "created_at": now,
+        }
+        return {
+            "id": "followup_turn_%s" % digest,
+            "interview_id": session["id"],
+            "turn_blueprint_id": "followup_blueprint_%s" % digest,
+            "question_id": question_id,
+            "question_snapshot_id": snapshot_id,
+            "question_snapshot": question_snapshot,
+            "phase": root_turn.get("phase", "position_bank"),
+            "is_followup": True,
+            "parent_turn_id": root_turn["id"],
+            "root_turn_id": root_turn["id"],
+            "followup_depth": 1,
+            "followup_reason": decision["reason"],
+            "target_key_points": deepcopy(decision.get("target_key_points", [])),
+            "probe_source": decision.get("probe_source", "deterministic_template"),
+            "allow_followup": False,
+            "weight": 0.0,
+            "expected_minutes": 1,
+            "status": "pending",
+            "question_spoken_text": decision["question_text"],
+            "started_at": None,
+            "completed_at": None,
+        }
+
+    @staticmethod
+    def _followup_projection(turn: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if turn is None:
+            return None
+        return {
+            "turn_id": turn["id"],
+            "parent_turn_id": turn.get("parent_turn_id"),
+            "root_turn_id": turn.get("root_turn_id"),
+            "followup_depth": turn.get("followup_depth", 1),
+            "reason": turn.get("followup_reason"),
+            "target_key_points": deepcopy(turn.get("target_key_points", [])),
+            "question_text": turn.get("question_spoken_text"),
         }
 
     def _required(self, session: Optional[Dict[str, Any]]) -> Dict[str, Any]:

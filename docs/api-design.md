@@ -14,6 +14,8 @@
 - 明确建模为异步工作的接口（题库 import/rebuild/build、PDF 摄取等）返回 `202 Accepted` 和 `job_id`，通过工作项接口查询状态。
 - 创建题目、题目语音重建和题库语音配置切换不得在 HTTP 请求内调用 TTS；它们只提交 DurableWorkItem 并由 `app/workers/` 中的 Celery task 执行。
 - `GET /healthz` 只表示进程存活；`GET /readyz` 对数据库/Redis 和生产密钥、OSS bucket 鉴权、扫描器执行只读探针，未就绪返回 `503` 与不含密钥值的逐项结果。业务模型 route readiness 仍由预约准入按组织、purpose 和健康 TTL 判断。
+- 成功资源响应保持资源本身为顶层对象，避免为已有客户端引入破坏性的二次 `data` 包络；集合响应统一为 `{"items": [...], "next_cursor": null|string}`，即使当前实现尚未分页也保留 cursor 槽位；异步命令统一返回 `202`。二进制文件、音频和 CSV 导出不套 JSON 格式。
+- JSON 输出统一经过 `app/transport/http/responses.py`；需要防止内部字段泄露的投影在 `app/transport/http/fields/` 声明 allow-list 并由 `marshal` 执行。字段声明只负责 transport 投影，不承载领域计算；服务层不能依赖 transport fields。`app/api/routes.py` 只总装 `app/api/routers/` 下按业务域拆分的 router，不放 response、module 构造或实时连接 implementation。
 
 通用错误：
 
@@ -28,6 +30,8 @@
 ```
 
 公开邀请、填报和匹配接口对“token 不存在、已过期、候选人不匹配”使用相同 HTTP 状态和通用消息，防止枚举候选人或预约。
+
+请求体、路径和查询参数校验失败同样使用上述错误包络，固定为 `422 REQUEST_VALIDATION_FAILED`；`details.fields` 只返回 `location/message/type`，不回显请求原值。Provider、Persistence、认证与限流错误也跨同一 response seam，客户端不再兼容 FastAPI 默认 `detail` 形状。
 
 ## Web 工作台与候选人页面
 
@@ -248,6 +252,8 @@
 | `GET` | `/api/v1/candidate-profiles/{candidate_id}` | 查看候选人及最新岗位初筛投影 |
 | `PATCH` | `/api/v1/candidate-profiles/{candidate_id}` | 更新基本信息或归档 |
 | `DELETE` | `/api/v1/candidate-profiles/{candidate_id}?expected_version={version}` | 乐观并发地逻辑归档候选人并从活动列表隐藏，保留审计事实 |
+| `GET` | `/api/v1/candidate-profiles/{candidate_id}/experience-questions` | 读取候选人简历问答；只返回生效结论符合且证据绑定有效的非归档项 |
+| `POST` | `/api/v1/candidate-profiles/{candidate_id}/experience-questions` | 人工创建绑定候选人、符合的 ResumeReview 和 1–3 个简历证据标签的问题；初始为草稿 |
 | `POST` | `/api/v1/candidate-profiles/{candidate_id}/resumes` | 以 multipart 上传本地 PDF，创建新简历版本 |
 | `POST` | `/api/v1/candidate-profiles/{candidate_id}/resumes/import-url` | 从公开 HTTPS URL 异步导入 PDF，创建新简历版本 |
 | `GET` | `/api/v1/candidate-profiles/{candidate_id}/resumes` | 列出简历版本和摄取状态 |
@@ -338,11 +344,19 @@ JSON `resume_text` 兼容请求已删除；开发和生产均以系统托管 PDF
 | `GET` | `/api/v1/resume-reviews/{review_id}` | 返回岗位初筛、项目/技能证据、告警和问题状态 |
 | `POST` | `/api/v1/resume-reviews/{review_id}/retry` | 以 `expected_version + reason` 将 failed/dead-letter 初筛原子恢复为 queued/pending，并记录操作者审计 |
 | `PATCH` | `/api/v1/resume-reviews/{review_id}/screening-review` | 人工复核初筛；提交 `expected_version`、`decision=qualified|unqualified` 和可选说明，保留 AI 原建议并审计 |
-| `GET` | `/api/v1/resume-reviews/{review_id}/experience-questions` | 列出 AI 生成问题 |
+| `GET` | `/api/v1/resume-reviews/{review_id}/experience-questions` | 仅在生效结论符合时列出证据绑定有效的问题；否则返回空集合 |
 | `PATCH` | `/api/v1/experience-questions/{question_id}` | 人工编辑、批准或拒绝 |
+| `DELETE` | `/api/v1/experience-questions/{question_id}?expected_version={version}` | 从候选人个人题库归档；保留已冻结计划和历史面试快照 |
 | `POST` | `/api/v1/experience-questions/{question_id}/speech/regenerate` | 重建问题语音 |
 
-创建与重试接口只验证并排队，绝不在 HTTP 请求内等待 LLM。同一 ready 简历的重复创建命令返回原 ResumeReview；若该审阅仍为 queued 但工作项缺失，命令会在同一事务补建指向当前审阅的 DurableWorkItem，并校验返回工作的 aggregate ID，避免界面永久显示排队。失败重试仅接受 `ResumeReview.status=failed` 且关联 DurableWorkItem 为 `failed/dead_letter` 的组合；源 ResumeDocument 必须仍为 `ready`，岗位和要求必须存在。命令使用审阅 version 防双击/并发覆盖，清空当前错误与分块进度、把工作 attempt 归零并增加 `replay_count`，但不创建第二份审阅。`GET` 在处理中返回 `status/processing_stage/processing_strategy/processing_progress`；完成后通过 `screening.recommendation/score/summary/matched_requirements/unmet_requirements` 给出可解释建议，证据包含 `source_pages`。服务端按 `candidate_screening_score.v1` 强制把 0–59 映射为 `unqualified`、60–74 映射为 `manual_review`、75–100 映射为 `qualified`，并返回 `screening_policy_version`；候选人列表的嵌套 screening 投影返回同值的 `score_policy_version`。模型建议与分数冲突时以分数带为准，人工 `screening-review` 决定仍可覆盖生效结论。AI 问题默认为 `draft`，批准后才生成语音。不得把简历中的受保护属性或无关个人信息发送给模型。
+创建与重试接口只验证并排队，绝不在 HTTP 请求内等待 LLM。同一 ready 简历的重复创建命令返回原 ResumeReview；若该审阅仍为 queued 但工作项缺失，命令会在同一事务补建指向当前审阅的 DurableWorkItem，并校验返回工作的 aggregate ID，避免界面永久显示排队。失败重试仅接受 `ResumeReview.status=failed` 且关联 DurableWorkItem 为 `failed/dead_letter` 的组合；源 ResumeDocument 必须仍为 `ready`，岗位和要求必须存在。命令使用审阅 version 防双击/并发覆盖，清空当前错误与分块进度、把工作 attempt 归零并增加 `replay_count`，但不创建第二份审阅。`GET` 在处理中返回 `status/processing_stage/processing_strategy/processing_progress`；完成后通过 `screening.recommendation/score/summary/matched_requirements/unmet_requirements` 给出可解释建议，证据包含 `source_pages`。服务端按 `candidate_screening_score.v1` 强制把 0–59 映射为 `unqualified`、60–74 映射为 `manual_review`、75–100 映射为 `qualified`，并返回 `screening_policy_version`；候选人列表的嵌套 screening 投影还返回 `question_generation_status/error/count`。模型建议与分数冲突时以分数带为准，人工 `screening-review` 决定仍可覆盖生效结论。只有生效结论为 `qualified` 时才排入独立的 `resume.experience_questions.generate` 工作；AI 不符合/待复核不生成，人工改判符合时才临时排队。AI 问题默认为 `draft`，批准后才生成语音。不得把简历中的受保护属性或无关个人信息发送给模型。
+
+候选人个人题库不新建第二套题目实体，而是按 `candidate_profile_id` 汇总 ExperienceQuestion。AI 生成项记录
+`source_type=ai_generated` 和来源 ResumeReview；人工创建项记录 `source_type=manual`，并必须选择属于同一候选人且已完成的
+ResumeReview，使岗位、简历版本和证据上下文可追溯。人工创建请求至少包含非空 `question_text`、`standard_answer`、
+`key_points` 和 1–3 个 `evidence_refs` 标签；标签必须来自该审阅的项目/技能证据，且题干必须明确包含至少一个所选标签。服务端把标签解析为含证据文本和来源页的不可变快照。初始状态固定为 `draft`。编辑仍使用 `expected_version`，状态只允许
+`draft/approved/rejected`；批准后进入既有经历题语音生成链。DELETE 使用归档语义，已归档项不再出现在个人题库、
+审阅问题列表或新计划中，但已批准计划和历史 InterviewQuestionSnapshot 保持不变。生效结论改为不符合后，读取、创建、编辑、语音生成和新计划组卷全部失败关闭；历史上没有有效证据快照或题干未点名证据的题也从活动读取与新计划中过滤。
 
 同一候选人按岗位只取最新审阅决定留存：只要存在 `qualified` 或 `manual_review`/处理中结论，就不设置初筛清理期限；所有最新岗位结论均为 `unqualified` 时设置 `retention_reason=screening_unqualified` 和服务端时间加 7 天。Celery Beat 周期任务先按当前分数带校正存量候选人的期限，首次命中从该次运行起重新给足 7 天，再由 RetentionService 清除到期私有简历和敏感投影并写审计；列表读取或页面点击不产生隐式写入或物理删除。
 
@@ -421,6 +435,7 @@ React 岗位卡片根据该岗位是否已有要求，显示“添加岗位要�
     "record_audio": true,
     "record_video": false,
     "avatar_mode": "local",
+    "speech_dialogue_mode": "cascade",
     "avatar_id": "avatar_default_cn",
     "voice_profile_id": "voice_cn_01",
     "language": "zh-CN"
@@ -435,6 +450,8 @@ React 岗位卡片根据该岗位是否已有要求，显示“添加岗位要�
 ```
 
 `settings.avatar_mode` 只接受 `local | cloud`。新预约省略时默认 `local`；`local` 复用计划冻结的 `QuestionSpeechAsset` 并由候选人浏览器渲染形象，`cloud` 调用已配置的 `avatar.speak/interview_question_delivery` route。已持久化但没有该字段的历史预约/会话按 `cloud` 解释，避免升级后改变旧场次。`PATCH` 只合并显式提供的 settings 字段。
+
+`settings.speech_dialogue_mode` 只接受 `cascade | s2s`，默认 `cascade`。`cascade` 保留 `STT -> 受控追问策略 -> Avatar/TTS`；`s2s` 让同一 PCM 并行进入 `speech.dialogue_realtime/candidate_followup_dialogue`，但仍以服务端 STT final 和策略批准文本为真相。S2S route 不可用或输出不符合批准文本时自动回到 cascade，不能影响 CandidateAnswer 或评分。
 
 邀请响应只在签发时返回一次明文 URL：
 
@@ -511,7 +528,7 @@ React 工作台必须在这个一次性响应弹窗中提供“复制链接”�
 
 Avatar Delivery 响应额外包含 `avatar_mode=local|cloud` 和可空的 `fallback_reason=cloud_unavailable`。自研模式的 `audio_uri` 必须是当前轮次冻结语音的五分钟签名地址，不能返回 `private-file://`、对象键或供应商临时 URL。云模式缺少真实 route 或调用失败时不再次复制播放分支，而是调用同一个 local adapter；此时 `avatar_mode=local` 且设置 fallback reason。只有返回 `session_id` 的云媒体需要调用 close。
 
-真实流式转写使用 `/api/v1/interviews/{interview_id}/stt-stream?token=...`：客户端先发送 `stream.open`（正式 Web 端为 `audio/pcm + 16000 Hz + mono`），随后发送二进制 PCM chunk，最后发送 `stream.finish`。服务端返回 `stream.ready/transcript.partial/transcript.final/stream.closed`，且只有唯一 `transcript.final` 可创建 CandidateAnswer；连接或 Provider 失败后使用已保存录音走 `stt.batch`，不信任浏览器 SpeechRecognition。
+真实流式转写使用 `/api/v1/interviews/{interview_id}/stt-stream?token=...`：客户端先发送 `stream.open`（正式 Web 端为 `audio/pcm + 16000 Hz + mono`），随后发送二进制 PCM chunk，最后发送 `stream.finish`。服务端返回 `stream.ready/transcript.partial/transcript.final/stream.closed`，且只有唯一 `transcript.final` 可创建 CandidateAnswer；随后立即返回 `answer.accepted + evaluation.queued`，不等待评分。S2S 预约还会返回 `dialogue.ready`、安全的 `followup.selected`、`output.transcript.*`、流式 `output.audio.delta/done` 或 `dialogue.error`。连接或 Provider 失败后使用已保存录音走 `stt.batch`，不信任浏览器 SpeechRecognition。
 
 ## 面试会话、逐题评分与企业复核 API
 
@@ -625,6 +642,11 @@ API 不根据 `job_fit_level` 自动写入录用/淘汰结果；若未来接 ATS
 | `stt.transcript.partial` | 服务端 STT 临时转写，只用于展示 |
 | `stt.transcript.final` | 服务端权威 final、置信度和片段时间戳 |
 | `stt.repair.pending/completed` | 流式识别失败后的批量修复 |
+| `answer.accepted` / `evaluation.queued` | 权威答案已落库，评分工作已持久化；响应不包含分数 |
+| `followup.selected` | 安全追问投影，只含父子轮次与题干，不含内部缺失关键点 |
+| `dialogue.ready/error/closed` | S2S 表达轨状态；失败不改变证据轨 |
+| `output.transcript.delta/final` | S2S 实际播报文本，用于可观察性与批准文本校验 |
+| `output.audio.delta/done` | Base64 PCM 语音分片；候选人端按采样率排队播放 |
 | `evaluation.started/completed/failed` | 当前题评分状态和安全摘要 |
 | `interview.phase.changed` | `position_bank` 切换到 `resume_experience` |
 | `interview.completed` | 问答完成，报告可能仍在生成 |
@@ -653,11 +675,20 @@ class ModelGateway:
         *,
         route: "ModelRoute | None" = None,
     ) -> "ValidatedSTTStream": ...
+
+    async def open_speech_dialogue(
+        self,
+        request: "RealtimeSpeechDialogueRequest",
+        *,
+        route: "ModelRoute | None" = None,
+    ) -> "ValidatedSpeechDialogueStream": ...
 ```
 
 业务调用按 `organization_id + capability + purpose` 解析 route。正式面试目标流程要求统一 schema 覆盖 `llm.chat_json`、`tts.synthesize`、`stt.streaming`、`stt.batch` 和需要的 `avatar.speak`；没有 schema、可执行 adapter 和通过健康测试的能力不能进入 active route。`embedding.text` 是可选的未来题库治理能力，不是题库 ready、计划批准、预约邀请、随机抽题或答案评分的前置条件；仓库不再持久化旧向量题库 projection。
 
-模型管理分为三层：`ProviderConnection` 只保存组织级厂商连接、API Key 引用和区域等连接参数；`ModelConfiguration` 选择 `llm/embedding/tts/stt/avatar` 类型及厂商模型，并保存该模型的专属设置和统一默认参数；`ModelRoute` 只引用模型配置。插件 manifest 返回 `connection_form`、`credential_form` 与各模型类型的 `configuration_form`，前端使用通用控件渲染器，不内置任何厂商字段。
+低延迟追问可额外配置 `speech.dialogue_realtime/candidate_followup_dialogue`。对应 ModelConfiguration 使用 `realtime_speech` 类型；没有 schema、可执行 adapter 和通过健康测试的模型不能进入 active route，缺 route 时面试继续使用 cascade。
+
+模型管理分为三层：`ProviderConnection` 只保存组织级厂商连接、API Key 引用和区域等连接参数；`ModelConfiguration` 选择 `llm/embedding/tts/stt/avatar/realtime_speech` 类型及厂商模型，并保存该模型的专属设置和统一默认参数；`ModelRoute` 只引用模型配置。插件 manifest 返回 `connection_form`、`credential_form` 与各模型类型的 `configuration_form`，前端使用通用控件渲染器，不内置任何厂商字段。
 
 `POST /admin/model-routes` 使用强类型请求：`primary`/`fallbacks` 仅接受 `model_configuration_id`、`timeout_s`、`pricing`；路由创建时校验模型配置已启用、状态为 `ready` 且支持目标 capability。`policy` 仅接受既有重试、熔断、成本和 readiness 字段。生产环境找不到精确 route 时返回 `provider_route_missing`，只有 development/test 允许离线 mock fallback。
 

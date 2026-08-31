@@ -793,6 +793,11 @@ class CatalogService:
                     work_item_id, lease_token=work["lease_token"], result_status="superseded"
                 )
                 return owner
+            if owner_type == "experience_question" and owner.get("status") != "approved":
+                transaction.outbox.complete(
+                    work_item_id, lease_token=work["lease_token"], result_status="superseded"
+                )
+                return owner
             profile = deepcopy(payload.get("speech_profile"))
             profile_revision = payload.get("speech_profile_revision")
             if owner_type == "question":
@@ -865,6 +870,18 @@ class CatalogService:
                     current is None
                     or int(current["version"]) != int(owner["version"])
                     or int(current_revision or -1) != int(profile_revision or -2)
+                ):
+                    transaction.outbox.complete(
+                        work_item_id, lease_token=work["lease_token"], result_status="superseded"
+                    )
+                    return current or owner
+        elif owner_type == "experience_question":
+            with self.persistence.transaction(organization_id) as transaction:
+                current = transaction.experience_questions.get(owner["id"])
+                if (
+                    current is None
+                    or int(current["version"]) != int(owner["version"])
+                    or current.get("status") != "approved"
                 ):
                     transaction.outbox.complete(
                         work_item_id, lease_token=work["lease_token"], result_status="superseded"

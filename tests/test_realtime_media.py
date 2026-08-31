@@ -15,7 +15,12 @@ from app.persistence.provider import persistence_for
 from app.workers.outbox import OutboxWorker
 
 
-def _create_started_interview(api: TestClient, *, avatar_mode: str = "local") -> dict:
+def _create_started_interview(
+    api: TestClient,
+    *,
+    avatar_mode: str = "local",
+    speech_dialogue_mode: str = "cascade",
+) -> dict:
     position = api.post(
         "/api/v1/job-positions",
         json={"code": "realtime", "name": "实时系统工程师"},
@@ -83,7 +88,7 @@ def _create_started_interview(api: TestClient, *, avatar_mode: str = "local") ->
             "job_position_id": position["id"],
             "scheduled_start_at": (now - timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
             "scheduled_end_at": (now + timedelta(hours=1)).isoformat().replace("+00:00", "Z"),
-            "settings": {"record_audio": True, "record_video": False, "avatar_mode": avatar_mode, "avatar_id": "avatar_default_cn"},
+            "settings": {"record_audio": True, "record_video": False, "avatar_mode": avatar_mode, "speech_dialogue_mode": speech_dialogue_mode, "avatar_id": "avatar_default_cn"},
         },
     )
     assert appointment.status_code == 200, appointment.text
@@ -235,6 +240,8 @@ def test_avatar_and_realtime_audio_flow(tmp_path: Path, monkeypatch) -> None:
     assert candidate_detail.status_code == 200, candidate_detail.text
     assert "candidate_session_token" not in candidate_detail.json()
     assert "question_snapshot" not in candidate_detail.json()["turns"][0]
+    assert "target_key_points" not in candidate_detail.json()["turns"][0]
+    assert "followup_reason" not in candidate_detail.json()["turns"][0]
     assert api.get(
         "/api/v1/public/interviews/%s" % interview_id,
         headers={"X-Candidate-Session-Token": "invalid"},
@@ -261,9 +268,12 @@ def test_avatar_and_realtime_audio_flow(tmp_path: Path, monkeypatch) -> None:
         },
     )
     assert submitted.status_code == 200, submitted.text
-    assert submitted.json()["status"] == "report_ready"
-    assert submitted.json()["evaluation"] == {"status": "completed"}
+    assert submitted.json()["status"] == "in_progress"
+    assert submitted.json()["evaluation"]["status"] == "pending"
     assert "score" not in submitted.text
+
+    worker_results = asyncio.run(OutboxWorker(get_store()).run_once())
+    assert any(item["kind"] == "answer.evaluate" and item["status"] == "completed" for item in worker_results)
 
     completed = api.get("/api/v1/interviews/%s" % interview_id)
     assert completed.status_code == 200
@@ -329,13 +339,65 @@ def test_server_streaming_stt_websocket_produces_authoritative_final(tmp_path: P
         assert [item["type"] for item in events] == [
             "transcript.final",
             "stream.closed",
-            "evaluation.completed",
-            "interview.completed",
+            "answer.accepted",
+            "evaluation.queued",
         ]
+    asyncio.run(OutboxWorker(get_store()).run_once())
     completed = api.get(f"/api/v1/interviews/{interview_id}").json()
     assert completed["answers"][0]["final_transcript"] == transcript
     assert completed["answers"][0]["transcript_source"] == "server_streaming"
     assert completed["answers"][0]["stt_provider"]["provider_id"] == "mock"
+
+
+def test_s2s_followup_audio_is_streamed_before_async_evaluation_ack(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("INTERVIEWER_MEDIA_PATH", str(tmp_path))
+    reset_store_for_tests()
+    api = TestClient(create_app())
+    interview = _create_started_interview(api, speech_dialogue_mode="s2s")
+    interview_id = interview["id"]
+    turn_id = api.get(f"/api/v1/interviews/{interview_id}").json()["current_turn_id"]
+    url = f"/api/v1/interviews/{interview_id}/stt-stream?token={interview['candidate_session_token']}"
+    transcript = "发生异常后我一般先观察监控，如果仍未恢复就人工重启服务再继续观察。"
+
+    with api.websocket_connect(url) as websocket:
+        websocket.send_json(
+            {
+                "type": "stream.open",
+                "payload": {
+                    "turn_id": turn_id,
+                    "content_type": "audio/pcm",
+                    "sample_rate_hz": 16000,
+                    "channels": 1,
+                    "development_transcript": transcript,
+                },
+            }
+        )
+        assert websocket.receive_json()["type"] == "stream.ready"
+        assert websocket.receive_json()["type"] == "dialogue.ready"
+        websocket.send_bytes(b"\x00\x00" * 1600)
+        assert websocket.receive_json()["type"] == "transcript.partial"
+        assert websocket.receive_json()["type"] == "input.speech.started"
+        websocket.send_json({"type": "stream.finish", "payload": {"duration_seconds": 8}})
+
+        received = []
+        while not any(item["type"] == "evaluation.queued" for item in received):
+            received.append(websocket.receive_json())
+
+    types = [item["type"] for item in received]
+    assert "followup.selected" in types
+    assert "output.audio.delta" in types
+    assert types.index("output.audio.delta") < types.index("answer.accepted")
+    selected = next(item for item in received if item["type"] == "followup.selected")
+    assert selected["delivery"] == "s2s"
+    assert "target_key_points" not in selected["payload"]
+    public = api.get(
+        f"/api/v1/public/interviews/{interview_id}",
+        headers={"X-Candidate-Session-Token": interview["candidate_session_token"]},
+    ).json()
+    assert public["speech_dialogue_mode"] == "s2s"
+    followup = next(item for item in public["turns"] if item["id"] == public["current_turn_id"])
+    assert followup["is_followup"] is True
+    assert "target_key_points" not in followup
 
 
 def test_heartbeat_and_monitor_timeout_share_lifecycle(tmp_path: Path, monkeypatch) -> None:

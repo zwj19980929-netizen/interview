@@ -281,6 +281,152 @@ def test_candidate_screening_explains_outcome_supports_review_resume_and_crud(tm
     assert all(item["id"] != candidate["id"] for item in api.get("/api/v1/candidate-profiles").json()["items"])
 
 
+def test_candidate_question_bank_combines_ai_questions_with_manual_crud(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("INTERVIEWER_PRIVATE_FILE_ROOT", str(tmp_path / "private"))
+    monkeypatch.setenv("INTERVIEWER_FILE_QUARANTINE_ROOT", str(tmp_path / "quarantine"))
+    reset_private_file_storage_for_tests()
+    reset_store_for_tests()
+    api = TestClient(create_app())
+
+    candidate, review = _screen_candidate(api, "Personal Question Bank")
+    candidate_url = f"/api/v1/candidate-profiles/{candidate['id']}/experience-questions"
+    generated = api.get(candidate_url)
+    assert generated.status_code == 200, generated.text
+    generated_items = generated.json()["items"]
+    assert generated_items == []
+    assert review["question_generation_status"] == "not_eligible"
+    ineligible_create = api.post(
+        candidate_url,
+        json={
+            "resume_review_id": review["id"],
+            "question_text": "请解释一个与简历无关的通用技术概念。",
+            "standard_answer": "通用答案。",
+            "key_points": ["概念"],
+            "evidence_refs": ["项目经历"],
+        },
+    )
+    assert ineligible_create.status_code == 409
+    assert ineligible_create.json()["error"]["code"] == "CANDIDATE_QUESTION_BANK_NOT_ELIGIBLE"
+
+    qualified = api.patch(
+        f"/api/v1/resume-reviews/{review['id']}/screening-review",
+        json={
+            "expected_version": review["version"],
+            "decision": "qualified",
+            "note": "人工确认项目经验可迁移",
+        },
+        headers={"X-Actor-Id": "interviewer_1"},
+    )
+    assert qualified.status_code == 200, qualified.text
+    assert qualified.json()["question_generation_status"] == "queued"
+    asyncio.run(OutboxWorker(get_store()).run_once())
+    review = api.get(f"/api/v1/resume-reviews/{review['id']}").json()
+    assert review["question_generation_status"] == "ready"
+
+    generated_items = api.get(candidate_url).json()["items"]
+    assert generated_items
+    assert {item["source_type"] for item in generated_items} == {"ai_generated"}
+    assert all(item["candidate_profile_id"] == candidate["id"] for item in generated_items)
+    assert all(item["evidence_refs"] for item in generated_items)
+    assert all(
+        any(ref["label"] in item["question_text"] for ref in item["evidence_refs"])
+        for item in generated_items
+    )
+
+    unrelated = api.post(
+        candidate_url,
+        json={
+            "resume_review_id": review["id"],
+            "question_text": "请解释 Redis 的常见数据结构。",
+            "standard_answer": "说明常见数据结构。",
+            "key_points": ["数据结构"],
+            "evidence_refs": ["项目经历"],
+        },
+    )
+    assert unrelated.status_code == 422
+    assert unrelated.json()["error"]["code"] == "EXPERIENCE_QUESTION_NOT_GROUNDED"
+
+    created = api.post(
+        candidate_url,
+        json={
+            "resume_review_id": review["id"],
+            "question_text": "你为什么在项目经历里选择 Redis，而不是只使用数据库？",
+            "standard_answer": "说明业务约束、替代方案、权衡、具体实现和验证结果。",
+            "key_points": ["业务约束", "技术权衡", "实现细节", "量化结果"],
+            "evidence_refs": ["项目经历"],
+        },
+        headers={"X-Actor-Id": "interviewer_1"},
+    )
+    assert created.status_code == 201, created.text
+    manual = created.json()
+    assert manual["source_type"] == "manual"
+    assert manual["status"] == "draft"
+    assert manual["resume_review_id"] == review["id"]
+    assert manual["evidence_refs"][0]["label"] == "项目经历"
+    assert [item["text"] for item in manual["key_points"]] == [
+        "业务约束",
+        "技术权衡",
+        "实现细节",
+        "量化结果",
+    ]
+
+    edited = api.patch(
+        f"/api/v1/experience-questions/{manual['id']}",
+        json={
+            "expected_version": manual["version"],
+            "question_text": "你为什么在项目经历里选择 Redis？具体是怎么落地并验证的？",
+            "key_points": ["选择依据", "实现细节", "验证结果"],
+        },
+        headers={"X-Actor-Id": "interviewer_1"},
+    )
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["question_text"].endswith("怎么落地并验证的？")
+    assert [item["text"] for item in edited.json()["key_points"]] == ["选择依据", "实现细节", "验证结果"]
+
+    approved = api.patch(
+        f"/api/v1/experience-questions/{manual['id']}",
+        json={"expected_version": edited.json()["version"], "status": "approved"},
+        headers={"X-Actor-Id": "interviewer_1"},
+    )
+    assert approved.status_code == 200, approved.text
+    assert approved.json()["status"] == "approved"
+    assert approved.json()["speech_status"] == "ready"
+
+    rejected = api.patch(
+        f"/api/v1/experience-questions/{manual['id']}",
+        json={"expected_version": approved.json()["version"], "status": "rejected"},
+        headers={"X-Actor-Id": "interviewer_1"},
+    )
+    assert rejected.status_code == 200, rejected.text
+    assert rejected.json()["status"] == "rejected"
+
+    deleted = api.delete(
+        f"/api/v1/experience-questions/{manual['id']}?expected_version={rejected.json()['version']}",
+        headers={"X-Actor-Id": "interviewer_1"},
+    )
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json()["status"] == "archived"
+    assert all(item["id"] != manual["id"] for item in api.get(candidate_url).json()["items"])
+    assert all(
+        item["id"] != manual["id"]
+        for item in api.get(f"/api/v1/resume-reviews/{review['id']}/experience-questions").json()["items"]
+    )
+
+    with persistence_for(get_store()).transaction("org_default") as transaction:
+        actions = [
+            item["action"]
+            for item in transaction.audit_events.list()
+            if item.get("resource_id") == manual["id"]
+        ]
+    assert actions == [
+        "candidate_question.created",
+        "candidate_question.updated",
+        "candidate_question.updated",
+        "candidate_question.updated",
+        "candidate_question.archived",
+    ]
+
+
 def test_unqualified_screening_is_automatically_purged_after_seven_days(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("INTERVIEWER_PRIVATE_FILE_ROOT", str(tmp_path / "private"))
     monkeypatch.setenv("INTERVIEWER_FILE_QUARANTINE_ROOT", str(tmp_path / "quarantine"))

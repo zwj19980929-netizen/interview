@@ -426,7 +426,19 @@ def test_question_to_report_mvp_flow() -> None:
         },
     )
     assert answer.status_code == 200, answer.text
-    assert answer.json()["evaluation"]["score"] >= 80
+    answer_body = answer.json()
+    assert answer_body["evaluation"]["status"] == "pending"
+    assert answer_body["evaluation_work_id"]
+    worker_results = asyncio.run(OutboxWorker(get_store()).run_once())
+    assert any(
+        item["kind"] == "answer.evaluate" and item["status"] == "completed"
+        for item in worker_results
+    )
+    evaluations = api.get(
+        f"/api/v1/interviews/{interview_id}/answers/{answer_body['answer']['id']}/evaluations"
+    )
+    assert evaluations.status_code == 200, evaluations.text
+    assert evaluations.json()["items"][0]["score"] >= 80
 
     complete = api.post(f"/api/v1/interviews/{interview_id}/complete")
     assert complete.status_code == 200, complete.text

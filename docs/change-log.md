@@ -6,6 +6,93 @@
 
 每个工作项必须包含：日期、ID、目标、关联问题、状态、实际修改文件、验证命令与结果、未完成事项或恢复说明。
 
+## 2026-08-30 · REALTIME-SPEECH-DIALOGUE-001
+
+- 目标：在保留现有固定题、流式/批量 STT、TTS、自研/云数字人和完整评分链路的前提下，新增供应商无关的实时语音对话（S2S/STS）能力；接入 OpenAI Realtime 和阿里云百炼千问 Realtime，评估火山引擎豆包实时语音并在无法完整实现其官方二进制协议时保留明确 TODO；实现低延迟、受预算约束、可审计的动态澄清追问，并修复候选人实际面试中的 PCM 录音、断线修复、自动播题、状态同步、心跳、媒体权限和重复提交问题。
+- 关联问题：动态追问元数据未进入 execution、评分建议没有运行时消费者；评分/报告同步阻塞下一题；浏览器 `audio/pcm` 与录音存储 MIME 合同冲突；STT 断线未按文档执行 batch repair；企业 `/live` 收不到正常转写/评分广播；数字人不自动主持；候选人忽略会话/题目事件且没有心跳；`record_video=false` 仍强制摄像头；读题与录音可并发、实时与降级提交语义不一致。
+- 状态：`verified（仓库）`；真实厂商联调为 `environment_pending`，豆包 adapter 为显式 `TODO/not implemented`。
+- 设计边界：实时语音对话只负责回合检测、低延迟澄清追问和音频输出；权威转写、题目快照、CandidateAnswer、异步完整评分与报告继续作为证据链真相。追问是原题的子轮次，必须有父轮次、原因、目标关键点、深度/总量/时间预算，不能独立增加计划权重或根据受保护属性改变难度。Provider 凭据只通过现有 ProviderConnection/ModelConfiguration/ModelRoute 注入，仓库默认留空。
+- 计划修改：先新增统一实时语音对话 schema、stream interface、路由能力和 Provider manifest/adapter；随后扩展 Plan Assembly、Interview Lifecycle、Interview Service、WebSocket 与候选人/企业 React runtime；补齐 Prompt 合同、离线 Provider 合同、生命周期/端到端/前端测试，并同步架构、API、领域、检索评分、Provider、存储、问题、进度、路线图、统一语言及 ADR。
+- 实际修改文件：
+  - 统一能力、Schema 与 Prompt：`app/model_gateway/{capabilities,schemas,gateway,registry,dialogue}.py`、`app/core/prompt/realtime_dialogue.py`。
+  - Provider：新增 `app/providers/openai/` 与共享 `app/providers/realtime_speech.py`；扩展 `app/providers/{dashscope,mock}/provider.py` 和 manifest。OpenAI 实现官方 HTTP Chat/Embedding/TTS/batch STT 与 Realtime WebSocket；DashScope 实现 Qwen Realtime 路由与 PCM 事件归一化；火山引擎未修改为 implemented。
+  - 领域与编排：`app/domain/interview_lifecycle.py`、`app/services/{evaluation,interviews,streaming_stt,plan_assembly,appointments}.py`、`app/workers/outbox.py`、`app/schemas/api.py`。新增父子追问轮次/预算、确定性批准、异步评分、状态/事件和 `cascade/s2s` 预约设置。
+  - 媒体与 Web：`app/adapters/{local_media,private_media}.py`、`app/transport/realtime.py`、`app/api/routers/realtime.py`、`app/web/candidate/{pcm-stream,runtime}.js`、`app/web/src/features/candidate/Page.jsx`、预约表单、行为测试、样式和重建后的 `app/web/dist/`。
+  - 测试：新增 `tests/test_{realtime_speech_dialogue,openai_realtime_provider}.py`；扩展 DashScope、实时媒体、私有候选人媒体、生命周期、预约长流程和 MVP 闭环测试。
+  - 文档：`CONTEXT.md`、`docs/{architecture,api-design,domain-model,retrieval-and-evaluation,model-provider-plugins,database-and-vector-storage,known-issues-and-remediation,development-progress,implementation-roadmap,change-log}.md`。
+- 实际实现：同一候选人 PCM 可并行进入权威 STT 与可选 S2S 表达轨；S2S 只流式逐字播报服务端已批准的追问，不自行决定问题，也不成为评分证据。权威 STT final 原子保存 CandidateAnswer 与 `answer.evaluate` 工作项后立即返回；worker 完整评分并追加 evaluation/report revision。追问固定零权重、深度 1、每根题最多 1 次、全场默认最多 2 次，并检查文本长度与剩余时间。浏览器实现 PCM delta 播放、完整本地备份、断线 batch repair、自动播题、心跳、媒体权限降级和防重复；角色投影不泄漏追问目标、标准答案或评分。Realtime transport 还把 commit 超时/断连统一映射为可观察 ProviderError；任何已输出音频必须同时提供可与批准题干比对的 final transcript，否则立即关闭 S2S 并走 cascade。
+- 验证命令与结果：`PYTHONPYCACHEPREFIX=/private/tmp/interviewer_realtime_dialogue_pycache .venv/bin/python -m compileall -q app tests` 通过；Realtime/OpenAI/媒体定向回归为 `12 passed`；`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q` 最终为 `220 passed, 5 skipped in 10.02s`；`cd app/web && npm test` 为 `32 passed`；`npm run build` 成功，生成 `index--8cvjCid.js/index-Kmpcg04A.css`；`git diff --check` 通过。
+- 失败与恢复留痕：首次前端测试误加 Vitest 不支持的 `--runInBand` 参数，去掉后通过；首次后端全量回归有 1 个旧 MVP 断言仍同步读取 score，按新合同改为验证 `pending/work_item_id`、执行 worker 后读取 append-only evaluation，复跑全量通过。一次只读 `rg` 命令中的 Markdown 反引号被 shell 当成命令替换并报告 `command not found: 106`，未写入仓库或业务数据，随后使用安全查询完成检查。首次暂存审计发现 4 个拆分后的 router 文件末尾多一个空白行，`git diff --cached --check` 失败；删除多余空白、重新暂存后通过，不影响业务数据。
+- 未完成事项或恢复说明：OpenAI、阿里云和火山引擎真实凭据、区域/模型权限、实际首音、打断、网络抖动、费用与音质尚未提供；OpenAI/DashScope route 在管理员完成连接、探针和目标环境验收前不得视为生产 ready。火山引擎豆包虽有官方端到端实时语音能力，但其二进制 StartConnection/StartSession adapter 和“严格保持批准追问文本”尚未完成，本轮明确保留 TODO，没有伪造兼容实现或开放活动 route。
+
+## 2026-08-29 · QUALIFIED-RESUME-QUESTIONS-UX-001
+
+- 目标：只为生效初筛结论为“符合”的候选人生成简历问答；AI 不符合/待复核时不生成，人工复核改为符合后再排队生成。每道 AI/人工题必须绑定来自该份 ResumeReview 的具体简历证据快照。将个人题库从初筛报告长弹窗移出，在候选人表格外层提供“简历问答”弹窗入口，编辑/删除收入题目三点菜单。
+- 关联问题：现有 Resume Review 无论符合与否都在同一模型响应中生成并持久化 ExperienceQuestion，且 `evidence_refs` 可为空；React 把 CandidateQuestionBank 放在初筛/简历详情弹窗中部，查找成本高，题目操作按钮又全部平铺。
+- 状态：`verified`（仓库与本地运行时）。
+- 设计决策：将经历题生成从 Resume Review 最终响应拆为独立的 `resume.experience_questions.generate` 持久工作，复用已配置的 `resume_experience_question_generation` purpose；候选人生效结论不是 `qualified` 时不排队，转为符合时原子排队。生成 module 只接受审阅中的项目/技能证据，Schema 强制每题至少一个精确证据标签，持久前再解析为不可变证据快照。
+- 实际修改文件：`app/core/prompt/contracts.py`、`app/providers/mock/provider.py`、`app/services/{resume_review,talent,plan_assembly}.py`、`app/workers/outbox.py`、`app/schemas/api.py`；`app/web/src/features/workflow/Page.jsx`、`app/web/src/App.test.jsx`、`app/web/styles.css` 及重建后的 `app/web/dist/`；`tests/test_{candidate_screening,prompt_governance,resume_review_pipeline,position_resume_appointment_flow}.py`；同步 `CONTEXT.md`、`docs/{architecture,api-design,domain-model,retrieval-and-evaluation,model-provider-plugins,database-and-vector-storage,known-issues-and-remediation,development-progress,implementation-roadmap,change-log}.md`。
+- 实际实现：Resume Review 升级为 `resume_review.v6` / `resume_review_reduce.v4`，只返回证据与初筛，彻底移除同响应经历题；只有生效结论 `qualified` 才原子排入独立 `resume_experience_question_generation.v1` 工作，AI 不符合/待复核停在资格门禁，人工改判符合或重试失败/存量未生成状态才排队。AI Schema 强制 1–3 题和精确 evidence label，Talent module 继续校验引用归属、题干点名并冻结证据文本/来源页；人工新建/编辑同样必须提交证据标签并在题干写出标签。读取、语音和计划装配过滤不符合审阅、无证据快照或题干未点名的存量题；冻结计划同时保留 `evidence_refs`。React 从初筛详情移除题库，在候选人表格增加独立“简历问答”弹窗入口和生成状态；新建表单必须选择简历依据，卡片展示依据，题目及候选人的编辑/删除收入三点菜单。
+- 验证命令与结果：定向资格/Prompt/长流程回归最终 `24 passed in 2.25s`；完整后端 `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q` 为 `212 passed, 5 skipped in 9.26s`；前端 `npm test -- --run` 为 `32 passed`；`npm run build` 成功；`compileall` 与 `git diff --check` 通过。停止旧服务 PID `23678`，最终以最新代码启动 PID `28105`；`GET /healthz` 为 200，用户指定候选人的个人题库 API 为 200 空集合，符合其当前生效结论 `unqualified` 和 `question_generation_status=not_eligible`；首页实际加载新 bundle `index-C3iURwrH.js/index-Kmpcg04A.css`。
+- 失败与恢复留痕：首次定向长流程测试仍假定审阅完成后无条件已有题，改为显式人工复核符合并运行独立工作；首次 React 断言把折叠菜单中仍存在但不可见的 DOM 按钮误判为平铺按钮，改为验证 details 默认关闭、点击三点后展开。两次均只影响测试断言，没有业务数据副作用。文档批量补丁有两次因上下文不匹配未应用，随后拆成小补丁完成，没有产生部分写入。
+- 未完成事项或恢复说明：没有自动调用付费真实模型为历史合格审阅补生成问题；再次“复核为符合”会为旧的未生成状态排队。真实 DeepSeek 的新问题质量、时延和费用仍为 `environment_pending`。上传失败日志已确认是旧调用 `deepseek-v4-pro` 在 6000 输出 token 中消耗 4081 reasoning token 后 `finish_reason=length` 导致 JSON 截断；该历史审阅后来已恢复为 `ready_for_review`，本轮没有重放付费审阅。
+
+## 2026-08-29 · RESUME-REVIEW-TRUNCATION-001
+
+- 目标：在保留最新 API router/transport 拆分的前提下，修复真实简历审阅因模型输出用尽限额、JSON 未完整而失败的问题；重启本地 API 使新增候选人个人题库路由实际生效。
+- 关联问题：`candidate_400e16c5c49f470a` 的个人题库源码路由已存在但 8000 端口运行旧进程，OpenAPI 未加载该路由；`resume_review_0324bc54908047cb` 的真实调用在 `deepseek-v4-pro` 上以 `finish_reason=length` 结束，6000 输出 token 中有 4081 reasoning token，只留下 4905 字符的未完整 JSON。
+- 状态：`verified`（仓库与本地运行时）。
+- 计划修改：为 Resume Review 最终结构化响应增加数量/长度上界和精简指令、提升 Prompt 版本并补充合同测试；同步检索/Provider 文档；完成后重启 8000 服务并用实际 HTTP 验证健康检查、OpenAPI 与个人题库路由。
+- 实际修改文件：`app/core/prompt/contracts.py`、`app/services/resume_review.py`、新增 `tests/test_resume_review_pipeline.py`、修改 `tests/test_prompt_governance.py`；同步 `docs/architecture.md`、`docs/retrieval-and-evaluation.md`、`docs/model-provider-plugins.md`、`docs/known-issues-and-remediation.md`、`docs/development-progress.md`、`docs/implementation-roadmap.md` 和本日志。用户已有的 `app/api/routers/`、`app/transport/` 及统一响应改造全部保留。
+- 实际实现：最终审阅 Prompt 升级为 `resume_review.v5` / `resume_review_reduce.v3`，对摘要、项目/技能证据、命中/缺失要求、告警和 1–3 个经历题同时增加 `maxItems/maxLength`。预算内单次阶段若返回 `provider_output_truncated`，流水线丢弃半截 JSON，自动复用全文的页感知 evidence Map/final Reduce，并记录 `map_reduce_after_output_truncation + fallback_reason`；其他 Provider 错误和 Map/Reduce 内部截断仍保持结构化失败，不做无界成本重试。
+- 验证命令与结果：定向 Prompt/降级/初筛测试 `20 passed in 1.57s`；`PYTHONPYCACHEPREFIX=/private/tmp/interviewer_resume_review_pycache .venv/bin/python -m compileall -q app tests` 通过；完整后端 `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q` 为 `211 passed, 5 skipped in 9.22s`；`git diff --check` 通过。停止 2026-08-28 22:57 启动的旧 PID `10252`，以 `.venv/bin/python main.py` 启动最新代码 PID `23678`；`GET /healthz` 为 200，OpenAPI 已注册候选人个人题库 GET/POST，用户给出的 `GET /api/v1/candidate-profiles/candidate_400e16c5c49f470a/experience-questions` 实测为 200 并返回 4 道经历题。
+- 未完成事项或恢复说明：未自动调用付费真实模型重放已失败的 `resume_review_0324bc54908047cb`，避免在没有用户明确确认时产生额外调用与费用；候选人页保留“重新初筛”入口，下次重试会使用本轮修复。目标 DeepSeek 账户的实际恢复质量、时延和费用仍为 `environment_pending`。
+
+## 2026-08-29 · API-ROUTER-MODULE-SPLIT-001
+
+- 目标：修正 `app/api/routes.py` 仍集中全部路由、且 transport 支撑实现混入 `app/api` 的结构问题；让 `app/api` 只承担按业务域组织的路由声明和总装。
+- 关联问题：上一工作项虽然抽离了 response、module 定位和 realtime implementation，但仍把这些文件放在 `app/api`，并保留约 1340 行单体路由注册表，没有达到用户期望的维护性和目录清晰度。
+- 状态：`verified`（仓库）。
+- 计划修改：把 fields/responses、module locator、实时连接管理移动到 `app/transport/`；把路由按 system、admin、catalog、talent、plans、interviews、realtime 拆入 `app/api/routers/`；`app/api/routes.py` 只保留 router 总装；保持所有路径、状态码、字段和错误合同不变。
+- 实际修改文件：新增 `app/api/routers/{__init__,system,admin,catalog,talent,plans,interviews,realtime}.py`；把 `app/api/dependencies.py` 移为 `app/transport/service_locator.py`、`app/api/realtime.py` 移为 `app/transport/realtime.py`、`app/api/responses.py` 与 `app/api/fields/` 移为 `app/transport/http/responses.py` 与 `app/transport/http/fields/`，并新增 transport package 初始化文件；把 `app/api/routes.py` 重写为 13 行总装入口；同步修改 `app/main.py`、`app/core/{auth,errors,rate_limit}.py`、`tests/test_api_responses.py`、`docs/{architecture,api-design,development-progress,change-log}.md`。
+- 实际实现：141 个 HTTP/WebSocket route 声明按 system、admin、catalog、talent、plans、interviews、realtime 七个业务 router 物理拆分；总装入口只按原顺序 include 子 router。`app/api` 现在只含 route package 和总装，不再含 fields、response factory、module locator 或实时连接 implementation。新增结构合同测试约束 router 清单、总装文件规模和 transport 文件不得回流 `app/api`；所有 URL、状态码、公开字段白名单和错误格式保持不变。
+- 验证命令与结果：`PYTHONPYCACHEPREFIX=/private/tmp/interviewer_router_split_pycache .venv/bin/python -m compileall -q app tests` 通过；完整后端 `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q` 为 `210 passed, 5 skipped`；OpenAPI 成功生成 `107` 个 HTTP path，应用共注册 `150` 个含静态资源/WebSocket 的 route；`npm test -- --run` 为 `32 passed`；`npm run build` 成功；`git diff --check` 通过。
+- 失败与恢复留痕：首次结构测试发现移动源码后遗留了空目录 `app/api/fields/`，按目标结构用 `rmdir` 删除空目录后全量测试通过；首次 OpenAPI 单行检查因 shell 中 f-string 转义产生 SyntaxError，随后改用 `%` 格式化通过；一次在 `app/web` 工作目录误用根目录相对 `.venv/bin/python` 返回“文件不存在”，随后回到仓库根目录执行。三次失败均未修改业务数据或外部状态。
+- 未完成事项或恢复说明：无仓库内遗留。现有未提交的 `CANDIDATE-QUESTION-BANK-001` 与 `API-RESPONSE-MARSHAL-001` 修改全部保留，未执行 reset、checkout 或清理。
+
+## 2026-08-29 · API-RESPONSE-MARSHAL-001
+
+- 目标：审查并改善 `app/api` 的维护性与可读性；参考 `zfsoft-agent-platform/api/fields` 的声明式白名单投影，为 FastAPI 建立统一 response/marshal seam，在不破坏现有成功响应兼容形状的前提下统一集合、异步和错误响应，并让公开候选人投影不再由路由手工拼字段。
+- 关联问题：`app/api/routes.py` 同时承担 REST 路由、WebSocket 连接管理、module 定位和响应序列化；JSON 返回普遍使用 `Dict[str, Any]`，缺少可复用字段合同；业务错误使用 `error` 包络，而请求校验错误仍使用 FastAPI 默认 `detail`；同类列表和 202 响应存在重复拼装。
+- 状态：`verified`（仓库）。
+- 计划修改：新增 `app/api/fields/` 声明式字段与 marshal 实现、统一 `app/api/responses.py` 响应工厂和错误处理；迁移重复列表/异步响应及安全敏感公开投影；增加合同测试并更新接口设计与架构说明。
+- 实际修改文件：新增 `app/api/dependencies.py`、`app/api/realtime.py`、`app/api/responses.py`、`app/api/fields/__init__.py`、`app/api/fields/core.py`、`app/api/fields/common.py`、`app/api/fields/public_interview.py`、`tests/test_api_responses.py`；修改 `app/api/routes.py`、`app/main.py`、`app/core/errors.py`、`app/core/auth.py`、`app/core/rate_limit.py`、`docs/api-design.md`、`docs/architecture.md`、`docs/development-progress.md` 和本日志。
+- 实际实现：以 `ApiJSONResponse` 作为 API router 默认 JSON transport；`api_response/accepted_response/collection_response/error_response` 统一资源编码、202、`items + next_cursor` 和 `error.code/message/details`。声明式 Field/Nested/ListOf 支持 key/attribute、嵌套 source、默认值、类型转换和显式 allow-list；公开候选人详情与答题响应已用 fields 投影，路由不再手写评分裁剪。FastAPI RequestValidationError 固定映射为 `422 REQUEST_VALIDATION_FAILED`，仅返回字段位置、消息和类型，不回显原输入；Provider、Persistence、认证和限流复用同一错误工厂。ServiceLocator 与实时连接/Redis fan-out/候选人事件裁剪分别移出 routes，并在 routes 中增加领域分区标识。
+- 兼容决策：没有给成功资源强加 `data` 二次包络，既有前端仍直接读取资源字段；列表只统一补齐 `next_cursor`，二进制/音频/CSV 不进入 JSON marshal。这样获得统一 seam 与字段白名单，同时避免对现有 `/api/v1` 客户端做破坏性版本迁移。
+- 验证命令与结果：`PYTHONPYCACHEPREFIX=/private/tmp/interviewer_api_response_pycache .venv/bin/python -m compileall -q app tests` 通过；完整后端 `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q` 为 `209 passed, 5 skipped`；定向 API/主流程/实时/限流/鉴权/候选人回归为 `31 passed`；`npm test -- --run` 为 `32 passed`；`npm run build` 成功；`git diff --check` 通过。
+- 未完成事项或恢复说明：仓库开始前已有 `CANDIDATE-QUESTION-BANK-001` 的代码、文档和前端 bundle 修改，本工作项全部保留，未执行 reset、checkout 或清理。`routes.py` 仍作为全部路径的注册表，后续可按 admin/catalog/talent/interview 物理拆成子 router；本轮已先抽离 response、依赖构造和 realtime 三个高变化 implementation，合同与运行行为无仓库内遗留。
+
+## 2026-08-29 · CANDIDATE-QUESTION-BANK-001
+
+- 目标：把现有 ResumeReview 自动生成的 ExperienceQuestion 提升为候选人可见、可维护的个人题库；保留 AI 基于简历项目/技术描述自动生成追问题的能力，补齐人工新建、候选人范围查询、编辑、批准/拒绝和归档删除，并让正式面试继续复用既有 `resume_experience` 计划、语音和评分链路。
+- 关联问题：现有 ExperienceQuestion 已绑定 CandidateProfile 并能由 AI 生成、编辑和进入计划，但只能按 ResumeReview 查询，缺少候选人个人题库入口、人工创建和删除合同，React 候选人详情也未展示这些题目。
+- 状态：`verified`（仓库）。
+- 计划修改：先更新 API、领域模型和统一语言；随后扩展 ExperienceQuestion schema/TalentService/API，增加 CandidateQuestionBank React 管理区和后端/前端测试，重建生产 bundle；最后运行定向与全量验证并补充实际文件、结果和未完成事项。
+- 不变量：CandidateQuestionBank 是 ExperienceQuestion 的候选人范围投影，不复制岗位 KnowledgeBase/Question；人工题必须绑定候选人及其 ResumeReview，评分依据完整后才可批准；归档删除不破坏已批准计划和历史 InterviewQuestionSnapshot；AI 草稿仍需人工批准后才能进入计划。
+- 实际修改文件：
+  - 合同与领域：`app/schemas/api.py`、`app/domain/enums.py`、`app/api/routes.py`、`app/services/talent.py`、`app/services/catalog.py`。
+  - React 与生产 bundle：`app/web/src/features/workflow/Page.jsx`、`app/web/src/App.test.jsx`、`app/web/styles.css`、`app/web/dist/index.html`、`app/web/dist/bundles/index-B_0U1sv3.js`、`app/web/dist/bundles/index-CWyy4anR.css`；构建替换旧 hash bundle `index-jppRnCoU.js` 和 `index-Nk8y8ETG.css`。
+  - 测试：`tests/test_candidate_screening.py`。
+  - 同步文档：`CONTEXT.md`、`docs/architecture.md`、`docs/api-design.md`、`docs/domain-model.md`、`docs/retrieval-and-evaluation.md`、`docs/database-and-vector-storage.md`、`docs/development-progress.md`、`docs/implementation-roadmap.md`、本日志。
+- 验证命令与结果：
+  - `PYTHONPYCACHEPREFIX=/private/tmp/interviewer_candidate_bank_pycache .venv/bin/python -m compileall -q app tests`：通过。
+  - `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q`：`205 passed, 5 skipped in 9.46s`。
+  - `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q tests/test_candidate_screening.py -x`：最终定向复验 `9 passed in 1.23s`；覆盖 AI/人工来源、候选人范围查询、新建、编辑、批准与语音 ready、拒绝、归档、审阅范围隐藏和审计。
+  - `cd app/web && npm test`：`32 passed`；新增行为测试覆盖 AI 题展示、人工新建、批准和删除。
+  - `cd app/web && npm run build`：通过，生产 bundle 已更新。
+  - `git diff --check`：通过。
+- 未完成事项或恢复说明：个人题库复用现有 Resume Review Prompt，本轮未新增或修改业务 Prompt。真实简历追问题质量、真实 TTS 音质和目标模型/对象存储仍沿用既有 `environment_pending` 边界；仓库内功能无未完成项。首次直接调用 `python` 因当前环境仅提供 `.venv/bin/python` 而失败；首次从 `app/web` 使用根目录相对测试过滤 `app/web/src/App.test.jsx` 未匹配文件，改为 `src/App.test.jsx` 后通过。两次失败都未修改业务数据或产生额外仓库副作用。
+
 ## 2026-08-28 · DUAL-AVATAR-DELIVERY-001
 
 - 目标：保留现有腾讯云数字人 WebRTC/SFU 链路并标注后续扩展 TODO；新增预约级“自研数字人 / 云数字人”选择。自研模式复用计划冻结的题目 TTS 私有音频，在浏览器本地完成形象渲染和口型状态，不创建云数字人会话；两种模式共用 Avatar Delivery interface、候选人播放 runtime、失败降级与会话清理。

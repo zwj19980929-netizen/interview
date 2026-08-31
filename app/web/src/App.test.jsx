@@ -391,6 +391,107 @@ describe("React workbench shell", () => {
     await act(async () => root.unmount());
   });
 
+  it("shows AI resume questions and supports manual candidate question CRUD", async () => {
+    window.history.replaceState(null, "", "#workflow");
+    const calls = [];
+    const candidate = {
+      id: "candidate_bank", name: "个人题库候选人", email: "q***@example.com", phone: "138****0008", version: 1,
+      screening: {
+        review_id: "review_bank", review_version: 3, resume_document_id: "resume_bank",
+        job_position_name: "平台后端", ai_recommendation: "qualified", effective_outcome: "qualified",
+        score: 88, summary: "项目经验匹配", matched_requirements: [], unmet_requirements: [], human_review_status: "pending", question_generation_status: "ready",
+      },
+    };
+    const evidence = { label: "循道大模型开发平台", evidence: "负责 Redis 缓存与事件驱动架构落地", source_pages: [1], evidence_type: "project" };
+    const review = { id: "review_bank", status: "ready_for_review", question_generation_status: "ready", project_evidence: [evidence], skill_evidence: [] };
+    let questions = [{
+      id: "experience_ai", version: 1, source_type: "ai_generated", status: "draft", speech_status: "pending",
+      question_text: "你在循道大模型开发平台中为什么选择 Redis？", standard_answer: "说明约束与权衡。", evidence_refs: [evidence],
+      key_points: [{ id: "kp_ai", text: "技术选型依据", weight: 1, order: 1 }],
+    }];
+    const originalConfirm = window.confirm;
+    window.confirm = vi.fn(() => true);
+    globalThis.fetch = async (path, options = {}) => {
+      const url = String(path);
+      if (url.endsWith("/auth/session")) return new Response(JSON.stringify({ actor_id: "admin_1", organization_id: "org_1", roles: ["admin"], authenticated: true }));
+      if (url.endsWith("/candidate-profiles/candidate_bank/experience-questions") && options.method === "POST") {
+        const body = JSON.parse(options.body); calls.push({ url, method: options.method, body });
+        const created = { id: "experience_manual", version: 1, source_type: "manual", status: "draft", speech_status: "pending", ...body, evidence_refs: body.evidence_refs.map(() => evidence), key_points: body.key_points.map((text, index) => ({ id: `kp_${index}`, text, weight: 1, order: index + 1 })) };
+        questions = [created, ...questions];
+        return new Response(JSON.stringify(created), { status: 201 });
+      }
+      if (url.endsWith("/experience-questions/experience_manual") && options.method === "PATCH") {
+        const body = JSON.parse(options.body); calls.push({ url, method: options.method, body });
+        questions = questions.map((item) => item.id === "experience_manual" ? { ...item, ...body, version: 2, speech_status: body.status === "approved" ? "ready" : item.speech_status } : item);
+        return new Response(JSON.stringify(questions.find((item) => item.id === "experience_manual")));
+      }
+      if (url.includes("/experience-questions/experience_manual?expected_version=2") && options.method === "DELETE") {
+        calls.push({ url, method: options.method }); questions = questions.filter((item) => item.id !== "experience_manual");
+        return new Response(JSON.stringify({ id: "experience_manual", version: 3, status: "archived" }));
+      }
+      if (url.endsWith("/candidate-profiles/candidate_bank/experience-questions")) return new Response(JSON.stringify({ items: questions }));
+      if (url.endsWith("/resume-reviews/review_bank")) return new Response(JSON.stringify(review));
+      if (url.endsWith("/candidate-profiles/candidate_bank/resumes")) return new Response(JSON.stringify({ items: [] }));
+      if (url.endsWith("/candidate-profiles")) return new Response(JSON.stringify({ items: [candidate] }));
+      return new Response(JSON.stringify({ items: [] }));
+    };
+    const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+    try {
+      await act(async () => root.render(<App />));
+      let view;
+      for (let attempt = 0; attempt < 30 && !view; attempt += 1) { await new Promise((resolve) => setTimeout(resolve, 10)); view = [...host.querySelectorAll("button")].find((node) => node.textContent === "简历问答"); }
+      expect(document.body.textContent).not.toContain("AI 简历生成");
+      await act(async () => view.click());
+      for (let attempt = 0; attempt < 30 && !document.body.textContent.includes("循道大模型开发平台中为什么选择 Redis"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(document.body.textContent).toContain("简历问答");
+      expect(document.body.textContent).toContain("AI 简历生成");
+      expect(document.body.textContent).toContain("简历依据：循道大模型开发平台");
+
+      await act(async () => [...document.querySelectorAll("button")].find((node) => node.textContent === "新建简历问题").click());
+      const form = document.querySelector(".candidate-question-form");
+      await act(async () => {
+        const values = {
+          question_text: "循道大模型开发平台为什么采用事件驱动架构？",
+          standard_answer: "说明场景、替代方案、权衡和落地效果。",
+          key_points: "场景约束\n架构权衡\n落地效果",
+        };
+        for (const [name, value] of Object.entries(values)) {
+          const input = form.querySelector(`[name="${name}"]`);
+          Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value").set.call(input, value);
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+        form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
+      });
+      for (let attempt = 0; attempt < 30 && !document.body.textContent.includes("事件驱动架构"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(calls.find((call) => call.method === "POST").body).toEqual({
+        resume_review_id: "review_bank",
+        question_text: "循道大模型开发平台为什么采用事件驱动架构？",
+        standard_answer: "说明场景、替代方案、权衡和落地效果。",
+        key_points: ["场景约束", "架构权衡", "落地效果"],
+        evidence_refs: ["循道大模型开发平台"],
+      });
+
+      let manualCard = [...document.querySelectorAll(".candidate-question-card")].find((node) => node.textContent.includes("事件驱动架构"));
+      await act(async () => [...manualCard.querySelectorAll("button")].find((node) => node.textContent === "批准").click());
+      for (let attempt = 0; attempt < 30 && !calls.some((call) => call.method === "PATCH"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(calls.find((call) => call.method === "PATCH").body).toEqual({ expected_version: 1, status: "approved" });
+
+      manualCard = [...document.querySelectorAll(".candidate-question-card")].find((node) => node.textContent.includes("事件驱动架构"));
+      const menu = manualCard.querySelector(".position-action-menu");
+      expect(menu.hasAttribute("open")).toBe(false);
+      await act(async () => menu.querySelector("summary").click());
+      expect(menu.hasAttribute("open")).toBe(true);
+      await act(async () => [...menu.querySelectorAll("button")].find((node) => node.textContent === "删除").click());
+      for (let attempt = 0; attempt < 30 && !calls.some((call) => call.method === "DELETE"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(calls.find((call) => call.method === "DELETE").url).toContain("expected_version=2");
+      expect(window.confirm).toHaveBeenCalled();
+      expect(document.body.textContent).not.toContain("循道大模型开发平台为什么采用事件驱动架构？");
+    } finally {
+      window.confirm = originalConfirm;
+      await act(async () => root.unmount());
+    }
+  });
+
   it("requeues a failed resume screening from candidate detail", async () => {
     window.history.replaceState(null, "", "#workflow");
     const calls = [];
@@ -461,7 +562,7 @@ describe("React workbench shell", () => {
     try {
       await act(async () => root.render(<App />));
       let view;
-      for (let attempt = 0; attempt < 30 && !view; attempt += 1) { await new Promise((resolve) => setTimeout(resolve, 10)); view = [...host.querySelectorAll("button")].find((node) => node.textContent === "查看"); }
+      for (let attempt = 0; attempt < 30 && !view; attempt += 1) { await new Promise((resolve) => setTimeout(resolve, 10)); view = [...host.querySelectorAll("button")].find((node) => node.textContent === "查看初筛"); }
       await act(async () => view.click());
       for (let attempt = 0; attempt < 30 && !document.body.textContent.includes("latest.pdf"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
       await act(async () => [...document.querySelectorAll("button")].find((node) => node.textContent === "修改名称").click());

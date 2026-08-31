@@ -6,6 +6,7 @@ from typing import Deque, Dict, Optional
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+from app.transport.http.responses import error_response
 
 class PublicRateLimiter:
     """Redis-backed production limiter with a deterministic development fallback."""
@@ -92,9 +93,10 @@ class PublicRateLimiter:
         return "signed-file"
 
     def _error(self, code: str, message: str, status_code: int) -> JSONResponse:
-        return JSONResponse(
+        return error_response(
+            code,
+            message,
             status_code=status_code,
-            content={"error": {"code": code, "message": message, "details": {}}},
             headers={"Retry-After": os.getenv("INTERVIEWER_PUBLIC_RATE_LIMIT_WINDOW_SECONDS", "60")},
         )
 

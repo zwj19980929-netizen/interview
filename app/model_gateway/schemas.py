@@ -119,6 +119,59 @@ class StreamingSTTEvent(BaseModel):
     provider: Optional[ProviderMeta] = None
 
 
+class RealtimeSpeechDialogueRequest(BaseModel):
+    organization_id: str = "org_default"
+    interview_id: str = Field(min_length=1)
+    turn_id: str = Field(min_length=1)
+    purpose: str = "candidate_followup_dialogue"
+    input_audio: StreamingAudioConfig = Field(
+        default_factory=lambda: StreamingAudioConfig(
+            content_type="audio/pcm", sample_rate_hz=16000, channels=1
+        )
+    )
+    output_audio: StreamingAudioConfig = Field(
+        default_factory=lambda: StreamingAudioConfig(
+            content_type="audio/pcm", sample_rate_hz=24000, channels=1
+        )
+    )
+    language: str = "zh-CN"
+    voice: str = "default"
+    turn_detection: Literal["manual", "server_vad", "semantic_vad", "smart_turn"] = "manual"
+    session_instructions: str = Field(min_length=1, max_length=8000)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
+
+
+class RealtimeSpeechResponseCommand(BaseModel):
+    spoken_text: str = Field(min_length=1, max_length=1000)
+    response_instructions: str = Field(min_length=1, max_length=4000)
+
+
+class RealtimeSpeechDialogueEvent(BaseModel):
+    stream_id: str = Field(min_length=1)
+    sequence: int = Field(ge=1)
+    type: Literal[
+        "dialogue.ready",
+        "input.speech.started",
+        "input.speech.stopped",
+        "input.transcript.partial",
+        "input.transcript.final",
+        "output.transcript.delta",
+        "output.transcript.final",
+        "output.audio.delta",
+        "output.audio.done",
+        "output.interrupted",
+        "dialogue.error",
+        "dialogue.closed",
+    ]
+    text: str = ""
+    audio_base64: str = ""
+    audio_content_type: str = "audio/pcm"
+    sample_rate_hz: int = Field(default=24000, ge=8000, le=192000)
+    is_final: bool = False
+    error_code: Optional[str] = None
+    provider: Optional[ProviderMeta] = None
+
+
 class BatchSTTRequest(BaseModel):
     organization_id: str = "org_default"
     purpose: str = "candidate_answer_repair"

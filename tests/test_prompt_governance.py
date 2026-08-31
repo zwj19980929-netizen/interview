@@ -101,12 +101,19 @@ def test_resume_review_contract_contains_explainable_screening_and_protected_att
         {"position_name": "后端工程师", "role_description": "必须掌握 Python", "sanitized_resume": "Python 项目"},
     )
     screening = contract.response_schema["properties"]["screening"]
-    assert contract.version == "resume_review.v4"
+    assert contract.version == "resume_review.v6"
     assert screening["properties"]["recommendation"]["enum"] == ["qualified", "unqualified", "manual_review"]
     assert {"matched_requirements", "unmet_requirements"}.issubset(screening["required"])
     assert "受保护属性" in contract.messages[0].content
     assert "0到59分 recommendation=unqualified" in contract.messages[0].content
     assert "75到100分 recommendation=qualified" in contract.messages[0].content
+    schema = contract.response_schema["properties"]
+    assert schema["summary"]["maxLength"] == 320
+    assert schema["project_evidence"]["maxItems"] == 4
+    assert schema["skill_evidence"]["maxItems"] == 6
+    assert "experience_questions" not in schema
+    assert "不生成面试问题" in contract.messages[0].content
+    assert "输出必须精炼" in contract.messages[0].content
 
 
 def test_long_resume_map_reduce_contracts_separate_evidence_from_screening() -> None:
@@ -145,11 +152,29 @@ def test_long_resume_map_reduce_contracts_separate_evidence_from_screening() -> 
     assert compacted.version == "resume_evidence_compaction.v1"
     compact_item = compacted.response_schema["properties"]["project_evidence"]["items"]
     assert "source_pages" in compact_item["required"]
-    assert reduced.version == "resume_review_reduce.v2"
+    assert reduced.version == "resume_review_reduce.v4"
     assert "screening" in reduced.response_schema["properties"]
     assert "60到74分 recommendation=manual_review" in reduced.messages[0].content
     reduced_evidence = reduced.response_schema["properties"]["project_evidence"]["items"]
     assert "source_pages" in reduced_evidence["required"]
+
+
+def test_resume_question_generation_requires_explicit_resume_evidence_labels() -> None:
+    contract = prompt_contract(
+        "resume_experience_question_generation",
+        {
+            "position_name": "后端工程师",
+            "evidence_json": '[{"label":"订单平台","evidence":"负责Python服务性能优化"}]',
+        },
+    )
+    questions = contract.response_schema["properties"]["questions"]
+    evidence_refs = questions["items"]["properties"]["evidence_refs"]
+    assert contract.version == "resume_experience_question_generation.v1"
+    assert questions["minItems"] == 1
+    assert questions["maxItems"] == 3
+    assert evidence_refs["minItems"] == 1
+    assert evidence_refs["uniqueItems"] is True
+    assert "禁止引入证据中没有出现的技术" in contract.messages[0].content
 
 
 @pytest.mark.parametrize(

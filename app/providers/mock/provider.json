@@ -3,7 +3,7 @@
   "provider_id": "mock",
   "display_name": "Mock Provider",
   "version": "2.0.0",
-  "capabilities": ["avatar.speak", "embedding.text", "llm.chat_json", "llm.chat_text", "stt.streaming", "stt.batch", "tts.synthesize"],
+  "capabilities": ["avatar.speak", "embedding.text", "llm.chat_json", "llm.chat_text", "speech.dialogue_realtime", "stt.streaming", "stt.batch", "tts.synthesize"],
   "model_selection": "predefined",
   "defaults": {},
   "connection_form": {"schema_version": "2", "fields": []},
@@ -17,6 +17,7 @@
       {"name": "voice_map", "label": "音色映射", "control": "key_value", "required": false}
     ]}},
     "avatar": {"label": "数字人", "selection_mode": "predefined", "capabilities": ["avatar.speak"], "configuration_form": {"fields": []}}
+    ,"realtime_speech": {"label": "实时语音对话", "selection_mode": "predefined", "capabilities": ["speech.dialogue_realtime"], "configuration_form": {"fields": []}}
   },
   "models": [
     {"model_id": "mock-json", "label": "Mock JSON", "model_type": "llm", "capabilities": ["llm.chat_json"], "default": true},
@@ -25,6 +26,7 @@
     {"model_id": "mock-avatar", "label": "Mock Avatar", "model_type": "avatar", "capabilities": ["avatar.speak"], "default": true},
     {"model_id": "mock-stt", "label": "Mock STT", "model_type": "stt", "capabilities": ["stt.streaming", "stt.batch"], "default": true},
     {"model_id": "mock-tts", "label": "Mock TTS", "model_type": "tts", "capabilities": ["tts.synthesize"], "default": true}
+    ,{"model_id": "mock-dialogue", "label": "Mock Realtime Speech", "model_type": "realtime_speech", "capabilities": ["speech.dialogue_realtime"], "default": true}
   ],
   "entrypoint": "app.providers.mock.provider:MockProvider",
   "implemented": true

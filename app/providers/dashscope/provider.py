@@ -4,7 +4,7 @@ import hashlib
 import json
 import uuid
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 import websockets
 
@@ -15,6 +15,7 @@ from app.model_gateway.schemas import (
     BatchSTTResponse,
     ProviderContext,
     ProviderMeta,
+    RealtimeSpeechDialogueRequest,
     StreamingSTTEvent,
     StreamingSTTRequest,
     TTSSynthesizeRequest,
@@ -22,6 +23,7 @@ from app.model_gateway.schemas import (
     TranscriptSegment,
 )
 from app.providers.openai_compatible.provider import OpenAICompatibleProvider
+from app.providers.realtime_speech import OpenAIStyleRealtimeSpeechStream
 
 
 class DashScopeProvider(OpenAICompatibleProvider):
@@ -42,6 +44,74 @@ class DashScopeProvider(OpenAICompatibleProvider):
         if context.capability != cap.STT_STREAMING:
             raise ProviderError("provider_capability_missing", "DashScope stream capability is invalid.", retryable=False)
         return await DashScopeSTTStream.open(self, request, context)
+
+    async def open_dialogue(
+        self,
+        request: RealtimeSpeechDialogueRequest,
+        context: ProviderContext,
+    ) -> OpenAIStyleRealtimeSpeechStream:
+        """Open Qwen Realtime behind the provider-neutral speech dialogue seam."""
+        if context.capability != cap.SPEECH_DIALOGUE_REALTIME:
+            raise ProviderError(
+                "provider_capability_missing",
+                "DashScope realtime speech capability is invalid.",
+                retryable=False,
+            )
+        api_key = _api_key(context.credentials)
+        base = _dialogue_endpoint(context.config)
+        separator = "&" if "?" in base else "?"
+        url = "%s%s%s" % (base, separator, urlencode({"model": context.model}))
+        voice_map = context.config.get("voice_map") or {}
+        voice = str(
+            voice_map.get(request.voice)
+            or context.config.get("dialogue_default_voice")
+            or context.config.get("default_voice")
+            or request.voice
+        )
+        if voice == "default":
+            voice = "Cherry"
+        transcription_model = str(
+            context.config.get("dialogue_input_transcription_model")
+            or "qwen3-asr-flash"
+        )
+        session = {
+            "modalities": ["text", "audio"],
+            "instructions": request.session_instructions,
+            "voice": voice,
+            "input_audio_format": "pcm16",
+            "output_audio_format": "pcm24",
+            "input_audio_transcription": {
+                "model": transcription_model,
+                "language": _language_hint(request.language),
+            },
+            # The interviewer owns turn boundaries. Vendor VAD is deliberately
+            # disabled so a premature endpoint cannot become scoring evidence.
+            "turn_detection": None,
+        }
+        response_payload = {
+            "modalities": ["text", "audio"],
+            "voice": voice,
+            "output_audio_format": "pcm24",
+        }
+        headers = {
+            "Authorization": "Bearer %s" % api_key,
+            "User-Agent": "Interviewer/0.1",
+        }
+        workspace_id = str(context.config.get("workspace_id") or "").strip()
+        if workspace_id:
+            headers["X-DashScope-WorkSpace"] = workspace_id
+        return await OpenAIStyleRealtimeSpeechStream.open(
+            provider_id=self.provider_id,
+            connector=self.websocket_connect,
+            url=url,
+            headers=headers,
+            request=request,
+            context=context,
+            session=session,
+            vendor_input_rate=16000,
+            vendor_output_rate=24000,
+            response_payload=response_payload,
+        )
 
     async def _transcribe_batch(self, request: BatchSTTRequest, context: ProviderContext) -> BatchSTTResponse:
         audio = request.audio_bytes
@@ -371,6 +441,30 @@ def _asr_stream_endpoint(config: Dict[str, Any]) -> str:
     if parsed.scheme != "https" or not parsed.hostname:
         raise ProviderError("provider_bad_request", "DashScope base_url must be HTTPS.", retryable=False)
     return "wss://%s/api-ws/v1/inference" % parsed.hostname
+
+
+def _dialogue_endpoint(config: Dict[str, Any]) -> str:
+    configured = str(config.get("realtime_websocket_url") or "").strip()
+    if configured:
+        parsed = urlparse(configured)
+        if parsed.scheme != "wss" or not parsed.hostname or parsed.username or parsed.password:
+            raise ProviderError(
+                "provider_bad_request",
+                "DashScope Realtime WebSocket URL must be secure.",
+                retryable=False,
+            )
+        return configured
+    workspace_id = str(config.get("workspace_id") or "").strip()
+    if not workspace_id:
+        raise ProviderError(
+            "provider_bad_request",
+            "DashScope Realtime requires workspace_id or realtime_websocket_url.",
+            retryable=False,
+        )
+    return "wss://%s.%s.maas.aliyuncs.com/api-ws/v1/realtime" % (
+        workspace_id,
+        _workspace_region(config),
+    )
 
 
 def _workspace_region(config: Dict[str, Any]) -> str:

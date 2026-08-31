@@ -32,6 +32,8 @@ def prompt_contract(name: str, context: Dict[str, Any]) -> PromptContract:
         return _resume_evidence_compaction(context)
     if name == "resume_review_reduce":
         return _resume_review_reduce(context)
+    if name == "resume_experience_question_generation":
+        return _resume_experience_question_generation(context)
     if name == "json_probe":
         return PromptContract(
             version="json_probe.v1",
@@ -279,27 +281,50 @@ def _answer_evaluation(context: Dict[str, Any]) -> PromptContract:
     )
 
 
-def _resume_review_response_schema(*, require_source_pages: bool = False) -> Dict[str, Any]:
-    non_empty_string = {"type": "string", "minLength": 1}
-    question = {
+def _experience_question_schema() -> Dict[str, Any]:
+    def bounded_string(max_length: int) -> Dict[str, Any]:
+        return {"type": "string", "minLength": 1, "maxLength": max_length}
+
+    return {
         "type": "object",
         "required": ["question_text", "verification_points", "evidence_refs", "evaluation_guide"],
         "properties": {
-            "question_text": non_empty_string,
-            "verification_points": {"type": "array", "minItems": 1, "items": non_empty_string},
-            "evidence_refs": {"type": "array", "items": non_empty_string},
-            "evaluation_guide": non_empty_string,
+            "question_text": bounded_string(300),
+            "verification_points": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 4,
+                "items": bounded_string(120),
+            },
+            "evidence_refs": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 3,
+                "uniqueItems": True,
+                "items": bounded_string(80),
+            },
+            "evaluation_guide": bounded_string(320),
         },
         "additionalProperties": False,
     }
+
+
+def _resume_review_response_schema(*, require_source_pages: bool = False) -> Dict[str, Any]:
+    def bounded_string(max_length: int) -> Dict[str, Any]:
+        return {"type": "string", "minLength": 1, "maxLength": max_length}
+
     evidence_required = ["label", "evidence", "source_pages"] if require_source_pages else ["label", "evidence"]
     evidence = {
         "type": "object",
         "required": evidence_required,
         "properties": {
-            "label": non_empty_string,
-            "evidence": non_empty_string,
-            "source_pages": {"type": "array", "items": {"type": "integer", "minimum": 1}},
+            "label": bounded_string(80),
+            "evidence": bounded_string(240),
+            "source_pages": {
+                "type": "array",
+                "maxItems": 12,
+                "items": {"type": "integer", "minimum": 1},
+            },
         },
         "additionalProperties": False,
     }
@@ -307,39 +332,45 @@ def _resume_review_response_schema(*, require_source_pages: bool = False) -> Dic
         "type": "object",
         "required": ["requirement", "evidence", "source_pages"] if require_source_pages else ["requirement", "evidence"],
         "properties": {
-            "requirement": non_empty_string,
-            "evidence": non_empty_string,
-            "source_pages": {"type": "array", "items": {"type": "integer", "minimum": 1}},
+            "requirement": bounded_string(120),
+            "evidence": bounded_string(240),
+            "source_pages": {
+                "type": "array",
+                "maxItems": 12,
+                "items": {"type": "integer", "minimum": 1},
+            },
         },
         "additionalProperties": False,
     }
     screening_gap = {
         "type": "object",
         "required": ["requirement", "reason"],
-        "properties": {"requirement": non_empty_string, "reason": non_empty_string},
+        "properties": {
+            "requirement": bounded_string(120),
+            "reason": bounded_string(240),
+        },
         "additionalProperties": False,
     }
     return {
         "type": "object",
-        "required": ["summary", "project_evidence", "skill_evidence", "screening", "experience_questions"],
+        "required": ["summary", "project_evidence", "skill_evidence", "screening"],
         "properties": {
-            "summary": non_empty_string,
-            "project_evidence": {"type": "array", "items": evidence},
-            "skill_evidence": {"type": "array", "items": evidence},
-            "warnings": {"type": "array", "items": non_empty_string},
+            "summary": bounded_string(320),
+            "project_evidence": {"type": "array", "maxItems": 4, "items": evidence},
+            "skill_evidence": {"type": "array", "maxItems": 6, "items": evidence},
+            "warnings": {"type": "array", "maxItems": 4, "items": bounded_string(160)},
             "screening": {
                 "type": "object",
                 "required": ["recommendation", "score", "summary", "matched_requirements", "unmet_requirements"],
                 "properties": {
                     "recommendation": {"type": "string", "enum": ["qualified", "unqualified", "manual_review"]},
                     "score": {"type": "integer", "minimum": 0, "maximum": 100},
-                    "summary": non_empty_string,
-                    "matched_requirements": {"type": "array", "items": screening_evidence},
-                    "unmet_requirements": {"type": "array", "items": screening_gap},
+                    "summary": bounded_string(320),
+                    "matched_requirements": {"type": "array", "maxItems": 6, "items": screening_evidence},
+                    "unmet_requirements": {"type": "array", "maxItems": 8, "items": screening_gap},
                 },
                 "additionalProperties": False,
             },
-            "experience_questions": {"type": "array", "minItems": 1, "items": question},
         },
         "additionalProperties": False,
     }
@@ -347,15 +378,17 @@ def _resume_review_response_schema(*, require_source_pages: bool = False) -> Dic
 
 def _resume_review(context: Dict[str, Any]) -> PromptContract:
     return PromptContract(
-        version="resume_review.v4",
+        version="resume_review.v6",
         messages=[
             ChatMessage(
                 role="system",
                 content=(
-                    "只依据脱敏简历中的工作能力证据评估岗位初筛，并生成经历核验问题。"
+                    "只依据脱敏简历中的工作能力证据提取证据并评估岗位初筛。"
                     "匹配分必须为0到100的整数：0到59分 recommendation=unqualified，"
                     "60到74分 recommendation=manual_review，75到100分 recommendation=qualified。"
                     "不得使用性别、年龄、婚育、民族、照片等受保护属性；初筛结论仅是可人工复核的岗位匹配建议，不是录用决定。"
+                    "输出必须精炼：只保留最相关且可核验的证据，每项只表达一个事实；岗位要求不要重复列举。"
+                    "本阶段只输出证据与初筛结论，不生成面试问题。"
                 ),
             ),
             ChatMessage(
@@ -456,15 +489,17 @@ def _resume_evidence_compaction(context: Dict[str, Any]) -> PromptContract:
 
 def _resume_review_reduce(context: Dict[str, Any]) -> PromptContract:
     return PromptContract(
-        version="resume_review_reduce.v2",
+        version="resume_review_reduce.v4",
         messages=[
             ChatMessage(
                 role="system",
                 content=(
-                    "只依据已从全部简历分块提取并带来源页的证据，综合评估岗位初筛并生成经历核验问题。"
+                    "只依据已从全部简历分块提取并带来源页的证据，综合评估岗位初筛。"
                     "匹配分必须为0到100的整数：0到59分 recommendation=unqualified，"
                     "60到74分 recommendation=manual_review，75到100分 recommendation=qualified。"
                     "证据不足必须标为缺口并反映在匹配分中；不得使用受保护属性，不得把建议表述为录用决定。"
+                    "输出必须精炼：合并重复证据和岗位要求，每项只表达一个事实；禁止复述整份输入。"
+                    "本阶段只输出证据与初筛结论，不生成面试问题。"
                 ),
             ),
             ChatMessage(
@@ -479,6 +514,42 @@ def _resume_review_reduce(context: Dict[str, Any]) -> PromptContract:
             ),
         ],
         response_schema=_resume_review_response_schema(require_source_pages=True),
+    )
+
+
+def _resume_experience_question_generation(context: Dict[str, Any]) -> PromptContract:
+    return PromptContract(
+        version="resume_experience_question_generation.v1",
+        messages=[
+            ChatMessage(
+                role="system",
+                content=(
+                    "你只为已经确认符合岗位要求的候选人生成简历核验问题。每道问题必须直接来源于输入中的"
+                    "项目或技能证据，evidence_refs 必须逐字使用输入 evidence label，至少引用一个且不得引用不存在的 label。"
+                    "题干中必须明确写出至少一个所引用的 evidence label，使用户能直接看出问题来自哪条简历经历。"
+                    "问题只核验简历已经写明的项目、本人职责、技术选型、实现方式、结果和复盘；"
+                    "禁止引入证据中没有出现的技术、系统、业务或经历，禁止生成通用岗位题。生成1到3道精炼中文问题。"
+                ),
+            ),
+            ChatMessage(
+                role="user",
+                content="岗位：%s\n可用简历证据 JSON：%s"
+                % (context["position_name"], context["evidence_json"]),
+            ),
+        ],
+        response_schema={
+            "type": "object",
+            "required": ["questions"],
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 3,
+                    "items": _experience_question_schema(),
+                }
+            },
+            "additionalProperties": False,
+        },
     )
 
 

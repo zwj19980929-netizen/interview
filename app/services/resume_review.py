@@ -144,6 +144,10 @@ def queue_resume_review(
             "human_review_status": "pending",
             "human_decision": None,
             "human_review_note": None,
+            "question_generation_status": "not_eligible",
+            "question_generation_work_item_id": None,
+            "question_generation_error": None,
+            "question_count": 0,
             "created_at": now,
             "updated_at": now,
         }
@@ -189,27 +193,41 @@ class ResumeReviewPipeline:
     ) -> ResumeReviewPipelineResult:
         sanitized = redact_resume(parsed_text)
         estimated_tokens = estimate_tokens(sanitized)
+        fallback_prompt_version: Optional[str] = None
         if estimated_tokens <= self.single_pass_budget:
-            response, contract_version = await self._single_pass(
-                sanitized=sanitized,
-                position=position,
-                role=role,
-                organization_id=organization_id,
-            )
-            data = deepcopy(response.data)
-            _attach_default_pages(data, list(range(1, max(1, page_count) + 1)))
-            return ResumeReviewPipelineResult(
-                data=data,
-                processing={
-                    "strategy": "single_pass",
-                    "estimated_input_tokens": estimated_tokens,
-                    "chunk_count": 1,
-                    "chunks": [],
-                    "prompt_versions": [contract_version],
-                    "providers": [response.provider.model_dump()],
-                    "usage": response.usage.model_dump(),
-                },
-            )
+            try:
+                response, contract_version = await self._single_pass(
+                    sanitized=sanitized,
+                    position=position,
+                    role=role,
+                    organization_id=organization_id,
+                )
+            except ProviderError as exc:
+                if exc.code != "provider_output_truncated":
+                    raise
+                fallback_prompt_version = prompt_contract(
+                    "resume_review",
+                    {
+                        "position_name": position["name"],
+                        "role_description": role["description"],
+                        "sanitized_resume": sanitized,
+                    },
+                ).version
+            else:
+                data = deepcopy(response.data)
+                _attach_default_pages(data, list(range(1, max(1, page_count) + 1)))
+                return ResumeReviewPipelineResult(
+                    data=data,
+                    processing={
+                        "strategy": "single_pass",
+                        "estimated_input_tokens": estimated_tokens,
+                        "chunk_count": 1,
+                        "chunks": [],
+                        "prompt_versions": [contract_version],
+                        "providers": [response.provider.model_dump()],
+                        "usage": response.usage.model_dump(),
+                    },
+                )
 
         chunks, page_structure = build_evidence_chunks(
             sanitized,
@@ -225,6 +243,8 @@ class ResumeReviewPipeline:
             organization_id=organization_id,
             on_progress=on_progress,
         )
+        if fallback_prompt_version:
+            prompt_versions.insert(0, fallback_prompt_version)
         evidence, compact_versions, compact_providers, compact_usage = await self._fit_reduce_budget(
             evidence,
             role=role,
@@ -253,7 +273,8 @@ class ResumeReviewPipeline:
         return ResumeReviewPipelineResult(
             data=data,
             processing={
-                "strategy": "map_reduce",
+                "strategy": "map_reduce_after_output_truncation" if fallback_prompt_version else "map_reduce",
+                "fallback_reason": "provider_output_truncated" if fallback_prompt_version else None,
                 "estimated_input_tokens": estimated_tokens,
                 "chunk_count": len(chunks),
                 "chunks": chunk_records,

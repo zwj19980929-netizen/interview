@@ -58,14 +58,14 @@ Resume Review 只能读取已完成摄取和解析的 `ResumeDocument`。本地 
 1. 摄取本地上传流或受控下载的公开 HTTPS URL，计算 SHA-256，并校验大小、`application/pdf` 和 PDF 文件签名。
 2. 文件先进入隔离区完成恶意文件扫描，再写入系统私有存储；外部 URL 不能成为后续解析和审阅的长期真相来源。
 3. 解析 PDF 并以页分隔符保存全部可提取文本；调用模型前去除联系方式及照片、性别、年龄、婚育等无关字段。
-4. 估算脱敏文本 Token：预算内使用 `resume_review.v4` 单次审阅；超预算则按页贪心组块，单页仍超限时再按段落/字符安全切分，任何文本都不能静默截断。
+4. 估算脱敏文本 Token：预算内使用 `resume_review.v6` 单次审阅；超预算则按页贪心组块，单页仍超限时再按段落/字符安全切分，任何文本都不能静默截断。单次审阅若以 `provider_output_truncated` 结束，丢弃未完整输出并自动切换到完整 Map/Reduce，不使用相同参数盲目重试。
 5. 长简历的每个 `ResumeEvidenceChunk` 通过 `resume_evidence_map.v1` 只抽取项目、职责、技能、量化结果和来源页，不允许输出岗位符合性；分块在受控并发数内执行。
 6. 合并重复证据；若证据本身超过 Reduce 预算，用 `resume_evidence_compaction.v1` 分层压缩并保留来源页。达到最大压缩轮次仍超限则结构化失败，不截断。
-7. 只有全部 Map 成功后，`resume_review_reduce.v2` 才把完整规范化证据映射到岗位能力，并形成 `qualified/unqualified/manual_review`、0–100 辅助分、命中要求和缺口。
-8. 为最相关项目生成经历核验问题，覆盖本人职责、技术权衡、困难、结果验证和复盘；输出严格 JSON，保存策略、分块进度、用量、model/prompt revision，不保存完整 Prompt/响应。
-9. 初筛和问题都进入人工审核。任一分块失败不得基于部分结果生成淘汰建议；复核人可覆盖生效符合性，但 AI 原建议和证据保持不可变。
+7. 只有全部 Map 成功后，`resume_review_reduce.v4` 才把完整规范化证据映射到岗位能力，并形成 `qualified/unqualified/manual_review`、0–100 辅助分、命中要求和缺口；Resume Review 本身不再返回问题。
+8. 生效结论为 `qualified` 时才创建 `resume.experience_questions.generate` 工作，使用 `resume_experience_question_generation.v1` 和该审阅的项目/技能证据生成 1–3 个问题；AI 不符合/待复核不调用该模型，人工改判符合时才排队。
+9. 每题 `evidence_refs` 必须精确引用输入证据标签，题干必须点名至少一个标签，服务端再解析为不可变证据快照；任一引用未知、缺少证据或题干不点名均整体失败，不保存通用技术题。
 
-模型输入预算与结构化输出预算必须分开配置。默认单次审阅/最终 Reduce 输出上限为 6000 tokens，Map/证据压缩为 4000 tokens，可分别通过 `INTERVIEWER_RESUME_SINGLE_PASS_OUTPUT_TOKENS`、`INTERVIEWER_RESUME_MAP_OUTPUT_TOKENS`、`INTERVIEWER_RESUME_COMPACTION_OUTPUT_TOKENS`、`INTERVIEWER_RESUME_REDUCE_OUTPUT_TOKENS` 调整。Provider 以 `finish_reason=length` 截断或返回空正文时必须结构化失败，不得保存半截 JSON 或部分初筛结论。
+模型输入预算与结构化输出预算必须分开配置。默认单次审阅/最终 Reduce 输出上限为 6000 tokens，Map/证据压缩为 4000 tokens，独立问题生成默认为 3000 tokens，可分别通过 `INTERVIEWER_RESUME_SINGLE_PASS_OUTPUT_TOKENS`、`INTERVIEWER_RESUME_MAP_OUTPUT_TOKENS`、`INTERVIEWER_RESUME_COMPACTION_OUTPUT_TOKENS`、`INTERVIEWER_RESUME_REDUCE_OUTPUT_TOKENS`、`INTERVIEWER_RESUME_QUESTION_OUTPUT_TOKENS` 调整。审阅最终 Schema 只限制摘要、证据和岗位要求；问题生成 Schema 独立限制 1–3 题、核验点与引用。Provider 以 `finish_reason=length` 截断或返回空正文时必须结构化失败，不得保存半截 JSON 或部分结果。
 
 初筛仅比较简历中的明确能力证据与岗位要求。模型负责生成 0–100 匹配分和证据，服务端在写入 CandidateScreening 前用版本化策略强制归一化建议：0–59 为 `unqualified`，60–74 为 `manual_review`，75–100 为 `qualified`；模型建议与分数冲突时以该映射为准。生效结论为人工复核优先、归一化 AI 建议次之；候选人列表同时展示两者及证据，分数带只形成筛选建议，不构成自动录用决定。同一候选人在不同岗位的最新审阅分别计算；只有所有最新生效结论均为 `unqualified` 时才设置 7 天留存期限，任何符合、待复核或处理中结论都会取消该初筛期限。周期 worker 先用当前策略校正存量审阅对应的期限；首次命中从本次校正时间起完整保留 7 天，不追溯立即删除，之后再由 RetentionService 到期清理并审计。
 
@@ -89,6 +89,8 @@ Resume Review 只能读取已完成摄取和解析的 `ResumeDocument`。本地 
 ```
 
 简历只提供提问上下文，不能把简历中声称的成果直接当作候选人已证明的能力。经历问题评分以面试回答中的具体证据为主，并把与简历的矛盾标为“待人工核验”，不能直接判定不诚信。
+
+`CandidateQuestionBank` 是按 `candidate_profile_id` 聚合 `ExperienceQuestion` 的读取与管理投影，不另建一套 Question 真相。它只对生效结论 `qualified` 开放，并在候选人列表通过独立“简历问答”弹窗进入。AI 生成项记录 `source_type=ai_generated`；面试官可基于符合审阅人工创建 `source_type=manual` 草稿，必须选择简历证据，题干也必须写出所选项目/技能名称。人工与 AI 题共用版本化编辑、批准/拒绝、语音生成、计划冻结和 `resume_experience.v1` 评分。归档题、无有效证据快照的旧题以及不符合审阅的问题从读取和新计划中消失，但已批准计划与历史面试继续读取冻结快照。人工题也不能绕过审核：只有 `approved + speech_ready` 才进入计划装配。
 
 ## 岗位题候选池筛选
 
@@ -182,6 +184,14 @@ candidate audio -> realtime gateway -> stt.streaming
 - `stt_confidence` 低于语言/Provider 校准阈值时可继续评分，但评分置信度设上限并进入人工复核。
 
 回答结束由候选人提交、服务端静音检测、最长时限或面试官结束触发。服务端必须在音频 flush 完成后等待 final；不能在 `candidate.media.stop` 到达时直接拿客户端文本评分。
+
+## 受控澄清追问与低延迟双轨
+
+追问不等待 AnswerEvaluation，也不让 S2S 模型自行决定问什么。权威 STT final 到达后，`EvaluationService.decide_followup` 先用冻结关键点做确定性覆盖判断；只对未覆盖关键点选择题目已审核的 `followup_probes`，没有 probe 时使用固定澄清模板。策略固定 `max_depth=1`、每根题最多 1 次、全场默认最多 2 次、追问权重为 0，并检查回答长度和剩余时间。追问子轮次保存 parent/root、目标关键点和判定来源用于企业审计，但 Candidate Session Projection 只返回父子关系与题干。
+
+`cascade` 模式使用 `权威 STT -> 追问策略 -> Avatar/TTS`；`s2s` 模式从录音开始就维持第二条 Realtime Speech Dialogue 流，在追问文本批准后通过版本化 Prompt 要求 Provider 逐字播报，并把 PCM delta 立即送到浏览器。S2S transcript 必须与批准文本规范化一致；不一致、断流或缺 route 只触发表达轨降级，不能写 CandidateAnswer、不能改变关键点判定、不能给分。
+
+CandidateAnswer、`answer.evaluate` DurableWorkItem 和生命周期事件在同一事务提交。HTTP/WebSocket 随即返回 `evaluation.status=pending` / `evaluation.queued`；完整 LLM 评分由 worker 执行，完成后才写 append-only AnswerEvaluation 并广播安全摘要。因此评分吞吐或模型抖动不会延长追问首包语音延迟，也不会丢失证据链。
 
 ## 岗位题逐题评分
 

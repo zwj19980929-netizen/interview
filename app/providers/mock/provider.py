@@ -1,7 +1,8 @@
 import hashlib
 import math
 import re
-from typing import Any, Dict, List
+import base64
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from app.core.ids import new_id
 from app.model_gateway import capabilities as cap
@@ -22,6 +23,9 @@ from app.model_gateway.schemas import (
     TranscriptSegment,
     StreamingSTTEvent,
     StreamingSTTRequest,
+    RealtimeSpeechDialogueEvent,
+    RealtimeSpeechDialogueRequest,
+    RealtimeSpeechResponseCommand,
     TTSSynthesizeRequest,
     TTSSynthesizeResponse,
     Usage,
@@ -56,6 +60,8 @@ class MockProvider:
                     data = review_resume_evidence(request.metadata)
                 else:
                     data = review_resume(request.metadata)
+            elif request.purpose == "resume_experience_question_generation":
+                data = generate_resume_experience_questions(request.metadata)
             elif request.purpose == "role_parsing":
                 data = {"parsed": True, "profile": request.metadata}
             elif request.purpose == "model_configuration_test":
@@ -128,6 +134,87 @@ class MockProvider:
                 retryable=False,
             )
         return MockSTTStream(request, context)
+
+    async def open_dialogue(
+        self, request: RealtimeSpeechDialogueRequest, context: ProviderContext
+    ) -> Any:
+        if context.capability != cap.SPEECH_DIALOGUE_REALTIME:
+            raise ProviderError(
+                "provider_capability_missing",
+                "Mock provider can only open a realtime speech dialogue stream.",
+                retryable=False,
+            )
+        return MockSpeechDialogueStream(request, context)
+
+
+class MockSpeechDialogueStream:
+    def __init__(self, request: RealtimeSpeechDialogueRequest, context: ProviderContext) -> None:
+        self.request = request
+        self.context = context
+        self.stream_id = new_id("dialogue_stream")
+        self.sequence = 1
+        self.closed = False
+        self.audio_started = False
+        self.provider = ProviderMeta(
+            provider_id="mock",
+            model=context.model,
+            request_id=new_id("vendor_req"),
+            latency_ms=0,
+        )
+        self.ready_events = [self._event("dialogue.ready")]
+
+    async def send_audio(self, chunk: bytes) -> List[RealtimeSpeechDialogueEvent]:
+        if self.closed:
+            raise ProviderError("provider_stream_closed", "Mock dialogue is closed.", retryable=False)
+        if not chunk or self.audio_started:
+            return []
+        self.audio_started = True
+        return [self._event("input.speech.started")]
+
+    async def commit(
+        self,
+        command: RealtimeSpeechResponseCommand,
+        on_event: Optional[Callable[[RealtimeSpeechDialogueEvent], Awaitable[None]]] = None,
+    ) -> List[RealtimeSpeechDialogueEvent]:
+        if self.closed:
+            return []
+        transcript = str(self.request.metadata.get("development_transcript") or "候选人回答")
+        pcm = b"\x00\x00" * max(1600, min(24000, len(command.spoken_text) * 800))
+        events = [
+            self._event("input.speech.stopped"),
+            self._event("input.transcript.final", text=transcript, is_final=True),
+            self._event("output.transcript.final", text=command.spoken_text, is_final=True),
+            self._event("output.audio.delta", audio_base64=base64.b64encode(pcm).decode("ascii")),
+            self._event("output.audio.done"),
+            self._event("dialogue.closed"),
+        ]
+        self.closed = True
+        if on_event:
+            for event in events:
+                await on_event(event)
+            return []
+        return events
+
+    async def interrupt(self) -> List[RealtimeSpeechDialogueEvent]:
+        if self.closed:
+            return []
+        return [self._event("output.interrupted")]
+
+    async def abort(self) -> None:
+        self.closed = True
+
+    def _event(self, event_type: str, **values: Any) -> RealtimeSpeechDialogueEvent:
+        event = RealtimeSpeechDialogueEvent(
+            stream_id=self.stream_id,
+            sequence=self.sequence,
+            type=event_type,
+            audio_content_type=self.request.output_audio.content_type,
+            sample_rate_hz=self.request.output_audio.sample_rate_hz,
+            provider=self.provider,
+            **values,
+        )
+        self.sequence += 1
+        return event
 
 
 class MockSTTStream:
@@ -400,14 +487,22 @@ def review_resume(metadata: Dict[str, Any]) -> Dict[str, Any]:
                 {"requirement": skill, "reason": "简历中未找到明确的可核验证据"} for skill in missing
             ],
         },
-        "experience_questions": [
+    }
+
+
+def generate_resume_experience_questions(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    evidence = metadata.get("resume_evidence") or []
+    selected = [item for item in evidence if str(item.get("label") or "").strip()][:3]
+    return {
+        "questions": [
             {
-                "question_text": "请具体说明你在简历项目中如何使用%s解决问题，以及结果如何衡量？" % focus,
-                "verification_points": ["个人职责", "技术决策", "量化结果", "复盘改进"],
-                "evidence_refs": [evidence[:120]],
-                "evaluation_guide": "回答应包含与简历一致的背景、本人行动、技术取舍和可核验结果。",
+                "question_text": "请围绕简历中的“%s”说明你本人负责的工作、关键取舍和结果如何验证？" % item["label"],
+                "verification_points": ["本人职责", "具体实现", "方案取舍", "结果证据"],
+                "evidence_refs": [item["label"]],
+                "evaluation_guide": "回答应与所引用的简历证据一致，并说明本人行动和可核验结果。",
             }
-        ],
+            for item in selected
+        ]
     }
 
 

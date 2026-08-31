@@ -5,6 +5,7 @@ from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
 from app.core.errors import ApiError
 from app.core.ids import new_id
 from app.core.time import utc_now
+from app.domain.candidate_screening import effective_screening_outcome
 from app.domain.question_selection import QuestionSelection, QuestionSelectionRequest
 from app.persistence.errors import ConcurrencyConflict
 from app.persistence.interface import Persistence
@@ -216,6 +217,12 @@ class InterviewPlanAssembly:
                     raise ApiError("RESUME_REVIEW_SCOPE_MISMATCH", "Resume review does not match the plan scope.", status_code=409)
                 if review["status"] != "ready_for_review":
                     raise ApiError("RESUME_REVIEW_NOT_READY", "Resume review is not ready.", status_code=409)
+                if effective_screening_outcome(review) != "qualified":
+                    raise ApiError(
+                        "CANDIDATE_QUESTION_BANK_NOT_ELIGIBLE",
+                        "Resume questions require a qualified effective screening outcome.",
+                        status_code=409,
+                    )
 
     def _bank_slots(
         self,
@@ -378,6 +385,7 @@ class InterviewPlanAssembly:
                     "dimension": slot.get("dimension", "general"),
                     "weight": float(slot.get("weight", 0.0)),
                     "expected_minutes": int(slot.get("expected_minutes", 0)),
+                    "allow_followup": bool(slot.get("allow_followup", True)),
                     "selection": selection,
                 }
             )
@@ -395,6 +403,7 @@ class InterviewPlanAssembly:
                     "dimension": "resume_experience",
                     "weight": float(question.get("weight", 0.0)),
                     "expected_minutes": int(question.get("expected_minutes", 0)),
+                    "allow_followup": bool(question.get("allow_followup", True)),
                     "selection_reason": "使用计划批准的简历经历核验问题。",
                 }
             )
@@ -466,6 +475,12 @@ class InterviewPlanAssembly:
                 raise ApiError("EXPERIENCE_QUESTION_SCOPE_MISMATCH", "Experience question belongs to another review.", status_code=409)
             if question.get("status") != "approved" or question.get("speech_status") != "ready":
                 raise ApiError("EXPERIENCE_QUESTION_NOT_READY", "Experience question is not approved and ready.", status_code=409)
+            if not self._experience_question_grounded(question):
+                raise ApiError(
+                    "EXPERIENCE_QUESTION_NOT_GROUNDED",
+                    "Experience question is not bound to an immutable resume evidence snapshot.",
+                    status_code=409,
+                )
             snapshot = self._experience_snapshot(question)
             snapshot["order"] = order
             snapshots.append(snapshot)
@@ -554,6 +569,7 @@ class InterviewPlanAssembly:
                 "standard_answer",
                 "key_points",
                 "rubric",
+                "evidence_refs",
                 "speech_asset_id",
                 "speech_status",
             )
@@ -571,6 +587,7 @@ class InterviewPlanAssembly:
                 if item["resume_review_id"] == resume_review_id
                 and item["status"] == "approved"
                 and item["speech_status"] == "ready"
+                and self._experience_question_grounded(item)
             ]
 
     def _knowledge_base_snapshots(
@@ -606,6 +623,7 @@ class InterviewPlanAssembly:
                     if item["resume_review_id"] == resume_review_id
                     and item["status"] == "approved"
                     and item["speech_status"] == "ready"
+                    and self._experience_question_grounded(item)
                 ),
                 start=1,
             ):
@@ -613,6 +631,18 @@ class InterviewPlanAssembly:
                 snapshot["order"] = order
                 result.append(snapshot)
             return result
+
+    @staticmethod
+    def _experience_question_grounded(item: Dict[str, Any]) -> bool:
+        refs = item.get("evidence_refs") or []
+        question_text = str(item.get("question_text") or "")
+        return bool(refs) and all(
+            isinstance(ref, dict)
+            and bool(str(ref.get("label") or "").strip())
+            and bool(str(ref.get("evidence") or "").strip())
+            and str(ref.get("label") or "").strip().casefold() in question_text.casefold()
+            for ref in refs
+        )
 
     def _validate_request(self, request: PlanAssemblyRequest) -> None:
         if not request.job_position_id or not request.candidate_profile_id or not request.knowledge_base_ids:

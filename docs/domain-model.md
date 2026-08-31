@@ -315,24 +315,34 @@ PDF 原件扫描为 clean 后存为一个 FileObject；解析文本使用另一�
 
 `ResumeEvidenceChunk` 是 ResumeReview implementation 内部证据单元，不是独立候选人结论。每个分块覆盖连续来源页且不超过配置输入预算；分块只允许返回项目/技能证据和告警。全部分块成功并完成必要压缩后，最终 Reduce 才能写入 CandidateScreening。任何分块失败、聚合预算仍超限或 Schema 校验失败都使审阅失败，不能用部分证据生成 `unqualified`。
 
+### CandidateQuestionBank
+
+一个 CandidateProfile 的经历追问题集合视图，汇总 ResumeReview 自动生成和面试官人工创建的 ExperienceQuestion。
+它不是独立聚合，也不复制岗位 KnowledgeBase/Question；计划、语音、评分和历史快照继续只引用 ExperienceQuestion。
+
 ### ExperienceQuestion
 
-由 `ResumeReview` 生成、面试官可编辑和批准的过往经历问题。
+绑定 CandidateProfile，并由 `ResumeReview` 生成或由面试官基于该候选人简历审阅人工创建的过往经历问题。
 
 | 字段 | 说明 |
 | --- | --- |
 | `id` | 经历问题 ID |
 | `resume_review_id` | 来源审阅 |
+| `candidate_profile_id` | 个人题库所属候选人 |
+| `job_position_id` | 来源审阅对应岗位 |
+| `source_type` | `ai_generated` 或 `manual` |
 | `question_text` | 问题文本 |
-| `project_ref` | 对应项目或经历证据引用 |
+| `evidence_refs` | 1–3 个来自 ResumeReview 项目/技能证据的不可变快照，包含标签、证据文本、来源页和证据类型 |
 | `evaluation_focus` | 要核验的职责、技术选择、结果或复盘能力 |
 | `rubric` | 经历问题评分规则 |
 | `weight` | 计划中的建议权重 |
-| `status` | `draft`、`approved`、`rejected` |
+| `status` | `draft`、`approved`、`rejected`、归档删除使用的 `archived` |
 | `speech_status` | `pending`、`ready`、`failed` |
 | `edited_by` | 最近编辑人 |
 
-AI 生成内容默认为 `draft`，未经面试官批准不得进入正式计划。
+AI 和人工创建内容都默认为 `draft`，未经面试官批准不得进入正式计划。只有 ResumeReview 的生效初筛结论为 `qualified` 才能生成、创建、显示、修改和组卷；AI 不符合/待复核不生成，人工改判符合时排入独立生成工作。每道题必须绑定 1–3 个同一审阅的证据快照，题干必须点名至少一个所选证据标签；无证据或与简历无关的旧题失败关闭。人工创建必须绑定同一候选人的已完成
+ResumeReview，使简历版本、岗位和证据上下文可追溯。`archived` 只从活动个人题库和新计划隐藏该题，不能改写已批准
+InterviewPlan 的经历题快照或历史 InterviewQuestionSnapshot。
 
 ### RoleRequirement
 
@@ -413,7 +423,7 @@ Plan Assembly 支持两种显式命令语义：API 客户端可以先产生 `dra
 | `invitation_token_hash` | 一次性邀请 token 哈希 |
 | `invitation_expires_at` | 邀请过期时间 |
 | `email_reminder` | `{status, scheduled_for, work_item_id, sent_at, last_error_code}`；内部投影可追踪持久提醒，公开投影不得返回工作项 ID/错误细节 |
-| `settings` | 冻结 `{record_audio, record_video, avatar_mode, avatar_id, voice_profile_id, language}`；`avatar_mode` 只允许 `local/cloud` |
+| `settings` | 冻结 `{record_audio, record_video, avatar_mode, speech_dialogue_mode, avatar_id, voice_profile_id, language}`；`avatar_mode` 只允许 `local/cloud`，`speech_dialogue_mode` 只允许 `cascade/s2s` |
 | `admission_policy` | 冻结的提前/延后宽限、设备检查有效期和服务端 readiness 要求 |
 | `readiness_facts` | 最近一次浏览器、麦克风和音频格式检查结果、服务端检查时间及失效时间 |
 | `created_by` | 创建人 |
@@ -515,7 +525,8 @@ Plan Assembly 支持两种显式命令语义：API 客户端可以先产生 `dra
 | `plan_snapshot` | 不可变计划快照 |
 | `candidate` | 本次会话候选人快照 |
 | `status` | 见状态机 |
-| `settings` | 录音、数字人和语言配置 |
+| `settings` | 录音、数字人、`cascade/s2s` 语音对话和语言配置 |
+| `followup_policy` | 冻结追问深度、总量、每根题数量、回答长度和剩余时间预算 |
 | `random_seed` | 抽题随机种子，创建后不可变 |
 | `current_turn_id` | 当前轮次 |
 | `current_report_id` | 当前报告 revision ID |
@@ -527,7 +538,7 @@ Plan Assembly 支持两种显式命令语义：API 客户端可以先产生 `dra
 
 状态、抽题、轮次推进和报告触发只能由生命周期命令改变。REST、WebSocket、数字人、STT、评分和 worker 只提交命令或效果结果。
 
-候选人持有独立短期 `candidate_session_token`，它不授予后台资源访问权。Candidate Session Projection 使用 allow-list，只暴露姓名、会话状态、冻结的 `avatar_mode`、轮次 ID/顺序/状态，以及当前或已完成轮次的题干；不得暴露 token 本身、联系方式、计划/候选池、未来题干、`question_snapshot.standard_answer`、rubric、评分 revision 或报告。候选人录音提交还必须证明媒体属于当前 `interview_id + current_turn_id`。
+候选人持有独立短期 `candidate_session_token`，它不授予后台资源访问权。Candidate Session Projection 使用 allow-list，只暴露姓名、会话状态、冻结的 `avatar_mode/record_video/speech_dialogue_mode`、轮次 ID/顺序/状态、安全父子关系，以及当前或已完成轮次的题干；不得暴露 token 本身、联系方式、追问内部 reason/target key points、计划/候选池、未来题干、`question_snapshot.standard_answer`、rubric、评分 revision 或报告。候选人录音提交还必须证明媒体属于当前 `interview_id + current_turn_id`。
 
 ### InterviewLifecycleEvent
 
@@ -574,6 +585,12 @@ Plan Assembly 支持两种显式命令语义：API 客户端可以先产生 `dra
 | `question_snapshot` | 本轮题目快照 |
 | `order` | 实际顺序 |
 | `status` | `pending`、`asking`、`answering`、`transcribing`、`evaluating`、`completed`、`skipped` |
+| `is_followup` | 是否为澄清追问子轮次 |
+| `parent_turn_id` / `root_turn_id` | 追问父轮次和根轮次；根题自身为空/自身 |
+| `followup_depth` | 根题为 0，追问固定为 1；不允许递归追问 |
+| `followup_reason` / `target_key_points` | 企业内部可审计判定依据；不得进入候选人投影 |
+| `allow_followup` | 冻结计划是否允许对该根题追问 |
+| `weight` | 根题沿用批准计划权重；追问固定为 0，不重复计分 |
 | `started_at` | 开始时间 |
 | `completed_at` | 完成时间 |
 
@@ -597,6 +614,7 @@ Plan Assembly 支持两种显式命令语义：API 客户端可以先产生 `dra
 | `language` | 语言 |
 | `duration_seconds` | 回答时长 |
 | `current_evaluation_id` | 当前评分 revision ID |
+| `evaluation_status` | `pending`、`completed` 或 `failed`；答案落库后由 `answer.evaluate` worker 推进 |
 
 浏览器 SpeechRecognition 的 partial/final 不得写入生产 `raw_transcript`。人工修正产生新转写 revision 并触发新评分 revision，原文本保留审计。
 
@@ -759,7 +777,7 @@ stateDiagram-v2
 - 候选人登记与设备就绪只形成准入事实；公开 start 必须校验预约时间窗和生产 STT 路由，并在同一事务创建已进入 `in_progress` 的会话。
 - 岗位题库槽位按顺序选择并冻结问题；全部完成后才能进入 `resume_experience` 阶段。
 - 回答停止后进入 `transcribing`。只有服务端 streaming/batch STT 的 authoritative final 才能进入 `evaluating`；客户端文本或浏览器 final 不是领域命令。
-- 评分完成后推进下一题；最后一题完成后形成 `completed` 并异步生成报告。
+- 权威答案落库后立即创建 `answer.evaluate` DurableWorkItem；若确定性策略命中缺失关键点，可在评分完成前激活一个权重 0 的追问子轮次。没有追问时当前输入门关闭，worker 完成评分后推进下一根题；最后一个未决评分完成后形成报告。
 - 暂停/断线保留当前轮次、选择事实和音频；恢复不得重新随机或重复评分。
 
 ### InterviewTurn.status

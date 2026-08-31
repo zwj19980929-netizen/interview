@@ -44,6 +44,7 @@ class ExperienceQuestionStatus(str, Enum):
     DRAFT = "draft"
     APPROVED = "approved"
     REJECTED = "rejected"
+    ARCHIVED = "archived"
 
 
 class AppointmentStatus(str, Enum):

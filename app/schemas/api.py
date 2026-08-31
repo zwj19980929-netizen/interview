@@ -262,12 +262,26 @@ class CandidateScreeningReview(VersionedPatch):
     note: str = Field(default="", max_length=2000)
 
 
+class ExperienceQuestionCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    resume_review_id: str = Field(min_length=1)
+    question_text: str = Field(min_length=1, max_length=2000)
+    standard_answer: str = Field(min_length=1, max_length=4000)
+    key_points: List[Union[str, KeyPointInput]] = Field(min_length=1, max_length=20)
+    rubric: Dict[str, Any] = Field(default_factory=dict)
+    evidence_refs: List[str] = Field(min_length=1, max_length=3)
+
+
 class ExperienceQuestionPatch(VersionedPatch):
-    question_text: Optional[str] = None
-    standard_answer: Optional[str] = None
-    key_points: Optional[List[Dict[str, Any]]] = None
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    question_text: Optional[str] = Field(default=None, min_length=1, max_length=2000)
+    standard_answer: Optional[str] = Field(default=None, min_length=1, max_length=4000)
+    key_points: Optional[List[Union[str, KeyPointInput]]] = Field(default=None, min_length=1, max_length=20)
     rubric: Optional[Dict[str, Any]] = None
-    status: Optional[str] = None
+    evidence_refs: Optional[List[str]] = Field(default=None, min_length=1, max_length=3)
+    status: Optional[Literal["draft", "approved", "rejected"]] = None
 
 
 class InterviewControlCommand(BaseModel):
@@ -290,6 +304,7 @@ class InterviewAppointmentSettings(BaseModel):
     record_audio: bool = True
     record_video: bool = False
     avatar_mode: Literal["local", "cloud"] = "local"
+    speech_dialogue_mode: Literal["cascade", "s2s"] = "cascade"
     avatar_id: str = Field(default="avatar_default_cn", min_length=1, max_length=128)
     voice_profile_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
     language: str = Field(default="zh-CN", min_length=2, max_length=32)
@@ -301,6 +316,7 @@ class InterviewAppointmentSettingsPatch(BaseModel):
     record_audio: Optional[bool] = None
     record_video: Optional[bool] = None
     avatar_mode: Optional[Literal["local", "cloud"]] = None
+    speech_dialogue_mode: Optional[Literal["cascade", "s2s"]] = None
     avatar_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
     voice_profile_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
     language: Optional[str] = Field(default=None, min_length=2, max_length=32)

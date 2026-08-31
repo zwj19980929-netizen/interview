@@ -15,6 +15,7 @@ from app.core.prompt.validation import StructuredResponseValidationError, valida
 from app.core.time import utc_now
 from app.model_gateway import capabilities as cap
 from app.model_gateway.errors import ProviderError
+from app.model_gateway.dialogue import ValidatedSpeechDialogueStream
 from app.model_gateway.registry import ProviderRegistry
 from app.model_gateway.schemas import (
     AvatarSpeakRequest,
@@ -33,6 +34,7 @@ from app.model_gateway.schemas import (
     TextEmbeddingRequest,
     TextEmbeddingResponse,
     StreamingSTTRequest,
+    RealtimeSpeechDialogueRequest,
 )
 from app.model_gateway.streaming import ValidatedSTTStream
 from app.persistence.interface import Persistence
@@ -460,6 +462,132 @@ class ModelGateway:
         self._annotate_error(error, invocation_id, resolved_route, len(targets))
         raise error
 
+    async def open_speech_dialogue(
+        self,
+        request: RealtimeSpeechDialogueRequest,
+        *,
+        route: Optional[Dict[str, Any]] = None,
+    ) -> ValidatedSpeechDialogueStream:
+        """Open a provider-neutral S2S stream; fallback ends after audio starts."""
+        capability = cap.SPEECH_DIALOGUE_REALTIME
+        resolved_route = deepcopy(route) if route is not None else self._resolve_route(
+            request.organization_id, capability, request.purpose
+        )
+        if resolved_route.get("capability") != capability:
+            raise ProviderError(
+                "provider_route_invalid",
+                "Realtime speech dialogue route capability is invalid.",
+                retryable=False,
+            )
+        targets = [resolved_route.get("primary") or {}] + list(
+            resolved_route.get("fallbacks") or []
+        )
+        invocation_id = new_id("model_invocation")
+        request_hash = self._request_hash(request)
+        last_error: Optional[ProviderError] = None
+        for fallback_index, target in enumerate(targets):
+            model_configuration_id = str(target.get("model_configuration_id") or "")
+            model = "unknown"
+            timeout_s = max(0.01, float(target.get("timeout_s", 10)))
+            provider_id = "unknown"
+            provider_connection_id = "unknown"
+            started_at = perf_counter()
+            try:
+                model_configuration, provider_connection, credentials = self._model_connection(
+                    request.organization_id,
+                    model_configuration_id,
+                    capability,
+                    allow_unready=resolved_route.get("id") == "model_configuration_test",
+                )
+                provider_id = model_configuration["provider_id"]
+                provider_connection_id = model_configuration["provider_connection_id"]
+                model = model_configuration["provider_model_id"]
+                adapter = self.providers.adapter(provider_id, capability)
+                open_dialogue = getattr(adapter, "open_dialogue", None)
+                if not callable(open_dialogue):
+                    raise ProviderError(
+                        "provider_streaming_not_supported",
+                        "Provider adapter does not implement open_dialogue.",
+                        retryable=False,
+                    )
+                context = ProviderContext(
+                    organization_id=request.organization_id,
+                    invocation_id=invocation_id,
+                    route_id=str(resolved_route.get("id") or "route_inline"),
+                    provider_connection_id=provider_connection_id,
+                    model_configuration_id=model_configuration_id,
+                    model_type=model_configuration["model_type"],
+                    capability=capability,
+                    purpose=request.purpose,
+                    model=model,
+                    timeout_s=timeout_s,
+                    attempt=1,
+                    fallback_index=fallback_index,
+                    connection_config=provider_connection.get("connection_config") or {},
+                    model_settings=model_configuration.get("settings") or {},
+                    default_parameters=model_configuration.get("default_parameters") or {},
+                    credentials=credentials,
+                    metadata=request.metadata,
+                )
+                try:
+                    provider_stream = await asyncio.wait_for(
+                        open_dialogue(request, context), timeout=timeout_s
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise ProviderError(
+                        "provider_timeout",
+                        "Realtime speech dialogue open timed out.",
+                        retryable=True,
+                    ) from exc
+                stream = ValidatedSpeechDialogueStream(provider_stream, request)
+                self._log_invocation(
+                    invocation_id=invocation_id,
+                    organization_id=request.organization_id,
+                    capability=capability,
+                    purpose=request.purpose,
+                    route=resolved_route,
+                    provider_connection_id=provider_connection_id,
+                    model_configuration_id=model_configuration_id,
+                    provider_id=provider_id,
+                    model=model,
+                    status="stream_opened" if not fallback_index else "stream_fallback_opened",
+                    latency_ms=int((perf_counter() - started_at) * 1000),
+                    attempt=1,
+                    fallback_index=fallback_index,
+                    request_hash=request_hash,
+                )
+                return stream
+            except ProviderError as exc:
+                last_error = exc
+                self._log_invocation(
+                    invocation_id=invocation_id,
+                    organization_id=request.organization_id,
+                    capability=capability,
+                    purpose=request.purpose,
+                    route=resolved_route,
+                    provider_connection_id=provider_connection_id,
+                    model_configuration_id=model_configuration_id,
+                    provider_id=provider_id,
+                    model=model,
+                    status="failed",
+                    latency_ms=int((perf_counter() - started_at) * 1000),
+                    attempt=1,
+                    fallback_index=fallback_index,
+                    request_hash=request_hash,
+                    error_code=exc.code,
+                    error_details=exc.details,
+                )
+                if not exc.retryable or fallback_index + 1 >= len(targets):
+                    self._annotate_error(exc, invocation_id, resolved_route, fallback_index + 1)
+                    raise
+        error = last_error or ProviderError(
+            "provider_route_invalid",
+            "Realtime speech dialogue route has no target.",
+            retryable=False,
+        )
+        self._annotate_error(error, invocation_id, resolved_route, len(targets))
+        raise error
+
     def _resolve_route(self, organization_id: str, capability: str, purpose: str) -> Dict[str, Any]:
         with self.persistence.transaction(organization_id) as transaction:
             routes = transaction.model_routes.list()
@@ -743,6 +871,7 @@ class ModelGateway:
             cap.STT_BATCH: "mock-stt",
             cap.TTS_SYNTHESIZE: "mock-tts",
             cap.AVATAR_SPEAK: "mock-avatar",
+            cap.SPEECH_DIALOGUE_REALTIME: "mock-dialogue",
         }.get(capability, "mock")
 
     def _default_mock_model_configuration_id(self, capability: str) -> str:
