@@ -96,7 +96,7 @@ Provider adapter 负责把统一请求转换成厂商协议、注入厂商鉴权
 - `openai_compatible` provider 已支持真实 HTTP 调用：`llm.chat_json`、`llm.chat_text`、`embedding.text` 和 `tts.synthesize`。TTS 使用 `/audio/speech`，支持 `wav/mp3/opus/aac/flac/pcm`，二进制响应会转为 data URI 后交给私有资产复制层校验和落盘。
 - 官方 `openai` provider 复用 HTTP Chat/Embedding/TTS runtime，并独立实现 multipart `/audio/transcriptions` 与 Realtime WebSocket。`gpt-realtime-*` 会话关闭 vendor turn detection，由面试状态机提交回合；24 kHz PCM delta、输入/输出 transcript 和中断事件统一映射到 `RealtimeSpeechDialogueEvent`。
 - `deepseek` 与 `zhipuai` provider 复用 `OpenAICompatibleProvider` 的 HTTP、Bearer 鉴权、用量解析、错误映射和响应归一化；两者的 `llm.chat_json` 使用厂商支持的 `json_object` 并在 system message 注入目标 JSON Schema，避免假定支持 OpenAI `json_schema` 扩展。智谱 adapter 另在 TTS seam 校验 `glm-tts`、官方 WAV/PCM 格式、1024 字符上限和默认音色 `tongtong`，再复用共享二进制响应归一化。
-- `dashscope` provider 已支持 OpenAI-compatible Qwen Chat/Embedding、Qwen3-ASR batch、Qwen-Audio-3.0-ASR-Flash-Streaming duplex WebSocket，并按模型路由 Qwen3-TTS 的 multimodal-generation HTTP 接口或 CosyVoice/Qwen-Audio 的 `SpeechSynthesizer` HTTP 接口。实时流使用 workspace 地域域名、Bearer 握手、run-task/task-started、二进制 PCM、result-generated 和 finish-task/task-finished；只投影一个 authoritative final。Batch 只接收服务端解析的私有音频字节并以 Base64 data URL 调用，不把对象存储凭据交给厂商。供应商返回的临时 TTS URL 会复制到 PrivateFileStorage。
+- `dashscope` provider 已支持 OpenAI-compatible Qwen Chat/Embedding、Qwen3-ASR batch、Qwen-Audio-3.0-ASR-Flash-Streaming duplex WebSocket，并按模型路由 Qwen3-TTS 的 multimodal-generation HTTP 接口或 CosyVoice/Qwen-Audio 的 `SpeechSynthesizer` HTTP 接口。LLM 目录保留阿里云官方模型 ID `qwen-plus`，并提供 `qwen3.8-max`、`qwen3.8-flash`、`qwen3.7-plus`、`qwen3.7-flash`、`qwen-flash`、`qwen-turbo`、`qwen-long` 和 `qwen3-coder-plus` 作为千问官方候选建议；同一百炼连接还可选托管的 `deepseek-v4-pro`、`deepseek-v4-flash`、`glm-5.2`、`kimi-k2.7-code`、`MiniMax-M3` 和 `mimo-v2.5-pro`。这些第三方模型的结构化业务调用默认使用集中 Prompt 约束，再由模型网关执行统一 Schema 校验，不虚假声明它们支持 OpenAI JSON Schema 协议。模型类型仍是 customizable，管理员可填写已授权的快照或后续新模型 ID，但必须通过独立探针才能进入活动路由；托管模型还需要匹配的地域、业务空间 endpoint 和授权。实时流使用 workspace 地域域名、Bearer 握手、run-task/task-started、二进制 PCM、result-generated 和 finish-task/task-finished；只投影一个 authoritative final。Batch 只接收服务端解析的私有音频字节并以 Base64 data URL 调用，不把对象存储凭据交给厂商。供应商返回的临时 TTS URL 会复制到 PrivateFileStorage。
 - 同一 `dashscope` adapter 还把 Qwen 3.5 Omni/Audio Realtime 映射到 `speech.dialogue_realtime`：连接由 workspace/region 解析，输入固定 16 kHz PCM、输出 24 kHz PCM；Qwen 3.5 使用当前嵌套 `audio.input/output.format` session 结构、`qwen3-asr-flash-realtime` 输入转写和默认音色 `Tina`，历史 `qwen3-asr-flash`/`Cherry` 配置在 adapter 边界兼容归一化。每个已批准追问先通过 `session.update` 固定指令，再提交音频并创建 response，避免依赖不受支持的 response 级 instructions。S2S 出错只关闭表达轨，权威 STT 和级联播报继续工作。
 - `tencent_cloud_avatar` provider 使用 AppKey/AccessToken HMAC-SHA256 query 签名，按官方会话管理接口执行 HTTPS create-by-asset/stat/start/close，并在 start 后用携带 `requestid=SessionId` 的 WSS command channel 发送 `SEND_TEXT`、等待对应 ReqId 的播报状态确认。响应 `mode=webrtc`，包含 `webrtc://` 拉流地址、不透明 session ID 与 `tencent_web_player` 类型；候选人页用同源 TCPlayerLite 页面拉流，换流/离场调用关闭接口释放并发。供应商云渲染/SFU 承担视频媒体面，业务 WebSocket 不传视频帧。
 - `media_http` provider 已实现真实 HTTP 媒体调用：健康探针使用 Bearer API Key；`stt.batch` 把服务端读取的私有音频作为 multipart 上传并归一化 text/confidence/segments；`stt.streaming` 在统一流接口内安全缓存分片并在 finish 时调用同一真实转写端点，产出唯一 authoritative final；`avatar.speak` 发送 JSON 并接受 HTTPS `audio/video` 媒体。它是可部署的协议 adapter，不代表任何具体厂商账号已经验收，也不宣称提供低延迟 partial。
@@ -495,6 +495,7 @@ ProviderConnection 拥有其凭证和 ModelConfiguration 生命周期。删除�
     "base_url": "https://models.example.com/v1"
   },
   "credential_ref": "secret://model-providers/provider_conn_01J",
+  "configuration_revision": 1,
   "created_at": "2026-07-01T18:30:00Z"
 }
 ```
@@ -513,6 +514,7 @@ ProviderConnection 拥有其凭证和 ModelConfiguration 生命周期。删除�
   "settings": {"structured_output_mode": "json_object"},
   "default_parameters": {"temperature": 0.2},
   "supported_capabilities": ["llm.chat_json"],
+  "configuration_revision": 1,
   "status": "ready"
 }
 ```
@@ -582,11 +584,11 @@ ProviderConnection 拥有其凭证和 ModelConfiguration 生命周期。删除�
 
 - `stt.streaming/candidate_answer_transcription` 有已启用、`implemented=true`、能力匹配且最近健康测试成功的非 mock route。
 - `stt.batch/candidate_answer_repair` 已配置，或预约策略明确说明流式失败将暂停并人工处理。
-- `tts.synthesize/question_speech_generation` 已能生成并持久化计划所需语音；计划实际引用的语音资产均为 ready。
+- `tts.synthesize/question_speech_generation` 已能按计划冻结的 ModelConfiguration ID/version、音色、语言、格式和语速生成并持久化语音。岗位题资产在邀请前 ready；简历题在 Candidate Intake 成功后按预约生成，并在 start 前要求全部 ready。
 - `llm.chat_json/answer_evaluation` 与 `interview_report` 通过 schema 测试。
 - route 引用的凭证未过期，成本上限、数据区域和留存配置满足组织策略。
 
-readiness 是带检查时间和有效期的事实，不是永久布尔值；超过有效期或 Provider 熔断后候选人 start 必须重新检查。
+readiness 是带检查时间和有效期的事实，不是永久布尔值；超过有效期或 Provider 熔断后候选人 start 必须重新检查。`can_invite` 与 `can_start` 是两个不同门禁：前者不能等待尚未由候选人同意触发的简历题 TTS，后者必须校验预约级资产与冻结 profile 完全一致。业务服务只提交冻结 profile，Provider adapter 仍只负责厂商协议，不得自行回退到组织默认声音。
 
 ## 后台配置 API
 
@@ -605,7 +607,7 @@ readiness 是带检查时间和有效期的事实，不是永久布尔值；超�
 | `GET` | `/api/v1/admin/model-routes` | 查看路由 |
 | `POST` | `/api/v1/admin/model-routes/{id}/test` | 测试路由和 fallback |
 
-两个 `PATCH` 和两个 `DELETE` 都必须携带 `expected_version`（删除使用查询参数）。连接文档和凭证引用使用同一租户事务更新；并发版本不匹配时拒绝写入。连接编辑时空密码不能清除现有密钥。模型测试只使用 ModelConfiguration 已保存的模型标识与参数，不允许客户端在测试时临时替换模型。`llm.chat_json` 连通性探针必须携带最小 JSON Schema；对仅支持 `json_object` 的厂商，adapter 同时下发 schema、合法 JSON 示例和 `response_format` JSON Object 约束，避免把普通文本响应误判为结构化输出。
+两个 `PATCH` 和两个 `DELETE` 都必须携带 `expected_version`（删除使用查询参数）。连接文档和凭证引用使用同一租户事务更新；并发版本不匹配时拒绝写入。连接与模型另有 `configuration_revision`：只有表单配置、凭据、settings、统一参数、显示名或启停变化才递增；凭据校验和 `llm/embedding/stt/tts/realtime_speech/avatar` 任一健康探针只更新运行健康事实和通用 version。通用管理 UI 提交前读取最新资源，configuration revision 未变时吸收探针 version，变化时要求重新确认。连接编辑时空密码不能清除现有密钥。模型测试只使用 ModelConfiguration 已保存的模型标识与参数，不允许客户端在测试时临时替换模型。`llm.chat_json` 连通性探针必须携带最小 JSON Schema；对仅支持 `json_object` 的厂商，adapter 同时下发 schema、合法 JSON 示例和 `response_format` JSON Object 约束，避免把普通文本响应误判为结构化输出。
 
 ProviderConnection 凭证校验也属于 Provider adapter seam：管理服务只调用 `validate_credentials(connection_config, credentials)` 并保存状态，具体鉴权方式由插件吸收。OpenAI-compatible、DeepSeek 与 DashScope 优先使用 Bearer 认证的模型列表接口，不产生文本生成费用；没有独立凭证接口的厂商可由插件使用最小、固定模型探针，或显式返回 `model_required`。鉴权成功只证明 API Key 与连接端点有效，不代表所有具体模型均已授权、可调用或符合业务 schema；每个 ModelConfiguration 仍必须单独测试。
 

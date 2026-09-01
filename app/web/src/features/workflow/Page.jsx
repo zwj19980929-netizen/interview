@@ -1,11 +1,15 @@
 import { useEffect, useState } from "react";
 
+import { requestWithLatestVersion, semanticIdentity } from "../../../core/concurrency.js";
 import { useWorkbench } from "../../core/WorkbenchProvider.jsx";
 import { Empty, Field, ModalForm, Status, formatDate } from "../../core/ui.jsx";
 
 const screeningLabels = { qualified: "符合", unqualified: "不符合", manual_review: "待人工复核", processing: "处理中", failed: "处理失败" };
 const screeningScorePolicyText = "匹配分标准：0–59 分不符合，60–74 分待人工复核，75–100 分符合；人工复核可覆盖 AI 建议。";
 const splitSkills = (value) => String(value || "").split(/[,，、\n]/).map((item) => item.trim()).filter(Boolean);
+const candidateIdentity = semanticIdentity(["name", "external_ref", "job_position_id", "email", "phone"]);
+const resumeIdentity = semanticIdentity(["id", "candidate_profile_id", "file_name", "source_hash"]);
+const reviewCommandIdentity = semanticIdentity(["id", "status", "resume_document_id", "job_position_id", "role_requirement_id", "input_hash"]);
 
 export default function WorkflowPage() {
   const { API, data, request, reloadRoute, openModal, closeModal, toast, navigate } = useWorkbench();
@@ -34,8 +38,8 @@ export default function WorkflowPage() {
     const impact = await request(`${API}/job-positions/${encodeURIComponent(position.id)}/deletion-impact`);
     openModal({ title: `删除岗位 ${position.name}`, body: <ModalForm submitLabel="永久删除岗位及候选人" submitVariant="danger" onSubmit={async (form) => { const confirmation = String(form.get("confirmation") || "").trim(); if (confirmation !== position.name) throw new Error(`请输入完整岗位名称“${position.name}”`); await request(`${API}/job-positions/${encodeURIComponent(position.id)}`, { method: "DELETE", body: { expected_version: impact.position_version, confirmation } }); await finish("岗位及其私有招聘数据已按规则处理"); }}><div className="delete-warning field-full"><strong>这是不可撤销的敏感数据清除操作</strong><p>将清除其下 {impact.candidate_count} 位候选人的联系方式、简历、录音、转写和评分数据；归档 {impact.role_requirement_count} 条岗位要求、{impact.plan_count} 份计划并取消 {impact.appointment_count} 个预约。共享题库不会删除。</p></div><Field label={`请输入完整岗位名称“${position.name}”确认`} full><input className="form-input" name="confirmation" required autoComplete="off" /></Field></ModalForm> });
   };
-  const editCandidate = (candidate) => openModal({ title: `编辑 ${candidate.name}`, body: <ModalForm submitLabel="保存修改" onSubmit={async (form) => { const body = { expected_version: candidate.version, name: form.get("name"), external_ref: form.get("external_ref") || null }; if (String(form.get("email") || "").trim()) body.email = form.get("email"); if (String(form.get("phone") || "").trim()) body.phone = form.get("phone"); await request(`${API}/candidate-profiles/${encodeURIComponent(candidate.id)}`, { method: "PATCH", body }); await finish("候选人资料已更新"); }}><Field label="姓名"><input className="form-input" name="name" defaultValue={candidate.name} required /></Field><Field label="外部编号"><input className="form-input" name="external_ref" defaultValue={candidate.external_ref || ""} /></Field><Field label="新邮箱" hint={`留空则保持 ${candidate.email || "现有邮箱"}`}><input className="form-input" name="email" type="email" /></Field><Field label="新手机号" hint={`留空则保持 ${candidate.phone || "现有手机号"}`}><input className="form-input" name="phone" /></Field></ModalForm> });
-  const deleteCandidate = (candidate) => openModal({ title: `删除 ${candidate.name}`, body: <ModalForm submitLabel="确认删除" submitVariant="danger" onSubmit={async () => { await request(`${API}/candidate-profiles/${encodeURIComponent(candidate.id)}?expected_version=${candidate.version}`, { method: "DELETE" }); await finish("候选人已从当前列表归档；审计与历史面试快照仍保留"); }}><p className="form-intro field-full">删除后将从候选人列表移除。历史面试与审计记录不会被破坏。</p></ModalForm> });
+  const editCandidate = (candidate) => { const path = `${API}/candidate-profiles/${encodeURIComponent(candidate.id)}`; openModal({ title: `编辑 ${candidate.name}`, body: <ModalForm submitLabel="保存修改" onSubmit={async (form) => { const changes = { name: form.get("name"), external_ref: form.get("external_ref") || null }; if (String(form.get("email") || "").trim()) changes.email = form.get("email"); if (String(form.get("phone") || "").trim()) changes.phone = form.get("phone"); await requestWithLatestVersion({ request, resourcePath: path, snapshot: candidate, identity: candidateIdentity, changedMessage: "候选人资料已被修改，请刷新后重新确认", perform: (latest) => request(path, { method: "PATCH", body: { expected_version: latest.version, ...changes } }) }); await finish("候选人资料已更新"); }}><Field label="姓名"><input className="form-input" name="name" defaultValue={candidate.name} required /></Field><Field label="外部编号"><input className="form-input" name="external_ref" defaultValue={candidate.external_ref || ""} /></Field><Field label="新邮箱" hint={`留空则保持 ${candidate.email || "现有邮箱"}`}><input className="form-input" name="email" type="email" /></Field><Field label="新手机号" hint={`留空则保持 ${candidate.phone || "现有手机号"}`}><input className="form-input" name="phone" /></Field></ModalForm> }); };
+  const deleteCandidate = (candidate) => { const path = `${API}/candidate-profiles/${encodeURIComponent(candidate.id)}`; openModal({ title: `删除 ${candidate.name}`, body: <ModalForm submitLabel="确认删除" submitVariant="danger" onSubmit={async () => { await requestWithLatestVersion({ request, resourcePath: path, snapshot: candidate, identity: candidateIdentity, changedMessage: "候选人资料已发生变化，请重新确认删除", perform: (latest) => request(`${path}?expected_version=${latest.version}`, { method: "DELETE" }) }); await finish("候选人已从当前列表归档；审计与历史面试快照仍保留"); }}><p className="form-intro field-full">删除后将从候选人列表移除。历史面试与审计记录不会被破坏。</p></ModalForm> }); };
   const resumeForm = (candidate) => openModal({ title: `上传 ${candidate.name} 的简历并初筛`, body: <ResumeForm candidate={candidate} data={data} request={request} API={API} onDone={finish} /> });
   const showCandidate = async (candidate) => {
     const resumes = await request(`${API}/candidate-profiles/${encodeURIComponent(candidate.id)}/resumes`);
@@ -107,12 +111,15 @@ function CandidateDetail({ candidate, resumes, request, API, toast, onReviewed, 
   const [displayName, setDisplayName] = useState("");
   const [busyResumeId, setBusyResumeId] = useState("");
   const openResume = async (resume) => { const grant = await request(`${API}/candidate-profiles/${encodeURIComponent(candidate.id)}/resumes/${encodeURIComponent(resume.id)}/content-url`, { method: "POST" }); window.open(grant.url, "_blank", "noopener,noreferrer"); };
-  const review = async (decision) => { if (!screening) return; const note = document.querySelector('[name="screening_review_note"]')?.value || ""; await request(`${API}/resume-reviews/${encodeURIComponent(screening.review_id)}/screening-review`, { method: "PATCH", body: { expected_version: screening.review_version, decision, note } }); await onReviewed(decision === "qualified" ? "复核为符合岗位要求，已取消自动清理" : "复核为不符合岗位要求，将按 7 天规则清理"); };
+  const review = async (decision) => { if (!screening) return; const note = document.querySelector('[name="screening_review_note"]')?.value || ""; const path = `${API}/resume-reviews/${encodeURIComponent(screening.review_id)}`; const snapshot = await request(path); await requestWithLatestVersion({ request, resourcePath: path, snapshot, identity: reviewCommandIdentity, changedMessage: "初筛结论已发生变化，请刷新后重新复核", perform: (latest) => request(`${path}/screening-review`, { method: "PATCH", body: { expected_version: latest.version, decision, note } }) }); await onReviewed(decision === "qualified" ? "复核为符合岗位要求，已取消自动清理" : "复核为不符合岗位要求，将按 7 天规则清理"); };
   const retryScreening = async () => {
     if (!screening?.review_id) return;
     setRetryingScreening(true);
     try {
-      await request(`${API}/resume-reviews/${encodeURIComponent(screening.review_id)}/retry`, { method: "POST", body: { expected_version: screening.review_version, reason: "interviewer_requested_retry" } });
+      const path = `${API}/resume-reviews/${encodeURIComponent(screening.review_id)}`;
+      const snapshot = await request(path);
+      const idempotencyKey = globalThis.crypto?.randomUUID?.() || `${Date.now()}`;
+      await requestWithLatestVersion({ request, resourcePath: path, snapshot, identity: reviewCommandIdentity, changedMessage: "初筛任务状态已发生变化，请刷新后重新确认", perform: (latest) => request(`${path}/retry`, { method: "POST", idempotencyKey, body: { expected_version: latest.version, reason: "interviewer_requested_retry" } }) });
       await onReviewed("失败的简历初筛已重新排队，Worker 会从头生成完整结论");
     } catch (error) {
       toast("重试失败", error.message, "error");
@@ -124,7 +131,8 @@ function CandidateDetail({ candidate, resumes, request, API, toast, onReviewed, 
   const renameResume = async (resume) => {
     setBusyResumeId(resume.id);
     try {
-      const updated = await request(`${API}/candidate-profiles/${encodeURIComponent(candidate.id)}/resumes/${encodeURIComponent(resume.id)}`, { method: "PATCH", body: { expected_version: resume.version, display_name: displayName } });
+      const path = `${API}/candidate-profiles/${encodeURIComponent(candidate.id)}/resumes/${encodeURIComponent(resume.id)}`;
+      const updated = await requestWithLatestVersion({ request, resourcePath: path, snapshot: resume, identity: resumeIdentity, changedMessage: "简历内容或名称已发生变化，请刷新后重新确认", perform: (latest) => request(path, { method: "PATCH", body: { expected_version: latest.version, display_name: displayName } }) });
       setResumeItems((items) => items.map((item) => item.id === updated.id ? updated : item));
       setEditingResumeId("");
       await onResumeChanged("简历名称已更新；PDF 内容和历史版本没有变化");
@@ -138,7 +146,8 @@ function CandidateDetail({ candidate, resumes, request, API, toast, onReviewed, 
     if (!window.confirm(`确认删除简历“${resume.file_name || "候选人简历.pdf"}”？待处理任务和私有文件会一并清理。`)) return;
     setBusyResumeId(resume.id);
     try {
-      await request(`${API}/candidate-profiles/${encodeURIComponent(candidate.id)}/resumes/${encodeURIComponent(resume.id)}?expected_version=${resume.version}`, { method: "DELETE" });
+      const path = `${API}/candidate-profiles/${encodeURIComponent(candidate.id)}/resumes/${encodeURIComponent(resume.id)}`;
+      await requestWithLatestVersion({ request, resourcePath: path, snapshot: resume, identity: resumeIdentity, changedMessage: "简历内容或名称已发生变化，请重新确认删除", perform: (latest) => request(`${path}?expected_version=${latest.version}`, { method: "DELETE" }) });
       setResumeItems((items) => items.filter((item) => item.id !== resume.id));
       await onResumeDeleted("简历、待处理任务和私有文件已删除；面试历史引用的简历不会允许删除");
     } catch (error) {
@@ -170,7 +179,7 @@ function CandidateQuestionBank({ candidate, screening, review, initialQuestions,
       const created = await request(`${API}/candidate-profiles/${encodeURIComponent(candidate.id)}/experience-questions`, { method: "POST", body: { resume_review_id: activeReviewId, ...payload } });
       setQuestions((items) => [created, ...items]);
       setCreating(false);
-      toast("简历问题已创建", "题目已绑定所选简历证据；批准并生成语音后才会进入新面试计划");
+      toast("简历问题已创建", "题目已绑定所选简历证据；批准后可进入新计划，候选人确认预约时再生成语音");
     } catch (error) { toast("创建失败", error.message, "error"); } finally { setBusyId(""); }
   };
   const update = async (question, changes, successMessage) => {
@@ -192,7 +201,7 @@ function CandidateQuestionBank({ candidate, screening, review, initialQuestions,
     } catch (error) { toast("删除失败", error.message, "error"); } finally { setBusyId(""); }
   };
   return <section className="candidate-question-bank">
-    <div className="section-title-row"><div><h3>简历问答</h3><p>每道问题都必须点名并绑定简历中真实出现的项目或技能证据；与简历无关的通用题请放到岗位题库。</p></div><button className="button button-primary button-small" onClick={() => setCreating(true)} disabled={!activeReviewId || !evidenceOptions.length || creating}>新建简历问题</button></div>
+    <div className="section-title-row"><div><h3>简历问答</h3><p>每道问题都必须点名并绑定简历中真实出现的项目或技能证据；批准后可进入计划，候选人确认预约时按题库冻结音色生成语音。</p></div><button className="button button-primary button-small" onClick={() => setCreating(true)} disabled={!activeReviewId || !evidenceOptions.length || creating}>新建简历问题</button></div>
     {["queued", "processing"].includes(generationStatus) && <p className="inline-warning">正在根据这份简历的项目与技能证据生成问题，页面会自动刷新候选人状态。</p>}
     {generationStatus === "failed" && <p className="inline-warning">自动生成失败。可在初筛页再次复核为符合来重新排队，或先人工新建与简历证据绑定的问题。</p>}
     {!activeReviewId && <p className="inline-warning">只有最终初筛结论为符合时，才能查看或维护简历问答。</p>}
@@ -201,7 +210,7 @@ function CandidateQuestionBank({ candidate, screening, review, initialQuestions,
     {questions.length ? <div className="candidate-question-list">{questions.map((question) => <article className="list-card candidate-question-card" key={question.id}>
       {editingId === question.id ? <ExperienceQuestionForm evidenceOptions={evidenceOptions} current={question} title="编辑简历问题" submitLabel={busyId === question.id ? "保存中…" : "保存修改"} disabled={busyId === question.id} onCancel={() => setEditingId("")} onSubmit={(payload) => update(question, payload, "题干、简历依据与评分依据已保存")} /> : <>
         <div className="candidate-question-copy"><div className="candidate-question-meta"><span className="tag">{question.source_type === "manual" ? "人工创建" : "AI 简历生成"}</span><Status value={question.status} /><Status value={question.speech_status} /></div><strong>{question.question_text}</strong><small className="candidate-question-evidence">简历依据：{question.evidence_refs?.map((item) => typeof item === "string" ? item : item.label).filter(Boolean).join(" · ") || "无（已被规则拦截）"}</small><small>评分关键点：{question.key_points?.map((item) => item.text).join(" · ") || "待补充"}</small></div>
-        <div className="table-actions">{question.status !== "approved" && <button className="button button-primary button-small" onClick={() => update(question, { status: "approved" }, "题目已批准并生成读题语音，可用于新计划")} disabled={busyId === question.id}>批准</button>}{question.status !== "rejected" && <button className="button button-secondary button-small" onClick={() => update(question, { status: "rejected" }, "题目已拒绝，不会进入计划")} disabled={busyId === question.id}>拒绝</button>}<QuestionActions question={question} disabled={busyId === question.id} onEdit={() => setEditingId(question.id)} onDelete={() => archive(question)} /></div>
+        <div className="table-actions">{question.status !== "approved" && <button className="button button-primary button-small" onClick={() => update(question, { status: "approved" }, "题目已批准，可用于新计划；读题语音将在候选人确认预约后生成")} disabled={busyId === question.id}>批准</button>}{question.status !== "rejected" && <button className="button button-secondary button-small" onClick={() => update(question, { status: "rejected" }, "题目已拒绝，不会进入计划")} disabled={busyId === question.id}>拒绝</button>}<QuestionActions question={question} disabled={busyId === question.id} onEdit={() => setEditingId(question.id)} onDelete={() => archive(question)} /></div>
       </>}
     </article>)}</div> : !creating && <Empty title="还没有简历问题" copy={["queued", "processing"].includes(generationStatus) ? "AI 正在根据简历证据生成，请稍后查看" : "可点击“新建简历问题”人工添加，每题必须选择并写明简历依据"} />}
   </section>;

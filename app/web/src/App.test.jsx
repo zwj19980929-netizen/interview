@@ -365,6 +365,7 @@ describe("React workbench shell", () => {
       if (url.endsWith("/auth/session")) return new Response(JSON.stringify({ actor_id: "admin_1", organization_id: "org_1", roles: ["admin"], authenticated: true }));
       if (url.endsWith("/candidate-profiles/candidate_1/resumes/resume_1/content-url")) { calls.push({ url, method: options.method }); return new Response(JSON.stringify({ url: "/api/v1/private-files/grant_1" })); }
       if (url.endsWith("/candidate-profiles/candidate_1/resumes")) return new Response(JSON.stringify({ items: [{ id: "resume_1", original_file_name: "resume.pdf", status: "ready" }] }));
+      if (url.endsWith("/resume-reviews/review_1")) return new Response(JSON.stringify({ id: "review_1", version: 2, status: "ready_for_review" }));
       if (url.endsWith("/resume-reviews/review_1/screening-review")) { calls.push({ url, method: options.method, body: JSON.parse(options.body) }); return new Response(JSON.stringify({ ...candidate.screening, human_decision: "qualified" })); }
       if (url.endsWith("/candidate-profiles/candidate_1") && options.method === "PATCH") { calls.push({ url, method: options.method }); return new Response(JSON.stringify({ ...candidate, version: 4 })); }
       if (url.includes("/candidate-profiles/candidate_1?expected_version=3") && options.method === "DELETE") { calls.push({ url, method: options.method }); return new Response(JSON.stringify({ ...candidate, status: "archived" })); }
@@ -513,6 +514,7 @@ describe("React workbench shell", () => {
         calls.push({ url, body: JSON.parse(options.body) });
         return new Response(JSON.stringify({ review: { id: "review_retry", status: "queued", version: 9 }, job: { id: "work_retry", status: "pending" } }), { status: 202 });
       }
+      if (url.endsWith("/resume-reviews/review_retry")) return new Response(JSON.stringify({ id: "review_retry", version: 8, status: "failed" }));
       if (url.endsWith("/candidate-profiles/candidate_retry/resumes")) return new Response(JSON.stringify({ items: [{ id: "resume_retry", file_name: "retry.pdf", status: "ready", version: 1 }] }));
       if (url.endsWith("/candidate-profiles")) return new Response(JSON.stringify({ items: [candidate] }));
       return new Response(JSON.stringify({ items: [] }));
@@ -554,6 +556,7 @@ describe("React workbench shell", () => {
         resumes = [];
         return new Response(JSON.stringify({ id: "resume_2", status: "deleted", version: 5 }));
       }
+      if (url.endsWith("/candidate-profiles/candidate_1/resumes/resume_2")) return new Response(JSON.stringify(resumes[0]));
       if (url.endsWith("/candidate-profiles/candidate_1/resumes")) return new Response(JSON.stringify({ items: resumes }));
       if (url.endsWith("/candidate-profiles")) return new Response(JSON.stringify({ items: [candidate] }));
       return new Response(JSON.stringify({ items: [] }));
@@ -725,8 +728,8 @@ describe("React workbench shell", () => {
   it("drills into one provider for typed model CRUD and confirms provider cascade scope", async () => {
     window.history.replaceState(null, "", "#models");
     const calls = [];
-    const provider = { id: "provider_1", provider_id: "mock", display_name: "Mock 厂商", enabled: true, credential_status: "valid", connection_config: {}, version: 3 };
-    const model = { id: "model_1", provider_connection_id: provider.id, display_name: "评分模型", model_type: "llm", provider_model_id: "mock-json", enabled: true, status: "ready", supported_capabilities: ["llm.chat_json"], version: 2 };
+    const provider = { id: "provider_1", provider_id: "mock", display_name: "Mock 厂商", enabled: true, credential_status: "valid", connection_config: {}, configuration_revision: 1, version: 3 };
+    const model = { id: "model_1", provider_connection_id: provider.id, display_name: "评分模型", model_type: "llm", provider_model_id: "mock-json", enabled: true, status: "ready", supported_capabilities: ["llm.chat_json"], configuration_revision: 1, version: 2 };
     globalThis.fetch = async (path, options = {}) => {
       calls.push({ path: String(path), method: options.method || "GET" });
       if (String(path).endsWith("/auth/session")) return new Response(JSON.stringify({ actor_id: "admin_1", organization_id: "org_1", roles: ["admin"], authenticated: true }));
@@ -734,8 +737,8 @@ describe("React workbench shell", () => {
       if (String(path).endsWith("/model-provider-connections")) return new Response(JSON.stringify({ items: [provider] }));
       if (String(path).endsWith("/model-configurations")) return new Response(JSON.stringify({ items: [model] }));
       if (String(path).endsWith("/model-routes")) return new Response(JSON.stringify({ items: [] }));
-      if (String(path).includes("model-provider-connections/provider_1?expected_version=3")) return new Response(JSON.stringify({ deleted: true, deleted_model_configuration_ids: [model.id], deleted_model_route_ids: [] }));
-      if (String(path).endsWith("/model-provider-connections/provider_1")) return new Response(JSON.stringify(provider));
+      if (String(path).includes("model-provider-connections/provider_1?expected_version=5")) return new Response(JSON.stringify({ deleted: true, deleted_model_configuration_ids: [model.id], deleted_model_route_ids: [] }));
+      if (String(path).endsWith("/model-provider-connections/provider_1")) return new Response(JSON.stringify({ ...provider, version: 5 }));
       return new Response(JSON.stringify({}));
     };
     const host = document.createElement("div");
@@ -759,7 +762,7 @@ describe("React workbench shell", () => {
     const confirm = [...document.querySelectorAll("button")].find((node) => node.textContent === "确认删除");
     await act(async () => confirm.click());
     for (let attempt = 0; attempt < 30 && !calls.some((call) => call.method === "DELETE"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(calls).toContainEqual({ path: "/api/v1/admin/model-provider-connections/provider_1?expected_version=3", method: "DELETE" });
+    expect(calls).toContainEqual({ path: "/api/v1/admin/model-provider-connections/provider_1?expected_version=5", method: "DELETE" });
     await act(async () => root.unmount());
   });
 
@@ -844,6 +847,45 @@ describe("React workbench shell", () => {
     await act(async () => root.unmount());
   });
 
+  it("suggests DashScope catalog LLMs while preserving custom model IDs", async () => {
+    window.history.replaceState(null, "", "#models/dash_llm_conn");
+    const connection = { id: "dash_llm_conn", provider_id: "dashscope", display_name: "阿里云百炼", enabled: true, credential_status: "valid", version: 1 };
+    globalThis.fetch = async (path) => {
+      const url = String(path);
+      if (url.endsWith("/auth/session")) return new Response(JSON.stringify({ actor_id: "admin_1", organization_id: "org_1", roles: ["admin"], authenticated: true }));
+      if (url.endsWith("/model-providers/catalog")) return new Response(JSON.stringify({ items: [] }));
+      if (url.endsWith("/model-provider-connections")) return new Response(JSON.stringify({ items: [connection] }));
+      if (url.endsWith("/model-configurations") || url.endsWith("/model-routes")) return new Response(JSON.stringify({ items: [] }));
+      if (url.endsWith("/dash_llm_conn/model-catalog")) return new Response(JSON.stringify({
+        model_types: { llm: { label: "大语言模型", selection_mode: "customizable", configuration_form: { fields: [] } } },
+        models: [
+          { model_id: "qwen-plus", model_type: "llm", label: "千问 Plus（官方模型 ID）", default: true },
+          { model_id: "qwen3.8-max", model_type: "llm", label: "千问 3.8 Max（旗舰）" },
+          { model_id: "qwen3.7-plus", model_type: "llm", label: "千问 3.7 Plus（均衡推荐）" },
+        ],
+        parameter_forms: { llm: { fields: [] } },
+      }));
+      return new Response(JSON.stringify({ items: [] }));
+    };
+    const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+    await act(async () => root.render(<App />));
+    for (let attempt = 0; attempt < 30 && !host.textContent.includes("阿里云百炼"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    await act(async () => [...host.querySelectorAll("button")].find((node) => node.textContent === "添加模型").click());
+    for (let attempt = 0; attempt < 30 && !document.querySelector("datalist"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    const dialog = document.querySelector('[role="dialog"]');
+    const modelInput = dialog.querySelector('input[list^="model-suggestions-"]');
+    const suggestions = [...dialog.querySelectorAll("datalist option")];
+    expect(modelInput.value).toBe("qwen-plus");
+    expect(suggestions.map((option) => option.value)).toEqual(["qwen-plus", "qwen3.8-max", "qwen3.7-plus"]);
+    expect(dialog.textContent).toContain("可从官方目录选择");
+    const setInputValue = (value) => Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(modelInput, value);
+    await act(async () => { setInputValue("qwen3.8-max"); modelInput.dispatchEvent(new Event("input", { bubbles: true })); });
+    expect(dialog.querySelector('input[name="display_name"]').value).toBe("千问 3.8 Max（旗舰）");
+    await act(async () => { setInputValue("qwen-custom-snapshot"); modelInput.dispatchEvent(new Event("input", { bubbles: true })); });
+    expect(dialog.querySelector('input[name="display_name"]').value).toBe("qwen-custom-snapshot");
+    await act(async () => root.unmount());
+  });
+
   it("derives route capability from purpose and filters incompatible models", async () => {
     window.history.replaceState(null, "", "#models");
     const connection = { id: "provider_1", provider_id: "mock", display_name: "模型连接", enabled: true, credential_status: "valid", version: 1 };
@@ -877,7 +919,8 @@ describe("React workbench shell", () => {
   it("loads one knowledge base detail and submits a bank-wide TTS rebuild", async () => {
     window.history.replaceState(null, "", "#questions/kb_1");
     const calls = [];
-    const bank = { id: "kb_1", name: "Java 题库", job_position_id: "position_1", version: 4, speech_build_status: "ready", speech_profile: null };
+    const bank = { id: "kb_1", name: "Java 题库", job_position_id: "position_1", version: 54, speech_build_status: "ready", speech_profile: null };
+    let detailReads = 0;
     globalThis.fetch = async (path, options = {}) => {
       const url = String(path);
       calls.push({ path: url, method: options.method || "GET", body: options.body });
@@ -888,7 +931,10 @@ describe("React workbench shell", () => {
       if (url.endsWith("/knowledge-bases/kb_1/speech-builds")) return new Response(JSON.stringify({ items: [] }));
       if (url.endsWith("/knowledge-bases/kb_1/speech-options")) return new Response(JSON.stringify({ current: null, items: [{ id: "tts_1", display_name: "中文 TTS", provider_model_id: "tts-model", voices: [{ voice_profile_id: "voice_a", label: "声音 A" }] }] }));
       if (url.endsWith("/knowledge-bases/kb_1/speech-profile") && options.method === "PUT") return new Response(JSON.stringify({ total: 3, status: "pending" }), { status: 202 });
-      if (url.endsWith("/knowledge-bases/kb_1")) return new Response(JSON.stringify(bank));
+      if (url.endsWith("/knowledge-bases/kb_1")) {
+        detailReads += 1;
+        return new Response(JSON.stringify(detailReads === 1 ? bank : { ...bank, version: 56 }));
+      }
       return new Response(JSON.stringify({ items: [] }));
     };
     const host = document.createElement("div");
@@ -903,7 +949,92 @@ describe("React workbench shell", () => {
     await act(async () => submit.click());
     for (let attempt = 0; attempt < 30 && !calls.some((call) => call.method === "PUT"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
     const update = calls.find((call) => call.method === "PUT");
-    expect(JSON.parse(update.body)).toMatchObject({ expected_version: 4, model_configuration_id: "tts_1", voice_profile_id: "voice_a" });
+    expect(JSON.parse(update.body)).toMatchObject({ expected_version: 56, expected_speech_profile_revision: null, model_configuration_id: "tts_1", voice_profile_id: "voice_a" });
+    await act(async () => root.unmount());
+  });
+
+  it("requeues failed bank and single-question speech from the question bank", async () => {
+    window.history.replaceState(null, "", "#questions/kb_1");
+    const calls = [];
+    const profile = { model_configuration_id: "tts_1", model_configuration_version: 2, voice_profile_id: "Cherry", language: "zh-CN", audio_format: "audio/wav", speaking_rate: 1, revision: 3 };
+    const bank = { id: "kb_1", name: "Qwen 语音题库", job_position_id: "position_1", version: 56, speech_build_status: "failed", speech_profile: profile };
+    const question = { id: "q_1", title: "失败语音题", question_text: "请回答", standard_answer: "答案", key_points: [{ text: "关键点" }], skills: ["测试"], difficulty: "mid", type: "open_ended", validation_status: "valid", speech_status: "failed", speech_error: "provider timeout", version: 8 };
+    const build = { id: "build_1", job_id: "build_1", status: "failed", total: 1, ready: 0, failed: 1, pending: 0, running: 0, superseded: 0, failed_items: [{ question_id: "q_1", error_code: "TTS_TIMEOUT", retryable: true }] };
+    let resolveBuildRetry;
+    let resolveQuestionRetry;
+    globalThis.fetch = async (path, options = {}) => {
+      const url = String(path);
+      calls.push({ path: url, method: options.method || "GET", body: options.body });
+      if (url.endsWith("/auth/session")) return new Response(JSON.stringify({ actor_id: "admin_1", organization_id: "org_1", roles: ["admin"], authenticated: true }));
+      if (url.endsWith("/job-positions")) return new Response(JSON.stringify({ items: [{ id: "position_1", name: "后端" }] }));
+      if (url.endsWith("/knowledge-bases")) return new Response(JSON.stringify({ items: [bank] }));
+      if (url.endsWith("/knowledge-bases/kb_1/questions")) return new Response(JSON.stringify({ items: [question] }));
+      if (url.endsWith("/knowledge-bases/kb_1/speech-builds")) return new Response(JSON.stringify({ items: [build] }));
+      if (url.endsWith("/knowledge-bases/kb_1/speech-options")) return new Response(JSON.stringify({ current: profile, items: [{ id: "tts_1", display_name: "Qwen TTS", voices: [{ voice_profile_id: "Cherry", label: "Cherry" }] }], candidates: [] }));
+      if (url.endsWith("/knowledge-bases/kb_1/speech-builds/build_1/retry-failed") && options.method === "POST") return new Promise((resolve) => { resolveBuildRetry = () => resolve(new Response(JSON.stringify({ job_id: "retry_1", total: 1, status: "pending" }), { status: 202 })); });
+      if (url.endsWith("/questions/q_1/speech/regenerate") && options.method === "POST") return new Promise((resolve) => { resolveQuestionRetry = () => resolve(new Response(JSON.stringify({ ...question, job_id: "speech_retry_1", speech_status: "pending", version: 9 }), { status: 202 })); });
+      if (url.endsWith("/questions/q_1")) return new Response(JSON.stringify(question));
+      if (url.endsWith("/knowledge-bases/kb_1")) return new Response(JSON.stringify(bank));
+      return new Response(JSON.stringify({ items: [] }));
+    };
+    const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+    await act(async () => root.render(<App />));
+    for (let attempt = 0; attempt < 30 && !host.textContent.includes("失败语音题"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+
+    await act(async () => { [...host.querySelectorAll("button")].find((node) => node.textContent === "重试失败语音").click(); await Promise.resolve(); });
+    const busyBuildRetry = [...host.querySelectorAll("button")].find((node) => node.textContent.includes("重新生成中"));
+    expect(busyBuildRetry.disabled).toBe(true);
+    expect(busyBuildRetry.querySelector(".spinner")).not.toBeNull();
+    busyBuildRetry.click();
+    expect(calls.filter((call) => call.path.endsWith("/retry-failed") && call.method === "POST")).toHaveLength(1);
+    await act(async () => { resolveBuildRetry(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    for (let attempt = 0; attempt < 30 && !calls.some((call) => call.path.endsWith("/retry-failed") && call.method === "POST"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    const bankRetry = calls.find((call) => call.path.endsWith("/retry-failed") && call.method === "POST");
+    expect(JSON.parse(bankRetry.body)).toEqual({ expected_version: 56 });
+
+    const regenerate = [...host.querySelectorAll("button")].find((node) => node.textContent === "重新生成");
+    await act(async () => { regenerate.click(); await Promise.resolve(); });
+    const busyQuestionRetry = [...host.querySelectorAll("button")].find((node) => node.textContent.includes("重新生成中"));
+    expect(busyQuestionRetry.disabled).toBe(true);
+    expect(busyQuestionRetry.querySelector(".spinner")).not.toBeNull();
+    busyQuestionRetry.click();
+    expect(calls.filter((call) => call.path.endsWith("/speech/regenerate") && call.method === "POST")).toHaveLength(1);
+    await act(async () => { resolveQuestionRetry(); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    for (let attempt = 0; attempt < 30 && !calls.some((call) => call.path.endsWith("/speech/regenerate") && call.method === "POST"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    const singleRetry = calls.find((call) => call.path.endsWith("/speech/regenerate") && call.method === "POST");
+    expect(JSON.parse(singleRetry.body)).toEqual({ expected_version: 8 });
+    await act(async () => root.unmount());
+  });
+
+  it("keeps completed speech playable while the remaining build items retry", async () => {
+    window.history.replaceState(null, "", "#questions/kb_1");
+    const profile = { model_configuration_id: "tts_1", voice_profile_id: "voice", language: "zh-CN", audio_format: "audio/wav", speaking_rate: 1, revision: 1 };
+    const bank = { id: "kb_1", name: "自动重试题库", job_position_id: "position_1", version: 3, speech_build_status: "running", speech_profile: profile };
+    const questions = [
+      { id: "q_ready", title: "已完成", skills: [], difficulty: "mid", validation_status: "valid", speech_status: "ready", speech_asset_id: "asset_1", speech_preview: { available: true }, version: 2 },
+      { id: "q_pending", title: "等待重试", skills: [], difficulty: "mid", validation_status: "valid", speech_status: "pending", speech_asset_id: null, speech_preview: { available: false, message: "语音正在生成。" }, version: 2 },
+    ];
+    const build = { id: "build_1", status: "running", total: 2, ready: 1, pending: 1, running: 0, failed: 0, superseded: 0, failed_items: [] };
+    globalThis.fetch = async (path) => {
+      const url = String(path);
+      if (url.endsWith("/auth/session")) return new Response(JSON.stringify({ actor_id: "admin_1", organization_id: "org_1", roles: ["admin"], authenticated: true }));
+      if (url.endsWith("/job-positions")) return new Response(JSON.stringify({ items: [{ id: "position_1", name: "后端" }] }));
+      if (url.endsWith("/knowledge-bases")) return new Response(JSON.stringify({ items: [bank] }));
+      if (url.endsWith("/knowledge-bases/kb_1/questions")) return new Response(JSON.stringify({ items: questions }));
+      if (url.endsWith("/knowledge-bases/kb_1/speech-builds")) return new Response(JSON.stringify({ items: [build] }));
+      if (url.endsWith("/knowledge-bases/kb_1/speech-options")) return new Response(JSON.stringify({ current: profile, items: [{ id: "tts_1", display_name: "通用 TTS", voices: [] }], candidates: [] }));
+      if (url.endsWith("/knowledge-bases/kb_1")) return new Response(JSON.stringify(bank));
+      return new Response(JSON.stringify({ items: [] }));
+    };
+    const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+    await act(async () => root.render(<App />));
+    for (let attempt = 0; attempt < 30 && !host.textContent.includes("等待重试"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    const rows = [...host.querySelectorAll("tbody tr")];
+    expect(rows[0].textContent).toContain("就绪");
+    expect(rows[0].querySelector("button").disabled).toBe(false);
+    expect(rows[1].textContent).toContain("重新生成中");
+    expect(rows[1].querySelector("button").disabled).toBe(true);
+    expect(host.textContent).not.toContain("重试失败语音");
     await act(async () => root.unmount());
   });
 
@@ -980,6 +1111,7 @@ describe("React workbench shell", () => {
       if (url.endsWith("/question-speech-assets/speech_1/content-url")) return new Response(JSON.stringify({ url: "/preview.wav", expires_in_seconds: 300 }));
       if (url.endsWith("/questions/q_1") && options.method === "PATCH") return new Response(JSON.stringify({ ...question, version: 3 }));
       if (url.includes("/questions/q_1?expected_version=2") && options.method === "DELETE") return new Response(JSON.stringify({ id: "q_1", deleted: true, status: "archived" }));
+      if (url.endsWith("/questions/q_1")) return new Response(JSON.stringify(question));
       if (url.endsWith("/knowledge-bases/kb_1")) return new Response(JSON.stringify(bank));
       return new Response(JSON.stringify({ items: [] }));
     };

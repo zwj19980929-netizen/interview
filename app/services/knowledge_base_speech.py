@@ -141,14 +141,20 @@ class KnowledgeBaseSpeechService:
             knowledge_base = transaction.knowledge_bases.get(knowledge_base_id)
             if knowledge_base is None:
                 raise ApiError("KNOWLEDGE_BASE_NOT_FOUND", "Knowledge base does not exist.", status_code=404)
-            if int(knowledge_base["version"]) != int(payload["expected_version"]):
+            previous = knowledge_base.get("speech_profile") or {}
+            current_profile_revision = previous.get("revision")
+            version_matches = int(knowledge_base["version"]) == int(payload["expected_version"])
+            profile_guard_matches = (
+                payload.get("speech_profile_guard_provided") is True
+                and current_profile_revision == payload.get("expected_speech_profile_revision")
+            )
+            if not version_matches and not profile_guard_matches:
                 from app.persistence.errors import ConcurrencyConflict
 
                 raise ConcurrencyConflict(
                     "KnowledgeBase %s expected version %s, found %s"
                     % (knowledge_base_id, payload["expected_version"], knowledge_base["version"])
                 )
-            previous = knowledge_base.get("speech_profile") or {}
             comparable = {
                 "model_configuration_id": model["id"],
                 "model_configuration_version": model["version"],
@@ -191,6 +197,30 @@ class KnowledgeBaseSpeechService:
                 "configured_by": actor_id,
                 "configured_at": now,
             }
+            cancelled_work_ids = []
+            for candidate in transaction.outbox.list():
+                candidate_payload = candidate.get("payload", {})
+                same_revision = int(
+                    candidate_payload.get("speech_profile_revision", -1)
+                ) == int(previous.get("revision", -2))
+                belongs_to_bank = (
+                    candidate.get("kind") == self.BUILD_KIND
+                    and candidate.get("aggregate_id") == knowledge_base_id
+                ) or (
+                    candidate.get("kind") == self.CHILD_KIND
+                    and candidate_payload.get("knowledge_base_id") == knowledge_base_id
+                )
+                if (
+                    belongs_to_bank
+                    and same_revision
+                    and candidate.get("status") in {"pending", "failed", "running"}
+                ):
+                    transaction.outbox.cancel(
+                        candidate["id"],
+                        reason="Superseded by speech profile revision %s" % revision,
+                        actor_id=actor_id,
+                    )
+                    cancelled_work_ids.append(candidate["id"])
             manifest = []
             for question in transaction.questions.list():
                 if question.get("knowledge_base_id") != knowledge_base_id or question.get("status") != "active":
@@ -208,7 +238,7 @@ class KnowledgeBaseSpeechService:
             knowledge_base["status"] = "building" if manifest else "draft"
             knowledge_base["updated_at"] = now
             updated = transaction.knowledge_bases.update(
-                knowledge_base, expected_version=int(payload["expected_version"])
+                knowledge_base, expected_version=int(knowledge_base["version"])
             )
             work = transaction.outbox.enqueue(
                 new_work_item(
@@ -239,6 +269,8 @@ class KnowledgeBaseSpeechService:
                         "model_configuration_id": model["id"],
                         "voice_profile_id": profile["voice_profile_id"],
                         "question_count": len(manifest),
+                        "superseded_work_count": len(cancelled_work_ids),
+                        "superseded_work_ids": cancelled_work_ids,
                     },
                     "created_at": now,
                 }
@@ -285,6 +317,22 @@ class KnowledgeBaseSpeechService:
             knowledge_base = transaction.knowledge_bases.get(knowledge_base_id)
             if knowledge_base is None:
                 raise ApiError("KNOWLEDGE_BASE_NOT_FOUND", "Knowledge base does not exist.", status_code=404)
+            retry_idempotency_key = "knowledge-base.speech.retry:%s:%s" % (
+                build_id,
+                idempotency_key,
+            )
+            existing = next(
+                (
+                    item
+                    for item in transaction.outbox.list()
+                    if item.get("idempotency_key") == retry_idempotency_key
+                    and item.get("kind") == self.BUILD_KIND
+                    and item.get("aggregate_id") == knowledge_base_id
+                ),
+                None,
+            )
+            if existing is not None:
+                return self._project_build(existing, transaction.outbox.list())
             if int(knowledge_base["version"]) != int(expected_version):
                 from app.persistence.errors import ConcurrencyConflict
 
@@ -295,27 +343,42 @@ class KnowledgeBaseSpeechService:
             revision = int((knowledge_base.get("speech_profile") or {}).get("revision", 0))
             if revision != int(parent.get("payload", {}).get("speech_profile_revision", -1)):
                 raise ApiError("KNOWLEDGE_BASE_SPEECH_BUILD_SUPERSEDED", "Only the current speech build can be retried.", status_code=409)
-            children = [
-                item
-                for item in transaction.outbox.list()
-                if item.get("payload", {}).get("parent_build_id") == build_id
-                and item.get("status") in {"failed", "dead_letter"}
-            ]
-            if not children:
-                raise ApiError("KNOWLEDGE_BASE_SPEECH_BUILD_NOT_FAILED", "Speech build has no failed questions.", status_code=409)
-            manifest = [
-                {
-                    "question_id": item["payload"]["owner_id"],
-                    "question_version": item["payload"]["source_version"],
-                }
-                for item in children
-            ]
+            # Current Question state is authoritative for a manual retry. Older
+            # workers could advance the Question version on a transient failure
+            # and then complete the successful retry as `superseded`; those
+            # children no longer look failed even though the current question is.
+            failed_question_ids = {
+                item.get("question_id")
+                for item in parent.get("payload", {}).get("question_manifest", [])
+            }
+            manifest = []
+            for question_id in failed_question_ids:
+                question = transaction.questions.get(question_id)
+                if (
+                    question is None
+                    or question.get("knowledge_base_id") != knowledge_base_id
+                    or question.get("status") != "active"
+                    or question.get("speech_status") != "failed"
+                ):
+                    continue
+                manifest.append(
+                    {
+                        "question_id": question["id"],
+                        "question_version": question["version"],
+                    }
+                )
+            if not manifest:
+                raise ApiError(
+                    "KNOWLEDGE_BASE_SPEECH_BUILD_NOT_FAILED",
+                    "Speech build has no current failed questions.",
+                    status_code=409,
+                )
             work = transaction.outbox.enqueue(
                 new_work_item(
                     organization_id=organization_id,
                     kind=self.BUILD_KIND,
                     aggregate_id=knowledge_base_id,
-                    idempotency_key="knowledge-base.speech.retry:%s:%s" % (build_id, idempotency_key),
+                    idempotency_key=retry_idempotency_key,
                     payload={
                         "knowledge_base_id": knowledge_base_id,
                         "speech_profile": deepcopy(knowledge_base["speech_profile"]),
@@ -349,13 +412,20 @@ class KnowledgeBaseSpeechService:
                 question = transaction.questions.get(item["question_id"])
                 if question is None or int(question["version"]) != int(item["question_version"]):
                     continue
+                is_retry = bool(work["payload"].get("retry_of"))
+                child_idempotency_key = (
+                    "question.speech.retry:%s:%s:%s:%s"
+                    % (question["id"], question["version"], revision, work_item_id)
+                    if is_retry
+                    else "question.speech:%s:%s:%s"
+                    % (question["id"], question["version"], revision)
+                )
                 transaction.outbox.enqueue(
                     new_work_item(
                         organization_id=organization_id,
                         kind=self.CHILD_KIND,
                         aggregate_id=question["id"],
-                        idempotency_key="question.speech:%s:%s:%s"
-                        % (question["id"], question["version"], revision),
+                        idempotency_key=child_idempotency_key,
                         payload={
                             "owner_type": "question",
                             "owner_id": question["id"],
@@ -380,12 +450,22 @@ class KnowledgeBaseSpeechService:
         counts = {"pending": 0, "running": 0, "ready": 0, "failed": 0, "superseded": 0}
         for child in children:
             status = child.get("status")
-            if child.get("result_status") == "superseded":
+            if (
+                child.get("result_status") == "superseded"
+                or status == "cancelled"
+                or child.get("cancel_requested")
+            ):
                 counts["superseded"] += 1
             elif status == "completed":
                 counts["ready"] += 1
-            elif status in {"failed", "dead_letter"}:
+            elif status == "dead_letter":
                 counts["failed"] += 1
+            elif status == "failed":
+                # `failed` is the durable outbox's retry-waiting state.  Only a
+                # dead letter is terminal; presenting a claimable retry as a
+                # completed build failure makes operators race the worker with
+                # a manual replay.
+                counts["pending"] += 1
             elif status == "running":
                 counts["running"] += 1
             else:
@@ -396,10 +476,21 @@ class KnowledgeBaseSpeechService:
             status = "pending"
         elif counts["failed"]:
             status = "failed" if counts["pending"] == 0 and counts["running"] == 0 else "running"
+        elif manifest_count == counts["ready"] + counts["superseded"] and counts["superseded"]:
+            status = "superseded"
         elif manifest_count == counts["ready"]:
             status = "ready"
         else:
             status = "running"
+        failed_items = [
+            {
+                "question_id": child.get("payload", {}).get("owner_id"),
+                "error_code": child.get("last_error_code") or "speech_generation_failed",
+                "retryable": child.get("error_retryable") is not False,
+            }
+            for child in children
+            if child.get("status") == "dead_letter"
+        ]
         return {
             "id": work["id"],
             "job_id": work["id"],
@@ -408,6 +499,7 @@ class KnowledgeBaseSpeechService:
             "status": status,
             "total": manifest_count,
             **counts,
+            "failed_items": failed_items,
             "last_error": work.get("last_error"),
             "created_at": work.get("created_at"),
             "updated_at": work.get("updated_at"),

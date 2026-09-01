@@ -1,5 +1,12 @@
 # 开发进度
 
+## 2026-08-31：简历题预约确认后按题库音色生成
+
+- ExperienceQuestion 批准后不再走 `voice_default_cn` 或组织默认 TTS route，而是进入 `deferred` 并可直接冻结到计划；未确认预约不创建语音工作。
+- InterviewPlan 现冻结所选题库唯一 `speech_profile_snapshot`；多个题库的模型版本、音色、语言、格式或语速不一致时拒绝装配。预约 settings 的 voice/language 由该快照派生，不能另选一套声音。
+- Candidate Intake 成功事务按预约、经历题版本和 profile 指纹幂等排队 TTS，可复用完全匹配的不可变资产。邀请与 start readiness 已拆分：邀请不等待未触发语音，start 必须等本预约全部简历题资产 ready；失败可重试，取消预约会协作取消未完成工作。
+- InterviewSession 创建时把预约资产注入简历题快照，并冻结 plan speech profile 与 preparation 证据；生成结果不回写 ExperienceQuestion 全局资产，避免不同计划或预约互相覆盖。
+
 ## 2026-08-31：流式模型健康探针与 Qwen Realtime 协议校正
 
 - 模型配置和路由测试现已覆盖 `stt.streaming` 与 `speech.dialogue_realtime`：两者复用统一 stream handshake probe，在真实 Provider 确认端点、凭据、模型访问和 session 后置为 ready，不再要求静音样本产生 final transcript。
@@ -31,8 +38,8 @@
 当前统一验证基线：
 
 - `PYTHONPYCACHEPREFIX=/private/tmp/interviewer_pycache .venv/bin/python -m compileall -q app tests`：通过。
-- `cd app/web && npm test -- --run && npm run build`：React 生产构建通过，Vitest `32 passed`；此前依赖审计为 0 个 high 漏洞。
-- `.venv/bin/python -m pytest -q`：`220 passed, 5 skipped`；5 个环境测试仅在提供真实 PostgreSQL/Redis/clamd 地址时启用。
+- `cd app/web && npm test -- --run && npm run build`：React 生产构建通过，Vitest `33 passed`；此前依赖审计为 0 个 high 漏洞。
+- `.venv/bin/python -m pytest -q`：`224 passed, 5 skipped`；5 个环境测试仅在提供真实 PostgreSQL/Redis/clamd 地址时启用。
 - `git diff --check`：通过。
 
 ### React Web 工作台
@@ -41,11 +48,11 @@
 - 总览、题库、招聘流程、面试计划、面试会话、模型服务、公开邀请和候选人面试入口已无损接入 React shell；框架切换不改变 REST/WebSocket 路径或请求体。
 - 面试计划的“生成并启用”在同一 Plan Assembly 事务内完成就绪校验和批准，工作台不再要求创建人点击“审批计划”；API 仍保留默认草稿模式供需要编辑/分权审批的客户端使用。一次性邀请弹窗提供“复制链接”和即时反馈。
 - 创建预约表单增加数字人方案选择，默认“自研数字人（推荐，低成本）”，也可选择“云数字人（实时视频，需配置服务）”；候选人房间展示实际执行模式和云失败降级原因，两种模式共用播放、停止与云 session 回收 runtime。
-- 候选人邀请页已把“身份核验并确认预约”与“到点检查设备并进入面试”拆开；确认事务创建提前 30 分钟的持久邮件提醒，队列不携带邮箱明文，SMTP 授权码通过空置的环境变量占位等待部署配置。
+- 候选人邀请页已把“身份核验并确认预约”与“到点检查设备并进入面试”拆开；确认事务创建提前 30 分钟的持久邮件提醒和预约级简历题语音工作，队列不携带邮箱明文，SMTP 授权码通过空置的环境变量占位等待部署配置。
 - 招聘流程已支持岗位增查改删；删除前展示候选人/岗位要求/计划/预约影响并要求输入完整岗位名称，确认后清除该岗位候选人敏感数据、归档下游流程，同时保留共享题库与不可识别历史。
 - 新建岗位弹窗同时采集首版岗位要求、必备/加分技能、目标级别和面试时长；后端原子创建 JobPosition 与 RoleRequirement，创建后可直接用于简历初筛。既有岗位卡片同时提供“添加岗位要求/新增要求版本”，无需删除重建。
 - 岗位题库入口始终可用：未关联时显示“关联题库”，已关联时显示“管理题库”。管理弹窗列出当前关系与剩余组织题库；没有新增项时明确说明现有题库已全部关联，并提供题库管理入口，不再用 disabled“暂无可选题库”伪装成故障。
-- 候选人和简历版本均支持增查改删：PDF/URL 上传创建不可变内容版本，受控查看，展示名可乐观并发修改；删除会取消未运行工作、清理隔离/私有对象，并保护已进入计划或面试历史的版本。上传接口立即返回，摄取成功后原子排队后台初筛；不同简历版本的审阅工作按 `resume_document_id + input_hash` 隔离，同一 queued 审阅缺少工作时自动补建。短简历单次审阅，长简历按页和 Token 预算执行证据 Map/分层压缩/最终 Reduce；输入与结构化输出预算独立配置，长模型调用使用覆盖 Worker hard limit 的任务租约。失败初筛可在候选人详情通过版本化领域命令重新排队，重置 work attempt 并保留 replay 审计。列表展示处理进度、中文失败原因、符合性、来源页、命中依据和缺口并支持人工复核；服务端统一按 0–59 不符合、60–74 待人工复核、75–100 符合归一化模型建议。仅最终不符合者设置 7 天期限。
+- 候选人和简历版本均支持增查改删：PDF/URL 上传创建不可变内容版本，受控查看，展示名可乐观并发修改；删除会取消未运行工作、清理隔离/私有对象，并保护已进入计划或面试历史的版本。上传接口立即返回，摄取成功后原子排队后台初筛；不同简历版本的审阅工作按 `resume_document_id + input_hash` 隔离，同一 queued 审阅缺少工作时自动补建。短简历单次审阅，长简历按页和 Token 预算执行证据 Map/分层压缩/最终 Reduce；输入与结构化输出预算独立配置，长模型调用使用覆盖 Worker hard limit 的任务租约。失败初筛可在候选人详情通过 latest version + `Idempotency-Key` 领域命令重新排队，重复传输返回同一 replay，重置 work attempt 并保留审计。列表展示处理进度、中文失败原因、符合性、来源页、命中依据和缺口并支持人工复核；服务端统一按 0–59 不符合、60–74 待人工复核、75–100 符合归一化模型建议。仅最终不符合者设置 7 天期限。
 - 候选人列表外层现已提供独立“简历问答”弹窗：只有生效初筛结论符合才开放；AI 不符合/待复核不生成，人工改判符合时排入独立工作。AI/人工题都必须绑定审阅中的证据快照且题干点名证据标签；编辑/删除收在三点菜单，批准/拒绝保留为高频操作。无证据旧题、不符合审阅问题和已归档题不会进入读取或新计划。
 - Resume Review 最终 Prompt/Schema 已升级为 `resume_review.v6` / `resume_review_reduce.v4`，只负责摘要、证据和岗位要求；预算内单次审阅如果仍以 `provider_output_truncated` 结束，会自动转为完整 Map/Reduce 并记录降级事实，不保存半截 JSON。问题改由 `resume_experience_question_generation.v1` 在符合资格后独立生成。
 - 统一 HTTP、路由级 workspace query、schema form 和候选人录音恢复继续作为框架无关 deep modules；题库层级一次聚合加载，总览只取统计和最近 5 条，不再产生岗位/题库 N+1 或首屏完整题库下载。
@@ -86,6 +93,9 @@
 - DurableWorkItem/Outbox 继续作为数据库真相，Celery broker 只调度；`KB-SPEECH-001` 已有代码、Celery eager、Provider fake、React 行为和全量回归证据。
 - 题库配置下拉框可选择并查看尚未就绪的 TTS 及声音，但保存按钮继续以真实探针 ready 为门槛；模型探针对 429/超时等 retryable 错误执行有界退避并显示可操作中文错误。2026-08-27 对当前智谱连接的真实厂商校验和 GLM-TTS 探针均返回 HTTP 429，三次退避后仍失败，因此外部账户目前不可用，未伪造 profile/语音资产。
 - 新题库优先继承组织已启用且 ready 的 `question_speech_generation` route，冻结实际模型与默认音色；没有真实默认值时才保持待配置（本地离线 mock 明确显示“不可试听”）。题目接口以 `speech_preview` 区分可试听、未配置、生成中、生成失败、开发 mock 和私有文件缺失，页面禁用无效试听并直接告诉用户下一步操作。
+- 题库语音配置提交前会重读 KnowledgeBase；后台语音进度只推进聚合 version、未改变 speech profile 时安全采用最新 version，真正的并发配置变化则刷新并要求重新确认。整库失败项和单题失败行均提供重新生成入口；整库重试读取失败题目的当前 version 并创建新的重试工作，不会命中旧 failed/dead-letter 幂等项。
+- 模型驱动持久任务已统一 `failed=等待自动重试 / dead_letter=领域终态失败`：可重试 TTS 不再改写 Question version，SpeechBuild 不会在下一 attempt 前误报失败；同一边界也用于题库导入、Resume Review、经历题生成、异步答案评分和报告。整库重试还能从 build manifest 恢复旧 worker 误标 completed/superseded 但 Question 仍失败的历史项；React 在批量重试期间仍允许试听已经 ready 的题目。
+- 语音运行中切换已改为 profile revision 语义 CAS：后台进度可以任意推进 KnowledgeBase version 而不阻断管理员切换模型，真正的并发 profile 变化仍失败关闭。新 revision 会取消旧任务，迟到结果作废。题库页面每 1.8 秒刷新活动构建，整库/单题手动重试按钮均显示 spinner、禁止双击，提交后继续在进度区显示转圈。
 - 智能生题已实现 `QuestionGenerationBatch -> QuestionBlueprint -> 1–2 题 Celery 子任务 -> 去重/补槽 merge -> GeneratedQuestionDraft -> 人工确认 -> Question` 闭环。10 道题默认拆为 5 个独立生成工作，避免单次大响应超时；规划互斥键与合并层完全匹配/高阈值相似检查共同抑制重复，缺题最多补生成两轮。独立工作台展示规划、分片、合并和补生成进度；候选行可打开完整题目详情，支持逐题编辑、删除、单题异步导入或批量导入剩余题目。AI 草稿不会进入计划或面试；正式题目保留生成批次/草稿来源。Mock/Memory/SQLite 合同和 React 行为均不依赖外网。2026-08-27 的 DeepSeek 单题真实闭环仍有效；新的多任务结构仍需在目标模型账户做真实 10 题并发、费用与限流验收。
 
 ### 已完成：智能生题任务工作台
@@ -123,7 +133,7 @@
 
 - 题库目录卡片不再暴露内部 `model_configuration_id`；语音信息以独立“读题语音”区展示声音标识和“已配置/待配置”状态，模型配置细节继续留在题库详情与模型服务中。
 - `llm.chat_text` 已加入统一 schema；OpenAI-compatible 支持 Chat/Embedding/Speech TTS，DeepSeek/智谱 Chat 复用共享 runtime 并适配 JSON Object，智谱另实现官方 GLM-TTS，DashScope 支持 Qwen Chat/Embedding 以及 Qwen3-TTS/CosyVoice，均有离线 HTTP 合同测试。
-- 模型管理已拆分为 `ProviderConnection → ModelConfiguration → ModelRoute`：Provider manifest 声明连接/凭证及 `llm/embedding/tts/stt/avatar` 模型表单，管理 UI 通用渲染；模型测试更新健康事实，route target 只引用 ready 的模型配置。未知字段返回 422、同组织重复 capability/purpose 返回冲突、predefined 目录外模型返回冲突；生产缺少精确 route 时返回 `provider_route_missing`。
+- 模型管理已拆分为 `ProviderConnection → ModelConfiguration → ModelRoute`：Provider manifest 声明连接/凭证及 `llm/embedding/tts/stt/avatar/realtime_speech` 模型表单，管理 UI 通用渲染；模型测试更新健康事实，route target 只引用 ready 的模型配置。连接和模型使用独立 `configuration_revision` 区分配置语义与探针 version，所有可执行模型类型共用 latest-version command，探针完成后编辑/删除不会因旧 version 误冲突，真实并发配置变化仍失败关闭。未知字段返回 422、同组织重复 capability/purpose 返回冲突、predefined 目录外模型返回冲突；生产缺少精确 route 时返回 `provider_route_missing`。
 - OpenAI-compatible 共享 transport 默认不继承环境代理，只有显式 `use_environment_proxy=true` 才读取代理变量；缺少 SOCKS transport 等初始化错误映射为 `provider_transport_unavailable`，不再泄漏原始 500。测试 helper 强制新建内存 store；当前全量 `220` 项通过测试不会触碰开发 SQLite。
 - `ModelGateway.open_stream()` 只在音频接受前允许 fallback；`ValidatedSTTStream` 校验 chunk/总量、事件序号和唯一 authoritative final。`open_speech_dialogue()` 使用同一 route/断路/调用日志策略，但只承载受控追问表达。
 - `stt-stream` WebSocket 保存音频，stream final 立即形成 CandidateAnswer 并排队完整评分；final 缺失/断流时使用 `stt.batch` 修复。S2S 输出 delta 不形成答案，也不绕过评分 Prompt/Schema。

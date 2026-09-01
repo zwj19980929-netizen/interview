@@ -174,14 +174,18 @@ question_speech_assets(
   owner_id text not null,
   source_version integer not null,
   speech_profile_revision integer,
+  speech_profile_fingerprint text,
+  knowledge_base_speech_profile_revisions jsonb not null default '{}',
   model_configuration_id text,
   model_configuration_version integer,
   language text not null,
   voice_profile_id text not null,
+  audio_format text not null,
+  speaking_rate numeric not null,
   content_hash text not null,
   audio_uri text not null,
   status text not null,
-  unique (organization_id, owner_type, owner_id, source_version, speech_profile_revision, model_configuration_id, model_configuration_version, language, voice_profile_id, content_hash)
+  unique (organization_id, owner_type, owner_id, source_version, speech_profile_fingerprint, model_configuration_id, model_configuration_version, language, voice_profile_id, audio_format, speaking_rate, content_hash)
 )
 
 candidate_profiles(..., organization_id text not null, status text not null, retention_reason text, retention_expires_at timestamptz, version integer not null)
@@ -240,8 +244,9 @@ FileObject 的资产永远不能签发试听地址。
 - 姓名用于显示和联合校验，不建立跨候选人的模糊匹配索引。
 - 高熵 `invitation_token` 只在签发响应中出现一次；数据库保存 SHA-256 token hash、过期时间和消费时间，不保存明文。
 - `candidate_session_token` 由 `INTERVIEWER_CANDIDATE_TOKEN_SECRET` 对 `interview_id + created_at` 做 HMAC-SHA256 派生，数据库和后台 API 均不保存/返回明文；生产缺少签名密钥时会话签发失败关闭。
-- Candidate Intake 的匹配事务锁定预约记录，验证 token 和时间窗，比较预约绑定候选人的 email/phone 哈希，保存同意版本并把预约推进到 `registered`。
+- Candidate Intake 的匹配事务锁定预约记录，验证 token 和时间窗，比较预约绑定候选人的 email/phone 哈希，保存同意版本并把预约推进到 `registered`。同一事务按 `appointment_id + experience_question_id/version + speech_profile_fingerprint` 幂等创建简历题语音 DurableWorkItem，并把进度保存到 `InterviewAppointment.speech_preparation`；不更新 ExperienceQuestion 的全局资产指针。
 - 同一登记事务以 `appointment.reminder.email:{appointment_id}` 幂等键创建 DurableWorkItem，`available_at` 为开始前 30 分钟；payload 只含 `appointment_id`。Worker 执行时才从 CandidateProfile 解密邮箱，SMTP 凭据不进入数据库、Outbox、审计或日志。未配置 SMTP 时工作保持 retryable，面试已开始、预约取消/消费或邮箱已清理时显式完成为 skipped。
+- 预约级 `QuestionSpeechAsset` 继续进入同一 repository，以 `owner_type=experience_question + owner_id + source_version` 标识内容来源，并额外保存 ModelConfiguration ID/version、voice、language、audio format、speaking rate 和 profile fingerprint。只有这些字段全部匹配才可跨预约复用；取消预约只取消未完成工作，不删除可能被其他预约复用的不可变资产。
 - start 事务通过 `UNIQUE(interviews.appointment_id)` 保证一个预约只创建一个会话，同时把预约推进到 `consumed`；幂等重试返回已有会话。
 - 匹配失败日志只保存预约、原因枚举和请求哈希，不保存提交的明文联系方式。
 
@@ -307,15 +312,20 @@ WHERE q.organization_id = $1
 
 外部 LLM、STT、TTS、文件解析和数字人调用不得占用数据库事务；可选 Embedding 任务遵守同一规则。流程拆成短事务并以 Outbox 记录事实，Celery 负责调度和唤醒：
 
-- Resume Review 的业务重试在同一短事务内把 `resume_reviews.failed -> queued` 与对应 DurableWorkItem `failed/dead_letter -> pending` 一并提交，attempt 归零、`replay_count` 递增并写审计，避免界面显示处理中但 Worker 没有任务，或任务已重放但候选人仍显示失败。
+- Resume Review 的业务重试在同一短事务内把 `resume_reviews.failed -> queued` 与对应 DurableWorkItem `failed/dead_letter -> pending` 一并提交，attempt 归零、`replay_count` 递增并写审计，避免界面显示处理中但 Worker 没有任务，或任务已重放但候选人仍显示失败；审阅同时保存最近 retry `Idempotency-Key/work_item_id`，重复传输在 version 校验前返回同一工作。
 - Resume Review 工作的 Outbox 幂等键使用 `resume.review:{resume_document_id}:{input_hash}`：同一简历版本的重复排队仍复用一个工作项，不同简历版本即使内容和岗位配置完全相同也不会命中旧版本工作。排队入口发现 queued 审阅没有任何关联工作时必须补建，并拒绝接受 aggregate ID 指向其他审阅的幂等命中。
 - Resume Review 领取工作时使用 330 秒租约，覆盖 Celery 默认 300 秒 hard time limit；不能沿用通用 60 秒租约，否则合法的长模型调用会被 Beat 当成 Worker 丢失并并发补发。任务硬超时后最多等待剩余租约窗口再恢复，避免双执行。
+- 题库语音失败重试不 replay 原 `question.speech:{question}:{source_version}:{revision}` 工作。失败落库已推进 Question version，重试父工作必须冻结当前仍为 failed 的 Question ID/version，并以 `question.speech.retry:{question}:{current_version}:{revision}:{retry_parent_id}` 创建新子工作；同一人工命令仍由父工作的 `Idempotency-Key` 去重。
 
 1. 首个事务保存领域状态和工作项，例如题目 `validation_status=pending`、语音 `pending`、Resume Review `queued` 或轮次 `transcribing`。
 2. 事务提交后向 Celery 发布只含 `organization_id + work_item_id` 的小消息；发布失败不回滚已提交领域事实，由 Celery Beat dispatcher 扫描待执行/租约过期工作项补发。
 3. `app/workers/` 中的 Celery task 按租约领取工作项，在事务外调用 Provider 或处理文件。
 4. 后续事务验证租约和目标 version，保存结果、领域事件和下一个工作项。
 5. 重复投递通过 `(organization_id, idempotency_key)`、内容哈希和业务唯一约束返回同一结果；幂等键必须包含正确的聚合身份，不能只用可跨聚合重复的内容哈希。
+
+ProviderConnection/ModelConfiguration 文档的通用 `version` 覆盖配置和健康探针两类写入；`configuration_revision` 只覆盖管理员配置语义。旧文档缺少该字段时读取按 revision 1 兼容，首次配置 PATCH 写为 2。该字段让所有模型类型共用同一并发恢复策略，不需要按 Provider、能力或探针协议增加分支。
+
+`DurableWorkItem.status=failed` 明确表示“本次 attempt 失败、仍等待自动重试”，不是领域终态；任何模型供应商和能力都不得据此把聚合写成 failed 或发出 `*.failed` 领域事件。只有 `error_retryable=false` 或耗尽 `max_attempts` 形成的 `dead_letter` 才能推进领域终态。该合同覆盖 LLM、Embedding、STT、TTS、实时语音和数字人；具体流程可以展示 retrying/building，但不能通过这类展示写入破坏 source-version guard 的聚合版本。
 
 `DurableWorkItem.error_retryable=false` 是终止语义：即使 `attempt_count < max_attempts` 也立即进入 `dead_letter`，并从
 自动 claimable 集合排除；人工 replay 仍可显式把它恢复为 pending。智能生题的多槽位输出截断由领域服务完成自适应
@@ -336,7 +346,8 @@ Celery 部署合同：
 
 - 题库导入：`parse -> validate structured fields -> persist candidate pool -> speech generate -> build summary`。
 - 题库语音切换：`speech profile CAS -> parent rebuild -> freeze question manifest -> child speech fan-out -> current revision guard -> progress aggregate`。
-- 简历审阅与问答：`scan/page-preserving parse -> atomic review enqueue -> redact/budget -> single-pass 或 evidence Map/compact/final Reduce -> effective qualified gate -> resume.experience_questions.generate -> approved question speech`；非符合结论在 gate 停止，问题持久化不可变证据快照。
+- 题库语音运行中切换使用 profile revision 语义 CAS；新 profile、旧 revision 未完成 Outbox 的 cancel/cancel_requested、全部 Question 新 source version 与新 parent build 在同一数据库事务提交。running 任务在 Provider 返回后和资产落库前都要重读 revision/cancel guard，不能以旧配置覆盖新资产。
+- 简历审阅与问答：`scan/page-preserving parse -> atomic review enqueue -> redact/budget -> single-pass 或 evidence Map/compact/final Reduce -> effective qualified gate -> resume.experience_questions.generate -> interviewer approval -> plan freeze -> candidate intake -> appointment-scoped speech`；非符合结论在 gate 停止，问题持久化不可变证据快照，未确认预约不产生 TTS 成本。
 - 回答：`audio persist + turn.transcribing -> streaming final`；失败后 `batch repair -> answer final -> evaluate -> next question/report`。
 
 STT 流本身是长连接，不持有数据库事务。开始时保存 stream attempt 元数据，final 或 error 到达后用短事务提交；所有音频 chunk 只流向媒体/STT adapter，不逐 chunk 写领域表。

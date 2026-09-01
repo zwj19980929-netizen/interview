@@ -2,7 +2,9 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.core.errors import ApiError
+from app.domain.speech_profile import freeze_interview_speech_profile
 from app.main import create_app
+from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
 from app.repositories.provider import reset_store_for_tests
 from app.services.catalog import CatalogService
@@ -138,6 +140,57 @@ async def test_plan_assembly_balances_coverage_deduplication_curve_weights_and_t
     assert plan["assembly_policy"]["max_same_skill_questions"] == 1
     assert plan["status"] == "approved"
     assert plan["approved_at"]
+    assert plan["speech_profile_snapshot"]["voice_profile_id"] == knowledge_base["speech_profile"]["voice_profile_id"]
+    assert plan["speech_profile_snapshot"]["language"] == knowledge_base["speech_profile"]["language"]
+
+
+@pytest.mark.anyio
+async def test_plan_rejects_knowledge_bases_with_conflicting_speech_profiles() -> None:
+    store = InMemoryStore()
+    catalog, position, first_knowledge_base, role, candidate = create_scope(
+        store,
+        "语音一致性工程师",
+        ["python"],
+        20,
+    )
+    second_knowledge_base = catalog.create_knowledge_base(
+        position["id"],
+        {"name": "另一音色题库"},
+    )
+    with persistence_for(store).transaction("org_default") as transaction:
+        current = transaction.knowledge_bases.get(second_knowledge_base["id"])
+        current["speech_profile"]["voice_profile_id"] = "voice_profile_conflict"
+        current["speech_profile"]["revision"] += 1
+        transaction.knowledge_bases.update(current, expected_version=current["version"])
+    await add_question(
+        catalog,
+        first_knowledge_base["id"],
+        title="一致性一",
+        skill="python",
+        difficulty="mid",
+        key_points=["模型", "音色"],
+    )
+    await add_question(
+        catalog,
+        second_knowledge_base["id"],
+        title="一致性二",
+        skill="python",
+        difficulty="mid",
+        key_points=["语言", "格式"],
+    )
+
+    with pytest.raises(ApiError) as exc_info:
+        await InterviewPlanAssembly(store).assemble(
+            PlanAssemblyRequest(
+                role_requirement_id=role["id"],
+                job_position_id=position["id"],
+                candidate_profile_id=candidate["id"],
+                knowledge_base_ids=(first_knowledge_base["id"], second_knowledge_base["id"]),
+                question_count=1,
+            )
+        )
+
+    assert exc_info.value.code == "INTERVIEW_PLAN_SPEECH_PROFILE_CONFLICT"
 
 
 @pytest.mark.anyio
@@ -224,3 +277,25 @@ def test_role_profile_uses_declared_priorities_without_a_fixed_skill_catalog() -
     assert set(weights) == {"rust", "kafka", "observability"}
     assert weights["rust"] == weights["kafka"] > weights["observability"]
     assert round(sum(weights.values()), 4) == 1.0
+
+
+def test_interview_speech_profile_fingerprint_includes_knowledge_base_revision() -> None:
+    knowledge_base = {
+        "id": "kb_revision",
+        "speech_profile": {
+            "revision": 1,
+            "model_configuration_id": "model_tts",
+            "model_configuration_version": 3,
+            "voice_profile_id": "voice_cn",
+            "language": "zh-CN",
+            "audio_format": "audio/wav",
+            "speaking_rate": 1.0,
+        },
+    }
+    first = freeze_interview_speech_profile([knowledge_base])
+    knowledge_base["speech_profile"]["revision"] = 2
+    second = freeze_interview_speech_profile([knowledge_base])
+
+    assert first["knowledge_base_revisions"] == {"kb_revision": 1}
+    assert second["knowledge_base_revisions"] == {"kb_revision": 2}
+    assert first["fingerprint"] != second["fingerprint"]

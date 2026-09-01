@@ -97,7 +97,7 @@ _Avoid_: HiringDecision、AutoReject、ResumeRank
 _Avoid_: PersonalKnowledgeBase、CandidateKnowledgeBase、CopiedQuestionBank
 
 **ExperienceQuestion**:
-绑定 CandidateProfile，由符合资格后的独立生成工作或面试官基于该候选人简历证据创建，经批准后用于核验过往经历的问题；没有证据快照或题干未点名证据标签的题不得展示或组卷。
+绑定 CandidateProfile，由符合资格后的独立生成工作或面试官基于该候选人简历证据创建，经批准后用于核验过往经历的问题；批准表示可入计划，不提前产生全局读题语音。没有证据快照或题干未点名证据标签的题不得展示或组卷。
 _Avoid_: FollowUp、ResumeGuess、AutoApprovedQuestion、PersonalQuestion
 
 **InterviewPlanAssembly**:
@@ -105,15 +105,19 @@ _Avoid_: FollowUp、ResumeGuess、AutoApprovedQuestion、PersonalQuestion
 _Avoid_: TopNQuestions、SearchResult、GeneratedList
 
 **InterviewPlan**:
-面向一个候选人和岗位的唯一可执行面试定义，以抽题槽位、冻结候选池、经历问题、权重和阶段顺序为领域真相；批准后不可原地修改。
+面向一个候选人和岗位的唯一可执行面试定义，以抽题槽位、冻结候选池、经历问题、权重、阶段顺序和所选题库共同的 speech profile snapshot 为领域真相；批准后不可原地修改。
 _Avoid_: FixedQuestionList、EditableItems、DualPlanRepresentation
 
 **InterviewAppointment**:
-绑定候选人、岗位、岗位题库、已批准计划、时间窗和 `local/cloud` AvatarDelivery 策略的预约与一次性邀请；只有通过 readiness gate 且位于允许的 start 窗口内才能消费并创建 InterviewSession。
+绑定候选人、岗位、岗位题库、已批准计划、时间窗和 `local/cloud` AvatarDelivery 策略的预约与一次性邀请；拥有本场简历题语音准备状态，只有通过 start readiness 且位于允许窗口内才能消费并创建 InterviewSession。
 _Avoid_: InterviewSession、CalendarEvent、JoinLink
 
+**AppointmentSpeechPreparation**:
+候选人确认预约后创建的预约级简历题读题语音准备聚合，按计划冻结的 TTS 模型、音色、语言、格式和语速跟踪每个 ExperienceQuestion version 的工作与资产；不把预约结果回写为 ExperienceQuestion 的全局语音。
+_Avoid_: ExperienceQuestionSpeechStatus、DefaultVoiceGeneration、PlanApprovalSpeech
+
 **CandidateIntake**:
-候选人通过一次性邀请提交姓名、邮箱、手机号、明确隐私同意和所需录音同意形成的登记记录，用于和该预约绑定的 CandidateProfile 精确匹配。
+候选人通过一次性邀请提交姓名、邮箱、手机号、明确隐私同意和所需录音同意形成的登记记录，用于和该预约绑定的 CandidateProfile 精确匹配；成功事务也是预约级简历题语音的成本触发点。
 _Avoid_: CandidateProfile、RegistrationForm、AnonymousSignup
 
 **QuestionCandidatePool**:

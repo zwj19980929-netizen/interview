@@ -11,6 +11,7 @@
 - ID 使用不可猜测的 UUID/ULID。
 - 导入、异步审阅、邀请、登记、候选人开始、答案提交和重试支持 `Idempotency-Key`。
 - 所有修改聚合的请求携带 `expected_version`；陈旧写入返回 `409 PERSISTENCE_CONFLICT`。
+- 交互式客户端对可能被后台模型任务推进 version 的资源使用统一 latest-version command：提交前 GET 最新资源，仅当配置 revision 或命令相关业务字段未改变时采用最新 version；读写间再次冲突最多重读一次。真实语义变化返回本地 `RESOURCE_SEMANTIC_CONFLICT` 并要求重新确认，不能按供应商或模型类型写特例。
 - 明确建模为异步工作的接口（题库 import/rebuild/build、PDF 摄取等）返回 `202 Accepted` 和 `job_id`，通过工作项接口查询状态。
 - 创建题目、题目语音重建和题库语音配置切换不得在 HTTP 请求内调用 TTS；它们只提交 DurableWorkItem 并由 `app/workers/` 中的 Celery task 执行。
 - `GET /healthz` 只表示进程存活；`GET /readyz` 对数据库/Redis 和生产密钥、OSS bucket 鉴权、扫描器执行只读探针，未就绪返回 `503` 与不含密钥值的逐项结果。业务模型 route readiness 仍由预约准入按组织、purpose 和健康 TTL 判断。
@@ -105,14 +106,16 @@
 | `GET` | `/api/v1/workspace/question-overview` | 总览页只读取题目计数与最近 5 项，避免首屏下载完整题库 |
 | `GET` | `/api/v1/knowledge-bases/{knowledge_base_id}` | 查看题库、构建状态和计数 |
 | `PATCH` | `/api/v1/knowledge-bases/{knowledge_base_id}` | 修改名称、说明或归档；语音配置使用独立命令接口 |
-| `PUT` | `/api/v1/knowledge-bases/{knowledge_base_id}/speech-profile` | 以 `expected_version` 设置 TTS 模型、声音和输出参数；变化时创建新 revision 并返回整库重建 job |
+| `PUT` | `/api/v1/knowledge-bases/{knowledge_base_id}/speech-profile` | 以 `expected_version + expected_speech_profile_revision` 设置 TTS 模型、声音和输出参数；变化时创建新 revision 并返回整库重建 job。profile revision 未变时，服务端可吸收后台进度造成的任意 KnowledgeBase version 推进；profile 真正被并发修改时仍返回 409。新 revision 与旧 revision 未完成工作的协作取消在同一事务提交 |
 | `GET` | `/api/v1/knowledge-bases/{knowledge_base_id}/speech-options` | `items` 返回可选择的已就绪 TTS 模型；`candidates` 同时返回已添加但未测试/失败/停用的 TTS 及不可选原因和归一化声音目录，不包含 Provider 凭据 |
 | `GET` | `/api/v1/knowledge-bases/{knowledge_base_id}/speech-builds` | 列出语音构建历史、当前进度和失败计数 |
 | `GET` | `/api/v1/knowledge-bases/{knowledge_base_id}/speech-builds/{job_id}` | 查询一次整库语音构建和题目级失败摘要 |
-| `POST` | `/api/v1/knowledge-bases/{knowledge_base_id}/speech-builds/{job_id}/retry-failed` | 只重试当前 profile revision 下的失败题目 |
+| `POST` | `/api/v1/knowledge-bases/{knowledge_base_id}/speech-builds/{job_id}/retry-failed` | 以 `expected_version + Idempotency-Key` 只重试当前 profile revision 和该 build 冻结清单下当前仍为 `speech_status=failed` 的题目；按题目当前 version 创建新工作，不复用旧 dead-letter，也可恢复旧版 worker 误写为 completed/superseded 的失败子工作 |
 | `POST` | `/api/v1/knowledge-bases/{knowledge_base_id}/imports` | 上传或结构化导入题目 |
 | `POST` | `/api/v1/knowledge-bases/{knowledge_base_id}/rebuild` | 重建索引和缺失读题语音 |
 | `GET` | `/api/v1/knowledge-bases/{knowledge_base_id}/builds/{job_id}` | 查询构建工作项 |
+
+SpeechBuild 的 `failed` 计数和 `failed_items` 只包含已经进入 `dead_letter` 的题目子工作；仍可由 Worker 自动领取的 DurableWorkItem `status=failed` 对 API 投影为 `pending/running`。因此页面只对真正终态失败显示人工重试，自动重试期间保留已完成题目的试听能力。
 
 导入使用 multipart 文件或 JSON items。响应立即返回：
 
@@ -158,6 +161,8 @@
 
 父工作项在 Celery worker 中冻结活动 Question ID/version 清单并分批创建题目级工作项，进度投影至少包含 `total/pending/running/ready/failed/superseded`。切换到 revision 4 后，revision 3 的迟到结果不得成为当前资产。已批准计划或历史会话引用的旧 QuestionSpeechAsset 不删除、不覆盖。
 
+KnowledgeBase 的 version 也会因后台构建状态推进而变化。配置页面不能长期复用打开弹窗时的 version：提交前先读取最新 KnowledgeBase；若最新 speech profile 的 revision、模型配置 ID/version、声音、语言、格式和语速与打开时一致，可用最新 version 提交；若这些字段已经变化，必须刷新并要求用户重新确认。提交与读取之间的极窄竞态最多按同一规则重读并重试一次，不能无条件覆盖他人的语音配置。
+
 ### 题目
 
 | 方法 | 路径 | 说明 |
@@ -166,7 +171,7 @@
 | `GET` | `/api/v1/knowledge-bases/{knowledge_base_id}/questions` | 列出题目 |
 | `PATCH` | `/api/v1/questions/{question_id}` | 修改题目；内容变化产生新版本和新语音任务 |
 | `DELETE` | `/api/v1/questions/{question_id}?expected_version={version}` | 从当前题库归档题目；保留历史面试快照和不可变语音资产，不再出现在活动题列表 |
-| `POST` | `/api/v1/questions/{question_id}/speech/regenerate` | 按题库当前 speech profile 重建单题语音；返回 `202`，不在请求内执行 TTS |
+| `POST` | `/api/v1/questions/{question_id}/speech/regenerate` | 以 `expected_version + Idempotency-Key` 按题库当前 speech profile 重建单题语音；重复命令返回同一工作，响应 `202`，不在请求内执行 TTS |
 | `POST` | `/api/v1/question-speech-assets/{asset_id}/content-url` | 鉴权并审计后签发五分钟题目语音试听地址；浏览器不接触存储凭据 |
 | `GET` | `/api/v1/knowledge-bases/{knowledge_base_id}/question-generation-options` | 返回题库定位/标签默认值和可用于结构化生题的 ready LLM 模型，不包含凭据 |
 | `POST` | `/api/v1/knowledge-bases/{knowledge_base_id}/question-generation-batches` | 创建智能生题批次并返回 `202 + work_item_id`；请求包含模型、数量、定位、标签和可选要求，HTTP 不执行 LLM |
@@ -342,20 +347,20 @@ JSON `resume_text` 兼容请求已删除；开发和生产均以系统托管 PDF
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/api/v1/resume-reviews/{review_id}` | 返回岗位初筛、项目/技能证据、告警和问题状态 |
-| `POST` | `/api/v1/resume-reviews/{review_id}/retry` | 以 `expected_version + reason` 将 failed/dead-letter 初筛原子恢复为 queued/pending，并记录操作者审计 |
+| `POST` | `/api/v1/resume-reviews/{review_id}/retry` | 以 `expected_version + reason + Idempotency-Key` 将 failed/dead-letter 初筛原子恢复为 queued/pending，并记录操作者审计；相同命令在 version 校验前返回原 replay 结果 |
 | `PATCH` | `/api/v1/resume-reviews/{review_id}/screening-review` | 人工复核初筛；提交 `expected_version`、`decision=qualified|unqualified` 和可选说明，保留 AI 原建议并审计 |
 | `GET` | `/api/v1/resume-reviews/{review_id}/experience-questions` | 仅在生效结论符合时列出证据绑定有效的问题；否则返回空集合 |
 | `PATCH` | `/api/v1/experience-questions/{question_id}` | 人工编辑、批准或拒绝 |
 | `DELETE` | `/api/v1/experience-questions/{question_id}?expected_version={version}` | 从候选人个人题库归档；保留已冻结计划和历史面试快照 |
-| `POST` | `/api/v1/experience-questions/{question_id}/speech/regenerate` | 重建问题语音 |
+| `POST` | `/api/v1/experience-questions/{question_id}/speech/regenerate` | 重试引用该题的预约级 failed/dead-letter 语音工作；未确认预约时不提前生成 |
 
-创建与重试接口只验证并排队，绝不在 HTTP 请求内等待 LLM。同一 ready 简历的重复创建命令返回原 ResumeReview；若该审阅仍为 queued 但工作项缺失，命令会在同一事务补建指向当前审阅的 DurableWorkItem，并校验返回工作的 aggregate ID，避免界面永久显示排队。失败重试仅接受 `ResumeReview.status=failed` 且关联 DurableWorkItem 为 `failed/dead_letter` 的组合；源 ResumeDocument 必须仍为 `ready`，岗位和要求必须存在。命令使用审阅 version 防双击/并发覆盖，清空当前错误与分块进度、把工作 attempt 归零并增加 `replay_count`，但不创建第二份审阅。`GET` 在处理中返回 `status/processing_stage/processing_strategy/processing_progress`；完成后通过 `screening.recommendation/score/summary/matched_requirements/unmet_requirements` 给出可解释建议，证据包含 `source_pages`。服务端按 `candidate_screening_score.v1` 强制把 0–59 映射为 `unqualified`、60–74 映射为 `manual_review`、75–100 映射为 `qualified`，并返回 `screening_policy_version`；候选人列表的嵌套 screening 投影还返回 `question_generation_status/error/count`。模型建议与分数冲突时以分数带为准，人工 `screening-review` 决定仍可覆盖生效结论。只有生效结论为 `qualified` 时才排入独立的 `resume.experience_questions.generate` 工作；AI 不符合/待复核不生成，人工改判符合时才临时排队。AI 问题默认为 `draft`，批准后才生成语音。不得把简历中的受保护属性或无关个人信息发送给模型。
+创建与重试接口只验证并排队，绝不在 HTTP 请求内等待 LLM。同一 ready 简历的重复创建命令返回原 ResumeReview；若该审阅仍为 queued 但工作项缺失，命令会在同一事务补建指向当前审阅的 DurableWorkItem，并校验返回工作的 aggregate ID，避免界面永久显示排队。失败重试仅接受 `ResumeReview.status=failed` 且关联 DurableWorkItem 为 `failed/dead_letter` 的组合；源 ResumeDocument 必须仍为 `ready`，岗位和要求必须存在。命令使用审阅 version 防双击/并发覆盖，清空当前错误与分块进度、把工作 attempt 归零并增加 `replay_count`，但不创建第二份审阅。`GET` 在处理中返回 `status/processing_stage/processing_strategy/processing_progress`；完成后通过 `screening.recommendation/score/summary/matched_requirements/unmet_requirements` 给出可解释建议，证据包含 `source_pages`。服务端按 `candidate_screening_score.v1` 强制把 0–59 映射为 `unqualified`、60–74 映射为 `manual_review`、75–100 映射为 `qualified`，并返回 `screening_policy_version`；候选人列表的嵌套 screening 投影还返回 `question_generation_status/error/count`。模型建议与分数冲突时以分数带为准，人工 `screening-review` 决定仍可覆盖生效结论。只有生效结论为 `qualified` 时才排入独立的 `resume.experience_questions.generate` 工作；AI 不符合/待复核不生成，人工改判符合时才临时排队。AI 问题默认为 `draft`，批准后只变为可入计划的 `deferred`，不触发 TTS。不得把简历中的受保护属性或无关个人信息发送给模型。
 
 候选人个人题库不新建第二套题目实体，而是按 `candidate_profile_id` 汇总 ExperienceQuestion。AI 生成项记录
 `source_type=ai_generated` 和来源 ResumeReview；人工创建项记录 `source_type=manual`，并必须选择属于同一候选人且已完成的
 ResumeReview，使岗位、简历版本和证据上下文可追溯。人工创建请求至少包含非空 `question_text`、`standard_answer`、
 `key_points` 和 1–3 个 `evidence_refs` 标签；标签必须来自该审阅的项目/技能证据，且题干必须明确包含至少一个所选标签。服务端把标签解析为含证据文本和来源页的不可变快照。初始状态固定为 `draft`。编辑仍使用 `expected_version`，状态只允许
-`draft/approved/rejected`；批准后进入既有经历题语音生成链。DELETE 使用归档语义，已归档项不再出现在个人题库、
+`draft/approved/rejected`；批准后写入 `speech_status=deferred` 并可进入新计划，但不创建 TTS 工作。DELETE 使用归档语义，已归档项不再出现在个人题库、
 审阅问题列表或新计划中，但已批准计划和历史 InterviewQuestionSnapshot 保持不变。生效结论改为不符合后，读取、创建、编辑、语音生成和新计划组卷全部失败关闭；历史上没有有效证据快照或题干未点名证据的题也从活动读取与新计划中过滤。
 
 同一候选人按岗位只取最新审阅决定留存：只要存在 `qualified` 或 `manual_review`/处理中结论，就不设置初筛清理期限；所有最新岗位结论均为 `unqualified` 时设置 `retention_reason=screening_unqualified` 和服务端时间加 7 天。Celery Beat 周期任务先按当前分数带校正存量候选人的期限，首次命中从该次运行起重新给足 7 天，再由 RetentionService 清除到期私有简历和敏感投影并写审计；列表读取或页面点击不产生隐式写入或物理删除。
@@ -403,8 +408,8 @@ React 岗位卡片根据该岗位是否已有要求，显示“添加岗位要�
 
 - 岗位、题库、岗位要求、候选人和审阅同组织且关系一致。
 - 题库为 `ready`，候选池足够并已冻结题目 ID/version 与集合哈希。
-- 每个题库的 speech profile revision 和候选题对应 QuestionSpeechAsset ID 已冻结；题库后续切换模型/声音不覆盖已批准计划使用的旧资产。
-- Resume Review 为 `ready`，经历问题为 `approved` 且语音为 `ready`。
+- 所选题库的 speech profile 输出参数完全相同；计划冻结唯一 `speech_profile_snapshot`，包含 TTS ModelConfiguration ID/version、音色、语言、格式、语速和指纹。题库后续切换模型/声音不改写已批准计划。
+- Resume Review 为 `ready`，经历问题为 `approved` 且证据有效；其计划快照不绑定全局语音资产，状态为 `deferred`。
 - 权重和为 1，时长守恒；放宽去重或覆盖约束必须写入 `assembly_summary.warnings`。
 
 已批准计划不可编辑，只能归档或复制为新草稿。
@@ -453,6 +458,8 @@ React 岗位卡片根据该岗位是否已有要求，显示“添加岗位要�
 
 `settings.speech_dialogue_mode` 只接受 `cascade | s2s`，默认 `cascade`。`cascade` 保留 `STT -> 受控追问策略 -> Avatar/TTS`；`s2s` 让同一 PCM 并行进入 `speech.dialogue_realtime/candidate_followup_dialogue`，但仍以服务端 STT final 和策略批准文本为真相。S2S route 不可用或输出不符合批准文本时自动回到 cascade，不能影响 CandidateAnswer 或评分。
 
+预约的 `settings.voice_profile_id/language` 由计划冻结的 `speech_profile_snapshot` 派生。创建或修改时显式提交另一音色返回 `409 APPOINTMENT_SPEECH_PROFILE_MISMATCH`，不能让简历题和岗位题出现两套声音。
+
 邀请响应只在签发时返回一次明文 URL：
 
 ```json
@@ -465,7 +472,7 @@ React 岗位卡片根据该岗位是否已有要求，显示“添加岗位要�
 
 React 工作台必须在这个一次性响应弹窗中提供“复制链接”操作和成功/失败反馈，不要求用户手工选中 URL。
 
-数据库只保存 token 哈希。readiness 至少检查计划批准、题库/候选池、经历问题语音、服务端 `stt.streaming` route 健康、时间窗和录音留存策略。
+数据库只保存 token 哈希。邀请阶段的 `can_invite` 检查计划批准、题库/候选池、岗位题语音和可执行的冻结 speech profile，不等待尚未触发的简历题 TTS；候选人 start 的 `can_start` 还要求本预约全部简历题语音资产已 ready、来源版本与 profile 精确匹配，并继续检查服务端 STT、时间窗和录音留存策略。
 
 ### 公开邀请与填报
 
@@ -491,7 +498,7 @@ React 工作台必须在这个一次性响应弹窗中提供“复制链接”�
 }
 ```
 
-姓名、邮箱和手机号三项均为必填。GET 邀请响应返回服务端冻结的实际隐私/录音告知正文、允许版本、`recording_required` 和内容 hash；客户端只能回传该版本，不能自定义告知。服务端只与预约绑定的 `CandidateProfile` 比较；至少邮箱或手机号之一精确匹配，姓名联合校验。成功后预约进入 `registered`，表示身份核验和预约确认已经完成，而不是面试已经开始；同时创建 `appointment.reminder.email` DurableWorkItem，`available_at=scheduled_start_at-30min`。响应返回预约时间和安全的提醒状态，不返回简历内容、内部工作项 ID 或联系方式。失败响应不能说明哪个字段不匹配。
+姓名、邮箱和手机号三项均为必填。GET 邀请响应返回服务端冻结的实际隐私/录音告知正文、允许版本、`recording_required` 和内容 hash；客户端只能回传该版本，不能自定义告知。服务端只与预约绑定的 `CandidateProfile` 比较；至少邮箱或手机号之一精确匹配，姓名联合校验。成功后预约进入 `registered`，表示身份核验和预约确认已经完成，而不是面试已经开始；同一事务创建 `appointment.reminder.email` 和按经历题版本、预约 ID、profile 指纹幂等的 `question.speech.generate` DurableWorkItem。已有完全匹配资产可以复用。响应返回预约时间、安全的提醒状态和聚合 `speech_preparation` 进度，不返回简历内容、内部工作项 ID、题目或联系方式。失败响应不能说明哪个字段不匹配。
 
 登记成功响应示例：
 
@@ -505,6 +512,12 @@ React 工作台必须在这个一次性响应弹窗中提供“复制链接”�
   "email_reminder": {
     "status": "scheduled",
     "scheduled_for": "2026-09-01T01:30:00Z"
+  },
+  "speech_preparation": {
+    "status": "queued",
+    "total": 3,
+    "ready": 0,
+    "failed": 0
   }
 }
 ```
@@ -689,6 +702,8 @@ class ModelGateway:
 低延迟追问可额外配置 `speech.dialogue_realtime/candidate_followup_dialogue`。对应 ModelConfiguration 使用 `realtime_speech` 类型；没有 schema、可执行 adapter 和通过健康测试的模型不能进入 active route，缺 route 时面试继续使用 cascade。
 
 模型管理分为三层：`ProviderConnection` 只保存组织级厂商连接、API Key 引用和区域等连接参数；`ModelConfiguration` 选择 `llm/embedding/tts/stt/avatar/realtime_speech` 类型及厂商模型，并保存该模型的专属设置和统一默认参数；`ModelRoute` 只引用模型配置。插件 manifest 返回 `connection_form`、`credential_form` 与各模型类型的 `configuration_form`，前端使用通用控件渲染器，不内置任何厂商字段。
+
+ProviderConnection 与 ModelConfiguration 响应增加单调递增的 `configuration_revision`。创建为 1；连接参数/凭据或模型 settings/default parameters/启用状态/显示名修改时增加；凭据校验和任意能力健康探针只推进通用 `version` 与健康事实，不改变 `configuration_revision`。因此 LLM、Embedding、STT、TTS、实时语音和数字人的编辑/删除页面都可以安全吸收探针造成的新 version，同时拒绝覆盖真正的并发配置修改。
 
 `POST /admin/model-routes` 使用强类型请求：`primary`/`fallbacks` 仅接受 `model_configuration_id`、`timeout_s`、`pricing`；路由创建时校验模型配置已启用、状态为 `ready` 且支持目标 capability。`policy` 仅接受既有重试、熔断、成本和 readiness 字段。生产环境找不到精确 route 时返回 `provider_route_missing`，只有 development/test 允许离线 mock fallback。
 

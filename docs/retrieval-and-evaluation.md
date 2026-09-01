@@ -90,7 +90,7 @@ Resume Review 只能读取已完成摄取和解析的 `ResumeDocument`。本地 
 
 简历只提供提问上下文，不能把简历中声称的成果直接当作候选人已证明的能力。经历问题评分以面试回答中的具体证据为主，并把与简历的矛盾标为“待人工核验”，不能直接判定不诚信。
 
-`CandidateQuestionBank` 是按 `candidate_profile_id` 聚合 `ExperienceQuestion` 的读取与管理投影，不另建一套 Question 真相。它只对生效结论 `qualified` 开放，并在候选人列表通过独立“简历问答”弹窗进入。AI 生成项记录 `source_type=ai_generated`；面试官可基于符合审阅人工创建 `source_type=manual` 草稿，必须选择简历证据，题干也必须写出所选项目/技能名称。人工与 AI 题共用版本化编辑、批准/拒绝、语音生成、计划冻结和 `resume_experience.v1` 评分。归档题、无有效证据快照的旧题以及不符合审阅的问题从读取和新计划中消失，但已批准计划与历史面试继续读取冻结快照。人工题也不能绕过审核：只有 `approved + speech_ready` 才进入计划装配。
+`CandidateQuestionBank` 是按 `candidate_profile_id` 聚合 `ExperienceQuestion` 的读取与管理投影，不另建一套 Question 真相。它只对生效结论 `qualified` 开放，并在候选人列表通过独立“简历问答”弹窗进入。AI 生成项记录 `source_type=ai_generated`；面试官可基于符合审阅人工创建 `source_type=manual` 草稿，必须选择简历证据，题干也必须写出所选项目/技能名称。人工与 AI 题共用版本化编辑、批准/拒绝、计划冻结和 `resume_experience.v1` 评分。归档题、无有效证据快照的旧题以及不符合审阅的问题从读取和新计划中消失，但已批准计划与历史面试继续读取冻结快照。人工题也不能绕过审核：`approved + grounded evidence` 即可进入计划，批准时不生成语音。
 
 ## 岗位题候选池筛选
 
@@ -138,12 +138,12 @@ Interview Plan Assembly 接收岗位、岗位要求、岗位题库、候选人�
 1. 把必备和加分技能按默认 3:1 合并为覆盖权重。
 2. 为 `position_question_count` 分配 `bank_slots`，每个槽位包含阶段、能力维度、允许难度、权重和预计时长。
 3. 对每个槽位按岗位、题库、技能、难度、题型、状态和语音 readiness 过滤候选题，形成 `QuestionCandidatePool`；它保存筛选条件、题目 ID/version 和集合哈希，不把标准答案暴露到计划 API。
-4. 冻结所有题库版本、KnowledgeBaseSpeechProfile revision、候选题的 QuestionSpeechAsset ID、候选清单和集合哈希，供面试中的随机选择使用。
-5. 把面试官已批准的 `ExperienceQuestion` 固定在 `position_bank` 槽位之后。
+4. 冻结所有题库版本、岗位候选题的 QuestionSpeechAsset ID、候选清单和集合哈希；所选题库的 KnowledgeBaseSpeechProfile 输出参数必须完全一致，并冻结为计划级 `speech_profile_snapshot`。
+5. 把面试官已批准的 `ExperienceQuestion` 文本/证据/评分版本固定在 `position_bank` 槽位之后，语音资产留空并标记 `deferred`。
 6. 题目权重与经历问题权重用万分单位最大余数法归一，精确合计为 1；预计时长必须守恒。
 7. 候选池不足、覆盖不足或放宽去重/难度时写入 `assembly_summary.warnings`，不能伪造完整覆盖。
 
-计划批准前必须满足：题库和候选清单 ready、Resume Review ready、经历问题已批准且语音 ready、题目/经历问题总数与时长合法。计划批准后这些来源版本不可变；需要调整时复制新草稿。
+计划批准前必须满足：题库和候选清单 ready、Resume Review ready、经历问题已批准且证据有效、题目/经历问题总数与时长合法，并且多个题库没有 speech profile 冲突。计划批准后这些来源版本与语音特征不可变；需要调整时复制新草稿。
 
 ## 面试中可审计的随机检索
 
@@ -161,7 +161,8 @@ Interview Plan Assembly 接收岗位、岗位要求、岗位题库、候选人�
 ## 题目朗读
 
 - 岗位题优先播放 `InterviewQuestionSnapshot.speech_asset_id` 指向的预生成语音；该资产已冻结题库 speech profile revision 和实际 TTS 模型/声音。
-- 经历问题在批准后预生成语音，计划 readiness 要求资产可用。
+- 经历问题批准时不生成语音。候选人完成 Candidate Intake、预约进入 `registered` 的同一事务按预约和题目版本排队，使用计划冻结的 TTS 模型、音色、语言、格式和语速；匹配资产可复用。
+- 邀请 readiness 只要求计划有可执行的冻结 profile；start readiness 要求本预约所有经历题资产 ready 且来源版本和 profile 精确匹配。TTS 失败保留 `registered`，阻止 start 并允许重试；取消预约取消未完成工作。
 - 数字人视频层可根据相同音频驱动口型；视频供应商失败时仍播放语音资产。
 - 只有预约明确允许时才能在语音资产失败后即时调用 `tts.synthesize`，该次调用和实际朗读文本必须审计。
 - 实际朗读题干来自冻结快照，客户端不能提交任意文本让数字人读取。

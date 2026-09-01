@@ -6,6 +6,72 @@
 
 每个工作项必须包含：日期、ID、目标、关联问题、状态、实际修改文件、验证命令与结果、未完成事项或恢复说明。
 
+## 2026-08-31 · DASHSCOPE-LLM-CATALOG-001
+
+- 目标：核对阿里云百炼千问 Plus 的真实模型 ID，扩充 DashScope 头部与常用 LLM 目录，并让可自定义的模型类型在管理页可见、可选官方候选项。
+- 关联问题：页面当前只预填 `qwen-plus`，容易让用户误以为模型名不存在；DashScope LLM 虽然允许手填任意 ID，但 manifest 中已声明的候选模型没有在表单中形成可发现建议。
+- 状态：`verified（仓库）`。
+- 计划修改：更新 DashScope provider manifest 及版本；为 customizable 模型输入增加目录建议但保留自由输入；增加后端 manifest/API 与 React 行为回归，同步 Provider 设计文档并重建生产 bundle。
+- 实际修改文件：`app/providers/dashscope/provider.json`、`app/web/src/features/models/Page.jsx`、`app/web/src/App.test.jsx`、`tests/test_model_configuration_v2.py`、`docs/model-provider-plugins.md`、重建后的 `app/web/dist/index.html` 与 `app/web/dist/bundles/index-{7m08dfhY.js,FhSZ_GOI.css}`、本日志。
+- 实际实现：根据阿里云百炼官方模型资料确认 `qwen-plus` 是真实可用的官方模型 ID，保留为默认项并把展示名改为“千问 Plus（官方模型 ID）”。DashScope manifest 升级为 `0.5.0`，新增千问 3.8 Max/Flash、3.7 Plus/Flash、Flash、Turbo、Long 和 3 Coder Plus，以及百炼托管的 DeepSeek V4 Pro/Flash、GLM-5.2、Kimi K2.7 Code、MiniMax M3 和 MiMo V2.5 Pro。托管第三方模型默认使用集中 Prompt 约束 + 网关 Schema 校验，不假定它们原生支持 OpenAI JSON Schema。React 对 customizable 模型类型使用 datalist 展示 manifest 建议，选中已知模型时同步可读名称，同时继续允许已授权的快照或新模型 ID；新建配置仍必须独立测试成功才能用于正式路由。
+- 验证命令与结果：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q tests/test_model_configuration_v2.py tests/test_provider_registry.py tests/test_dashscope_provider.py` 为 `30 passed`；完整后端 `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q` 为 `236 passed, 5 skipped`；`cd app/web && npm test -- --run` 为 `38 passed`；`npm run build` 成功生成 `index-7m08dfhY.js/index-FhSZ_GOI.css`；`git diff --check` 通过。
+- 未完成事项或恢复说明：未使用真实百炼 API Key 发起付费调用；具体区域、业务空间授权和模型可用性仍由“测试模型”探针确认。首次 React 新回归直接设置受控 input 的 DOM value，未触发 React 状态更新而失败 1 条；改用原生 value setter 模拟真实输入后全量通过，该失败仅影响测试代码。一次从 `app/web` 目录读取根目录相对路径 `docs/change-log.md` 返回文件不存在，回到仓库根目录后读取成功。两次失败均无业务数据或外部调用副作用。
+
+## 2026-08-31 · KB-SPEECH-SWITCH-CANCEL-UX-001
+
+- 目标：语音整库构建期间切换模型/声音时，原子取代旧构建、协作取消旧子任务并启动新 revision，不再因后台进度高频推进 KnowledgeBase version 而暴露乐观锁冲突；为整库/单题失败重试提供可见的转圈与防重复提交状态。
+- 关联问题：客户端最多两次“重读 version 再提交”仍可在多个 TTS 子工作密集完成时连续撞上 CAS；服务端缺少“期望 speech profile revision”的语义 CAS。旧 revision 虽有迟到结果 guard，但未主动取消 pending/failed 子任务。已有重试按钮没有本地 busy/spinner，快速重复点击时反馈不清晰。
+- 状态：`verified（仓库与本机运行态）`。
+- 计划修改：扩展 speech-profile 命令的语义 revision guard；在同一事务取消旧 revision 未完成工作并审计 supersede 关系；修正 SpeechBuild cancelled 投影；增加整库/单题重试 busy spinner；补并发、取消、迟到结果及 React 防重回归，同步 API/领域/存储/进度文档和生产 bundle。
+- 实际修改文件：`app/schemas/api.py`、`app/api/routers/catalog.py`、`app/services/{knowledge_base_speech,catalog}.py`、`app/web/src/features/questions/Page.jsx`、`app/web/src/App.test.jsx`、`app/web/styles.css`、重建后的 `app/web/dist/index.html` 与 `app/web/dist/bundles/index-{Cvf-GtxJ.js,FhSZ_GOI.css}`、`tests/test_knowledge_base_speech.py`、`docs/{architecture,api-design,domain-model,database-and-vector-storage,known-issues-and-remediation,development-progress,implementation-roadmap}.md`、本日志。
+- 实际实现与诊断：API 日志确认同一页面先有一次 speech-profile `PUT 202`，随后密集出现四次 `409 PERSISTENCE_CONFLICT`，之后再次 `202`；根因是旧页面用会被语音子任务进度推进的 KnowledgeBase 通用 version 保护“切换语音配置”命令。现新增 `expected_speech_profile_revision` 语义 CAS：仅后台进度导致通用 version 变化时允许切换，真实的并发模型/声音配置变更仍返回冲突。切换在同一事务中创建新 revision、新整库构建并对旧 revision 的 pending/failed/running 父子工作分别执行取消或 `cancel_requested`；供应商调用迟到后在资产提交前再次校验取消标志、Question source version 和当前 profile revision，旧结果只记为 superseded，不覆盖新语音。页面配置弹窗明确提示会停止旧任务；整库和单题人工重试都增加 spinner、禁用与严格防双击；活动构建自动刷新进度。
+- 验证命令与结果：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest -q` 为 `235 passed, 5 skipped`；`cd app/web && npm test -- --run` 为 `37 passed`；`npm run build` 成功生成 `index-Cvf-GtxJ.js/index-FhSZ_GOI.css`；`git diff --check` 通过。新增后端回归覆盖“旧通用 version + 当前 profile revision”切换成功、旧 running 工作收到取消、旧构建投影为 superseded、真实旧 profile revision 仍 409；前端回归覆盖整库/单题重试期间 spinner、disabled 和双击仅发一个请求。本机 API 已重启为 PID `10336`，`GET /healthz` 返回 ok，首页引用新 bundle；Celery 已重启并连接 Redis DB 2，dispatcher 返回 `dispatched: 0`。目标题库 `kb_a9f8e46e4bdf4d20` 当前为 speech profile revision 7、Qwen/Cherry，投影 `ready 10/10`、失败数 0。
+- 未完成事项或恢复说明：无代码未完成事项。首次 React 回归因编辑时多出一个 `};` 发生语法失败，删除后全量通过；一次新增后端断言误选了最后一条 HTTP 审计而不是目标领域审计，改为按 action 查找后通过；两次失败均仅发生在测试环境，无持久数据副作用。浏览器若仍缓存旧 bundle，需要强制刷新后再验证新交互。
+
+## 2026-08-31 · DURABLE-MODEL-RETRY-PROJECTION-001
+
+- 目标：修复模型调用发生可重试异常时，持久任务尚未耗尽却提前把领域对象和批量构建投影标记为终态失败的问题；确保修复依赖统一 Outbox 终态语义，而非绑定 Qwen、GLM 或某一模型类型。
+- 关联问题：题库 TTS 子任务首次失败后会被 Outbox 自动重试，但 Question 同时写入 `speech_status=failed` 并推进 version；下一次供应商调用即使成功，也会因 source version 过期被判为 `superseded`，形成 6/10 生成且无法自然恢复。构建投影还把仍可 claim 的 `failed` 工作误计为终态失败。
+- 状态：`verified（仓库与本机运行投影）`。
+- 计划修改：以 Outbox 返回的 `dead_letter` 作为领域失败唯一判据；可重试 `failed` 保持领域对象生成态，并在构建投影中归入 pending/retrying；修正题目行级展示与试听能力；审计其他模型驱动任务是否存在相同的提前终态写入；补后端/前端回归、生产 bundle 和相关设计文档。
+- 实际修改文件：`app/services/{catalog,interviews,knowledge_base_speech,talent}.py`、`app/web/src/features/questions/Page.jsx`、`app/web/src/App.test.jsx`、`tests/test_{knowledge_base_speech,interview_session_aggregate}.py`、重建后的 `app/web/dist/index.html` 与 `app/web/dist/bundles/index-kBIiQffi.js`、`docs/{architecture,api-design,domain-model,database-and-vector-storage,known-issues-and-remediation,development-progress,implementation-roadmap}.md`、本日志。
+- 实际实现与诊断：持久 SQLite 显示 revision 5 的 10 个 Qwen TTS 子工作中，4 个首轮错误为 `Provider rate limited the request.`，Outbox 正确启动第 2 次 attempt；旧代码却先把这 4 道 Question 写成 failed 并把 version 9 推进到 10，导致成功重试被 source-version guard 判为 superseded，最终稳定为 6 ready / 4 failed。现在仅 `dead_letter` 可推进领域失败；可重试 `failed` 在 SpeechBuild 计为 pending，TTS 不修改 source Question，题库导入、Resume Review/经历题、评分和报告同步使用该终态门禁。整库人工重试以当前 build manifest 与 Question failed 真相交集选题，因此能恢复旧 worker 已误标 completed/superseded 的 4 条历史数据。React 以 KnowledgeBase 终态显示整库重试入口，构建期间不再禁用已 ready 题目的试听。
+- 验证命令与结果：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest -q` 为 `234 passed, 5 skipped`；`cd app/web && npm test -- --run` 为 `37 passed`；`npm run build` 成功生成 `index-kBIiQffi.js/index-cXhBMl4B.css`；`git diff --check` 通过。新增故障注入回归验证任意 Provider 的 retryable TTS 首次失败后 Question version/source_version 保持一致，第 2 次 attempt 产生 ready 资产且不是 superseded；另有回归验证历史 self-superseded 子工作可新建重试批次。本机重启 API 为 PID `5799`，`GET /healthz` 返回 ok，首页已引用 `index-kBIiQffi.js`，当前 revision 5 投影为 `6 ready / 4 superseded`而不再假装运行中，KnowledgeBase 仍如实保留 `4 failed` 供页面显示恢复按钮。旧 Celery 主进程 PID `2781` 已优雅停止，新 worker/beat 主进程 PID `6585` 以 prefork concurrency 10 连接 Redis DB 2，连续 dispatcher 均返回 `dispatched: 0`，确认未隐式触发任何外部模型任务。
+- 未完成事项或恢复说明：未自动提交用户现有 4 条失败语音的真实 Qwen 重生成，避免未经用户点击就消耗外部模型额度；页面硬刷新后可点击“重试失败语音”只排队这 4 道。首次前端测试在仓库根目录执行因无 `package.json` 返回 ENOENT，一次定向 pytest 引用不存在的 `test_mvp_closed_loop.py` 而未运行；两者均无文件/数据副作用，在正确目录/测试集重跑后全部通过。
+
+## 2026-08-31 · MODEL-AGNOSTIC-CONCURRENCY-001
+
+- 目标：把模型任务的版本冲突防护从题库 TTS 个案提升为供应商无关、模型类型无关的统一并发合同，覆盖 LLM、Embedding、STT、TTS、实时语音和数字人配置，以及当前有人工命令的模型驱动异步工作流。
+- 关联问题：模型/连接探针和后台模型工作会合法推进 ModelConfiguration、ProviderConnection、QuestionGenerationBatch、ResumeReview、Question 等聚合 version；页面弹窗或确认框若长期持有旧 version，会产生与具体供应商无关的 `PERSISTENCE_CONFLICT`。部分命令已有幂等回放优先检查，但前端获取最新 version 和语义变更 guard 仍散落在业务页面。
+- 状态：`verified（仓库）`。
+- 计划修改：增加通用 latest-version command helper；模型连接/所有模型类型配置的编辑删除、智能生题控制/审核/导入、简历初筛重试和题库语音命令统一采用最新资源 version，并在语义身份变化时失败关闭；审计服务端人工重试是否在 version 校验前识别同一幂等命令；补跨模型类型回归、文档和生产 bundle。
+- 实际修改文件：`app/web/core/{concurrency.js,concurrency.test.js}`、`app/services/{model_admin,talent,catalog,knowledge_base_speech}.py`、`app/api/routers/talent.py`、`app/web/src/features/{models,questions,workflow}/Page.jsx`、`app/web/src/App.test.jsx`、重建后的 `app/web/dist/index.html` 与 `app/web/dist/bundles/index-z_CNemdA.js`、`tests/test_{model_configuration_v2,candidate_screening,documented_gap_apis,knowledge_base_speech}.py`、`docs/{architecture,api-design,domain-model,model-provider-plugins,database-and-vector-storage,development-progress,implementation-roadmap}.md`、本日志。
+- 实际实现与审计：新增供应商/能力无关的 `requestWithLatestVersion`，统一执行“重读最新资源 → 比较命令相关语义身份 → 用最新 version 提交 → 极窄 CAS 冲突再重读一次”。ProviderConnection/ModelConfiguration 增加 `configuration_revision`，配置修改递增，凭据/模型健康探针只推进通用 version；管理页的连接/模型编辑和删除因此覆盖全部当前可执行 `llm/embedding/stt/tts/realtime_speech/avatar` 类型，而非 Qwen/GLM 特例。智能生题 stop/resume/retry/chunk、草稿编辑/删除/单题及整批导入按 execution/draft 身份吸收后台 LLM 进度 version；题目、候选人、简历、初筛复核/重试按各自内容身份处理后台 TTS/摄取/LLM 写入。服务端人工恢复审计确认 QuestionGenerationBatch 已在 version 前检查控制幂等；补齐 KnowledgeBaseSpeechBuild、Question speech regenerate 和 ResumeReview retry，相同命令返回原工作，不同旧命令继续失败关闭。
+- 验证命令与结果：`PYTHONPYCACHEPREFIX=/tmp/interviewer-pycache .venv/bin/python -m compileall -q app tests` 通过；`.venv/bin/pytest -q` 为 `232 passed, 5 skipped`；`cd app/web && npm test -- --run` 为 `36 passed`；`npm run build` 通过并生成 `index-z_CNemdA.js/index-cXhBMl4B.css`；`git diff --check` 通过。参数化后端回归逐一执行 LLM、Embedding、batch STT、TTS、数字人和 realtime speech 探针，均验证通用 version 增加但 `configuration_revision` 保持 1，配置 PATCH 后才变为 2；前端单元回归覆盖运行态 version 吸收、读写间单次重试和配置语义变化失败关闭，React 集成回归验证连接探针从 version 3 推进到 5 后删除提交 version 5。
+- 未完成事项或恢复说明：仓库内无未完成项；未对真实外部供应商发起调用，额度、网络、音质、WER 和数字人会话仍属部署环境验收。首次在仓库根目录串接 npm 命令因无 `package.json` 返回 ENOENT，无文件副作用；切换 `app/web` 后全量通过。本合同覆盖当前 API/React 中存在人工 CAS 命令的模型驱动流程；未来新增聚合命令必须复用该 helper 与“幂等回放先于 version 校验”合同。
+
+## 2026-08-31 · KB-SPEECH-CONFLICT-RETRY-001
+
+- 目标：修复题库语音配置弹窗因后台语音构建推进 KnowledgeBase version 而提交陈旧 `expected_version` 的冲突，并让整库/单题语音生成失败后可从题库详情真正重新排队生成。
+- 关联问题：用户选择 Qwen TTS 时请求携带 version 54，而持久题库已由后台进度更新到 56；已有失败重试会复用 `question.speech:{question}:{version}:{profile_revision}` 幂等键，可能再次得到原 failed/dead-letter 工作项而没有新的可执行任务，React 题库页也没有暴露现有整库或单题重试 API。
+- 状态：`verified（仓库）`。
+- 计划修改：配置提交前重新读取 KnowledgeBase，仅在 speech profile 未发生并发语义变更时采用最新 version；极窄竞态最多重新校验并重试一次。整库失败重试创建新的工作身份，单题失败暴露既有重新生成命令，补充失败项投影与 React 重试入口；更新 API/领域/存储/进度文档、自动化测试和生产 bundle。
+- 实际修改文件：`app/services/knowledge_base_speech.py`、`app/web/src/features/questions/Page.jsx`、重建后的 `app/web/dist/index.html` 与 `app/web/dist/bundles/index-B7aTUrcS.js`、`tests/test_knowledge_base_speech.py`、`app/web/src/App.test.jsx`、`docs/{api-design,domain-model,database-and-vector-storage,development-progress,implementation-roadmap}.md`、本日志。
+- 实际实现与诊断：持久 SQLite 事实显示 Qwen profile revision 3 已保存，10 个题目语音子工作最终全部 completed；报错请求仍携带页面旧 version 54，而后台构建已把 KnowledgeBase 推进到 56，因此该次失败是 CAS 防覆盖生效，不是 Qwen/Cherry 被 Provider 拒绝。React 保存前重读题库，只在 profile 语义身份未变时吸收新 version，极窄竞态按相同 guard 重试一次；真正并发修改 profile 时刷新并要求确认。SpeechBuild 投影返回 `failed_items`，题库/题目分别提供失败重试按钮；整库重试使用当前 failed Question version，并以 retry parent 区分新子工作，避免旧 source version 被 guard 跳过或复用 dead-letter 幂等项。
+- 验证命令与结果：`PYTHONPYCACHEPREFIX=/tmp/interviewer-pycache .venv/bin/python -m compileall -q app tests` 通过；`.venv/bin/pytest -q` 为 `225 passed, 5 skipped`；`cd app/web && npm test -- --run` 为 `34 passed`；`npm run build` 通过并生成 `index-B7aTUrcS.js/index-cXhBMl4B.css`；`git diff --check` 通过。新增后端回归验证失败落库推进 Question version 后，重试 manifest 使用当前 version、新 child 使用 `question.speech.retry:*` 且最终 ready；React 回归验证页面 version 54、后台 version 56 时提交 56，以及整库/单题失败重试请求。首次在仓库根目录执行 npm 测试因无 `package.json` 返回 ENOENT，无文件副作用；切换 `app/web` 后通过。
+- 未完成事项或恢复说明：仓库内无未完成项；本次未调用真实 Qwen/GLM TTS，也未启动本地 8000 服务。目标部署仍需用真实凭据验证音频质量、限流和网络稳定性；这些外部验收不改变本次 CAS/重试根因与仓库修复。
+
+## 2026-08-31 · APPOINTMENT-DEFERRED-RESUME-SPEECH-001
+
+- 目标：统一岗位题与简历经历题的读题语音特征；简历题批准时不再调用 TTS，改为计划冻结所选题库的唯一语音特征，候选人完成身份核验和明确同意、预约进入 `registered` 后才异步生成本场简历题语音。
+- 关联问题：ExperienceQuestion 当前使用 `voice_default_cn` 和组织默认 TTS 路由，不能保证与题库 KnowledgeBaseSpeechProfile 一致；批准即生成会为拒绝邀请或不参加面试的候选人产生无效成本。现有邀请与开始共用语音 readiness，若只移动调用时机会造成邀请前等待尚未触发的语音任务。
+- 状态：`verified（仓库）`。
+- 计划修改：为 InterviewPlan 冻结单一语音特征并拒绝多题库 profile 冲突；ExperienceQuestion 批准后进入延迟生成状态；CandidateIntake 成功时原子创建预约范围语音工作，复用匹配资产；拆分 `can_invite/can_start` 门禁并在取消预约时协作取消未完成工作；会话只消费预约准备完成的冻结资产。同步后端/前端测试及架构、接口、领域、检索、Provider、存储、进度、路线图和统一语言文档。
+- 实际修改文件：`app/domain/{speech_profile,appointment_speech,appointment_admission}.py`、`app/services/{plan_assembly,talent,appointments,catalog,interviews}.py`、`app/web/src/core/ui.jsx`、`app/web/src/features/{workflow,candidate}/Page.jsx`、重建后的 `app/web/dist/index.html` 与 bundle、`tests/test_{plan_assembly,appointment_reminders,candidate_screening,position_resume_appointment_flow}.py`、`CONTEXT.md`、`docs/{architecture,api-design,domain-model,retrieval-and-evaluation,model-provider-plugins,database-and-vector-storage,development-progress,implementation-roadmap}.md`、本日志。
+- 实际实现：ExperienceQuestion 新建为 `not_requested`、批准为 `deferred`，不再保存默认音色或在批准请求中调用 TTS。InterviewPlan 冻结包含题库 revision 映射的唯一 speech profile 指纹并拒绝多题库冲突；Candidate Intake 成功事务创建预约级幂等语音工作，worker 只更新 `InterviewAppointment.speech_preparation`，按完整 profile 复用资产且不覆盖 ExperienceQuestion。邀请/start readiness 分离，取消预约协作取消工作；会话创建只接受预约 ready 资产并冻结 profile/preparation 证据。React 同步展示“预约后生成”和确认后的语音准备提示。
+- 验证命令与结果：`PYTHONPYCACHEPREFIX=/tmp/interviewer-pycache .venv/bin/python -m compileall -q app tests` 通过；`.venv/bin/pytest -q` 为 `224 passed, 5 skipped`；`cd app/web && npm test -- --run` 为 `33 passed`；`npm run build` 通过并生成 `index-VnSd0Y0L.js/index-cXhBMl4B.css`；`git diff --check` 通过。端到端测试验证确认前无简历题 TTS、确认后 queued、完成前禁止 start、完成后资产的模型/version/音色/语言/格式/语速/题库 revision 指纹与计划一致，且会话快照引用预约资产。
+- 未完成事项或恢复说明：无仓库内未完成项；本次未执行数据迁移或真实外部 TTS 调用。真实供应商费用、延迟、失败率和目标部署 worker 调度仍按既有生产环境验收边界执行。
+
 ## 2026-08-31 · MODEL-STREAM-PROBE-001
 
 - 目标：修复 DashScope `stt.streaming` 模型配置测试把静音样本误判为模型故障，以及 `speech.dialogue_realtime` 缺少统一测试协议的问题；同步校正 Qwen 3.5 Omni Realtime 当前官方 session 事件结构。

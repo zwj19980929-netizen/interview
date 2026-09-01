@@ -111,7 +111,9 @@ FileObject 才可试听；开发 mock 即使流程状态完成，也必须投影
 | `failed_items` | 题目 ID、统一错误码和可重试标记，不含题干正文 |
 | `created_at/updated_at` | 服务端时间 |
 
-父工作项只负责冻结清单、分批 fan-out 和进度聚合；每道题拥有独立幂等子工作项。切换配置后未完成的旧 build 标记为 `superseded`，其结果不能把当前题库或 Question 标为 ready。
+父工作项只负责冻结清单、分批 fan-out 和进度聚合；每道题拥有独立幂等子工作项。DurableWorkItem 的 `failed` 是仍可自动领取的重试等待态，构建投影把它计入 `pending`，且不得修改 Question 或推进其 version；只有 `dead_letter` 才把 Question 更新为 `speech_status=failed` 并进入 `failed_items`。人工重试必须重新读取当前终态失败题目的 version，并创建区别于原 dead-letter 子工作的重试身份；旧 `source_version` 只保留为失败事实，不能作为新清单。切换配置后未完成的旧 build 标记为 `superseded`，其结果不能把当前题库或 Question 标为 ready。
+
+语音配置命令的语义 CAS 是 `expected_speech_profile_revision`，通用 KnowledgeBase `expected_version` 仍用于旧客户端与完整聚合保护。若只是旧语音子工作更新了进度/version，新 profile 可原子吸收；若 profile revision 已变则拒绝覆盖。新 revision 提交时，旧 revision 的 pending/failed 工作立即 cancelled，running 工作记录 `cancel_requested`；已到达供应商的请求可能无法物理中断，但其迟到结果在资产落库前再次校验 profile revision/cancel request，只能以 `superseded` 结束。
 
 ### Question
 
@@ -131,7 +133,7 @@ FileObject 才可试听；开发 mock 即使流程状态完成，也必须投影
 | `type` | `open_ended`、`coding_discussion`、`scenario`、`behavioral` |
 | `status` | `draft`、`active`、`archived` |
 | `validation_status` | `pending`、`valid`、`failed`；决定能否进入结构化候选池 |
-| `speech_status` | `pending`、`ready`、`failed` |
+| `speech_status` | `not_requested`、`deferred`；旧的全局 `pending/ready/failed` 仅作兼容读取，不用于新预约资产归属 |
 | `created_by` | 创建人 |
 | `updated_at` | 更新时间 |
 
@@ -311,7 +313,7 @@ PDF 原件扫描为 clean 后存为一个 FileObject；解析文本使用另一�
 | `model_info` | 模型、prompt 版本和 invocation ID |
 | `created_at` | 创建时间 |
 
-同一 `(resume_document_id, job_position_id, role_requirement_version, prompt_version)` 可幂等复用。输入变更产生新审阅，旧结果不覆盖。模型生成分数和解释，CandidateScreening 领域策略在写入前按 `candidate_screening_score.v1` 强制把分数映射为建议；模型给出的枚举与分数冲突时以分数带为准，不能把一致性责任留给 Provider。人工复核是带 `expected_version` 的领域命令，只改变生效结论与留存期限，AI 分数、按策略归一化的建议和证据必须保持不变并写入审计。失败恢复也是 ResumeReview 领域命令：仅允许 `failed + (failed|dead_letter work)` 迁移回 `queued + pending`，要求源简历仍 ready、岗位配置仍存在，重置本轮进度/attempt 但保留 replay 历史和 `resume.review.retried` 审计；运行中、已完成或 version 过期的请求必须拒绝。
+同一 `(resume_document_id, job_position_id, role_requirement_version, prompt_version)` 可幂等复用。输入变更产生新审阅，旧结果不覆盖。模型生成分数和解释，CandidateScreening 领域策略在写入前按 `candidate_screening_score.v1` 强制把分数映射为建议；模型给出的枚举与分数冲突时以分数带为准，不能把一致性责任留给 Provider。人工复核是带 `expected_version` 的领域命令，只改变生效结论与留存期限，AI 分数、按策略归一化的建议和证据必须保持不变并写入审计。失败恢复也是 ResumeReview 领域命令：仅允许 `failed + (failed|dead_letter work)` 迁移回 `queued + pending`，要求源简历仍 ready、岗位配置仍存在，重置本轮进度/attempt 但保留 replay 历史和 `resume.review.retried` 审计；同一 `Idempotency-Key` 在 version 校验前返回原 replay，新的命令若使用过期 version 仍拒绝。
 
 `ResumeEvidenceChunk` 是 ResumeReview implementation 内部证据单元，不是独立候选人结论。每个分块覆盖连续来源页且不超过配置输入预算；分块只允许返回项目/技能证据和告警。全部分块成功并完成必要压缩后，最终 Reduce 才能写入 CandidateScreening。任何分块失败、聚合预算仍超限或 Schema 校验失败都使审阅失败，不能用部分证据生成 `unqualified`。
 
@@ -343,6 +345,8 @@ PDF 原件扫描为 clean 后存为一个 FileObject；解析文本使用另一�
 AI 和人工创建内容都默认为 `draft`，未经面试官批准不得进入正式计划。只有 ResumeReview 的生效初筛结论为 `qualified` 才能生成、创建、显示、修改和组卷；AI 不符合/待复核不生成，人工改判符合时排入独立生成工作。每道题必须绑定 1–3 个同一审阅的证据快照，题干必须点名至少一个所选证据标签；无证据或与简历无关的旧题失败关闭。人工创建必须绑定同一候选人的已完成
 ResumeReview，使简历版本、岗位和证据上下文可追溯。`archived` 只从活动个人题库和新计划隐藏该题，不能改写已批准
 InterviewPlan 的经历题快照或历史 InterviewQuestionSnapshot。
+
+批准 ExperienceQuestion 只表示内容与证据可用于计划，不代表已有读题资产。新计划把该题的 ID/version、题干和评分依据冻结，并清空全局 `speech_asset_id`；实际语音属于 `InterviewAppointment.speech_preparation`，候选人确认预约后才按计划冻结的 speech profile 生成。
 
 ### RoleRequirement
 
@@ -378,6 +382,8 @@ InterviewPlan 的经历题快照或历史 InterviewQuestionSnapshot。
 | `bank_slots` | 岗位题库抽题槽位和约束 |
 | `question_candidate_pools` | 每个槽位按结构化字段冻结的 Question ID/version 集合及哈希 |
 | `experience_question_ids` | 已批准的经历问题，按执行顺序排列 |
+| `experience_question_snapshots` | 经历题 ID/version、题干、证据和评分依据；语音状态固定为 `deferred`，不绑定全局资产 |
+| `speech_profile_snapshot` | 所选题库共同的 TTS ModelConfiguration ID/version、音色、语言、格式、语速、题库 revision 映射和稳定指纹 |
 | `selection_policy` | 覆盖、去重、难度、随机种子和补位策略 |
 | `assembly_summary` | 候选池规模、覆盖、告警和选择解释 |
 | `created_by` | 创建人 |
@@ -402,7 +408,7 @@ Plan Assembly 支持两种显式命令语义：API 客户端可以先产生 `dra
 ]
 ```
 
-计划批准时形成每个槽位的 `QuestionCandidatePool`，冻结题库版本、筛选条件、可选题目 ID/version 清单及哈希，而不是提前固定所有岗位题目。面试时 `QuestionSelection` 在该候选池内按会话随机种子选题；经历问题固定排在岗位题库阶段之后。候选池、简历审阅、题目语音或经历问题未就绪时不能批准。
+计划批准时形成每个槽位的 `QuestionCandidatePool`，冻结题库版本、筛选条件、可选题目 ID/version 清单及哈希，而不是提前固定所有岗位题目。面试时 `QuestionSelection` 在该候选池内按会话随机种子选题；经历问题固定排在岗位题库阶段之后。岗位题语音必须 ready；经历题只要求批准和证据有效。多个题库的语音输出参数不一致时拒绝计划装配。
 
 ### InterviewAppointment
 
@@ -423,12 +429,13 @@ Plan Assembly 支持两种显式命令语义：API 客户端可以先产生 `dra
 | `invitation_token_hash` | 一次性邀请 token 哈希 |
 | `invitation_expires_at` | 邀请过期时间 |
 | `email_reminder` | `{status, scheduled_for, work_item_id, sent_at, last_error_code}`；内部投影可追踪持久提醒，公开投影不得返回工作项 ID/错误细节 |
+| `speech_preparation` | 本预约经历题语音准备聚合：冻结 profile 指纹、总数/就绪数/失败数、请求时间和每题 source version、状态、asset/work ID |
 | `settings` | 冻结 `{record_audio, record_video, avatar_mode, speech_dialogue_mode, avatar_id, voice_profile_id, language}`；`avatar_mode` 只允许 `local/cloud`，`speech_dialogue_mode` 只允许 `cascade/s2s` |
 | `admission_policy` | 冻结的提前/延后宽限、设备检查有效期和服务端 readiness 要求 |
 | `readiness_facts` | 最近一次浏览器、麦克风和音频格式检查结果、服务端检查时间及失效时间 |
 | `created_by` | 创建人 |
 
-只有计划、题库、经历问题语音和生产 STT 路由通过 readiness gate 后才能从 `scheduled` 进入 `invited`。token 只能被一次候选人登记消费，可撤销、不可明文持久化。`registered` 表示候选人身份与同意已核验、预约已确认；该事务同时幂等创建面试前 30 分钟的 `appointment.reminder.email` 工作项，但不得自动设备检查或 start。邀请过期和预约 start 窗口是两个独立条件；默认允许开始的窗口为 `[scheduled_start_at, scheduled_end_at]`，任何宽限都必须显式冻结在 `admission_policy` 中。
+邀请要求计划、题库、岗位题语音、冻结 speech profile 和生产依赖可用，不等待经历题语音。token 只能被一次候选人登记消费，可撤销、不可明文持久化。`registered` 表示候选人身份与同意已核验、预约已确认；该事务同时幂等创建面试前 30 分钟的提醒和预约级经历题 TTS 工作，但不得自动设备检查或 start。全部预约语音 ready 且与题目版本/profile 匹配后 `can_start` 才为真；取消预约会协作取消未完成工作。邀请过期和预约 start 窗口是两个独立条件。
 
 新建预约默认 `avatar_mode=local`，显式选择 `cloud` 才创建供应商实时会话。历史预约/会话没有该字段时按 `cloud` 解释。Appointment start 把完整 settings 冻结到 InterviewSession；会话开始后不能通过前端临时切换模式，以免改变费用、媒体授权和审计语义。
 
@@ -668,7 +675,7 @@ Plan Assembly 支持两种显式命令语义：API 客户端可以先产生 `dra
 
 ### ProviderConnection、ModelConfiguration、ModelRoute 与 ModelInvocationLog
 
-`ProviderPluginDefinition` 是安装期声明，不是租户聚合：它定义厂商连接表单、凭证表单、模型类型、模型目录、模型配置表单和 runtime entrypoint。`ProviderConnection` 保存组织级连接参数与 `credential_ref`，不选择具体模型；未发送 credentials 表示保留现有密钥。`ModelConfiguration` 属于一个 ProviderConnection，保存 `model_type`、`provider_model_id`、厂商专属 `settings`、统一 `default_parameters`、支持能力及健康状态。两者更新和删除都携带 `expected_version`。
+`ProviderPluginDefinition` 是安装期声明，不是租户聚合：它定义厂商连接表单、凭证表单、模型类型、模型目录、模型配置表单和 runtime entrypoint。`ProviderConnection` 保存组织级连接参数与 `credential_ref`，不选择具体模型；未发送 credentials 表示保留现有密钥。`ModelConfiguration` 属于一个 ProviderConnection，保存 `model_type`、`provider_model_id`、厂商专属 `settings`、统一 `default_parameters`、支持能力及健康状态。两者更新和删除都携带 `expected_version`，并额外维护 `configuration_revision` 区分配置语义变化与探针健康事实；探针不得增加该 revision。
 
 ProviderConnection 是其 ModelConfiguration 生命周期的所有者：删除连接会在同一事务删除凭证、全部子模型和引用这些模型的 ModelRoute/断路器状态。单独删除 ModelConfiguration 只终止该模型及其引用路由，不删除 ProviderConnection 或同连接下其他模型。历史 ModelInvocationLog 是脱敏、追加式审计事实，不随配置删除。
 

@@ -2,7 +2,7 @@
   "schema_version": "2",
   "provider_id": "dashscope",
   "display_name": "阿里云百炼（千问 / Qwen）",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "capabilities": ["llm.chat_json", "llm.chat_text", "embedding.text", "speech.dialogue_realtime", "stt.streaming", "stt.batch", "tts.synthesize"],
   "model_selection": "customizable",
   "defaults": {
@@ -85,14 +85,97 @@
   "models": [
     {
       "model_id": "qwen-plus",
-      "label": "通义千问 Plus",
+      "label": "千问 Plus（官方模型 ID）",
       "capabilities": ["llm.chat_json", "llm.chat_text"],
       "default": true
     },
     {
       "model_id": "qwen3.8-max",
-      "label": "通义千问 3.8 Max",
+      "label": "千问 3.8 Max（旗舰）",
       "capabilities": ["llm.chat_json", "llm.chat_text"]
+    },
+    {
+      "model_id": "qwen3.8-flash",
+      "label": "千问 3.8 Flash（高性价比）",
+      "capabilities": ["llm.chat_json", "llm.chat_text"]
+    },
+    {
+      "model_id": "qwen3.7-plus",
+      "label": "千问 3.7 Plus（均衡推荐）",
+      "capabilities": ["llm.chat_json", "llm.chat_text"]
+    },
+    {
+      "model_id": "qwen3.7-flash",
+      "label": "千问 3.7 Flash（低成本）",
+      "capabilities": ["llm.chat_json", "llm.chat_text"]
+    },
+    {
+      "model_id": "qwen-flash",
+      "label": "千问 Flash（稳定别名）",
+      "capabilities": ["llm.chat_json", "llm.chat_text"]
+    },
+    {
+      "model_id": "qwen-turbo",
+      "label": "千问 Turbo（常用兼容）",
+      "capabilities": ["llm.chat_json", "llm.chat_text"]
+    },
+    {
+      "model_id": "qwen-long",
+      "label": "千问 Long（超长文本）",
+      "capabilities": ["llm.chat_json", "llm.chat_text"]
+    },
+    {
+      "model_id": "qwen3-coder-plus",
+      "label": "千问 3 Coder Plus（代码）",
+      "capabilities": ["llm.chat_json", "llm.chat_text"]
+    },
+    {
+      "model_id": "deepseek-v4-pro",
+      "label": "DeepSeek V4 Pro（百炼托管）",
+      "capabilities": ["llm.chat_json", "llm.chat_text"],
+      "configuration_form": {"fields": [
+        {"name": "structured_output_mode", "label": "结构化输出模式", "control": "select", "required": false, "default": "prompt", "options": [{"label": "Prompt 约束 + Schema 校验", "value": "prompt"}, {"label": "JSON Object", "value": "json_object"}]}
+      ]}
+    },
+    {
+      "model_id": "deepseek-v4-flash",
+      "label": "DeepSeek V4 Flash（百炼托管）",
+      "capabilities": ["llm.chat_json", "llm.chat_text"],
+      "configuration_form": {"fields": [
+        {"name": "structured_output_mode", "label": "结构化输出模式", "control": "select", "required": false, "default": "prompt", "options": [{"label": "Prompt 约束 + Schema 校验", "value": "prompt"}, {"label": "JSON Object", "value": "json_object"}]}
+      ]}
+    },
+    {
+      "model_id": "glm-5.2",
+      "label": "GLM-5.2（百炼托管）",
+      "capabilities": ["llm.chat_json", "llm.chat_text"],
+      "configuration_form": {"fields": [
+        {"name": "structured_output_mode", "label": "结构化输出模式", "control": "select", "required": false, "default": "prompt", "options": [{"label": "Prompt 约束 + Schema 校验", "value": "prompt"}, {"label": "JSON Object", "value": "json_object"}]}
+      ]}
+    },
+    {
+      "model_id": "kimi-k2.7-code",
+      "label": "Kimi K2.7 Code（百炼托管）",
+      "capabilities": ["llm.chat_json", "llm.chat_text"],
+      "configuration_form": {"fields": [
+        {"name": "structured_output_mode", "label": "结构化输出模式", "control": "select", "required": false, "default": "prompt", "options": [{"label": "Prompt 约束 + Schema 校验", "value": "prompt"}, {"label": "JSON Object", "value": "json_object"}]}
+      ]}
+    },
+    {
+      "model_id": "MiniMax-M3",
+      "label": "MiniMax M3（百炼托管）",
+      "capabilities": ["llm.chat_json", "llm.chat_text"],
+      "configuration_form": {"fields": [
+        {"name": "structured_output_mode", "label": "结构化输出模式", "control": "select", "required": false, "default": "prompt", "options": [{"label": "Prompt 约束 + Schema 校验", "value": "prompt"}, {"label": "JSON Object", "value": "json_object"}]}
+      ]}
+    },
+    {
+      "model_id": "mimo-v2.5-pro",
+      "label": "MiMo V2.5 Pro（百炼托管）",
+      "capabilities": ["llm.chat_json", "llm.chat_text"],
+      "configuration_form": {"fields": [
+        {"name": "structured_output_mode", "label": "结构化输出模式", "control": "select", "required": false, "default": "prompt", "options": [{"label": "Prompt 约束 + Schema 校验", "value": "prompt"}, {"label": "JSON Object", "value": "json_object"}]}
+      ]}
     },
     {
       "model_id": "text-embedding-v4",

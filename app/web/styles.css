@@ -2889,6 +2889,24 @@ body.candidate-mode .content {
   animation: spin 700ms linear infinite;
 }
 
+.button-with-spinner,
+.speech-build-progress {
+  align-items: center;
+  gap: 7px;
+}
+
+.button-with-spinner .spinner,
+.speech-build-progress > .spinner {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+}
+
+.button-primary.button-with-spinner .spinner {
+  border-color: rgb(255 255 255 / 45%);
+  border-top-color: #fff;
+}
+
 .mobile-backdrop {
   display: none;
 }

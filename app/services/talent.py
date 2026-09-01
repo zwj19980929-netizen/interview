@@ -259,8 +259,16 @@ class TalentService:
             retryable = exc.retryable if isinstance(exc, ProviderError) else False
             with self.persistence.transaction(organization_id) as transaction:
                 current = transaction.resume_reviews.get(review["id"])
-                current["status"] = "failed"
-                current["processing_stage"] = "failed"
+                failed = transaction.outbox.fail(
+                    work_item_id,
+                    str(exc),
+                    lease_token=work["lease_token"],
+                    error_code=error_code,
+                    retryable=retryable,
+                )
+                terminal = failed.get("status") == "dead_letter"
+                current["status"] = "failed" if terminal else "processing"
+                current["processing_stage"] = "failed" if terminal else "retrying"
                 current["error"] = {
                     "code": error_code,
                     "message": str(exc)[:500],
@@ -268,13 +276,6 @@ class TalentService:
                 }
                 current["updated_at"] = utc_now()
                 transaction.resume_reviews.update(current, expected_version=current["version"])
-                transaction.outbox.fail(
-                    work_item_id,
-                    str(exc),
-                    lease_token=work["lease_token"],
-                    error_code=error_code,
-                    retryable=retryable,
-                )
             raise
         data = result.data
         with self.persistence.transaction(organization_id) as transaction:
@@ -390,9 +391,17 @@ class TalentService:
             )
             retryable = exc.retryable if isinstance(exc, ProviderError) else False
             with self.persistence.transaction(organization_id) as transaction:
+                failed = transaction.outbox.fail(
+                    work_item_id,
+                    str(exc),
+                    lease_token=work["lease_token"],
+                    error_code=error_code,
+                    retryable=retryable,
+                )
+                terminal = failed.get("status") == "dead_letter"
                 current = transaction.resume_reviews.get(review["id"])
                 if current is not None:
-                    current["question_generation_status"] = "failed"
+                    current["question_generation_status"] = "failed" if terminal else "retrying"
                     current["question_generation_error"] = {
                         "code": error_code,
                         "message": str(exc)[:500],
@@ -400,13 +409,6 @@ class TalentService:
                     }
                     current["updated_at"] = utc_now()
                     transaction.resume_reviews.update(current, expected_version=current["version"])
-                transaction.outbox.fail(
-                    work_item_id,
-                    str(exc),
-                    lease_token=work["lease_token"],
-                    error_code=error_code,
-                    retryable=retryable,
-                )
             raise
 
         with self.persistence.transaction(organization_id) as transaction:
@@ -479,14 +481,24 @@ class TalentService:
         review_id: str,
         payload: Dict[str, Any],
         *,
+        idempotency_key: str,
         actor_id: str,
         organization_id: str = "org_default",
     ) -> Dict[str, Any]:
+        if not idempotency_key.strip():
+            raise ApiError(
+                "IDEMPOTENCY_KEY_REQUIRED",
+                "Resume review retries require an Idempotency-Key header.",
+            )
         expected_version = int(payload["expected_version"])
         reason = str(payload.get("reason") or "interviewer_requested_retry").strip()
         with self.persistence.transaction(organization_id) as transaction:
             review = transaction.resume_reviews.get(review_id)
             self._required(review, "RESUME_REVIEW_NOT_FOUND", "Resume review does not exist.")
+            if review.get("last_retry_idempotency_key") == idempotency_key:
+                replayed = transaction.outbox.get(review.get("last_retry_work_item_id"))
+                if replayed is not None:
+                    return {"review": review, "job": self._public_work(replayed)}
             if int(review.get("version", 1)) != expected_version:
                 raise ApiError(
                     "RESUME_REVIEW_VERSION_CONFLICT",
@@ -532,6 +544,8 @@ class TalentService:
                     "processing_progress": {"completed_chunks": 0, "total_chunks": None},
                     "processing_strategy": None,
                     "error": None,
+                    "last_retry_idempotency_key": idempotency_key,
+                    "last_retry_work_item_id": work["id"],
                     "updated_at": now,
                 }
             )
@@ -712,10 +726,10 @@ class TalentService:
                     "rubric": deepcopy(payload.get("rubric") or self._default_experience_rubric()),
                     "evidence_refs": evidence_refs,
                     "status": "draft",
-                    "speech_status": "pending",
+                    "speech_status": "not_requested",
                     "speech_asset_id": None,
                     "language": "zh-CN",
-                    "voice_profile_id": "voice_default_cn",
+                    "voice_profile_id": None,
                     "created_by": actor_id,
                     "created_at": now,
                     "updated_at": now,
@@ -760,6 +774,8 @@ class TalentService:
                     "Resume questions can only be changed while the effective screening outcome is qualified.",
                     status_code=409,
                 )
+            original_status = question.get("status")
+            original_question_text = question.get("question_text")
             for field in ("question_text", "standard_answer"):
                 if field in payload and payload[field] is not None:
                     question[field] = str(payload[field]).strip()
@@ -780,8 +796,14 @@ class TalentService:
                 question_text=question["question_text"],
                 require_label_in_question=True,
             )
-            if question["status"] == "approved":
-                question["speech_status"] = "pending"
+            if question["status"] == "approved" and (
+                original_status != "approved" or question.get("question_text") != original_question_text
+            ):
+                question["speech_status"] = "deferred"
+                question["speech_asset_id"] = None
+                question["speech_error"] = None
+            elif question["status"] != "approved":
+                question["speech_status"] = "not_requested"
             question["updated_at"] = utc_now()
             question = transaction.experience_questions.update(question, expected_version=expected_version)
             transaction.audit_events.add(
@@ -796,18 +818,7 @@ class TalentService:
                     "created_at": question["updated_at"],
                 }
             )
-            if question["status"] != "approved":
-                return question
-            work = transaction.outbox.enqueue(
-                new_work_item(
-                    organization_id=organization_id,
-                    kind="question.speech.generate",
-                    aggregate_id=question["id"],
-                    idempotency_key="experience-question.speech:%s:%s" % (question["id"], question["version"]),
-                    payload={"owner_type": "experience_question", "owner_id": question["id"], "source_version": question["version"]},
-                )
-            )
-        return await self.catalog.process_speech_work(work["id"], organization_id)
+            return question
 
     def archive_experience_question(
         self,
@@ -832,6 +843,7 @@ class TalentService:
                 if (
                     work.get("aggregate_id") == question_id
                     and work.get("kind") == "question.speech.generate"
+                    and not work.get("payload", {}).get("appointment_id")
                     and work.get("status") not in {"completed", "cancelled"}
                 ):
                     transaction.outbox.cancel(
@@ -870,23 +882,36 @@ class TalentService:
                     "Only an approved experience question can regenerate speech.",
                     status_code=409,
                 )
-            question["speech_status"] = "pending"
-            question["updated_at"] = utc_now()
-            question = transaction.experience_questions.update(question, expected_version=expected_version)
-            work = transaction.outbox.enqueue(
-                new_work_item(
-                    organization_id=organization_id,
-                    kind="question.speech.generate",
-                    aggregate_id=question["id"],
-                    idempotency_key="experience-question.speech:%s:%s" % (question["id"], question["version"]),
-                    payload={
-                        "owner_type": "experience_question",
-                        "owner_id": question["id"],
-                        "source_version": question["version"],
-                    },
+            if int(question["version"]) != int(expected_version):
+                from app.persistence.errors import ConcurrencyConflict
+
+                raise ConcurrencyConflict(
+                    "ExperienceQuestion %s expected version %s, found %s"
+                    % (question_id, expected_version, question["version"])
                 )
-            )
-        return await self.catalog.process_speech_work(work["id"], organization_id)
+            works = [
+                item
+                for item in transaction.outbox.list()
+                if item.get("kind") == "question.speech.generate"
+                and item.get("aggregate_id") == question_id
+                and item.get("payload", {}).get("appointment_id")
+                and item.get("status") in {"failed", "dead_letter"}
+            ]
+            if not works:
+                raise ApiError(
+                    "EXPERIENCE_QUESTION_SPEECH_NOT_RETRYABLE",
+                    "Resume question speech is generated after a candidate confirms an appointment.",
+                    status_code=409,
+                )
+            replayed = [
+                transaction.outbox.replay(
+                    item["id"],
+                    reason="interviewer_requested_resume_speech_retry",
+                    actor_id="interviewer_local",
+                )
+                for item in works
+            ]
+            return {**question, "speech_retry_work_item_ids": [item["id"] for item in replayed]}
 
     def _load_resume_text(self, resume: Dict[str, Any], organization_id: str) -> str:
         file_object_id = resume.get("parsed_text_file_object_id")
@@ -1096,10 +1121,10 @@ class TalentService:
             "rubric": self._default_experience_rubric(),
             "evidence_refs": deepcopy(generated["evidence_refs"]),
             "status": "draft",
-            "speech_status": "pending",
+            "speech_status": "not_requested",
             "speech_asset_id": None,
             "language": "zh-CN",
-            "voice_profile_id": "voice_default_cn",
+            "voice_profile_id": None,
             "created_at": now,
             "updated_at": now,
         }

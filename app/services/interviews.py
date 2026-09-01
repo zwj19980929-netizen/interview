@@ -99,6 +99,7 @@ class InterviewService:
             readiness = self.admission.plan_readiness(
                 transaction,
                 plan,
+                appointment=appointment,
                 now=now_dt,
                 ttl_seconds=int(
                     appointment.get("admission_policy", {}).get(
@@ -154,6 +155,10 @@ class InterviewService:
             }
             turns: List[Dict[str, Any]] = []
             question_snapshots: List[Dict[str, Any]] = []
+            prepared_speech = {
+                (item.get("question_id"), int(item.get("source_version", 0))): item
+                for item in (appointment.get("speech_preparation") or {}).get("items", [])
+            }
             for blueprint in sorted(turn_blueprints, key=lambda item: item["order"]):
                 source_type = blueprint.get("source_type", "position_bank")
                 question = deepcopy(blueprint.get("frozen_question")) or (
@@ -167,6 +172,18 @@ class InterviewService:
                         "An approved plan refers to a question that no longer exists.",
                         status_code=409,
                     )
+                if source_type == "resume_experience":
+                    prepared = prepared_speech.get(
+                        (question["id"], int(question.get("version", 0)))
+                    )
+                    if not prepared or prepared.get("status") != "ready" or not prepared.get("asset_id"):
+                        raise ApiError(
+                            "APPOINTMENT_SPEECH_NOT_READY",
+                            "Resume question speech is not ready for this appointment.",
+                            status_code=409,
+                        )
+                    question["speech_asset_id"] = prepared["asset_id"]
+                    question["speech_status"] = "ready"
                 question_snapshot = self._question_snapshot(question, now, source_type=source_type)
                 snapshot_entry = deepcopy(blueprint)
                 snapshot_entry["question_snapshot_id"] = question_snapshot["id"]
@@ -217,6 +234,10 @@ class InterviewService:
                 "bank_slots": deepcopy(plan.get("bank_slots", [])),
                 "experience_question_ids": deepcopy(plan.get("experience_question_ids", [])),
                 "experience_question_snapshots": deepcopy(plan.get("experience_question_snapshots", [])),
+                "speech_profile_snapshot": deepcopy(plan.get("speech_profile_snapshot")),
+                "appointment_speech_preparation": deepcopy(
+                    appointment.get("speech_preparation")
+                ),
                 "question_selections": deepcopy(question_selections),
                 "created_at": now,
             }
@@ -919,21 +940,22 @@ class InterviewService:
             )
         except Exception as exc:
             with self.persistence.transaction(organization_id) as transaction:
-                session = self._required(transaction.interview_sessions.get(interview_id))
-                self._decide_and_persist(
-                    transaction,
-                    session,
-                    LifecycleCommand(
-                        LifecycleCommandType.EVALUATION_FAILED,
-                        {"answer_id": answer_id, "error": str(exc)},
-                    ),
-                    organization_id,
-                )
-                transaction.outbox.fail(
+                failed = transaction.outbox.fail(
                     work_item_id,
                     str(exc),
                     lease_token=running_work["lease_token"],
                 )
+                if failed.get("status") == "dead_letter":
+                    session = self._required(transaction.interview_sessions.get(interview_id))
+                    self._decide_and_persist(
+                        transaction,
+                        session,
+                        LifecycleCommand(
+                            LifecycleCommandType.EVALUATION_FAILED,
+                            {"answer_id": answer_id, "error": str(exc)},
+                        ),
+                        organization_id,
+                    )
             raise
 
         with self.persistence.transaction(organization_id) as transaction:
@@ -986,18 +1008,19 @@ class InterviewService:
             report = self.reports.build_report(source, trigger_reason=payload["trigger_reason"])
         except Exception as exc:
             with self.persistence.transaction(organization_id) as transaction:
-                session = self._required(transaction.interview_sessions.get(interview_id))
-                self._decide_and_persist(
-                    transaction,
-                    session,
-                    LifecycleCommand(LifecycleCommandType.REPORT_FAILED, {"error": str(exc)}),
-                    organization_id,
-                )
-                transaction.outbox.fail(
+                failed = transaction.outbox.fail(
                     work_item_id,
                     str(exc),
                     lease_token=running_work["lease_token"],
                 )
+                if failed.get("status") == "dead_letter":
+                    session = self._required(transaction.interview_sessions.get(interview_id))
+                    self._decide_and_persist(
+                        transaction,
+                        session,
+                        LifecycleCommand(LifecycleCommandType.REPORT_FAILED, {"error": str(exc)}),
+                        organization_id,
+                    )
             raise
 
         with self.persistence.transaction(organization_id) as transaction:

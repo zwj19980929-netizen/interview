@@ -309,7 +309,7 @@ def test_manual_completion_skips_open_turns_before_requesting_report() -> None:
     assert event_types[-3:] == ["interview.completed", "report.requested", "report.completed"]
 
 
-def test_failed_report_work_reenters_lifecycle_before_worker_retry() -> None:
+def test_retryable_report_work_stays_generating_until_worker_retry() -> None:
     api = api_client()
     _, _, plan = create_plan(api)
     approved = api.patch(
@@ -328,22 +328,21 @@ def test_failed_report_work_reenters_lifecycle_before_worker_retry() -> None:
     with pytest.raises(RuntimeError, match="report provider unavailable"):
         service.complete_interview(interview["id"])
 
-    failed = service.get_interview(interview["id"])
-    assert failed["status"] == "completed"
-    assert failed["lifecycle_events"][-1]["type"] == "report.failed"
+    retrying = service.get_interview(interview["id"])
+    assert retrying["status"] == "report_generating"
+    assert retrying["lifecycle_events"][-1]["type"] == "report.requested"
 
     result = asyncio.run(OutboxWorker(get_store()).run_once())
     assert result[-1]["status"] == "completed"
     recovered = service.get_interview(interview["id"])
     assert recovered["status"] == "report_ready"
-    assert [item["type"] for item in recovered["lifecycle_events"]][-3:] == [
-        "report.failed",
-        "report.retry_started",
+    assert [item["type"] for item in recovered["lifecycle_events"]][-2:] == [
+        "report.requested",
         "report.completed",
     ]
 
 
-def test_failed_evaluation_work_reenters_lifecycle_before_worker_retry() -> None:
+def test_retryable_evaluation_work_stays_pending_until_worker_retry() -> None:
     api = api_client()
     _, _, plan = create_plan(api)
     approved = api.patch(
@@ -376,9 +375,9 @@ def test_failed_evaluation_work_reenters_lifecycle_before_worker_retry() -> None
             worker.run_item(accepted["evaluation_work_id"])
         )
 
-    failed = service.get_interview(interview["id"])
-    assert failed["answers"][0]["evaluation_status"] == "failed"
-    assert failed["lifecycle_events"][-1]["type"] == "evaluation.failed"
+    retrying = service.get_interview(interview["id"])
+    assert retrying["answers"][0]["evaluation_status"] == "pending"
+    assert "evaluation.failed" not in [item["type"] for item in retrying["lifecycle_events"]]
 
     result = asyncio.run(OutboxWorker(get_store()).run_once())
     assert result[-1]["status"] == "completed"
@@ -387,8 +386,9 @@ def test_failed_evaluation_work_reenters_lifecycle_before_worker_retry() -> None
     followup = next(item for item in recovered["turns"] if item["id"] == recovered["current_turn_id"])
     assert followup["is_followup"] is True
     event_types = [item["type"] for item in recovered["lifecycle_events"]]
-    assert event_types.index("evaluation.failed") < event_types.index("evaluation.retry_started")
-    assert event_types.index("evaluation.retry_started") < event_types.index("evaluation.completed")
+    assert "evaluation.failed" not in event_types
+    assert "evaluation.retry_started" not in event_types
+    assert "evaluation.completed" in event_types
 
     asyncio.run(
         service.submit_audio_answer(

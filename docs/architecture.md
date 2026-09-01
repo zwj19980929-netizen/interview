@@ -6,8 +6,8 @@
 
 1. 企业创建岗位，并为岗位维护一个或多个知识库式题库；题目入库后校验结构化字段、形成候选池并异步预生成读题语音。
 2. 企业把候选人基本信息和 PDF 简历上传到组织级简历库；简历可来自浏览器本地文件或公开 HTTPS URL，但都要先进入系统私有存储，再由 AI 按指定岗位异步形成可解释初筛并提取项目/职责/技能证据。只有生效结论符合时才独立生成与这些证据严格绑定的过往经历问题；AI 草稿和面试官人工创建的问题共同组成候选人的简历问答。
-3. 面试官基于岗位、岗位题库、候选人简历审阅结果确认生成面试计划；React 工作台在这一命令内原子完成装配与批准，随后创建预约和一次性邀请链接。
-4. 候选人打开链接，填写姓名、邮箱、手机号码并完成隐私告知与授权；系统与预约绑定的简历库记录匹配后确认预约、安排面试前 30 分钟邮件提醒，到预约时间后才允许进入设备检查和面试。
+3. 面试官基于岗位、岗位题库、候选人简历审阅结果确认生成面试计划；React 工作台在这一命令内原子完成装配与批准，并冻结所选题库共同的 TTS 模型、音色、语言、格式和语速，随后创建预约和一次性邀请链接。
+4. 候选人打开链接，填写姓名、邮箱、手机号码并完成隐私告知与授权；系统与预约绑定的简历库记录匹配后确认预约、安排面试前 30 分钟邮件提醒，并按计划冻结的语音特征异步准备本场简历题语音，到预约时间且语音完成后才允许进入设备检查和面试。
 5. 面试中，数字人在已批准计划和已冻结题目池内进行可审计的随机检索，播放预生成题目语音；服务端识别候选人回答并逐题评分，然后进入下一题。
 6. 岗位题库问题结束后，数字人继续询问由简历项目经历生成的问题；面试结束后汇总岗位维度总分和客观匹配证据。
 7. 企业可以查看每题题干、转写、评分证据和候选人原始语音，自行复核并作出最终招聘决定。
@@ -82,10 +82,10 @@ flowchart LR
 | Resume Ingestion | 接收 multipart PDF 或拉取公开 HTTPS PDF，执行限流、哈希、类型校验、恶意文件扫描和解析 | URL 每次重定向都做 SSRF 防护；成功前文件处于隔离区，不直接交给 AI |
 | Private File Storage | 统一保存、读取、签发受控访问和删除私有文件 | 深模块；本地开发使用文件系统 adapter，部署后通过配置切换阿里云 OSS adapter，业务 module 不感知厂商 SDK |
 | Resume Review | 异步形成岗位初筛并提取项目/职责/技能证据 | 深模块；短简历优先单次调用，输出截断时自动改用页感知 Map/Reduce，长简历直接按页和输入预算执行证据 Map/分层压缩/最终 Reduce；分块只提证据，全部成功前不形成筛选结论，也不生成问题 |
-| Candidate Question Bank | 只为生效结论符合的候选人聚合 AI/人工简历问题，提供增查改、批准/拒绝和归档 | `resume.experience_questions.generate` 在符合后独立排队；每题必须绑定不可变证据快照且题干点名证据标签。它是 `ExperienceQuestion` 投影而非第二套题库实体，批准且语音 ready 后复用 `resume_experience` 链路 |
+| Candidate Question Bank | 只为生效结论符合的候选人聚合 AI/人工简历问题，提供增查改、批准/拒绝和归档 | `resume.experience_questions.generate` 在符合后独立排队；每题必须绑定不可变证据快照且题干点名证据标签。批准只使 `ExperienceQuestion` 可入计划，语音延迟到候选人确认预约后按计划冻结特征生成 |
 | 候选人匹配 | 把邀请填报与预约绑定的候选人记录匹配 | 使用规范化邮箱或手机号强匹配；姓名只作联合校验，禁止仅按姓名模糊匹配 |
-| Interview Plan Assembly | 从岗位要求、岗位题库和简历审阅形成计划 | 产出抽题槽位、结构化 `QuestionCandidatePool`、经历问题、阶段顺序、权重和解释 |
-| 计划审批与预约 | 批准计划，绑定岗位、候选人、题库、时间窗和邀请 | 计划、题库、简历审阅和语音资产未就绪时不得发出正式邀请 |
+| Interview Plan Assembly | 从岗位要求、岗位题库和简历审阅形成计划 | 产出抽题槽位、结构化 `QuestionCandidatePool`、经历问题、阶段顺序、权重和解释；冻结所选题库唯一 `speech_profile`，冲突时拒绝装配 |
+| 计划审批与预约 | 批准计划，绑定岗位、候选人、题库、时间窗和邀请 | 邀请要求题库语音就绪且计划已冻结语音特征；候选人确认后创建预约级简历题 TTS 工作，全部完成前禁止 start |
 | Appointment Reminder | 候选人确认预约后安排并发送开始前 30 分钟邮件提醒 | DurableWorkItem 只保存预约 ID；发送时才解密邮箱，SMTP 凭据只来自环境变量 |
 | Avatar Delivery | 按预约冻结的 `avatar_mode` 选择自研或云数字人，并归一化播放和关闭合同 | 深模块；`local` 复用冻结题目语音和候选人端渲染，`cloud` 复用 Model Gateway/WebRTC；云失败只通过同一本地 adapter 降级 |
 | Question Selection | 在计划冻结的结构化候选池中为题库槽位抽题 | 深模块；使用 SQL 过滤、会话随机种子、去重、覆盖和难度约束，保存选择事实并冻结题目快照；不依赖向量数据库 |
@@ -220,6 +220,8 @@ sequenceDiagram
 ## 可靠性要求
 
 - 题库校验/候选池构建、题目语音、简历审阅和经历问题语音均为可重试、幂等、可观察的持久工作项。Celery 使用 `acks_late`/worker-lost 重投，定时 dispatcher 补发未成功发布或租约过期的工作项；重复 delivery 不得重复生成当前资产。
+- 所有模型能力共享一条失败边界：Outbox `failed` 只是下一次 attempt 的等待态，不产生领域失败事实；仅 `dead_letter` 才能把题目语音、简历审阅/经历题、答案评分、报告或题库导入写成终态失败。尤其不得用重试等待态推进受 `source_version` 保护的模型输入聚合，否则下一次成功响应会被自身造成的 version 变化错误判为 superseded。
+- KnowledgeBase 的通用 version 可由题目语音进度高频推进，语音配置命令因此使用 profile revision 语义 CAS。运行中切换模型会在同一事务中协作取消旧 revision 工作、推进全部 Question source version 并创建新 build；旧 Provider 请求若已发出只允许完成为 superseded，在资产落库前还会再做一次 revision/cancel guard。
 - 正式邀请和候选人开始前执行 readiness gate：计划已批准、题库版本可用、经历问题已审核、所需题目语音可用、服务端 STT 路由健康、时间窗有效。
 - 实时会话从持久 `InterviewSession`、随机选择事实和生命周期事件恢复；刷新或断线不能重复抽题或跳过未评分答案。
 - STT 失败先批量补转写，不得把浏览器 SpeechRecognition 或客户端文本当作最终答案；补转写仍失败时保持可恢复失败态并请求人工处理。
@@ -231,7 +233,7 @@ sequenceDiagram
 当前本地 MVP 已把新主链路接入同一事务型 Persistence seam 和 `InterviewSessionLifecycle`：
 
 - `JobPosition -> KnowledgeBase -> Question` 边界、结构化字段校验、题库 readiness 和异步 `QuestionSpeechAsset` 工作项已实现；正式路径不调用 embedding。
-- 企业简历库、脱敏 Resume Review、证据化 ExperienceQuestion 草稿、人工批准和批准后语音生成已实现；简历主入口只接受 PDF，支持 multipart 与公开 URL，同一 `ResumeIngestion` 流水线完成隔离、magic/MIME/大小校验、扫描、私有存储和解析。旧 `resume_text` API 已删除。
+- 企业简历库、脱敏 Resume Review、证据化 ExperienceQuestion 草稿、人工批准和预约确认后语音生成已实现；简历主入口只接受 PDF，支持 multipart 与公开 URL，同一 `ResumeIngestion` 流水线完成隔离、magic/MIME/大小校验、扫描、私有存储和解析。旧 `resume_text` API 已删除。
 - 候选人专属计划以 execution v2 槽位、冻结 `QuestionCandidatePool` 和经历题快照为唯一执行表示；会话只能由预约创建。预约使用服务端告知与明确授权、哈希 token、强匹配、带 TTL 的准入事实、时间窗、原子消费和并发幂等 self-start。
 - `QuestionSelection` 使用会话种子与 HMAC-SHA256 在批准候选池内稳定随机，选择事实与题目快照保存在会话聚合中；岗位题完成后生命周期进入 `resume_experience`。
 - 音频回答会先进入 `transcribing`；React 候选人端把麦克风重采样为 16 kHz 单声道 PCM，经独立 `stt-stream` WebSocket 交给 `ModelGateway.open_stream()`，校验有序 partial/final，并只把唯一服务端 final 交给评分；浏览器 WebM 完整录音链路仍作为建流失败时的 batch 修复路径。本地 mock 允许显式开发转写输入，生产配置禁止该输入。
@@ -244,7 +246,7 @@ sequenceDiagram
 - `/healthz` 只承担存活探针；`/readyz` 通过 Deployment Readiness module 只读检查数据库、Redis、生产认证/加密密钥、私有 OSS bucket 鉴权和命令行或 clamd 扫描器。业务模型 route 的组织/purpose/TTL readiness 继续由 Appointment Admission 独占。
 - `app.operations.production_config` 把生产配置生成和静态检查收敛在一个运维 module：生成入口原子创建 `0600`、Git 忽略且不可覆盖的 shell 配置，检查入口只解析变量名/格式、不导出环境、不连接外部依赖；真正运行状态仍以 `/readyz` 为准。调用方不需要自行拼接 token JSON、Fernet 或 HMAC 密钥。
 
-仓库内能力已完成本地验证，并已有 `openai_compatible`、`deepseek`、`zhipuai` 与 `dashscope` 的 LLM HTTP adapter，OpenAI-compatible、智谱 GLM-TTS 与 DashScope 的 TTS/实时及批量 ASR，以及 `media_http` 的通用媒体协议和 `tencent_cloud_avatar` 的云渲染 WebRTC adapter。Model Invocation 仍是单一 deep module：插件 manifest 声明连接/凭证表单和按 `llm/embedding/tts/stt/avatar` 分类的模型表单，`ProviderConnection`、`ModelConfiguration` 与 `ModelRoute` 分别承载连接、具体模型和业务选择；registry 负责校验和加载，前端只通用渲染 schema。网关从 `model_configuration_id` 解析连接、凭证和 adapter，业务 module 不感知厂商差异。没有账号、凭据、数智人资产、并发额度和真实模型探针时仍不能把模型标记为健康。本机隔离 PostgreSQL 16/Redis 7 已通过最小权限 RLS、事务/CAS、约束、索引查询计划、跨实例事件和限流集成验收；官方 ClamAV arm64 daemon 已用本地 EICAR 验收库完成真实 TCP PING/INSTREAM/FOUND 协议测试。目标生产集群、阿里云 OSS、生产 clamd、真实 ASR WER/延迟、腾讯 WebRTC 可用性及外部模型音质/费用仍需部署联调。`INTERVIEWER_RUNTIME_ENV=production` 要求私有对象存储、显式非 mock 且近期健康的模型路由、扫描器和生产密钥；缺失时 `/readyz`、邀请或 start 按职责失败关闭。旧向量题库、管理员直建/直接 start、客户端文本答案、运行时计划 `items` 和旧模型 provider config interface 已删除。
+仓库内能力已完成本地验证，并已有 `openai_compatible`、`deepseek`、`zhipuai` 与 `dashscope` 的 LLM HTTP adapter，OpenAI-compatible、智谱 GLM-TTS 与 DashScope 的 TTS/实时及批量 ASR，以及 `media_http` 的通用媒体协议和 `tencent_cloud_avatar` 的云渲染 WebRTC adapter。Model Invocation 仍是单一 deep module：插件 manifest 声明连接/凭证表单和按 `llm/embedding/tts/stt/avatar` 分类的模型表单，`ProviderConnection`、`ModelConfiguration` 与 `ModelRoute` 分别承载连接、具体模型和业务选择；registry 负责校验和加载，前端只通用渲染 schema。网关从 `model_configuration_id` 解析连接、凭证和 adapter，业务 module 不感知厂商差异。Provider/模型健康探针、异步 LLM/TTS/STT/数字人进度可以推进聚合 `version`，但不推进配置语义 `configuration_revision`；人工命令统一在提交前读取最新资源，只吸收语义身份未变的运行态 version，真正的配置或业务内容变化失败关闭。没有账号、凭据、数智人资产、并发额度和真实模型探针时仍不能把模型标记为健康。本机隔离 PostgreSQL 16/Redis 7 已通过最小权限 RLS、事务/CAS、约束、索引查询计划、跨实例事件和限流集成验收；官方 ClamAV arm64 daemon 已用本地 EICAR 验收库完成真实 TCP PING/INSTREAM/FOUND 协议测试。目标生产集群、阿里云 OSS、生产 clamd、真实 ASR WER/延迟、腾讯 WebRTC 可用性及外部模型音质/费用仍需部署联调。`INTERVIEWER_RUNTIME_ENV=production` 要求私有对象存储、显式非 mock 且近期健康的模型路由、扫描器和生产密钥；缺失时 `/readyz`、邀请或 start 按职责失败关闭。旧向量题库、管理员直建/直接 start、客户端文本答案、运行时计划 `items` 和旧模型 provider config interface 已删除。
 
 补充的实时语音实现沿用同一 Model Invocation deep module：官方 `openai` 与 `dashscope` 新增 `realtime_speech` 模型类型和 `speech.dialogue_realtime` capability，候选人端按 PCM delta 排队播放。火山豆包 S2S 已确认产品能力，但当前二进制会话协议不能冒充 OpenAI-style adapter，继续以 `implemented=false` TODO 保留，待按官方完整协议实现并验证“批准文本约束”后再开放路由。
 

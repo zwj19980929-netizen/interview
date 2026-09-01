@@ -7,6 +7,7 @@ from app.core.ids import new_id
 from app.core.time import utc_now
 from app.domain.candidate_screening import effective_screening_outcome
 from app.domain.question_selection import QuestionSelection, QuestionSelectionRequest
+from app.domain.speech_profile import freeze_interview_speech_profile, speech_profile_fingerprint
 from app.persistence.errors import ConcurrencyConflict
 from app.persistence.interface import Persistence
 from app.persistence.provider import persistence_for
@@ -139,6 +140,9 @@ class InterviewPlanAssembly:
         )
         now = utc_now()
         bank_slots = self._bank_slots(slot_drafts, candidates, organization_id)
+        speech_profile_snapshot = self._interview_speech_profile(
+            request.knowledge_base_ids, organization_id
+        )
         experience_question_snapshots = self._approved_experience_question_snapshots(
             request.resume_review_id, organization_id
         )
@@ -158,6 +162,7 @@ class InterviewPlanAssembly:
             "knowledge_base_snapshots": self._knowledge_base_snapshots(
                 request.knowledge_base_ids, organization_id
             ),
+            "speech_profile_snapshot": speech_profile_snapshot,
             "status": "draft",
             "estimated_minutes": interview_duration,
             "assembly_policy": self._policy_document(request.policy),
@@ -473,8 +478,12 @@ class InterviewPlanAssembly:
                 raise ApiError("EXPERIENCE_QUESTION_NOT_FOUND", "Experience question does not exist.", status_code=404)
             if question.get("resume_review_id") != plan.get("resume_review_id"):
                 raise ApiError("EXPERIENCE_QUESTION_SCOPE_MISMATCH", "Experience question belongs to another review.", status_code=409)
-            if question.get("status") != "approved" or question.get("speech_status") != "ready":
-                raise ApiError("EXPERIENCE_QUESTION_NOT_READY", "Experience question is not approved and ready.", status_code=409)
+            if question.get("status") != "approved":
+                raise ApiError(
+                    "EXPERIENCE_QUESTION_NOT_APPROVED",
+                    "Experience question must be approved before it can enter a plan.",
+                    status_code=409,
+                )
             if not self._experience_question_grounded(question):
                 raise ApiError(
                     "EXPERIENCE_QUESTION_NOT_GROUNDED",
@@ -519,6 +528,7 @@ class InterviewPlanAssembly:
             blueprint["weight"] = round(value / 10_000, 4)
 
     def _validate_canonical_plan(self, transaction: Any, plan: Dict[str, Any]) -> None:
+        self._validate_speech_profile_snapshot(transaction, plan)
         slots = plan.get("bank_slots", [])
         experiences = plan.get("experience_question_snapshots", [])
         if not slots and not experiences:
@@ -560,7 +570,7 @@ class InterviewPlanAssembly:
             raise ApiError("INTERVIEW_PLAN_QUESTION_SCOPE_MISMATCH", "Plan question belongs to another knowledge base.", status_code=409)
 
     def _experience_snapshot(self, item: Dict[str, Any]) -> Dict[str, Any]:
-        return {
+        snapshot = {
             key: deepcopy(item.get(key))
             for key in (
                 "id",
@@ -570,10 +580,14 @@ class InterviewPlanAssembly:
                 "key_points",
                 "rubric",
                 "evidence_refs",
+                "status",
                 "speech_asset_id",
                 "speech_status",
             )
         }
+        snapshot["speech_asset_id"] = None
+        snapshot["speech_status"] = "deferred"
+        return snapshot
 
     def _approved_experience_questions(
         self, resume_review_id: Optional[str], organization_id: str
@@ -586,7 +600,6 @@ class InterviewPlanAssembly:
                 for item in sorted(transaction.experience_questions.list(), key=lambda value: value["order"])
                 if item["resume_review_id"] == resume_review_id
                 and item["status"] == "approved"
-                and item["speech_status"] == "ready"
                 and self._experience_question_grounded(item)
             ]
 
@@ -603,6 +616,7 @@ class InterviewPlanAssembly:
                             "knowledge_base_id": item["id"],
                             "knowledge_base_version": item["version"],
                             "status": item["status"],
+                            "speech_profile": deepcopy(item.get("speech_profile")),
                         }
                     )
             return result
@@ -622,7 +636,6 @@ class InterviewPlanAssembly:
                     )
                     if item["resume_review_id"] == resume_review_id
                     and item["status"] == "approved"
-                    and item["speech_status"] == "ready"
                     and self._experience_question_grounded(item)
                 ),
                 start=1,
@@ -631,6 +644,63 @@ class InterviewPlanAssembly:
                 snapshot["order"] = order
                 result.append(snapshot)
             return result
+
+    def _interview_speech_profile(
+        self,
+        knowledge_base_ids: Sequence[str],
+        organization_id: str,
+    ) -> Dict[str, Any]:
+        with self.persistence.transaction(organization_id) as transaction:
+            knowledge_bases = [transaction.knowledge_bases.get(item) for item in knowledge_base_ids]
+        if not knowledge_bases or any(item is None for item in knowledge_bases):
+            raise ApiError(
+                "KNOWLEDGE_BASE_NOT_FOUND",
+                "Every selected knowledge base must exist.",
+                status_code=404,
+            )
+        if any(not item.get("speech_profile") for item in knowledge_bases if item):
+            raise ApiError(
+                "KNOWLEDGE_BASE_SPEECH_PROFILE_REQUIRED",
+                "Every selected knowledge base must have a speech profile.",
+                status_code=409,
+            )
+        profile = freeze_interview_speech_profile(item for item in knowledge_bases if item)
+        if profile is None:
+            raise ApiError(
+                "INTERVIEW_PLAN_SPEECH_PROFILE_CONFLICT",
+                "All knowledge bases in one interview plan must use the same speech profile.",
+                status_code=409,
+            )
+        return profile
+
+    def _validate_speech_profile_snapshot(self, transaction: Any, plan: Dict[str, Any]) -> None:
+        frozen = plan.get("speech_profile_snapshot")
+        if not frozen:
+            raise ApiError(
+                "INTERVIEW_PLAN_SPEECH_PROFILE_REQUIRED",
+                "Interview plan must freeze one speech profile before approval.",
+                status_code=409,
+            )
+        knowledge_bases = [
+            transaction.knowledge_bases.get(item) for item in plan.get("knowledge_base_ids", [])
+        ]
+        current = freeze_interview_speech_profile(item for item in knowledge_bases if item)
+        if current is None:
+            raise ApiError(
+                "INTERVIEW_PLAN_SPEECH_PROFILE_CONFLICT",
+                "All knowledge bases in one interview plan must use the same speech profile.",
+                status_code=409,
+            )
+        if current["fingerprint"] != frozen.get("fingerprint"):
+            raise ApiError(
+                "INTERVIEW_PLAN_SPEECH_PROFILE_STALE",
+                "Knowledge base speech profile changed after this plan was assembled.",
+                status_code=409,
+                details={
+                    "expected_fingerprint": frozen.get("fingerprint"),
+                    "current_fingerprint": speech_profile_fingerprint(current),
+                },
+            )
 
     @staticmethod
     def _experience_question_grounded(item: Dict[str, Any]) -> bool:

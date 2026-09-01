@@ -94,6 +94,7 @@ class KnowledgeBaseSpeechProfileUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     expected_version: int = Field(ge=1)
+    expected_speech_profile_revision: Optional[int] = Field(default=None, ge=1)
     model_configuration_id: str = Field(min_length=1)
     voice_profile_id: str = Field(min_length=1)
     language: str = Field(default="zh-CN", min_length=2)

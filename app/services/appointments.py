@@ -16,6 +16,11 @@ from app.domain.appointment_admission import (
     format_utc,
     parse_utc,
 )
+from app.domain.appointment_speech import summarize_speech_preparation
+from app.domain.speech_profile import (
+    freeze_interview_speech_profile,
+    speech_asset_matches_profile,
+)
 from app.persistence.interface import Persistence, new_work_item
 from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
@@ -68,6 +73,16 @@ class AppointmentService:
             now_dt = self._now()
             readiness = self._readiness(transaction, plan, now=now_dt)
             settings = self._normalized_settings(payload.get("settings"), default_avatar_mode="local")
+            speech_profile = self._plan_speech_profile(transaction, plan)
+            requested_voice = settings.get("voice_profile_id")
+            if requested_voice and requested_voice != speech_profile.get("voice_profile_id"):
+                raise ApiError(
+                    "APPOINTMENT_SPEECH_PROFILE_MISMATCH",
+                    "Appointment voice must match the interview plan speech profile.",
+                    status_code=409,
+                )
+            settings["voice_profile_id"] = speech_profile.get("voice_profile_id")
+            settings["language"] = speech_profile.get("language", settings.get("language", "zh-CN"))
             raw_policy = deepcopy(payload.get("admission_policy", {}))
             admission_policy = {
                 "early_start_grace_seconds": max(0, int(raw_policy.get("early_start_grace_seconds", 0))),
@@ -114,6 +129,7 @@ class AppointmentService:
                     "consumed_at": None,
                     "cancelled_at": None,
                     "email_reminder": None,
+                    "speech_preparation": self._initial_speech_preparation(plan, speech_profile),
                     "created_at": now,
                     "updated_at": now,
                 }
@@ -148,12 +164,24 @@ class AppointmentService:
                 raise ApiError("APPOINTMENT_TIME_INVALID", "Appointment end must be after its start.")
             appointment["scheduled_start_at"] = start
             appointment["scheduled_end_at"] = end
+            plan = transaction.interview_plans.get(appointment["plan_id"])
+            speech_profile = self._plan_speech_profile(transaction, plan)
             if payload.get("settings") is not None:
-                appointment["settings"] = self._normalized_settings(
+                settings = self._normalized_settings(
                     payload["settings"],
                     current=appointment.get("settings", {}),
                     default_avatar_mode="cloud",
                 )
+                requested_voice = settings.get("voice_profile_id")
+                if requested_voice and requested_voice != speech_profile.get("voice_profile_id"):
+                    raise ApiError(
+                        "APPOINTMENT_SPEECH_PROFILE_MISMATCH",
+                        "Appointment voice must match the interview plan speech profile.",
+                        status_code=409,
+                    )
+                settings["voice_profile_id"] = speech_profile.get("voice_profile_id")
+                settings["language"] = speech_profile.get("language", "zh-CN")
+                appointment["settings"] = settings
             if payload.get("admission_policy") is not None:
                 policy = {**appointment.get("admission_policy", {}), **deepcopy(payload["admission_policy"])}
                 for field in (
@@ -165,8 +193,9 @@ class AppointmentService:
                     if field in policy:
                         policy[field] = max(0 if "grace" in field else 1, int(policy[field]))
                 appointment["admission_policy"] = policy
-            plan = transaction.interview_plans.get(appointment["plan_id"])
-            appointment["readiness"] = self._readiness(transaction, plan, now=self._now())
+            appointment["readiness"] = self._readiness(
+                transaction, plan, appointment=appointment, now=self._now()
+            )
             appointment["updated_at"] = format_utc(self._now())
             updated = transaction.interview_appointments.update(appointment, expected_version=expected_version)
             return self._private_projection(updated)
@@ -182,7 +211,9 @@ class AppointmentService:
             if appointment["status"] not in {"scheduled", "invited"}:
                 raise ApiError("APPOINTMENT_NOT_INVITABLE", "Appointment cannot be invited in its current state.", status_code=409)
             plan = transaction.interview_plans.get(appointment["plan_id"])
-            readiness = self._readiness(transaction, plan, now=self._now())
+            readiness = self._readiness(
+                transaction, plan, appointment=appointment, now=self._now()
+            )
             if not readiness["can_invite"]:
                 raise ApiError("APPOINTMENT_NOT_READY", "Appointment readiness checks failed.", status_code=409, details=readiness)
             token = secrets.token_urlsafe(32)
@@ -214,6 +245,9 @@ class AppointmentService:
             "required_fields": ["name", "email", "phone", "consent"],
             "consent": deepcopy(appointment["consent_notice"]),
             "email_reminder": self._public_reminder_projection(appointment.get("email_reminder")),
+            "speech_preparation": self._public_speech_preparation(
+                appointment.get("speech_preparation")
+            ),
         }
 
     def intake(self, token: str, payload: Dict[str, Any], organization_id: str = "org_default") -> Dict[str, Any]:
@@ -260,8 +294,15 @@ class AppointmentService:
             )
             if existing and existing.get("consent_evidence_status") == "verified":
                 reminder = self._ensure_email_reminder(transaction, appointment, organization_id)
-                if not appointment.get("email_reminder"):
+                plan = transaction.interview_plans.get(appointment["plan_id"])
+                preparation = self._queue_registered_speech(
+                    transaction, appointment, plan, organization_id
+                )
+                if appointment.get("email_reminder") != reminder or appointment.get(
+                    "speech_preparation"
+                ) != preparation:
                     appointment["email_reminder"] = reminder
+                    appointment["speech_preparation"] = preparation
                     appointment["updated_at"] = format_utc(self._now())
                     appointment = transaction.interview_appointments.update(
                         appointment,
@@ -274,6 +315,7 @@ class AppointmentService:
                     "scheduled_start_at": appointment["scheduled_start_at"],
                     "scheduled_end_at": appointment["scheduled_end_at"],
                     "email_reminder": self._public_reminder_projection(reminder),
+                    "speech_preparation": self._public_speech_preparation(preparation),
                 }
             now = format_utc(self._now())
             intake = {
@@ -306,6 +348,10 @@ class AppointmentService:
             appointment["registered_at"] = now
             reminder = self._ensure_email_reminder(transaction, appointment, organization_id)
             appointment["email_reminder"] = reminder
+            plan = transaction.interview_plans.get(appointment["plan_id"])
+            appointment["speech_preparation"] = self._queue_registered_speech(
+                transaction, appointment, plan, organization_id
+            )
             appointment["updated_at"] = now
             appointment = transaction.interview_appointments.update(appointment, expected_version=appointment["version"])
             return {
@@ -315,6 +361,9 @@ class AppointmentService:
                 "scheduled_start_at": appointment["scheduled_start_at"],
                 "scheduled_end_at": appointment["scheduled_end_at"],
                 "email_reminder": self._public_reminder_projection(reminder),
+                "speech_preparation": self._public_speech_preparation(
+                    appointment.get("speech_preparation")
+                ),
             }
 
     def readiness(
@@ -328,7 +377,7 @@ class AppointmentService:
             self._validate_public_token(appointment)
             plan = transaction.interview_plans.get(appointment["plan_id"])
             now_dt = self._now()
-            readiness = self._readiness(transaction, plan, now=now_dt)
+            readiness = self._readiness(transaction, plan, appointment=appointment, now=now_dt)
             if payload is not None:
                 content_type = str(payload.get("audio_content_type", "")).strip().lower()
                 device_ready = bool(payload.get("browser_supported")) and bool(
@@ -375,7 +424,9 @@ class AppointmentService:
                 ),
                 None,
             )
-            readiness = self._readiness(transaction, plan, now=self._now())
+            readiness = self._readiness(
+                transaction, plan, appointment=appointment, now=self._now()
+            )
             self.admission.validate_start(
                 appointment,
                 intake,
@@ -395,6 +446,25 @@ class AppointmentService:
             appointment["cancelled_at"] = utc_now()
             appointment["invitation_token_hash"] = None
             appointment["updated_at"] = utc_now()
+            for work in transaction.outbox.list():
+                if (
+                    work.get("kind") == "question.speech.generate"
+                    and work.get("payload", {}).get("appointment_id") == appointment_id
+                    and work.get("status") not in {"completed", "cancelled"}
+                ):
+                    transaction.outbox.cancel(
+                        work["id"],
+                        reason="appointment_cancelled",
+                        actor_id="appointment_service",
+                    )
+            preparation = deepcopy(appointment.get("speech_preparation") or {})
+            if preparation.get("status") not in {None, "ready"}:
+                preparation["status"] = "cancelled"
+                for item in preparation.get("items", []):
+                    if item.get("status") not in {"ready", "completed"}:
+                        item["status"] = "cancelled"
+                preparation["updated_at"] = appointment["updated_at"]
+                appointment["speech_preparation"] = preparation
             return self._private_projection(
                 transaction.interview_appointments.update(appointment, expected_version=appointment["version"])
             )
@@ -404,12 +474,14 @@ class AppointmentService:
         transaction: Any,
         plan: Dict[str, Any],
         *,
+        appointment: Optional[Dict[str, Any]] = None,
         now: Optional[datetime] = None,
     ) -> Dict[str, Any]:
         ttl = 60
         return self.admission.plan_readiness(
             transaction,
             plan,
+            appointment=appointment,
             now=now or self._now(),
             ttl_seconds=ttl,
         )
@@ -444,6 +516,152 @@ class AppointmentService:
             "work_item_id": queued["id"],
             "sent_at": None,
             "last_error_code": None,
+        }
+
+    def _plan_speech_profile(self, transaction: Any, plan: Dict[str, Any]) -> Dict[str, Any]:
+        frozen = deepcopy(plan.get("speech_profile_snapshot"))
+        if frozen:
+            return frozen
+        knowledge_bases = [
+            transaction.knowledge_bases.get(item) for item in plan.get("knowledge_base_ids", [])
+        ]
+        profile = freeze_interview_speech_profile(item for item in knowledge_bases if item)
+        if profile is None:
+            raise ApiError(
+                "INTERVIEW_PLAN_SPEECH_PROFILE_REQUIRED",
+                "Interview plan must resolve one knowledge base speech profile.",
+                status_code=409,
+            )
+        return profile
+
+    def _initial_speech_preparation(
+        self,
+        plan: Dict[str, Any],
+        profile: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        items = [
+            {
+                "question_id": item["id"],
+                "source_version": item["version"],
+                "status": "not_requested",
+                "asset_id": None,
+                "work_item_id": None,
+            }
+            for item in plan.get("experience_question_snapshots", [])
+        ]
+        return self._speech_preparation_summary(items, profile, requested_at=None)
+
+    def _queue_registered_speech(
+        self,
+        transaction: Any,
+        appointment: Dict[str, Any],
+        plan: Dict[str, Any],
+        organization_id: str,
+    ) -> Dict[str, Any]:
+        profile = self._plan_speech_profile(transaction, plan)
+        existing_items = {
+            (item.get("question_id"), int(item.get("source_version", 0))): item
+            for item in (appointment.get("speech_preparation") or {}).get("items", [])
+        }
+        assets = transaction.question_speech_assets.list()
+        work_items = transaction.outbox.list()
+        items: List[Dict[str, Any]] = []
+        requested_at = (appointment.get("speech_preparation") or {}).get("requested_at") or utc_now()
+        for snapshot in plan.get("experience_question_snapshots", []):
+            key = (snapshot["id"], int(snapshot["version"]))
+            ready_asset = next(
+                (
+                    asset
+                    for asset in assets
+                    if asset.get("owner_type") == "experience_question"
+                    and asset.get("owner_id") == snapshot["id"]
+                    and int(asset.get("source_version", 0)) == int(snapshot["version"])
+                    and asset.get("status") == "ready"
+                    and speech_asset_matches_profile(asset, profile)
+                ),
+                None,
+            )
+            if ready_asset is not None:
+                items.append(
+                    {
+                        "question_id": snapshot["id"],
+                        "source_version": snapshot["version"],
+                        "status": "ready",
+                        "asset_id": ready_asset["id"],
+                        "work_item_id": None,
+                    }
+                )
+                continue
+            previous = existing_items.get(key) or {}
+            work = next(
+                (
+                    item
+                    for item in work_items
+                    if item.get("id") == previous.get("work_item_id")
+                ),
+                None,
+            )
+            if work is None or work.get("status") in {"cancelled", "completed"}:
+                work = transaction.outbox.enqueue(
+                    new_work_item(
+                        organization_id=organization_id,
+                        kind="question.speech.generate",
+                        aggregate_id=snapshot["id"],
+                        idempotency_key="appointment.speech:%s:%s:%s:%s"
+                        % (
+                            appointment["id"],
+                            snapshot["id"],
+                            snapshot["version"],
+                            profile["fingerprint"],
+                        ),
+                        payload={
+                            "owner_type": "experience_question",
+                            "owner_id": snapshot["id"],
+                            "source_version": snapshot["version"],
+                            "appointment_id": appointment["id"],
+                            "speech_profile": deepcopy(profile),
+                            "speech_profile_fingerprint": profile["fingerprint"],
+                        },
+                    )
+                )
+            work_status = {
+                "pending": "queued",
+                "running": "building",
+                "failed": "failed",
+                "dead_letter": "failed",
+            }.get(work.get("status"), "queued")
+            items.append(
+                {
+                    "question_id": snapshot["id"],
+                    "source_version": snapshot["version"],
+                    "status": work_status,
+                    "asset_id": None,
+                    "work_item_id": work["id"],
+                    "last_error_code": work.get("last_error_code"),
+                }
+            )
+        return self._speech_preparation_summary(items, profile, requested_at=requested_at)
+
+    @staticmethod
+    def _speech_preparation_summary(
+        items: List[Dict[str, Any]],
+        profile: Dict[str, Any],
+        *,
+        requested_at: Optional[str],
+    ) -> Dict[str, Any]:
+        return summarize_speech_preparation(
+            items,
+            profile_fingerprint=profile.get("fingerprint"),
+            requested_at=requested_at,
+        )
+
+    @staticmethod
+    def _public_speech_preparation(value: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not value:
+            return None
+        return {
+            key: value.get(key)
+            for key in ("status", "total", "ready", "failed", "requested_at", "updated_at")
         }
 
     def _appointment_by_token(self, transaction: Any, token: str) -> Dict[str, Any]:

@@ -390,7 +390,7 @@ def test_candidate_question_bank_combines_ai_questions_with_manual_crud(tmp_path
     )
     assert approved.status_code == 200, approved.text
     assert approved.json()["status"] == "approved"
-    assert approved.json()["speech_status"] == "ready"
+    assert approved.json()["speech_status"] == "deferred"
 
     rejected = api.patch(
         f"/api/v1/experience-questions/{manual['id']}",
@@ -528,7 +528,7 @@ def test_failed_resume_review_can_be_retried_from_the_domain_endpoint(tmp_path, 
     retried = api.post(
         f"/api/v1/resume-reviews/{review['id']}/retry",
         json={"expected_version": failed_review["version"], "reason": "模型超时后人工重试"},
-        headers={"X-Actor-Id": "interviewer_1"},
+        headers={"X-Actor-Id": "interviewer_1", "Idempotency-Key": "resume-retry-1"},
     )
     assert retried.status_code == 202, retried.text
     assert retried.json()["review"]["status"] == "queued"
@@ -536,9 +536,17 @@ def test_failed_resume_review_can_be_retried_from_the_domain_endpoint(tmp_path, 
     assert retried.json()["job"]["status"] == "pending"
     assert retried.json()["job"]["attempt_count"] == 0
     assert retried.json()["job"]["replay_count"] == 1
-    stale = api.post(
+    replayed = api.post(
         f"/api/v1/resume-reviews/{review['id']}/retry",
         json={"expected_version": failed_review["version"], "reason": "重复点击"},
+        headers={"Idempotency-Key": "resume-retry-1"},
+    )
+    assert replayed.status_code == 202
+    assert replayed.json()["job"]["id"] == retried.json()["job"]["id"]
+    stale = api.post(
+        f"/api/v1/resume-reviews/{review['id']}/retry",
+        json={"expected_version": failed_review["version"], "reason": "不同命令使用旧版本"},
+        headers={"Idempotency-Key": "resume-retry-2"},
     )
     assert stale.status_code == 409
     with persistence_for(get_store()).transaction("org_default") as transaction:

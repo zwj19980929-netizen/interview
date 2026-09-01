@@ -10,6 +10,7 @@ from pypdf.generic import DictionaryObject, NameObject, StreamObject
 
 from app.file_storage.provider import reset_private_file_storage_for_tests
 from app.main import create_app
+from app.persistence.provider import persistence_for
 from app.repositories.provider import reset_store_for_tests
 from app.workers.outbox import OutboxWorker
 from app.repositories.provider import get_store
@@ -175,7 +176,13 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
         json={"expected_version": experience_question["version"], "status": "approved"},
     )
     assert approved_experience.status_code == 200, approved_experience.text
-    assert approved_experience.json()["speech_status"] == "ready"
+    assert approved_experience.json()["speech_status"] == "deferred"
+    assert approved_experience.json()["speech_asset_id"] is None
+    assert not any(
+        item.get("kind") == "question.speech.generate"
+        and item.get("payload", {}).get("owner_type") == "experience_question"
+        for item in get_store().outbox_work_items.values()
+    )
 
     plan = api.post(
         "/api/v1/interview-plans/generate",
@@ -229,6 +236,17 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
         },
     )
     assert appointment.status_code == 200, appointment.text
+    assert appointment.json()["speech_preparation"]["status"] == "not_requested"
+    assert appointment.json()["speech_preparation"]["total"] == 1
+    mismatched_voice = api.patch(
+        f"/api/v1/interview-appointments/{appointment.json()['id']}",
+        json={
+            "expected_version": appointment.json()["version"],
+            "settings": {"voice_profile_id": "another_voice"},
+        },
+    )
+    assert mismatched_voice.status_code == 409
+    assert mismatched_voice.json()["error"]["code"] == "APPOINTMENT_SPEECH_PROFILE_MISMATCH"
     appointment_patch = api.patch(
         f"/api/v1/interview-appointments/{appointment.json()['id']}",
         json={
@@ -263,6 +281,7 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
     assert public_invitation.json()["consent"]["privacy_notice"]
     assert public_invitation.json()["consent"]["recording_notice"]
     assert public_invitation.json()["consent"]["notice_hash"]
+    assert public_invitation.json()["speech_preparation"]["status"] == "not_requested"
 
     rejected_consent = api.post(
         f"/api/v1/public/interview-invitations/{token}/intake",
@@ -324,6 +343,7 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
     assert registered.status_code == 200, registered.text
     assert registered.json()["status"] == "registered"
     assert registered.json()["email_reminder"]["status"] == "scheduled"
+    assert registered.json()["speech_preparation"]["status"] == "queued"
     stored_appointment = api.get(f"/api/v1/interview-appointments/{appointment.json()['id']}").json()
     reminder_work = next(
         item
@@ -332,6 +352,46 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
     )
     assert reminder_work["payload"] == {"appointment_id": appointment.json()["id"]}
     assert reminder_work["id"] == stored_appointment["email_reminder"]["work_item_id"]
+    speech_work = next(
+        item
+        for item in get_store().outbox_work_items.values()
+        if item.get("kind") == "question.speech.generate"
+        and item.get("payload", {}).get("appointment_id") == appointment.json()["id"]
+    )
+    assert speech_work["payload"]["speech_profile"] == approved_plan.json()["speech_profile_snapshot"]
+
+    before_speech_ready = api.post(
+        f"/api/v1/public/interview-invitations/{token}/readiness",
+        json={
+            "browser_supported": True,
+            "microphone_granted": True,
+            "audio_content_type": "audio/webm;codecs=opus",
+        },
+    )
+    assert before_speech_ready.status_code == 200, before_speech_ready.text
+    assert before_speech_ready.json()["can_start"] is False
+
+    asyncio.run(OutboxWorker(get_store()).run_once())
+    stored_appointment = api.get(f"/api/v1/interview-appointments/{appointment.json()['id']}").json()
+    assert stored_appointment["speech_preparation"]["status"] == "ready"
+    assert stored_appointment["speech_preparation"]["ready"] == 1
+    speech_asset_id = stored_appointment["speech_preparation"]["items"][0]["asset_id"]
+    with persistence_for(get_store()).transaction("org_default") as transaction:
+        speech_asset = transaction.question_speech_assets.get(speech_asset_id)
+        stored_experience = transaction.experience_questions.get(experience_question["id"])
+    frozen_profile = approved_plan.json()["speech_profile_snapshot"]
+    assert speech_asset["model_configuration_id"] == frozen_profile["model_configuration_id"]
+    assert speech_asset["model_configuration_version"] == frozen_profile["model_configuration_version"]
+    assert speech_asset["voice_profile_id"] == frozen_profile["voice_profile_id"]
+    assert speech_asset["language"] == frozen_profile["language"]
+    assert speech_asset["audio_format"] == frozen_profile["audio_format"]
+    assert speech_asset["speaking_rate"] == frozen_profile["speaking_rate"]
+    assert speech_asset["speech_profile_fingerprint"] == frozen_profile["fingerprint"]
+    assert speech_asset["knowledge_base_speech_profile_revisions"] == frozen_profile[
+        "knowledge_base_revisions"
+    ]
+    assert stored_experience["speech_status"] == "deferred"
+    assert stored_experience["speech_asset_id"] is None
 
     device_ready = api.post(
         f"/api/v1/public/interview-invitations/{token}/readiness",
@@ -365,6 +425,9 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
     assert session["turns"][0]["question_id"] == question_ids[1]
     assert len(session["question_selections"]) == 1
     assert [item["phase"] for item in session["turns"]] == ["position_bank", "resume_experience"]
+    resume_turn = next(item for item in session["turns"] if item["phase"] == "resume_experience")
+    assert resume_turn["question_snapshot"]["speech_asset_id"] == speech_asset_id
+    assert session["plan_snapshot"]["speech_profile_snapshot"] == frozen_profile
 
     for expected_phase in ("position_bank", "resume_experience"):
         session = api.get(f"/api/v1/interviews/{interview_id}").json()

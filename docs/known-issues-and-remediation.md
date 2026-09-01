@@ -234,6 +234,7 @@ Report module 在生成开始时先物化唯一的 `current_evaluations` 集合�
 | --- | --- | --- | --- | --- | --- |
 | `FILE-001` | P1 | `verified` | 简历仍依赖 `resume_text`/调用方 URI，没有 PDF、扫描和私有文件真相 | 新增 PrivateFileStorage、FileObject、multipart/URL、SSRF/隔离/扫描/PDF 解析；原件和解析文本分别私有化；旧 JSON 入口删除；官方 OSS SDK 已纳入依赖，command/clamd INSTREAM 扫描合同、本地/OSS contract 与恶意/环回/幂等测试通过；官方 ClamAV arm64 daemon 的 PING/干净样本/EICAR 集成测试已通过 | 真实 OSS bucket/RAM、目标 clamd 完整签名库更新与告警 `environment_pending` |
 | `ASYNC-001` | P1 | `verified` | 题库构建/PDF/worker 缺少退避、dead-letter、监控和重放 | import/rebuild/build 与 PDF 均返回 job；Outbox 增加最大尝试、指数退避、dead-letter、指标和审计重放；故障矩阵通过 | 外部告警平台由部署环境接入 |
+| `DURABLE-MODEL-RETRY-001` | P1 | `verified（仓库）` | 模型调用首次可重试失败时，部分服务提前写领域 failed；TTS 因此推进 Question version，下一次成功响应被自身的 source-version guard 判成 superseded，出现 6/10 假终态 | 统一 `Outbox failed=重试等待 / dead_letter=领域终态`；SpeechBuild 把可领取失败计入 pending，TTS 保持 Question version，题库导入、Resume Review/经历题、评分和报告同步采用终态门禁；后端故障注入与 React 部分完成试听回归通过 | 真实供应商限流/超时率、目标 Celery/Redis/PostgreSQL 的长时间故障恢复仍为部署环境验收 |
 | `STREAM-001` | P1 | `verified（仓库）` | 没有 `stt.streaming/open_stream`、唯一 final 和断流修复 | 新增 streaming schema、网关开流、序号/大小/唯一 final 校验、WebSocket、私有录音和 batch repair；DashScope 提供低延迟 partial/final，`media_http` 保留通用 batch-final stream；端到端测试通过 | 阿里云真实凭据、目标网络、WER/延迟/费用 `environment_pending` |
 | `MODEL-STREAM-PROBE-001` | P1 | `verified（仓库与本机）` | 流式 STT 模型测试用静音 WAV 强求 final，真实握手成功仍误报 `provider_final_transcript_missing`；实时语音对话没有统一测试 schema | 模型配置与 route 复用 stream handshake probe；STT/实时语音收到 ready 后主动关闭并返回 `probe_mode=handshake`；Qwen 3.5 session、输入转写模型、音色和受控指令更新顺序按当前协议校正；合同测试与本机百炼真实握手通过 | WER、final/首音延迟、打断、音质和费用仍为独立环境验收 |
 | `SECURITY-001` | P1 | `verified` | 联系人/凭证明文、无 RBAC/公开限流、敏感访问/失败请求无审计，URL token 可能进入日志 | 联系人 Fernet+租户 HMAC、ProviderSecretVault、生产 Bearer RBAC、Redis fail-closed 公开限流、未认证/成功请求审计、签名文件/媒体、媒体实际下载审计、URL token 脱敏；生产权限/限流测试通过 | 外部 IdP/企业 SSO 尚未选择 |
@@ -253,7 +254,7 @@ Report module 在生成开始时先物化唯一的 `current_evaluations` 集合�
 | `FAIRNESS-001` | P2 | `verified（仓库）` | 只有抽题分布，没有 AI/人工评分一致性与 cohort 差异校准 | 保留抽题公平性投影；新增只接受 current evaluation ID、人工分和 opaque cohort 的校准 API，输出 MAE/RMSE/偏差/分层/样本量告警且绝不自动改分 | 用户尚未提供真实脱敏金标；实际公平性结论为 `data_pending` |
 | `RETENTION-001` | P1 | `verified` | 敏感数据只有设计中的到期字段，没有可执行删除边界 | 新增默认 dry-run 的管理员留存服务；显式执行删除私有文件/录音并清空联系人、审阅、经历题、转写、评分/报告敏感内容，审计测试通过 | 企业实际留存天数与 legal hold 策略由部署配置决定 |
 | `COMPAT-001` | P2 | `closed` | 计划 `items`、管理员直建会话、文本答案和旧向量 QuestionService 曾同时存在 | 提供显式 v2 迁移命令；运行时旧表示、旧 schema、旧路由、旧 service/repository/worker 分支和前端 fallback 均已删除；OpenAPI/端到端测试通过 | 部署已有旧数据时必须先运行 v2 迁移；当前 SQLite 检查无计划数据 |
-| `KB-SPEECH-001` | P1 | `verified（仓库与本机）` | 题库页曾平铺全部题目，题库只能保存声音且 HTTP 会直接等待 TTS | 已实现 KnowledgeBaseSpeechProfile、voice catalog、整库 SpeechBuild、revision 防旧写、分层 React UI/API、模型引用删除保护与 Celery+DurableWorkItem；全量回归、Celery eager 和前端行为测试通过 | 真实外部 TTS、目标 Redis/PostgreSQL 属部署环境验收，不回退本项仓库状态 |
+| `KB-SPEECH-001` | P1 | `verified（仓库与本机）` | 题库页曾平铺全部题目，题库只能保存声音且 HTTP 会直接等待 TTS；运行中切换模型还会与进度 version 写入竞争 | 已实现 KnowledgeBaseSpeechProfile、voice catalog、整库 SpeechBuild、revision 防旧写、分层 React UI/API、模型引用删除保护与 Celery+DurableWorkItem；切换改为 profile revision 语义 CAS 并原子取消旧任务，前端增加进度自动刷新、取代提示和失败重试 spinner；全量回归、Celery eager 和前端行为测试通过 | 真实外部 TTS、目标 Redis/PostgreSQL 属部署环境验收，不回退本项仓库状态 |
 
 ### KB-SPEECH-001 修改步骤与批量重建不变量
 

@@ -92,6 +92,7 @@ class ModelAdminService:
             "credential_ref": "secret://provider-connections/%s" % connection_id,
             "credential_status": "valid" if payload["provider_id"] == "mock" else "untested",
             "last_validation": None,
+            "configuration_revision": 1,
             "created_at": now,
             "updated_at": now,
         }
@@ -145,6 +146,7 @@ class ModelAdminService:
             for field in ("display_name", "enabled"):
                 if field in payload and payload[field] is not None:
                     item[field] = payload[field]
+            item["configuration_revision"] = int(item.get("configuration_revision", 1)) + 1
             item["updated_at"] = utc_now()
             return transaction.provider_connections.update(item, expected_version=expected_version)
 
@@ -300,6 +302,7 @@ class ModelAdminService:
             "enabled": payload.get("enabled", True),
             "status": "ready" if connection["provider_id"] == "mock" else "untested",
             "last_validation": None,
+            "configuration_revision": 1,
             "created_at": now,
             "updated_at": now,
         }
@@ -387,6 +390,7 @@ class ModelAdminService:
             for field in ("display_name", "enabled"):
                 if field in payload and payload[field] is not None:
                     item[field] = payload[field]
+            item["configuration_revision"] = int(item.get("configuration_revision", 1)) + 1
             item["updated_at"] = utc_now()
             return transaction.model_configurations.update(item, expected_version=expected_version)
 

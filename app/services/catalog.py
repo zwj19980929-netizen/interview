@@ -7,6 +7,11 @@ from typing import Any, Dict, List, Optional
 from app.core.errors import ApiError
 from app.core.ids import new_id
 from app.core.time import utc_now
+from app.domain.appointment_speech import update_speech_preparation_item
+from app.domain.speech_profile import (
+    speech_asset_matches_profile,
+    speech_profile_fingerprint,
+)
 from app.model_gateway import capabilities as cap
 from app.model_gateway.gateway import ModelGateway
 from app.model_gateway.schemas import TTSSynthesizeRequest
@@ -434,11 +439,37 @@ class CatalogService:
             return {"id": question_id, "deleted": True, "status": "archived"}
 
     async def regenerate_question_speech(
-        self, question_id: str, *, expected_version: int, organization_id: str = "org_default"
+        self,
+        question_id: str,
+        *,
+        expected_version: int,
+        idempotency_key: str,
+        organization_id: str = "org_default",
     ) -> Dict[str, Any]:
+        if not idempotency_key.strip():
+            raise ApiError(
+                "IDEMPOTENCY_KEY_REQUIRED",
+                "Question speech regeneration requires an Idempotency-Key header.",
+            )
         with self.persistence.transaction(organization_id) as transaction:
             question = transaction.questions.get(question_id)
             self._required(question, "QUESTION_NOT_FOUND", "Question does not exist.")
+            work_idempotency_key = "question.speech.regenerate:%s:%s" % (
+                question_id,
+                idempotency_key,
+            )
+            existing = next(
+                (
+                    item
+                    for item in transaction.outbox.list()
+                    if item.get("idempotency_key") == work_idempotency_key
+                    and item.get("kind") == "question.speech.generate"
+                    and item.get("aggregate_id") == question_id
+                ),
+                None,
+            )
+            if existing is not None:
+                return {**question, "job_id": existing["id"], "work_item_id": existing["id"]}
             if question.get("status") != "active":
                 raise ApiError("QUESTION_NOT_ACTIVE", "Only an active question can regenerate speech.", status_code=409)
             knowledge_base = transaction.knowledge_bases.get(question["knowledge_base_id"])
@@ -457,8 +488,7 @@ class CatalogService:
                     organization_id=organization_id,
                     kind="question.speech.generate",
                     aggregate_id=question["id"],
-                    idempotency_key="question.speech:%s:%s:%s"
-                    % (question["id"], question["version"], profile["revision"]),
+                    idempotency_key=work_idempotency_key,
                     payload={
                         "owner_type": "question",
                         "owner_id": question["id"],
@@ -676,16 +706,17 @@ class CatalogService:
                             batch["status"] = "reviewing"
                             batch["phase"] = "reviewing"
                         else:
-                            batch["status"] = "failed"
+                            batch["status"] = (
+                                "failed"
+                                if (failed_work or {}).get("status") == "dead_letter"
+                                else "importing"
+                            )
                             batch["last_error"] = str(exc)[:1000]
                         batch["updated_at"] = utc_now()
                         transaction.question_generation_batches.update(
                             batch, expected_version=batch["version"]
                         )
-                if knowledge_base and (
-                    work.get("payload", {}).get("generation_import_scope") != "single"
-                    or (failed_work or {}).get("status") == "dead_letter"
-                ):
+                if knowledge_base and (failed_work or {}).get("status") == "dead_letter":
                     knowledge_base["status"] = "failed"
                     knowledge_base["updated_at"] = utc_now()
                     transaction.knowledge_bases.update(knowledge_base, expected_version=knowledge_base["version"])
@@ -777,10 +808,42 @@ class CatalogService:
             work = transaction.outbox.start(work_item_id)
             payload = work["payload"]
             owner_type = payload["owner_type"]
-            repository = (
-                transaction.questions if owner_type == "question" else transaction.experience_questions
-            )
-            owner = repository.get(payload["owner_id"])
+            appointment_id = payload.get("appointment_id")
+            if appointment_id:
+                appointment, owner = self._appointment_speech_context(
+                    transaction,
+                    payload,
+                    work_item_id=work_item_id,
+                )
+                if owner is None:
+                    transaction.outbox.complete(
+                        work_item_id,
+                        lease_token=work["lease_token"],
+                        result_status="superseded",
+                    )
+                    if appointment is not None and appointment.get("status") != "cancelled":
+                        self._update_appointment_speech_item(
+                            transaction,
+                            appointment["id"],
+                            payload["owner_id"],
+                            int(payload["source_version"]),
+                            status="cancelled",
+                        )
+                    return {"id": payload["owner_id"], "status": "superseded"}
+                self._update_appointment_speech_item(
+                    transaction,
+                    appointment["id"],
+                    owner["id"],
+                    int(owner["version"]),
+                    status="building",
+                )
+            else:
+                repository = (
+                    transaction.questions
+                    if owner_type == "question"
+                    else transaction.experience_questions
+                )
+                owner = repository.get(payload["owner_id"])
             if owner is None:
                 raise RuntimeError("Speech owner disappeared: %s" % payload["owner_id"])
             if int(owner["version"]) != int(payload["source_version"]):
@@ -793,7 +856,11 @@ class CatalogService:
                     work_item_id, lease_token=work["lease_token"], result_status="superseded"
                 )
                 return owner
-            if owner_type == "experience_question" and owner.get("status") != "approved":
+            if (
+                owner_type == "experience_question"
+                and not appointment_id
+                and owner.get("status") != "approved"
+            ):
                 transaction.outbox.complete(
                     work_item_id, lease_token=work["lease_token"], result_status="superseded"
                 )
@@ -818,8 +885,39 @@ class CatalogService:
                     knowledge_base.get("voice_profile_id", "voice_default_cn") if knowledge_base else "voice_default_cn"
                 )
             else:
-                language = owner.get("language", "zh-CN")
-                voice = owner.get("voice_profile_id", "voice_default_cn")
+                language = (profile or {}).get("language") or owner.get("language", "zh-CN")
+                voice = (profile or {}).get("voice_profile_id") or owner.get("voice_profile_id")
+
+            if appointment_id and profile:
+                existing_asset = next(
+                    (
+                        asset
+                        for asset in transaction.question_speech_assets.list()
+                        if asset.get("owner_type") == "experience_question"
+                        and asset.get("owner_id") == owner["id"]
+                        and int(asset.get("source_version", 0)) == int(owner["version"])
+                        and asset.get("status") == "ready"
+                        and speech_asset_matches_profile(asset, profile)
+                    ),
+                    None,
+                )
+                if existing_asset is not None:
+                    appointment = transaction.interview_appointments.get(appointment_id)
+                    if appointment is not None:
+                        self._update_appointment_speech_item(
+                            transaction,
+                            appointment["id"],
+                            owner["id"],
+                            int(owner["version"]),
+                            status="ready",
+                            asset_id=existing_asset["id"],
+                        )
+                    transaction.outbox.complete(
+                        work_item_id,
+                        lease_token=work["lease_token"],
+                        result_status="reused",
+                    )
+                    return existing_asset
 
         route = None
         if profile and profile.get("model_configuration_id"):
@@ -837,6 +935,16 @@ class CatalogService:
             }
 
         try:
+            if appointment_id and (
+                not profile
+                or not profile.get("model_configuration_id")
+                or not voice
+            ):
+                raise ApiError(
+                    "APPOINTMENT_SPEECH_PROFILE_INVALID",
+                    "Appointment speech work requires a frozen model and voice profile.",
+                    status_code=409,
+                )
             response = await self.gateway.invoke(
                 cap.TTS_SYNTHESIZE,
                 TTSSynthesizeRequest(
@@ -845,20 +953,52 @@ class CatalogService:
                     text=owner["question_text"],
                     language=language,
                     voice_profile_id=voice,
-                    metadata={"owner_type": owner_type, "owner_id": owner["id"], "source_version": owner["version"]},
+                    format=(profile or {}).get("audio_format", "audio/wav"),
+                    speaking_rate=float((profile or {}).get("speaking_rate", 1.0)),
+                    metadata={
+                        "owner_type": owner_type,
+                        "owner_id": owner["id"],
+                        "source_version": owner["version"],
+                        "appointment_id": appointment_id,
+                    },
                 ),
                 route=route,
             )
         except Exception as exc:
             with self.persistence.transaction(organization_id) as transaction:
-                repository = transaction.questions if owner_type == "question" else transaction.experience_questions
-                current = repository.get(owner["id"])
-                if current is not None and current["version"] == owner["version"]:
-                    current["speech_status"] = "failed"
-                    current["speech_error"] = str(exc)[:500]
-                    current["updated_at"] = utc_now()
-                    repository.update(current, expected_version=current["version"])
-                transaction.outbox.fail(work_item_id, str(exc), lease_token=work["lease_token"])
+                failed = transaction.outbox.fail(
+                    work_item_id,
+                    str(exc),
+                    lease_token=work["lease_token"],
+                    error_code=getattr(exc, "code", exc.__class__.__name__),
+                    retryable=(
+                        False
+                        if isinstance(exc, ApiError)
+                        else getattr(exc, "retryable", None)
+                    ),
+                )
+                terminal = failed.get("status") == "dead_letter"
+                if appointment_id:
+                    self._update_appointment_speech_item(
+                        transaction,
+                        appointment_id,
+                        owner["id"],
+                        int(owner["version"]),
+                        status="failed" if terminal else "building",
+                        error_code=failed.get("last_error_code") if terminal else None,
+                    )
+                elif terminal:
+                    repository = (
+                        transaction.questions
+                        if owner_type == "question"
+                        else transaction.experience_questions
+                    )
+                    current = repository.get(owner["id"])
+                    if current is not None and current["version"] == owner["version"]:
+                        current["speech_status"] = "failed"
+                        current["speech_error"] = str(exc)[:500]
+                        current["updated_at"] = utc_now()
+                        repository.update(current, expected_version=current["version"])
             raise
 
         if owner_type == "question" and profile is not None:
@@ -875,6 +1015,20 @@ class CatalogService:
                         work_item_id, lease_token=work["lease_token"], result_status="superseded"
                     )
                     return current or owner
+        elif owner_type == "experience_question" and appointment_id:
+            with self.persistence.transaction(organization_id) as transaction:
+                _, current_snapshot = self._appointment_speech_context(
+                    transaction,
+                    payload,
+                    work_item_id=work_item_id,
+                )
+                if current_snapshot is None:
+                    transaction.outbox.complete(
+                        work_item_id,
+                        lease_token=work["lease_token"],
+                        result_status="superseded",
+                    )
+                    return owner
         elif owner_type == "experience_question":
             with self.persistence.transaction(organization_id) as transaction:
                 current = transaction.experience_questions.get(owner["id"])
@@ -901,21 +1055,80 @@ class CatalogService:
                 )
         except Exception as exc:
             with self.persistence.transaction(organization_id) as transaction:
-                repository = transaction.questions if owner_type == "question" else transaction.experience_questions
-                current = repository.get(owner["id"])
-                if current is not None and current["version"] == owner["version"]:
-                    current["speech_status"] = "failed"
-                    current["speech_error"] = str(exc)[:500]
-                    current["updated_at"] = utc_now()
-                    repository.update(current, expected_version=current["version"])
-                transaction.outbox.fail(work_item_id, str(exc), lease_token=work["lease_token"])
+                failed = transaction.outbox.fail(
+                    work_item_id,
+                    str(exc),
+                    lease_token=work["lease_token"],
+                    error_code=getattr(exc, "code", exc.__class__.__name__),
+                    retryable=getattr(exc, "retryable", None),
+                )
+                terminal = failed.get("status") == "dead_letter"
+                if appointment_id:
+                    self._update_appointment_speech_item(
+                        transaction,
+                        appointment_id,
+                        owner["id"],
+                        int(owner["version"]),
+                        status="failed" if terminal else "building",
+                        error_code=failed.get("last_error_code") if terminal else None,
+                    )
+                elif terminal:
+                    repository = (
+                        transaction.questions
+                        if owner_type == "question"
+                        else transaction.experience_questions
+                    )
+                    current = repository.get(owner["id"])
+                    if current is not None and current["version"] == owner["version"]:
+                        current["speech_status"] = "failed"
+                        current["speech_error"] = str(exc)[:500]
+                        current["updated_at"] = utc_now()
+                        repository.update(current, expected_version=current["version"])
             raise
 
         with self.persistence.transaction(organization_id) as transaction:
-            repository = transaction.questions if owner_type == "question" else transaction.experience_questions
-            current = repository.get(owner["id"])
-            if current is None:
-                raise RuntimeError("Speech owner disappeared: %s" % owner["id"])
+            current = None
+            if appointment_id:
+                _, current_snapshot = self._appointment_speech_context(
+                    transaction,
+                    payload,
+                    work_item_id=work_item_id,
+                )
+                if current_snapshot is None:
+                    transaction.outbox.complete(
+                        work_item_id,
+                        lease_token=work["lease_token"],
+                        result_status="superseded",
+                    )
+                    return owner
+            else:
+                repository = (
+                    transaction.questions
+                    if owner_type == "question"
+                    else transaction.experience_questions
+                )
+                current = repository.get(owner["id"])
+                if current is None:
+                    raise RuntimeError("Speech owner disappeared: %s" % owner["id"])
+                if owner_type == "question":
+                    current_work = transaction.outbox.get(work_item_id)
+                    knowledge_base = transaction.knowledge_bases.get(
+                        current["knowledge_base_id"]
+                    )
+                    current_revision = (
+                        (knowledge_base or {}).get("speech_profile") or {}
+                    ).get("revision")
+                    if (
+                        current_work.get("cancel_requested")
+                        or int(current["version"]) != int(owner["version"])
+                        or int(current_revision or -1) != int(profile_revision or -2)
+                    ):
+                        transaction.outbox.complete(
+                            work_item_id,
+                            lease_token=work["lease_token"],
+                            result_status="superseded",
+                        )
+                        return current
             now = utc_now()
             file_object = None
             if private_file is not None:
@@ -948,11 +1161,19 @@ class CatalogService:
                     "speech_profile_revision": profile_revision,
                     "model_configuration_id": (profile or {}).get("model_configuration_id"),
                     "model_configuration_version": (profile or {}).get("model_configuration_version"),
+                    "speech_profile_fingerprint": (
+                        speech_profile_fingerprint(profile) if profile else None
+                    ),
+                    "knowledge_base_speech_profile_revisions": deepcopy(
+                        (profile or {}).get("knowledge_base_revisions", {})
+                    ),
                     "audio_uri": (
                         "private-file://%s" % file_object["id"] if file_object else response.audio_uri
                     ),
                     "file_object_id": file_object["id"] if file_object else None,
                     "content_type": response.content_type,
+                    "audio_format": response.content_type,
+                    "speaking_rate": float((profile or {}).get("speaking_rate", 1.0)),
                     "duration_ms": response.duration_ms,
                     "content_hash": private_file.checksum if private_file else response.content_hash,
                     "provider": response.provider.model_dump(),
@@ -962,17 +1183,108 @@ class CatalogService:
                     "updated_at": now,
                 }
             )
-            current["speech_asset_id"] = asset["id"]
-            current["speech_status"] = "ready"
-            if owner_type == "question":
-                current["speech_profile_revision"] = profile_revision
-            current["speech_error"] = None
-            current["updated_at"] = now
-            updated = repository.update(current, expected_version=current["version"])
+            if appointment_id:
+                self._update_appointment_speech_item(
+                    transaction,
+                    appointment_id,
+                    owner["id"],
+                    int(owner["version"]),
+                    status="ready",
+                    asset_id=asset["id"],
+                )
+                updated = asset
+            else:
+                current["speech_asset_id"] = asset["id"]
+                current["speech_status"] = "ready"
+                if owner_type == "question":
+                    current["speech_profile_revision"] = profile_revision
+                current["speech_error"] = None
+                current["updated_at"] = now
+                updated = repository.update(current, expected_version=current["version"])
             transaction.outbox.complete(work_item_id, lease_token=work["lease_token"])
             if owner_type == "question":
                 self._refresh_knowledge_base(transaction, current["knowledge_base_id"])
             return updated
+
+    def _appointment_speech_context(
+        self,
+        transaction: Any,
+        payload: Dict[str, Any],
+        *,
+        work_item_id: str,
+    ) -> tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        appointment = transaction.interview_appointments.get(payload.get("appointment_id"))
+        if appointment is None or appointment.get("status") not in {"registered", "consumed"}:
+            return appointment, None
+        plan = transaction.interview_plans.get(appointment.get("plan_id"))
+        profile = payload.get("speech_profile") or {}
+        frozen_profile = (plan or {}).get("speech_profile_snapshot") or {}
+        expected_fingerprint = payload.get("speech_profile_fingerprint")
+        if (
+            not profile
+            or speech_profile_fingerprint(profile) != expected_fingerprint
+            or frozen_profile.get("fingerprint") != expected_fingerprint
+        ):
+            return appointment, None
+        snapshot = next(
+            (
+                item
+                for item in (plan or {}).get("experience_question_snapshots", [])
+                if item.get("id") == payload.get("owner_id")
+                and int(item.get("version", 0)) == int(payload.get("source_version", 0))
+            ),
+            None,
+        )
+        preparation_item = next(
+            (
+                item
+                for item in (appointment.get("speech_preparation") or {}).get("items", [])
+                if item.get("question_id") == payload.get("owner_id")
+                and int(item.get("source_version", 0)) == int(payload.get("source_version", 0))
+            ),
+            None,
+        )
+        if (
+            snapshot is None
+            or preparation_item is None
+            or preparation_item.get("work_item_id") != work_item_id
+            or preparation_item.get("status") == "cancelled"
+        ):
+            return appointment, None
+        return appointment, deepcopy(snapshot)
+
+    @staticmethod
+    def _update_appointment_speech_item(
+        transaction: Any,
+        appointment_id: str,
+        question_id: str,
+        source_version: int,
+        *,
+        status: str,
+        asset_id: Optional[str] = None,
+        error_code: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        appointment = transaction.interview_appointments.get(appointment_id)
+        if appointment is None:
+            return None
+        if appointment.get("status") == "cancelled" and status != "cancelled":
+            return appointment
+        updated_preparation = update_speech_preparation_item(
+            appointment.get("speech_preparation") or {},
+            question_id=question_id,
+            source_version=source_version,
+            status=status,
+            asset_id=asset_id,
+            error_code=error_code,
+        )
+        if updated_preparation == appointment.get("speech_preparation"):
+            return appointment
+        appointment["speech_preparation"] = updated_preparation
+        appointment["updated_at"] = utc_now()
+        return transaction.interview_appointments.update(
+            appointment,
+            expected_version=appointment["version"],
+        )
 
     def issue_speech_access(
         self,

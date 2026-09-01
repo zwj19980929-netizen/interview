@@ -226,11 +226,13 @@ async def get_resume_review(review_id: str) -> Dict[str, Any]:
 async def retry_resume_review(
     review_id: str,
     payload: ResumeReviewRetry,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     x_actor_id: str = Header(default="interviewer_local", alias="X-Actor-Id"),
 ) -> Dict[str, Any]:
     return services()["talent"].retry_review(
         review_id,
         payload.model_dump(),
+        idempotency_key=idempotency_key or "",
         actor_id=x_actor_id,
     )
 
@@ -325,7 +327,13 @@ async def delete_question(question_id: str, expected_version: int) -> Dict[str, 
 
 
 @router.post("/api/v1/questions/{question_id}/speech/regenerate", status_code=202)
-async def regenerate_question_speech(question_id: str, payload: VersionedPatch) -> Dict[str, Any]:
+async def regenerate_question_speech(
+    question_id: str,
+    payload: VersionedPatch,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+) -> Dict[str, Any]:
     return await services()["catalog"].regenerate_question_speech(
-        question_id, expected_version=payload.expected_version
+        question_id,
+        expected_version=payload.expected_version,
+        idempotency_key=idempotency_key or "",
     )

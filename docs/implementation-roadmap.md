@@ -85,6 +85,7 @@
 - 管理员可以配置一个 provider，并为 `answer_evaluation` 配置路由。
 - 业务代码只调用 `ModelGateway.invoke`，不直接 import provider；route 中的重试、fallback、超时、断路器和 schema 校验必须实际生效。
 - `stt.streaming` 与 `speech.dialogue_realtime` 的模型配置及 route 均可用同一握手探针验证，不会因静音没有 final 而误报失败。
+- ProviderConnection/ModelConfiguration 使用 `configuration_revision` 把管理员配置语义与健康探针 version 分开；LLM、Embedding、STT、TTS、实时语音和数字人共享同一 latest-version command，后台健康/进度写入不会制造误冲突，真实配置变化仍要求人工重新确认。
 
 ## 里程碑 3：题库查询和候选池
 
@@ -205,12 +206,14 @@
 - 加密联系方式并建立带租户盐的精确查找哈希。
 - 实现 Resume Review deep module：调用方只排队/查询；内部负责脱敏、Token 预算、短简历单次审阅、长简历页感知 Map/分层压缩/最终 Reduce、证据来源页和结构化失败。
 - Resume Review 同时输出 `qualified/unqualified/manual_review` 建议、分数、命中要求和缺口；领域策略强制将 0–59/60–74/75–100 分别归一化为不符合/待人工复核/符合，候选人列表展示生效结果，人工复核保留 AI 建议和审计。
-- Resume Review 失败时由业务 retry 命令校验审阅 version、源简历和配置状态，把审阅与 dead-letter 工作原子恢复排队；React 直接展示中文失败原因和重试入口，不能要求招聘人员使用通用 Outbox 管理接口。
+- Resume Review 失败时由业务 retry 命令校验审阅 version、源简历和配置状态，把审阅与 dead-letter 工作原子恢复排队；命令要求 `Idempotency-Key`，并在 version 校验前识别相同重试。React 提交前读取最新审阅并直接展示中文失败原因和重试入口，不能要求招聘人员使用通用 Outbox 管理接口。
 - Resume Review 工作幂等键绑定不可变简历版本；重复上传相同 PDF 不得复用旧版本工作，queued 审阅缺失工作项时排队命令必须自愈补建。
+- 所有模型驱动 DurableWorkItem 统一把 `failed` 解释为自动重试等待态，只有 `dead_letter` 才写入领域失败；题目语音等带 source-version guard 的流程在自动重试期间不得修改输入聚合版本。题库导入、Resume Review/经历题、异步评分和报告遵守同一合同。
+- 题库 TTS 运行中变更模型/声音时，以 profile revision 作为配置语义 CAS，原子取消旧 revision 工作并创建新 build；不依赖客户端在密集进度写入之间抢到稳定的通用 version。前端展示取代说明、活动进度转圈和手动重试 busy 状态。
 - Resume Review 的结构化输出预算独立于输入分块预算；任务租约必须长于 Worker hard time limit，避免合法长调用被重复领取。
 - Resume Review 最终 Schema 必须对证据和要求设置数量/长度上界；预算内单次输出截断时自动转入页感知 Map/Reduce，不保存半截 JSON 也不同参数盲目重试。经历题使用符合资格后的独立 Prompt/Schema。
 - 候选人支持增查改删；简历版本支持创建、列表/详情/短期受控查看、展示名修改和受引用保护的删除。PDF 内容更新只能重新上传为新版本；删除会取消未运行工作并清理隔离/私有对象。所有最新岗位结论均不符合时设置 7 天期限，周期留存任务自动清除，符合或待复核者取消期限。
-- 只有生效结论符合时才生成 `ExperienceQuestion` 草稿；AI 不符合/待复核不生成，人工改判符合时排队。`CandidateQuestionBank` 作为按候选人聚合的简历问答投影，强制每题绑定并点名 ResumeReview 证据，支持 AI/人工来源、人工新建/编辑、批准/拒绝、归档和批准后的语音生成，不复制岗位 Question 实体。
+- 只有生效结论符合时才生成 `ExperienceQuestion` 草稿；AI 不符合/待复核不生成，人工改判符合时排队。`CandidateQuestionBank` 作为按候选人聚合的简历问答投影，强制每题绑定并点名 ResumeReview 证据，支持 AI/人工来源、人工新建/编辑、批准/拒绝和归档；批准只允许入计划，语音延迟到候选人确认预约后按题库冻结 profile 生成，不复制岗位 Question 实体。
 - 为 `resume_review` 和 `resume_experience_question_generation` 配置独立 route、prompt/schema revision 和审计。
 
 验收：
@@ -235,15 +238,17 @@
 建议任务：
 
 - 把 Interview Plan Assembly 调整为岗位题库 `bank_slots`、冻结候选池和已批准经历问题。
+- 为 InterviewPlan 冻结所选题库唯一 speech profile；模型版本、音色、语言、格式或语速冲突时拒绝装配。
 - 实现 `InterviewAppointment`、readiness gate、一次性 invitation token 哈希、过期、撤销和消费。
 - 实现公开邀请页和 Candidate Intake；候选人填写姓名、邮箱、手机号与同意信息。
-- 将“核验身份并确认预约”与“检查设备并进入面试”拆开；确认事务创建开始前 30 分钟的邮件提醒 DurableWorkItem，SMTP 授权码只从部署环境读取。
+- 将“核验身份并确认预约”与“检查设备并进入面试”拆开；确认事务创建开始前 30 分钟的邮件提醒和预约级简历题 TTS DurableWorkItem，SMTP 授权码只从部署环境读取。
 - 匹配仅针对预约绑定的 `CandidateProfile`，至少邮箱或手机号精确相同；错误响应防枚举。
 - start 原子消费预约、创建唯一 InterviewSession，并冻结候选人、简历、岗位和计划快照。
 
 验收：
 
-- 题库、审阅、经历问题语音或生产 STT 未就绪时不能发邀请。
+- 题库、审阅、岗位题语音、冻结 speech profile 或生产依赖未就绪时不能发邀请；简历题只要求已批准且证据有效。
+- 候选人确认前没有简历题 TTS 工作；确认后全部预约级资产 ready 且与冻结 profile 匹配，才允许 start。失败不回滚登记，取消预约终止未完成工作。
 - 错误/过期/撤销 token 无法登记；重复登记/start 幂等，不能产生两个会话。
 - 未匹配候选人不能查看简历、标准答案或面试房间。
 
@@ -349,6 +354,7 @@
 - 新题库从明确、enabled 且 ready 的 `question_speech_generation` route 初始化实际模型和默认音色；开发 mock 只验证流程，页面不得把 mock URI 标为可试听，并通过 `speech_preview` 给出普通用户可执行的配置/重试提示。
 - 任务重复投递、乱序完成、worker crash、配置在构建中再次切换均不能让旧资产覆盖当前指针。
 - 部分失败可只重试失败题；全部当前资产 ready 后题库才恢复 ready，预约 readiness 使用冻结 profile revision。
+- 后台构建推进 KnowledgeBase version 时，配置 UI 提交前重读并只在 speech profile 身份未变时吸收最新 version；真正的并发 profile 变化必须失败关闭。失败重试使用当前 Question version 和新的子工作身份，题库级与单题级入口均有 React 回归覆盖。
 - Celery 不可用时已提交工作项仍保留，恢复后由 Beat dispatcher 补发；管理员状态和 replay 不依赖 Celery result backend。
 - Memory/SQLite/PostgreSQL contract、Celery eager/真实 Redis broker 集成、Provider fake、React 行为和端到端计划/历史资产测试全部通过后，`KB-SPEECH-001` 才能标记 verified。
 

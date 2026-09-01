@@ -61,9 +61,17 @@ def test_batch_import_build_query_question_update_archive_and_regenerate() -> No
     regenerated = api.post(
         f"/api/v1/questions/{current['id']}/speech/regenerate",
         json={"expected_version": patched.json()["version"]},
+        headers={"Idempotency-Key": "question-speech-regenerate-1"},
     )
     assert regenerated.status_code == 202, regenerated.text
     assert regenerated.json()["speech_status"] == "pending"
+    replayed = api.post(
+        f"/api/v1/questions/{current['id']}/speech/regenerate",
+        json={"expected_version": patched.json()["version"]},
+        headers={"Idempotency-Key": "question-speech-regenerate-1"},
+    )
+    assert replayed.status_code == 202
+    assert replayed.json()["job_id"] == regenerated.json()["job_id"]
     asyncio.run(OutboxWorker(get_store()).run_once())
     regenerated = api.get(f"/api/v1/questions/{current['id']}")
     archived = api.patch(

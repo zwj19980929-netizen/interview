@@ -7,6 +7,7 @@ from app.persistence.interface import new_work_item
 from app.persistence.provider import persistence_for
 from app.repositories.provider import get_store, reset_store_for_tests
 from app.services.appointment_reminders import AppointmentReminderService
+from app.services.appointments import AppointmentService
 
 
 class FakeEmailSender:
@@ -91,3 +92,60 @@ def test_missing_smtp_configuration_keeps_reminder_retryable_without_fake_succes
     with persistence.transaction("org_default") as transaction:
         appointment = transaction.interview_appointments.get("appointment_reminder")
     assert appointment["email_reminder"]["status"] == "waiting_configuration"
+
+
+def test_cancelling_registered_appointment_cancels_deferred_speech_work() -> None:
+    reset_store_for_tests()
+    store = get_store()
+    persistence = persistence_for(store)
+    with persistence.transaction("org_default") as transaction:
+        work = transaction.outbox.enqueue(
+            new_work_item(
+                organization_id="org_default",
+                kind="question.speech.generate",
+                aggregate_id="experience_cancel",
+                idempotency_key="appointment.speech:cancel-test",
+                payload={
+                    "appointment_id": "appointment_cancel",
+                    "owner_type": "experience_question",
+                    "owner_id": "experience_cancel",
+                    "source_version": 1,
+                },
+            )
+        )
+        transaction.interview_appointments.add(
+            {
+                "id": "appointment_cancel",
+                "organization_id": "org_default",
+                "status": "registered",
+                "invitation_token_hash": "private",
+                "speech_preparation": {
+                    "status": "queued",
+                    "profile_fingerprint": "sha256:test",
+                    "total": 1,
+                    "ready": 0,
+                    "failed": 0,
+                    "requested_at": utc_now(),
+                    "updated_at": utc_now(),
+                    "items": [
+                        {
+                            "question_id": "experience_cancel",
+                            "source_version": 1,
+                            "status": "queued",
+                            "asset_id": None,
+                            "work_item_id": work["id"],
+                        }
+                    ],
+                },
+                "updated_at": utc_now(),
+            }
+        )
+
+    cancelled = AppointmentService(store, persistence=persistence).cancel("appointment_cancel")
+
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["speech_preparation"]["status"] == "cancelled"
+    assert cancelled["speech_preparation"]["items"][0]["status"] == "cancelled"
+    with persistence.transaction("org_default") as transaction:
+        stored_work = transaction.outbox.get(work["id"])
+    assert stored_work["status"] == "cancelled"

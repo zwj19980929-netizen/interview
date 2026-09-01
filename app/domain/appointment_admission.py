@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from app.core.errors import ApiError
+from app.domain.speech_profile import speech_asset_matches_profile
 from app.model_gateway import capabilities as cap
 from app.model_gateway.registry import get_provider_manifest
 
@@ -35,6 +36,7 @@ class AppointmentAdmission:
         transaction: Any,
         plan: Dict[str, Any],
         *,
+        appointment: Optional[Dict[str, Any]] = None,
         now: datetime,
         ttl_seconds: int = 60,
     ) -> Dict[str, Any]:
@@ -45,6 +47,48 @@ class AppointmentAdmission:
             {
                 "name": "candidate_pools",
                 "ready": bool(slots) and all(slot.get("candidate_pool") for slot in slots),
+            }
+        )
+        experience_snapshots = plan.get("experience_question_snapshots", []) if plan else []
+        preparation = (appointment or {}).get("speech_preparation") or {}
+        prepared_items = preparation.get("items", [])
+        prepared_by_source = {
+            (item.get("question_id"), int(item.get("source_version", 0))): item
+            for item in prepared_items
+        }
+        speech_profile = (plan or {}).get("speech_profile_snapshot") or {}
+        experience_speech_local_ready = not experience_snapshots or (
+            preparation.get("status") == "ready"
+            and len(prepared_items) == len(experience_snapshots)
+            and all(
+                self._prepared_experience_asset_ready(
+                    transaction,
+                    prepared_by_source.get((snapshot.get("id"), int(snapshot.get("version", 0)))),
+                    snapshot,
+                    speech_profile,
+                )
+                for snapshot in experience_snapshots
+            )
+        )
+        experience_speech_production_ready = experience_speech_local_ready and all(
+            self._speech_asset_is_production_ready(transaction, item.get("asset_id"))
+            for item in prepared_items
+        )
+        if not experience_snapshots:
+            experience_speech_production_ready = True
+        checks.append(
+            {
+                "name": "experience_question_speech",
+                "ready": (
+                    experience_speech_local_ready
+                    if local_mode
+                    else experience_speech_production_ready
+                ),
+                "production_ready": experience_speech_production_ready,
+                "invite_ready": bool(speech_profile)
+                or not experience_snapshots
+                or experience_speech_local_ready,
+                "status": preparation.get("status", "not_requested"),
             }
         )
         referenced = {
@@ -117,6 +161,10 @@ class AppointmentAdmission:
         )
         local_ready = all(item["ready"] for item in checks)
         production_ready = all(item.get("production_ready", item["ready"]) for item in checks)
+        invite_ready = all(
+            item.get("invite_ready", item["ready"] if local_mode else item.get("production_ready", item["ready"]))
+            for item in checks
+        )
         checked_at = ensure_utc(now)
         return {
             "checked_at": format_utc(checked_at),
@@ -125,13 +173,32 @@ class AppointmentAdmission:
             "checks": checks,
             "local_ready": local_ready,
             "production_ready": production_ready,
-            "can_invite": local_ready if local_mode else production_ready,
+            "can_invite": invite_ready,
             "can_start": local_ready if local_mode else production_ready,
         }
 
     def _speech_asset_is_production_ready(self, transaction: Any, asset_id: Optional[str]) -> bool:
         asset = transaction.question_speech_assets.get(asset_id) if asset_id else None
         return bool(asset and asset.get("production_ready"))
+
+    @staticmethod
+    def _prepared_experience_asset_ready(
+        transaction: Any,
+        item: Optional[Dict[str, Any]],
+        snapshot: Dict[str, Any],
+        profile: Dict[str, Any],
+    ) -> bool:
+        if not item or item.get("status") != "ready":
+            return False
+        asset = transaction.question_speech_assets.get(item.get("asset_id"))
+        return bool(
+            asset
+            and asset.get("owner_type") == "experience_question"
+            and asset.get("owner_id") == snapshot.get("id")
+            and int(asset.get("source_version", 0)) == int(snapshot.get("version", 0))
+            and asset.get("status") == "ready"
+            and speech_asset_matches_profile(asset, profile)
+        )
 
     def _route_ready(
         self,

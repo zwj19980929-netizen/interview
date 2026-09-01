@@ -33,6 +33,43 @@ def test_manifest_exposes_backend_owned_connection_and_model_forms() -> None:
     }
 
 
+def test_dashscope_manifest_keeps_qwen_plus_and_recommends_current_llms() -> None:
+    manifest = get_provider_manifest("dashscope")
+    llms = {
+        model["model_id"]: model
+        for model in manifest["models"]
+        if model["model_type"] == "llm"
+    }
+
+    assert manifest["model_types"]["llm"]["selection_mode"] == "customizable"
+    assert {
+        "qwen-plus",
+        "qwen3.8-max",
+        "qwen3.8-flash",
+        "qwen3.7-plus",
+        "qwen3.7-flash",
+        "qwen-flash",
+        "qwen-turbo",
+        "qwen-long",
+        "qwen3-coder-plus",
+        "deepseek-v4-pro",
+        "deepseek-v4-flash",
+        "glm-5.2",
+        "kimi-k2.7-code",
+        "MiniMax-M3",
+        "mimo-v2.5-pro",
+    }.issubset(llms)
+    assert llms["qwen-plus"]["default"] is True
+    assert "官方" in llms["qwen-plus"]["label"]
+    for model_id in ("deepseek-v4-pro", "glm-5.2", "kimi-k2.7-code", "MiniMax-M3"):
+        structured_output = next(
+            field
+            for field in llms[model_id]["configuration_form"]["fields"]
+            if field["name"] == "structured_output_mode"
+        )
+        assert structured_output["default"] == "prompt"
+
+
 def test_dynamic_form_validation_rejects_unknown_and_invalid_values() -> None:
     schema = {
         "fields": [
@@ -92,6 +129,73 @@ def test_connection_model_and_route_are_separate_resources() -> None:
         "pricing": {},
     }
     assert "provider_config_id" not in str(route.json())
+
+
+@pytest.mark.parametrize(
+    ("model_type", "provider_model_id", "capability"),
+    [
+        ("llm", "mock-json", "llm.chat_json"),
+        ("embedding", "mock-embedding", "embedding.text"),
+        ("stt", "mock-stt", "stt.batch"),
+        ("tts", "mock-tts", "tts.synthesize"),
+        ("avatar", "mock-avatar", "avatar.speak"),
+        ("realtime_speech", "mock-dialogue", "speech.dialogue_realtime"),
+    ],
+)
+def test_probe_version_is_not_a_configuration_change_for_any_model_type(
+    model_type: str,
+    provider_model_id: str,
+    capability: str,
+) -> None:
+    api = client()
+    connection = api.post(
+        "/api/v1/admin/model-provider-connections",
+        json={"provider_id": "mock", "display_name": "All capability provider"},
+    ).json()
+    model = api.post(
+        "/api/v1/admin/model-configurations",
+        json={
+            "provider_connection_id": connection["id"],
+            "model_type": model_type,
+            "provider_model_id": provider_model_id,
+            "display_name": "Model %s" % model_type,
+        },
+    ).json()
+    assert model["configuration_revision"] == 1
+
+    probed = api.post(
+        f"/api/v1/admin/model-configurations/{model['id']}/test",
+        json={"capability": capability},
+    )
+    assert probed.status_code == 200, probed.text
+    after_probe = api.get(f"/api/v1/admin/model-configurations/{model['id']}").json()
+    assert after_probe["version"] > model["version"]
+    assert after_probe["configuration_revision"] == 1
+
+    patched = api.patch(
+        f"/api/v1/admin/model-configurations/{model['id']}",
+        json={
+            "expected_version": after_probe["version"],
+            "display_name": "Updated %s" % model_type,
+        },
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["configuration_revision"] == 2
+
+
+def test_provider_validation_does_not_change_connection_configuration_revision() -> None:
+    api = client()
+    connection = api.post(
+        "/api/v1/admin/model-provider-connections",
+        json={"provider_id": "mock", "display_name": "Probe-neutral provider"},
+    ).json()
+
+    validated = api.post(
+        f"/api/v1/admin/model-provider-connections/{connection['id']}/validate"
+    )
+    assert validated.status_code == 200, validated.text
+    assert validated.json()["version"] > connection["version"]
+    assert validated.json()["configuration_revision"] == connection["configuration_revision"] == 1
 
 
 def test_model_and_provider_crud_apply_scoped_cascades() -> None:

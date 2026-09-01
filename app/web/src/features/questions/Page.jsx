@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { requestWithLatestVersion } from "../../../core/concurrency.js";
 import { useWorkbench } from "../../core/WorkbenchProvider.jsx";
 import { Empty, Field, ModalForm, Status, formatDate, splitComma, splitLines } from "../../core/ui.jsx";
 
@@ -67,7 +68,18 @@ function KnowledgeBaseDetail({ API, data, request, navigate, reloadRoute, openMo
   const knowledgeBase = data.selectedKnowledgeBase;
   const [query, setQuery] = useState("");
   const [playingId, setPlayingId] = useState("");
+  const [speechAction, setSpeechAction] = useState("");
   const playerRef = useRef(null);
+  const speechActionRef = useRef("");
+  const currentBuild = data.speechBuilds[0];
+  const speechBuildActive = currentBuild && ["queued", "pending", "running"].includes(currentBuild.status);
+  useEffect(() => {
+    if (!speechBuildActive) return undefined;
+    const timer = window.setTimeout(() => {
+      reloadRoute("knowledgeBases", "knowledgeBaseDetail", "questions", "speechBuilds").catch(() => {});
+    }, 1800);
+    return () => window.clearTimeout(timer);
+  }, [currentBuild?.id, currentBuild?.status, currentBuild?.pending, currentBuild?.running, currentBuild?.ready, currentBuild?.failed, speechBuildActive, reloadRoute]);
   const questions = useMemo(() => {
     const needle = query.trim().toLowerCase();
     if (!needle) return data.questions;
@@ -89,7 +101,7 @@ function KnowledgeBaseDetail({ API, data, request, navigate, reloadRoute, openMo
   });
   const configureSpeech = () => openModal({
     title: "配置题库读题语音",
-    body: <SpeechProfileForm knowledgeBase={knowledgeBase} speechOptions={data.speechOptions} onTest={async (modelId) => {
+    body: <>{speechBuildActive && <div className="inline-warning field-full">当前 revision 仍在生成语音。保存新的模型或声音后，系统会停止尚未完成的旧任务，已在调用供应商的迟到结果会作废，并以新配置重新生成全部题目。</div>}<SpeechProfileForm knowledgeBase={knowledgeBase} speechOptions={data.speechOptions} onTest={async (modelId) => {
       try {
         await request(`${API}/admin/model-configurations/${encodeURIComponent(modelId)}/test`, { method: "POST", body: {}, timeoutMs: 40000 });
         const next = await request(`${API}/knowledge-bases/${encodeURIComponent(knowledgeBase.id)}/speech-options`);
@@ -104,13 +116,27 @@ function KnowledgeBaseDetail({ API, data, request, navigate, reloadRoute, openMo
         return next;
       }
     }} onSubmit={async (value) => {
-      const build = await request(`${API}/knowledge-bases/${encodeURIComponent(knowledgeBase.id)}/speech-profile`, {
-        method: "PUT",
-        idempotencyKey: globalThis.crypto?.randomUUID?.() || `${Date.now()}`,
-        body: { expected_version: knowledgeBase.version, ...value },
+      const path = `${API}/knowledge-bases/${encodeURIComponent(knowledgeBase.id)}`;
+      const updatePath = `${path}/speech-profile`;
+      const idempotencyKey = globalThis.crypto?.randomUUID?.() || `${Date.now()}`;
+      const build = await requestWithLatestVersion({
+        request,
+        resourcePath: path,
+        snapshot: knowledgeBase,
+        identity: knowledgeBaseSpeechIdentity,
+        changedMessage: "题库语音配置已在其他页面发生变化，请刷新确认后重新提交",
+        perform: (latest) => request(updatePath, {
+          method: "PUT",
+          idempotencyKey,
+          body: {
+            expected_version: latest.version,
+            expected_speech_profile_revision: knowledgeBase.speech_profile?.revision ?? null,
+            ...value,
+          },
+        }),
       });
       await finish("语音配置已更新", `已提交 ${build.total} 道题目的整库语音重建`);
-    }} />,
+    }} /></>,
   });
   const details = (item) => openModal({
     title: item.title,
@@ -119,9 +145,17 @@ function KnowledgeBaseDetail({ API, data, request, navigate, reloadRoute, openMo
   const editQuestion = (item) => openModal({
     title: `编辑 ${item.title}`,
     body: <QuestionForm current={item} onSubmit={async (form) => {
-      await request(`${API}/questions/${encodeURIComponent(item.id)}`, {
-        method: "PATCH",
-        body: { expected_version: item.version, ...questionFormPayload(form) },
+      const path = `${API}/questions/${encodeURIComponent(item.id)}`;
+      await requestWithLatestVersion({
+        request,
+        resourcePath: path,
+        snapshot: item,
+        identity: questionContentIdentity,
+        changedMessage: "题目内容已被修改，请刷新后重新确认",
+        perform: (latest) => request(path, {
+          method: "PATCH",
+          body: { expected_version: latest.version, ...questionFormPayload(form) },
+        }),
       });
       await finish("题目已更新", "题干变化时只会重新生成这一道题的语音");
     }} />,
@@ -129,7 +163,15 @@ function KnowledgeBaseDetail({ API, data, request, navigate, reloadRoute, openMo
   const deleteQuestion = (item) => openModal({
     title: "删除题目",
     body: <ModalForm submitLabel="确认删除" submitVariant="danger" onSubmit={async () => {
-      await request(`${API}/questions/${encodeURIComponent(item.id)}?expected_version=${item.version}`, { method: "DELETE" });
+      const path = `${API}/questions/${encodeURIComponent(item.id)}`;
+      await requestWithLatestVersion({
+        request,
+        resourcePath: path,
+        snapshot: item,
+        identity: questionContentIdentity,
+        changedMessage: "题目内容已被修改，请刷新后重新确认删除",
+        perform: (latest) => request(`${path}?expected_version=${latest.version}`, { method: "DELETE" }),
+      });
       await finish("题目已删除", "题目已从当前题库移除，历史面试记录和旧语音资产保持不变");
     }}><div className="delete-warning field-full"><strong>从当前题库移除“{item.title}”？</strong><p>该题不会再参与后续面试计划；历史面试快照不会被删除。</p></div></ModalForm>,
   });
@@ -153,10 +195,40 @@ function KnowledgeBaseDetail({ API, data, request, navigate, reloadRoute, openMo
       toast("暂时不能试听", message, "error");
     }
   };
+  const runSpeechAction = async (key, action) => {
+    if (speechActionRef.current) return;
+    speechActionRef.current = key;
+    setSpeechAction(key);
+    try {
+      await action();
+    } catch (error) {
+      toast("重新生成失败", error.message, "error");
+    } finally {
+      speechActionRef.current = "";
+      setSpeechAction("");
+    }
+  };
+  const regenerateQuestion = async (item) => runSpeechAction(`question:${item.id}`, async () => {
+    const latest = await request(`${API}/questions/${encodeURIComponent(item.id)}`);
+    const queued = await request(`${API}/questions/${encodeURIComponent(item.id)}/speech/regenerate`, {
+      method: "POST",
+      idempotencyKey: globalThis.crypto?.randomUUID?.() || `${Date.now()}`,
+      body: { expected_version: latest.version },
+    });
+    await finish("语音已重新排队", queued.job_id ? "Worker 将重新生成这道题的语音" : "语音任务已恢复");
+  });
   const profile = knowledgeBase.speech_profile;
   const developmentMock = profile?.source === "development_mock" || profile?.model_configuration_id?.startsWith("model_cfg_mock_");
   const selectedModel = data.speechOptions.items.find((item) => item.id === profile?.model_configuration_id);
-  const currentBuild = data.speechBuilds[0];
+  const retryFailedBuild = async () => runSpeechAction("build", async () => {
+    const latest = await request(`${API}/knowledge-bases/${encodeURIComponent(knowledgeBase.id)}`);
+    const retry = await request(`${API}/knowledge-bases/${encodeURIComponent(knowledgeBase.id)}/speech-builds/${encodeURIComponent(currentBuild.id)}/retry-failed`, {
+      method: "POST",
+      idempotencyKey: globalThis.crypto?.randomUUID?.() || `${Date.now()}`,
+      body: { expected_version: latest.version },
+    });
+    await finish("失败语音已重新排队", `正在重新生成 ${retry.total} 道失败题目的语音`);
+  });
 
   return <>
     <button className="back-link" type="button" onClick={() => navigate("questions")}>← 返回题库</button>
@@ -165,15 +237,17 @@ function KnowledgeBaseDetail({ API, data, request, navigate, reloadRoute, openMo
       <div className="speech-profile-copy"><span className="eyebrow">题库读题语音</span><strong>{developmentMock ? "开发模拟语音（不可试听）" : selectedModel?.display_name || profile?.model_configuration_id || "尚未配置 TTS 模型"}</strong><span>{developmentMock ? "请选择已测试通过的真实语音模型和声音" : profile ? `${profile.voice_profile_id} · ${profile.language} · ${profile.audio_format} · ${profile.speaking_rate}x` : "选择模型和声音后，将为题库内所有题目生成语音"}</span></div>
       <Status value={developmentMock ? "configuration_required" : knowledgeBase.speech_build_status || "configuration_required"} />
       {currentBuild && <BuildProgress build={currentBuild} />}
+      {currentBuild && knowledgeBase.speech_build_status === "failed" && <button className="button button-primary button-small button-with-spinner" type="button" onClick={retryFailedBuild} disabled={Boolean(speechAction)} aria-busy={speechAction === "build"}>{speechAction === "build" && <span className="spinner" />}{speechAction === "build" ? "重新生成中…" : "重试失败语音"}</button>}
     </section>
     {developmentMock && <div className="inline-warning">当前题库使用的是开发模拟语音，只用于流程测试，不包含实际音频。点击“配置语音”，选择已测试通过的模型和声音后，系统会重新生成全部题目语音。</div>}
     {!data.speechOptions.items.length && <div className="inline-warning">{data.speechOptions.candidates?.length ? `已找到 ${data.speechOptions.candidates.length} 个 TTS 模型，但尚未测试通过。点击“配置语音”可直接测试并启用。` : "还没有支持 TTS 的模型。请先到“模型服务”添加 TTS 模型。"}</div>}
     <section className="section-title-row question-list-heading"><div><h2>题目</h2><p>题目变化只生成当前题目的新语音；模型或声音变化会整库重建</p></div><input className="form-input question-filter" value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索题目或技能" /></section>
     {questions.length ? <div className="data-table-wrap"><table className="data-table"><thead><tr><th>题目</th><th>难度</th><th>校验</th><th>语音</th><th></th></tr></thead><tbody>{questions.map((item) => {
-      const speechStatus = !profile || developmentMock ? "configuration_required" : currentBuild && ["queued", "running"].includes(currentBuild.status) ? "rebuilding" : item.speech_status;
+      const speechStatus = !profile || developmentMock ? "configuration_required" : speechBuildActive && ["pending", "failed"].includes(item.speech_status) ? "rebuilding" : item.speech_status;
       const preview = item.speech_preview || {};
       const canPreview = speechStatus === "ready" && Boolean(item.speech_asset_id) && preview.available !== false;
-      return <tr key={item.id}><td><strong>{item.title}</strong><small className="cell-subtitle">{item.skills?.join(" · ")}</small></td><td>{item.difficulty}</td><td><Status value={item.validation_status} /></td><td><Status value={speechStatus} />{!canPreview && preview.message && <small className="cell-subtitle">{preview.message}</small>}</td><td><div className="table-actions"><button className="button button-secondary button-small" onClick={() => previewQuestion(item)} disabled={!canPreview} title={canPreview ? "播放读题语音" : preview.message || "语音尚未准备好"}>{playingId === item.id ? "播放中…" : "试听"}</button><button className="button button-secondary button-small" onClick={() => details(item)}>查看</button><button className="button button-secondary button-small" onClick={() => editQuestion(item)}>编辑</button><button className="button button-danger button-small" onClick={() => deleteQuestion(item)}>删除</button></div></td></tr>;
+      const retrying = speechAction === `question:${item.id}`;
+      return <tr key={item.id}><td><strong>{item.title}</strong><small className="cell-subtitle">{item.skills?.join(" · ")}</small></td><td>{item.difficulty}</td><td><Status value={item.validation_status} /></td><td><Status value={speechStatus} />{!canPreview && preview.message && <small className="cell-subtitle">{preview.message}</small>}</td><td><div className="table-actions"><button className="button button-secondary button-small" onClick={() => previewQuestion(item)} disabled={!canPreview} title={canPreview ? "播放读题语音" : preview.message || "语音尚未准备好"}>{playingId === item.id ? "播放中…" : "试听"}</button>{speechStatus === "failed" && <button className="button button-primary button-small button-with-spinner" onClick={() => regenerateQuestion(item)} disabled={Boolean(speechAction)} aria-busy={retrying}>{retrying && <span className="spinner" />}{retrying ? "重新生成中…" : "重新生成"}</button>}<button className="button button-secondary button-small" onClick={() => details(item)}>查看</button><button className="button button-secondary button-small" onClick={() => editQuestion(item)}>编辑</button><button className="button button-danger button-small" onClick={() => deleteQuestion(item)}>删除</button></div></td></tr>;
     })}</tbody></table></div> : <Empty title={query ? "没有匹配题目" : "题库中还没有题目"} copy={query ? "换一个关键词试试" : "点击“新建题目”建立第一道题"} />}
   </>;
 }
@@ -220,10 +294,18 @@ function QuestionGenerationWorkbench({ API, data, request, navigate, reloadRoute
       const endpoint = chunk
         ? `${API}/question-generation-batches/${encodeURIComponent(batch.id)}/chunks/${encodeURIComponent(chunk.chunk_id)}/retry`
         : `${API}/question-generation-batches/${encodeURIComponent(batch.id)}/${action}`;
-      await request(endpoint, {
-        method: "POST",
-        idempotencyKey: globalThis.crypto?.randomUUID?.() || `${Date.now()}`,
-        body: { expected_version: batch.version, reason: action === "stop" ? "面试官在生题工作台停止" : "面试官在生题工作台重试" },
+      const idempotencyKey = globalThis.crypto?.randomUUID?.() || `${Date.now()}`;
+      await requestWithLatestVersion({
+        request,
+        resourcePath: `${API}/question-generation-batches/${encodeURIComponent(batch.id)}`,
+        snapshot: batch,
+        identity: generationExecutionIdentity,
+        changedMessage: "生题任务已被其他人工命令推进，请刷新后重新确认",
+        perform: (latest) => request(endpoint, {
+          method: "POST",
+          idempotencyKey,
+          body: { expected_version: latest.version, reason: action === "stop" ? "面试官在生题工作台停止" : "面试官在生题工作台重试" },
+        }),
       });
       await finish(title === "停止任务" ? "已提交停止" : "任务已重新排队", action === "stop" ? "系统不会再发起新的模型调用，在途调用的迟到结果也不会写入" : "已完成的分片会保留，只处理失败或未完成部分");
     }}><div className="generation-command-confirm field-full"><strong>{copy}</strong><p>{action === "stop" ? "已到达供应商的请求可能无法立即撤销，但停止后的结果不会进入候选题。" : "该操作可能产生新的模型调用费用，成功分片不会重复生成。"}</p></div></ModalForm>,
@@ -231,9 +313,16 @@ function QuestionGenerationWorkbench({ API, data, request, navigate, reloadRoute
   const editDraft = (draft) => openModal({
     title: `审核候选题：${draft.title}`,
     body: <QuestionForm current={draft} submitLabel="保存候选题" onSubmit={async (form) => {
-      await request(`${API}/question-generation-batches/${encodeURIComponent(batch.id)}/drafts/${encodeURIComponent(draft.id)}`, {
-        method: "PATCH",
-        body: { expected_version: batch.version, ...questionFormPayload(form) },
+      await requestWithLatestVersion({
+        request,
+        resourcePath: `${API}/question-generation-batches/${encodeURIComponent(batch.id)}`,
+        snapshot: batch,
+        identity: generationDraftIdentity(draft.id),
+        changedMessage: "这道候选题已被修改或导入，请刷新后重新审核",
+        perform: (latest) => request(`${API}/question-generation-batches/${encodeURIComponent(batch.id)}/drafts/${encodeURIComponent(draft.id)}`, {
+          method: "PATCH",
+          body: { expected_version: latest.version, ...questionFormPayload(form) },
+        }),
       });
       await finish("候选题已保存", "修改仍只属于当前生成批次，尚未进入正式题库");
     }} />,
@@ -241,7 +330,14 @@ function QuestionGenerationWorkbench({ API, data, request, navigate, reloadRoute
   const deleteDraft = (draft) => openModal({
     title: "删除候选题",
     body: <ModalForm submitLabel="确认删除" submitVariant="danger" onSubmit={async () => {
-      await request(`${API}/question-generation-batches/${encodeURIComponent(batch.id)}/drafts/${encodeURIComponent(draft.id)}?expected_version=${batch.version}`, { method: "DELETE" });
+      await requestWithLatestVersion({
+        request,
+        resourcePath: `${API}/question-generation-batches/${encodeURIComponent(batch.id)}`,
+        snapshot: batch,
+        identity: generationDraftIdentity(draft.id),
+        changedMessage: "这道候选题已被修改或导入，请刷新后重新确认删除",
+        perform: (latest) => request(`${API}/question-generation-batches/${encodeURIComponent(batch.id)}/drafts/${encodeURIComponent(draft.id)}?expected_version=${latest.version}`, { method: "DELETE" }),
+      });
       await finish("候选题已删除", "正式题库没有受到影响");
     }}><div className="delete-warning field-full"><strong>删除候选题“{draft.title}”？</strong><p>删除后不会随本批次导入。</p></div></ModalForm>,
   });
@@ -252,10 +348,18 @@ function QuestionGenerationWorkbench({ API, data, request, navigate, reloadRoute
   const importDraft = (draft) => openModal({
     title: "单独导入题目",
     body: <ModalForm submitLabel={draft.import_status === "failed" ? "重新导入这一题" : "确认导入这一题"} onSubmit={async () => {
-      await request(`${API}/question-generation-batches/${encodeURIComponent(batch.id)}/drafts/${encodeURIComponent(draft.id)}/import`, {
-        method: "POST",
-        idempotencyKey: globalThis.crypto?.randomUUID?.() || `${Date.now()}`,
-        body: { expected_version: batch.version, expected_draft_version: draft.version || 1 },
+      const idempotencyKey = globalThis.crypto?.randomUUID?.() || `${Date.now()}`;
+      await requestWithLatestVersion({
+        request,
+        resourcePath: `${API}/question-generation-batches/${encodeURIComponent(batch.id)}`,
+        snapshot: batch,
+        identity: generationDraftIdentity(draft.id),
+        changedMessage: "这道候选题已被修改或导入，请刷新后重新确认",
+        perform: (latest) => request(`${API}/question-generation-batches/${encodeURIComponent(batch.id)}/drafts/${encodeURIComponent(draft.id)}/import`, {
+          method: "POST",
+          idempotencyKey,
+          body: { expected_version: latest.version, expected_draft_version: draft.version || 1 },
+        }),
       });
       await finish("已提交单题导入", "其他候选题仍保留在当前审核批次中");
     }}><div className="import-confirmation field-full"><strong>{draft.title}</strong><p>只把这一道候选题导入正式题库；其他题目不会受影响。导入成功后该候选题不能再次编辑或删除。</p></div></ModalForm>,
@@ -263,10 +367,18 @@ function QuestionGenerationWorkbench({ API, data, request, navigate, reloadRoute
   const importBatch = () => openModal({
     title: "确认导入题库",
     body: <ModalForm submitLabel={`导入 ${batch.drafts.length} 道题目`} onSubmit={async () => {
-      await request(`${API}/question-generation-batches/${encodeURIComponent(batch.id)}/import`, {
-        method: "POST",
-        idempotencyKey: globalThis.crypto?.randomUUID?.() || `${Date.now()}`,
-        body: { expected_version: batch.version },
+      const idempotencyKey = globalThis.crypto?.randomUUID?.() || `${Date.now()}`;
+      await requestWithLatestVersion({
+        request,
+        resourcePath: `${API}/question-generation-batches/${encodeURIComponent(batch.id)}`,
+        snapshot: batch,
+        identity: generationImportIdentity,
+        changedMessage: "候选题集合已发生变化，请刷新后重新确认导入范围",
+        perform: (latest) => request(`${API}/question-generation-batches/${encodeURIComponent(batch.id)}/import`, {
+          method: "POST",
+          idempotencyKey,
+          body: { expected_version: latest.version },
+        }),
       });
       await finish("已提交导入", "Celery 将写入正式题库，并按当前语音配置生成读题语音");
     }}><div className="import-confirmation field-full"><strong>审核完成后再导入</strong><p>候选题将成为正式题目，重复提交不会产生副本。</p></div></ModalForm>,
@@ -298,7 +410,57 @@ function BuildProgress({ build }) {
   const total = Math.max(0, Number(build.total || 0));
   const ready = Math.max(0, Number(build.ready || 0));
   const percent = total ? Math.round((ready / total) * 100) : build.status === "ready" ? 100 : 0;
-  return <span className="speech-build-progress"><span className="speech-build-track"><span style={{ width: `${percent}%` }} /></span><small>{build.status === "failed" ? `${build.failed} 道失败` : `${ready}/${total} 已生成`}</small></span>;
+  const active = ["queued", "pending", "running"].includes(build.status);
+  return <span className="speech-build-progress">{active && <span className="spinner" />}<span className="speech-build-track"><span style={{ width: `${percent}%` }} /></span><small>{build.status === "failed" ? `${build.failed} 道失败` : `${ready}/${total} 已生成`}</small></span>;
+}
+
+function knowledgeBaseSpeechIdentity(knowledgeBase) {
+  const profile = knowledgeBase?.speech_profile;
+  if (!profile) return [null];
+  return [
+    profile.revision,
+    profile.model_configuration_id,
+    profile.model_configuration_version,
+    profile.voice_profile_id,
+    profile.language,
+    profile.audio_format,
+    Number(profile.speaking_rate || 1),
+  ];
+}
+
+function questionContentIdentity(question) {
+  return [
+    question?.id,
+    question?.title,
+    question?.question_text,
+    question?.standard_answer,
+    question?.key_points,
+    question?.skills,
+    question?.difficulty,
+    question?.type,
+    question?.rubric,
+    question?.status,
+  ];
+}
+
+function generationExecutionIdentity(batch) {
+  return [batch?.id, batch?.execution_revision || 1];
+}
+
+function generationDraftIdentity(draftId) {
+  return (batch) => {
+    const draft = batch?.drafts?.find((item) => item.id === draftId);
+    return [batch?.id, batch?.execution_revision || 1, draft?.id, draft?.version || 1, draft?.import_status || null];
+  };
+}
+
+function generationImportIdentity(batch) {
+  return [
+    batch?.id,
+    batch?.execution_revision || 1,
+    batch?.status,
+    batch?.drafts?.map((draft) => [draft.id, draft.version || 1, draft.import_status || null]),
+  ];
 }
 
 function SpeechProfileForm({ knowledgeBase, speechOptions, onTest, onSubmit }) {

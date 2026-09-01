@@ -125,9 +125,13 @@ async def set_knowledge_base_speech_profile(
     idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
     x_actor_id: str = Header(default="admin_local", alias="X-Actor-Id"),
 ) -> JSONResponse:
+    command = payload.model_dump()
+    command["speech_profile_guard_provided"] = (
+        "expected_speech_profile_revision" in payload.model_fields_set
+    )
     result = services()["knowledge_base_speech"].set_profile(
         knowledge_base_id,
-        payload.model_dump(),
+        command,
         idempotency_key=idempotency_key or "",
         actor_id=x_actor_id,
     )
