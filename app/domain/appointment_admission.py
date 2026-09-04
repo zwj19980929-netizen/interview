@@ -2,7 +2,10 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
+from app.adapters.livekit_media import LiveKitConfiguration
 from app.core.errors import ApiError
+from app.core.interview_agent_release import realtime_agent_release_status
+from app.domain.avatar_asset import inspect_licensed_vrm
 from app.domain.speech_profile import speech_asset_matches_profile
 from app.model_gateway import capabilities as cap
 from app.model_gateway.registry import get_provider_manifest
@@ -42,6 +45,37 @@ class AppointmentAdmission:
     ) -> Dict[str, Any]:
         checks = []
         local_mode = os.getenv("INTERVIEWER_RUNTIME_ENV", "development").lower() != "production"
+        organization_id = str(
+            (appointment or {}).get("organization_id")
+            or (plan or {}).get("organization_id")
+            or "org_default"
+        )
+        release = realtime_agent_release_status(organization_id)
+        checks.extend(
+            [
+                {
+                    "name": "interview_agent_organization_rollout",
+                    "ready": local_mode or release["organization_enabled"],
+                    "production_ready": release["organization_enabled"],
+                    "invite_ready": local_mode or release["organization_enabled"],
+                    "mode": "organization_feature_flag",
+                },
+                {
+                    "name": "interview_agent_release_scope",
+                    "ready": local_mode or release["release_scope_configured"],
+                    "production_ready": release["release_scope_configured"],
+                    "invite_ready": local_mode or release["release_scope_configured"],
+                    "mode": "deployment_and_revision_bound",
+                },
+                {
+                    "name": "interview_agent_acceptance_report",
+                    "ready": local_mode or release["acceptance_report_ready"],
+                    "production_ready": release["acceptance_report_ready"],
+                    "invite_ready": local_mode or release["acceptance_report_ready"],
+                    "mode": "signed_release_bound_acceptance_v2",
+                },
+            ]
+        )
         slots = plan.get("bank_slots", []) if plan else []
         checks.append(
             {
@@ -136,12 +170,96 @@ class AppointmentAdmission:
         streaming_production_ready = self._route_ready(
             transaction, cap.STT_STREAMING, "candidate_answer_transcription", now
         )
+        streaming_route_configured = self._route_configured(
+            transaction, cap.STT_STREAMING, "candidate_answer_transcription"
+        )
         checks.append(
             {
                 "name": "stt_streaming",
-                "ready": local_mode or streaming_production_ready,
+                "ready": streaming_production_ready
+                or (local_mode and not streaming_route_configured),
                 "production_ready": streaming_production_ready,
-                "mode": "mock_development" if local_mode else "real_provider_required",
+                "mode": (
+                    "configured_route"
+                    if streaming_production_ready
+                    else "configured_route_unhealthy"
+                    if streaming_route_configured
+                    else "mock_development"
+                    if local_mode
+                    else "real_provider_required"
+                ),
+            }
+        )
+        warmup_production_ready = self._route_ready(
+            transaction, cap.STT_STREAMING, "warmup_calibration", now
+        )
+        warmup_route_configured = self._route_configured(
+            transaction, cap.STT_STREAMING, "warmup_calibration"
+        )
+        checks.append(
+            {
+                "name": "warmup_stt_streaming",
+                "ready": warmup_production_ready
+                or (local_mode and not warmup_route_configured),
+                "production_ready": warmup_production_ready,
+                "mode": (
+                    "configured_route"
+                    if warmup_production_ready
+                    else "configured_route_unhealthy"
+                    if warmup_route_configured
+                    else "ephemeral_mock_development"
+                    if local_mode
+                    else "real_provider_required"
+                ),
+            }
+        )
+        understanding_ready = self._route_ready(
+            transaction,
+            cap.LLM_CHAT_JSON,
+            "interview_turn_understanding",
+            now,
+        )
+        understanding_route_configured = self._route_configured(
+            transaction, cap.LLM_CHAT_JSON, "interview_turn_understanding"
+        )
+        checks.append(
+            {
+                "name": "turn_understanding",
+                "ready": understanding_ready
+                or (local_mode and not understanding_route_configured),
+                "production_ready": understanding_ready,
+                "mode": (
+                    "configured_route"
+                    if understanding_ready
+                    else "configured_route_unhealthy"
+                    if understanding_route_configured
+                    else "mock_development"
+                    if local_mode
+                    else "configured_route_required"
+                ),
+            }
+        )
+        controlled_followup_ready = self._route_ready(
+            transaction, cap.LLM_CHAT_JSON, "controlled_followup", now
+        )
+        controlled_followup_route_configured = self._route_configured(
+            transaction, cap.LLM_CHAT_JSON, "controlled_followup"
+        )
+        checks.append(
+            {
+                "name": "controlled_followup",
+                "ready": controlled_followup_ready
+                or (local_mode and not controlled_followup_route_configured),
+                "production_ready": controlled_followup_ready,
+                "mode": (
+                    "configured_route"
+                    if controlled_followup_ready
+                    else "configured_route_unhealthy"
+                    if controlled_followup_route_configured
+                    else "mock_development"
+                    if local_mode
+                    else "configured_route_required"
+                ),
             }
         )
         file_backend = os.getenv("INTERVIEWER_FILE_STORAGE_BACKEND", "local").lower()
@@ -157,6 +275,115 @@ class AppointmentAdmission:
                 "ready": local_mode or private_media_ready,
                 "production_ready": private_media_ready,
                 "mode": "local_development" if local_mode else "private_object_storage_required",
+            }
+        )
+        settings = (appointment or {}).get("settings") or {}
+        formal_audio_evidence_ready = bool(settings.get("record_audio", True))
+        checks.append(
+            {
+                "name": "formal_audio_evidence_consent_scope",
+                "ready": local_mode or formal_audio_evidence_ready,
+                "production_ready": formal_audio_evidence_ready,
+                "formal_ready": formal_audio_evidence_ready,
+                "mode": (
+                    "audio_recording_scope_required"
+                    if formal_audio_evidence_ready
+                    else "legacy_no_recording_compatibility_only"
+                ),
+            }
+        )
+        livekit = LiveKitConfiguration.from_environment()
+        recording_required = bool(
+            settings.get("record_audio", True) or settings.get("record_video")
+        )
+        livekit_ready = (
+            livekit.recording_ready()
+            if recording_required
+            else livekit.media_ready()
+        )
+        checks.append(
+            {
+                "name": "livekit_media_plane",
+                "ready": livekit_ready,
+                "production_ready": livekit_ready,
+                "formal_ready": livekit_ready,
+                "mode": "self_hosted_livekit" if livekit_ready else "formal_agent_unavailable",
+            }
+        )
+        authoritative_ingress_ready = (
+            livekit.authoritative_audio_ingress_ready()
+        )
+        checks.append(
+            {
+                "name": "livekit_authoritative_audio_ingress",
+                "ready": authoritative_ingress_ready,
+                "production_ready": authoritative_ingress_ready,
+                "formal_ready": authoritative_ingress_ready,
+                "mode": (
+                    "server_livekit_subscriber"
+                    if authoritative_ingress_ready
+                    else "authoritative_ingress_required"
+                ),
+            }
+        )
+        vrm_ready = bool(inspect_licensed_vrm()["ready"])
+        local_vrm_required = settings.get("avatar_mode", "local") == "local"
+        checks.append(
+            {
+                "name": "licensed_local_vrm",
+                "ready": not local_vrm_required or vrm_ready,
+                "production_ready": not local_vrm_required or vrm_ready,
+                "formal_ready": not local_vrm_required or vrm_ready,
+                "mode": (
+                    "not_required_for_cloud_avatar"
+                    if not local_vrm_required
+                    else "licensed_vrm_1_0"
+                    if vrm_ready
+                    else "asset_required"
+                ),
+            }
+        )
+        expression_tts_ready = self._route_ready(
+            transaction, cap.TTS_SYNTHESIZE, "interview_agent_expression", now
+        )
+        expression_tts_configured = self._route_configured(
+            transaction, cap.TTS_SYNTHESIZE, "interview_agent_expression"
+        )
+        checks.append(
+            {
+                "name": "agent_expression_tts",
+                # 开发环境没有配置真实路由时仍保留自动化测试用 mock；一旦管理员
+                # 明确配置了路由，就必须通过健康探测，不能静默回落后在面试中途停场。
+                "ready": expression_tts_ready
+                or (local_mode and not expression_tts_configured),
+                "production_ready": expression_tts_ready,
+                "formal_ready": expression_tts_ready,
+                "mode": (
+                    "configured_route"
+                    if expression_tts_ready
+                    else "configured_route_unhealthy"
+                    if expression_tts_configured
+                    else "mock_development_only"
+                ),
+            }
+        )
+        realtime_speech_ready = self._route_ready(
+            transaction,
+            cap.SPEECH_DIALOGUE_REALTIME,
+            "candidate_followup_dialogue",
+            now,
+        )
+        checks.append(
+            {
+                "name": "agent_realtime_speech",
+                "ready": local_mode or realtime_speech_ready,
+                "production_ready": realtime_speech_ready,
+                "formal_ready": realtime_speech_ready,
+                "mode": (
+                    "configured_s2s_with_cascade_fallback"
+                    if realtime_speech_ready
+                    else "production_route_required"
+                ),
             }
         )
         local_ready = all(item["ready"] for item in checks)
@@ -212,10 +439,9 @@ class AppointmentAdmission:
             for item in transaction.model_routes.list()
             if item.get("enabled", True)
             and item.get("capability") == capability
-            and item.get("purpose") in {purpose, "default"}
+            and item.get("purpose") == purpose
         ]
         route = next((item for item in routes if item.get("purpose") == purpose), None)
-        route = route or next((item for item in routes if item.get("purpose") == "default"), None)
         if route is None:
             return False
         model_configuration = transaction.model_configurations.get(
@@ -246,6 +472,17 @@ class AppointmentAdmission:
         ttl = max(1, int((route.get("policy") or {}).get("readiness_ttl_seconds", 60)))
         return parse_utc(health["checked_at"]) + timedelta(seconds=ttl) >= ensure_utc(now)
 
+    @staticmethod
+    def _route_configured(transaction: Any, capability: str, purpose: str) -> bool:
+        """判断管理员是否显式选择了某条运行时路由，不把未配置等同于故障。"""
+
+        return any(
+            item.get("enabled", True)
+            and item.get("capability") == capability
+            and item.get("purpose") == purpose
+            for item in transaction.model_routes.list()
+        )
+
     def validate_start(
         self,
         appointment: Dict[str, Any],
@@ -257,10 +494,17 @@ class AppointmentAdmission:
         current = ensure_utc(now)
         if not intake or intake.get("consent_evidence_status") != "verified" or not intake.get("privacy_accepted"):
             raise ApiError("CONSENT_REQUIRED", "Verified privacy consent is required.", status_code=409)
-        if appointment.get("settings", {}).get("record_audio", True) and not intake.get("recording_accepted"):
+        scopes = set(intake.get("media_consent_scopes") or [])
+        if appointment.get("settings", {}).get("record_audio", True) and "audio_recording" not in scopes:
             raise ApiError(
-                "RECORDING_CONSENT_REQUIRED",
-                "Recording consent is required for this appointment.",
+                "AUDIO_RECORDING_CONSENT_REQUIRED",
+                "Explicit audio recording consent is required for this appointment.",
+                status_code=409,
+            )
+        if appointment.get("settings", {}).get("record_video", False) and "video_recording" not in scopes:
+            raise ApiError(
+                "VIDEO_RECORDING_CONSENT_REQUIRED",
+                "Explicit video recording consent is required for this appointment.",
                 status_code=409,
             )
 

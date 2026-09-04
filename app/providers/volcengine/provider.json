@@ -1,31 +1,154 @@
 {
+  "schema_version": "2",
   "provider_id": "volcengine",
-  "display_name": "Volcengine",
-  "version": "0.1.0",
+  "display_name": "火山引擎（豆包 / Doubao）",
+  "version": "1.0.0",
   "capabilities": [
     "llm.chat_json",
     "llm.chat_text",
     "embedding.text",
+    "speech.dialogue_realtime",
     "stt.streaming",
-    "tts.synthesize",
-    "avatar.speak"
+    "stt.batch",
+    "tts.synthesize"
   ],
+  "model_selection": "customizable",
+  "defaults": {
+    "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+    "test_model": "doubao-seed-2-1-lite-260628",
+    "use_environment_proxy": false
+  },
+  "connection_form": {
+    "schema_version": "2",
+    "fields": [
+      {"name": "base_url", "label": "火山方舟 Base URL", "control": "text", "required": true, "default": "https://ark.cn-beijing.volces.com/api/v3"},
+      {"name": "test_model", "label": "连接验证模型", "control": "text", "required": true, "default": "doubao-seed-2-1-lite-260628", "help": "用于连接级一词探针；也可以填写账户中已开通的推理接入点 ID。"},
+      {"name": "use_environment_proxy", "label": "使用环境代理", "control": "switch", "required": false, "default": false}
+    ]
+  },
+  "credential_form": {
+    "schema_version": "2",
+    "fields": [
+      {"name": "ark_api_key", "label": "火山方舟 API Key", "control": "secret", "required": true, "write_only": true},
+      {"name": "speech_api_key", "label": "豆包语音 API Key（新版控制台）", "control": "secret", "required": true, "write_only": true, "help": "用于 Seed ASR、Seed-TTS 2.0 与 Seeduplex；不要填写方舟 API Key。"}
+    ]
+  },
+  "model_types": {
+    "llm": {
+      "label": "大语言模型",
+      "selection_mode": "customizable",
+      "capabilities": ["llm.chat_json", "llm.chat_text"],
+      "configuration_form": {"fields": [
+        {"name": "structured_output_mode", "label": "结构化输出模式", "control": "select", "required": false, "default": "json_schema", "options": [
+          {"label": "严格 JSON Schema", "value": "json_schema"},
+          {"label": "JSON Object", "value": "json_object"},
+          {"label": "Prompt 约束 + Schema 校验", "value": "prompt"}
+        ]}
+      ]}
+    },
+    "embedding": {
+      "label": "Embedding",
+      "selection_mode": "customizable",
+      "capabilities": ["embedding.text"],
+      "configuration_form": {"fields": [
+        {"name": "dimensions", "label": "期望向量维度", "control": "number", "required": false, "min": 1}
+      ]}
+    },
+    "stt": {
+      "label": "豆包语音识别",
+      "selection_mode": "predefined",
+      "capabilities": ["stt.streaming", "stt.batch"],
+      "configuration_form": {"fields": [
+        {"name": "asr_websocket_url", "label": "实时 ASR WebSocket", "control": "text", "required": false, "default": "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"},
+        {"name": "asr_resource_id", "label": "实时 ASR Resource ID", "control": "select", "required": true, "default": "volc.seedasr.sauc.duration", "options": [
+          {"label": "Seed ASR 2.0 小时版", "value": "volc.seedasr.sauc.duration"},
+          {"label": "Seed ASR 2.0 并发版", "value": "volc.seedasr.sauc.concurrent"},
+          {"label": "BigASR 1.0 小时版", "value": "volc.bigasr.sauc.duration"},
+          {"label": "BigASR 1.0 并发版", "value": "volc.bigasr.sauc.concurrent"}
+        ]},
+        {"name": "asr_batch_endpoint", "label": "极速批量 ASR Endpoint", "control": "text", "required": false, "default": "https://openspeech.bytedance.com/api/v3/auc/bigmodel/recognize/flash"},
+        {"name": "asr_batch_resource_id", "label": "极速批量 ASR Resource ID", "control": "text", "required": true, "default": "volc.bigasr.auc_turbo"},
+        {"name": "end_window_size_ms", "label": "VAD 强制判停（毫秒）", "control": "number", "required": false, "default": 800, "min": 200, "max": 6000},
+        {"name": "hotwords_context", "label": "面试技术词上下文 JSON", "control": "textarea", "required": false, "help": "透传至 corpus.context；建议包含岗位技术词、英文缩写与产品名。"},
+        {"name": "batch_max_bytes", "label": "批量修复最大字节", "control": "number", "required": false, "default": 20971520, "min": 1024, "max": 20971520},
+        {"name": "websocket_max_message_bytes", "label": "WebSocket 单帧上限", "control": "number", "required": false, "default": 8388608, "min": 1024, "max": 16777216}
+      ]}
+    },
+    "tts": {
+      "label": "豆包语音合成",
+      "selection_mode": "predefined",
+      "capabilities": ["tts.synthesize"],
+      "configuration_form": {"fields": [
+        {"name": "tts_endpoint", "label": "Seed-TTS HTTP Endpoint", "control": "text", "required": false, "default": "https://openspeech.bytedance.com/api/v3/tts/unidirectional"},
+        {"name": "tts_resource_id", "label": "TTS Resource ID", "control": "select", "required": true, "default": "seed-tts-2.0", "options": [
+          {"label": "Seed-TTS 2.0", "value": "seed-tts-2.0"},
+          {"label": "Seed ICL 声音复刻 2.0", "value": "seed-icl-2.0"}
+        ]},
+        {"name": "default_voice", "label": "默认音色 ID", "control": "text", "required": true, "default": "zh_female_vv_uranus_bigtts"},
+        {"name": "voice_map", "label": "系统音色映射", "control": "key_value", "required": false},
+        {"name": "sample_rate_hz", "label": "输出采样率", "control": "number", "required": false, "default": 24000, "min": 8000, "max": 48000},
+        {"name": "enable_subtitle", "label": "请求字级时间戳", "control": "switch", "required": false, "default": true}
+      ]}
+    },
+    "realtime_speech": {
+      "label": "Seeduplex 实时语音对话",
+      "selection_mode": "predefined",
+      "capabilities": ["speech.dialogue_realtime"],
+      "configuration_form": {"fields": [
+        {"name": "realtime_websocket_url", "label": "Seeduplex WebSocket", "control": "text", "required": false, "default": "wss://openspeech.bytedance.com/api/v3/duplex/realtime/dialogue"},
+        {"name": "dialogue_model_version", "label": "协议模型版本", "control": "text", "required": true, "default": "1.2.6.1"},
+        {"name": "dialogue_default_voice", "label": "实时对话音色 ID", "control": "text", "required": true, "default": "zh_female_vv_uranus_bigtts"},
+        {"name": "voice_map", "label": "系统音色映射", "control": "key_value", "required": false},
+        {"name": "websocket_max_message_bytes", "label": "WebSocket 单帧上限", "control": "number", "required": false, "default": 8388608, "min": 1024, "max": 16777216}
+      ]}
+    }
+  },
   "config_schema": {
     "type": "object",
+    "required": ["base_url", "test_model"],
     "properties": {
-      "region": {"type": "string"},
-      "base_url": {"type": "string"}
+      "base_url": {"type": "string"},
+      "test_model": {"type": "string"},
+      "use_environment_proxy": {"type": "boolean"},
+      "structured_output_mode": {"type": "string"},
+      "dimensions": {"type": "integer"},
+      "asr_websocket_url": {"type": "string"},
+      "asr_resource_id": {"type": "string"},
+      "asr_batch_endpoint": {"type": "string"},
+      "asr_batch_resource_id": {"type": "string"},
+      "end_window_size_ms": {"type": "integer"},
+      "hotwords_context": {"type": "string"},
+      "batch_max_bytes": {"type": "integer"},
+      "tts_endpoint": {"type": "string"},
+      "tts_resource_id": {"type": "string"},
+      "default_voice": {"type": "string"},
+      "voice_map": {"type": "object"},
+      "sample_rate_hz": {"type": "integer"},
+      "enable_subtitle": {"type": "boolean"},
+      "realtime_websocket_url": {"type": "string"},
+      "dialogue_model_version": {"type": "string"},
+      "dialogue_default_voice": {"type": "string"},
+      "websocket_max_message_bytes": {"type": "integer"}
     }
   },
   "credential_schema": {
     "type": "object",
-    "required": ["api_key"],
+    "required": ["ark_api_key", "speech_api_key"],
     "properties": {
-      "api_key": {"type": "string", "secret": true}
+      "ark_api_key": {"type": "string", "secret": true},
+      "speech_api_key": {"type": "string", "secret": true}
     }
   },
-  "models": [],
+  "models": [
+    {"model_id": "doubao-seed-2-1-pro-260628", "label": "Doubao Seed 2.1 Pro（260628）", "model_type": "llm", "capabilities": ["llm.chat_json", "llm.chat_text"], "default": true},
+    {"model_id": "doubao-seed-2-1-lite-260628", "label": "Doubao Seed 2.1 Lite（260628）", "model_type": "llm", "capabilities": ["llm.chat_json", "llm.chat_text"]},
+    {"model_id": "doubao-seed-2-0-pro-260215", "label": "Doubao Seed 2.0 Pro（260215）", "model_type": "llm", "capabilities": ["llm.chat_json", "llm.chat_text"]},
+    {"model_id": "doubao-seed-2-0-lite-260215", "label": "Doubao Seed 2.0 Lite（260215）", "model_type": "llm", "capabilities": ["llm.chat_json", "llm.chat_text"]},
+    {"model_id": "doubao-embedding-text-240715", "label": "Doubao Text Embedding", "model_type": "embedding", "capabilities": ["embedding.text"], "default": true},
+    {"model_id": "doubao-seed-asr-2.0", "label": "Doubao Seed ASR 2.0（实时＋批量修复）", "model_type": "stt", "capabilities": ["stt.streaming", "stt.batch"], "default": true},
+    {"model_id": "doubao-seed-tts-2.0", "label": "Doubao Seed-TTS 2.0", "model_type": "tts", "capabilities": ["tts.synthesize"], "default": true},
+    {"model_id": "1.2.6.1", "label": "Doubao Realtime Voice 3.0（Seeduplex）", "model_type": "realtime_speech", "capabilities": ["speech.dialogue_realtime"], "default": true}
+  ],
   "entrypoint": "app.providers.volcengine.provider:VolcengineProvider",
-  "implemented": false
+  "implemented": true
 }
-

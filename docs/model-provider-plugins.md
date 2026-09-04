@@ -77,7 +77,7 @@ Provider adapter 负责把统一请求转换成厂商协议、注入厂商鉴权
 | `dashscope` | `llm.chat_json`、`llm.chat_text`、`embedding.text`、`speech.dialogue_realtime`、`stt.streaming`、`stt.batch`、`tts.synthesize` | 阿里云百炼 Qwen LLM/Embedding/TTS、Qwen Realtime、实时 ASR 与 batch ASR |
 | `media_http` | `stt.streaming`、`stt.batch`、`avatar.speak` | 通用 HTTPS 媒体网关；multipart 音频转写和 JSON 音频/视频数字人响应，模型 ID 可配置 |
 | `tencent_cloud_avatar` | `avatar.speak` | 腾讯云智能数智人云渲染；HTTPS create/stat/start/close + WSS SEND_TEXT，媒体面为腾讯云 WebRTC/SFU |
-| `volcengine` | `llm.chat_json`、`llm.chat_text`、`embedding.text`、`stt.streaming`、`tts.synthesize`、`avatar.speak` | 国内模型、语音和数字人场景 |
+| `volcengine` | `llm.chat_json`、`llm.chat_text`、`embedding.text`、`speech.dialogue_realtime`、`stt.streaming`、`stt.batch`、`tts.synthesize` | 火山方舟与豆包语音；本地 VRM 复用 TTS/实时表达，不冒充云数字人能力 |
 | `azure_speech` | `stt.streaming`、`stt.batch`、`tts.synthesize` | 语音识别和合成 |
 | `tencent_cloud_speech` | `stt.streaming`、`stt.batch`、`tts.synthesize` | 国内语音识别和合成 |
 
@@ -94,18 +94,19 @@ Provider adapter 负责把统一请求转换成厂商协议、注入厂商鉴权
 - `stt.streaming` 与 `speech.dialogue_realtime` 的模型/路由探针只验证真实 WebSocket 鉴权、模型访问和 session 初始化，成功返回 `probe_mode=handshake` 后主动关闭。静音没有 final transcript 是合法结果，不能把它误判为模型故障；WER、final 延迟、首音、音质与打断属于带真实脱敏录音的环境验收。
 - `mock` provider 已实现 `avatar.speak` 的浏览器语音驱动响应，用于本地数字人演示；它不生成真人视频，也不应标记为生产数字人能力。
 - `openai_compatible` provider 已支持真实 HTTP 调用：`llm.chat_json`、`llm.chat_text`、`embedding.text` 和 `tts.synthesize`。TTS 使用 `/audio/speech`，支持 `wav/mp3/opus/aac/flac/pcm`，二进制响应会转为 data URI 后交给私有资产复制层校验和落盘。
-- 官方 `openai` provider 复用 HTTP Chat/Embedding/TTS runtime，并独立实现 multipart `/audio/transcriptions` 与 Realtime WebSocket。`gpt-realtime-*` 会话关闭 vendor turn detection，由面试状态机提交回合；24 kHz PCM delta、输入/输出 transcript 和中断事件统一映射到 `RealtimeSpeechDialogueEvent`。
+- 官方 `openai` provider 复用 HTTP Chat/Embedding/TTS runtime，并独立实现 multipart `/audio/transcriptions` 与 Realtime WebSocket。`gpt-realtime-*` 会话关闭 vendor turn detection，由面试状态机提交回合；24 kHz PCM delta、输入/输出 transcript 和中断事件统一映射到 `RealtimeSpeechDialogueEvent`。业务层在 Provider final 与冻结 ApprovedConversationAct 逐字一致前隔离所有输出音频，adapter 的 delta 事件本身不构成可播放授权。
 - `deepseek` 与 `zhipuai` provider 复用 `OpenAICompatibleProvider` 的 HTTP、Bearer 鉴权、用量解析、错误映射和响应归一化；两者的 `llm.chat_json` 使用厂商支持的 `json_object` 并在 system message 注入目标 JSON Schema，避免假定支持 OpenAI `json_schema` 扩展。智谱 adapter 另在 TTS seam 校验 `glm-tts`、官方 WAV/PCM 格式、1024 字符上限和默认音色 `tongtong`，再复用共享二进制响应归一化。
-- `dashscope` provider 已支持 OpenAI-compatible Qwen Chat/Embedding、Qwen3-ASR batch、Qwen-Audio-3.0-ASR-Flash-Streaming duplex WebSocket，并按模型路由 Qwen3-TTS 的 multimodal-generation HTTP 接口或 CosyVoice/Qwen-Audio 的 `SpeechSynthesizer` HTTP 接口。LLM 目录保留阿里云官方模型 ID `qwen-plus`，并提供 `qwen3.8-max`、`qwen3.8-flash`、`qwen3.7-plus`、`qwen3.7-flash`、`qwen-flash`、`qwen-turbo`、`qwen-long` 和 `qwen3-coder-plus` 作为千问官方候选建议；同一百炼连接还可选托管的 `deepseek-v4-pro`、`deepseek-v4-flash`、`glm-5.2`、`kimi-k2.7-code`、`MiniMax-M3` 和 `mimo-v2.5-pro`。这些第三方模型的结构化业务调用默认使用集中 Prompt 约束，再由模型网关执行统一 Schema 校验，不虚假声明它们支持 OpenAI JSON Schema 协议。模型类型仍是 customizable，管理员可填写已授权的快照或后续新模型 ID，但必须通过独立探针才能进入活动路由；托管模型还需要匹配的地域、业务空间 endpoint 和授权。实时流使用 workspace 地域域名、Bearer 握手、run-task/task-started、二进制 PCM、result-generated 和 finish-task/task-finished；只投影一个 authoritative final。Batch 只接收服务端解析的私有音频字节并以 Base64 data URL 调用，不把对象存储凭据交给厂商。供应商返回的临时 TTS URL 会复制到 PrivateFileStorage。
+- `dashscope` provider 已支持 OpenAI-compatible Qwen Chat/Embedding、Qwen3-ASR batch、Qwen-Audio-3.0-ASR-Flash-Streaming duplex WebSocket，并按模型路由 Qwen3-TTS 的 multimodal-generation HTTP 接口或 CosyVoice/Qwen-Audio 的 `SpeechSynthesizer` HTTP 接口。LLM 目录保留阿里云官方模型 ID `qwen-plus`，并提供 `qwen3.8-max`、`qwen3.8-flash`、`qwen3.7-plus`、`qwen3.7-flash`、`qwen-flash`、`qwen-turbo`、`qwen-long` 和 `qwen3-coder-plus` 作为千问官方候选建议；同一百炼连接还可选托管的 `deepseek-v4-pro`、`deepseek-v4-flash`、`glm-5.2`、`kimi-k2.7-code`、`MiniMax-M3` 和 `mimo-v2.5-pro`。这些第三方模型的结构化业务调用默认使用集中 Prompt 约束，再由模型网关执行统一 Schema 校验，不虚假声明它们支持 OpenAI JSON Schema 协议。模型类型仍是 customizable，管理员可填写已授权的快照或后续新模型 ID，但必须通过独立探针才能进入活动路由；托管模型还需要匹配的地域、业务空间 endpoint 和授权。实时轮次理解/受控追问对 Qwen 默认发送 `enable_thinking=false`，避免短 JSON 合同被混合思考耗尽 30 秒轮转时限；模型配置中可用中文开关显式覆盖，离线评分等其他 purpose 不受影响。实时 ASR 使用 workspace 地域域名、Bearer 握手、run-task/task-started、二进制 PCM、result-generated 和 finish-task/task-finished；PCM 由两秒字节预算的后台 sender 发出，vendor event 由独立 reader 接收，业务收帧不逐帧等待网络，只投影一个 authoritative final。Batch 只接收服务端解析的私有音频字节并以 Base64 data URL 调用，不把对象存储凭据交给厂商。供应商返回的临时 TTS URL 会复制到 PrivateFileStorage。
 - 同一 `dashscope` adapter 还把 Qwen 3.5 Omni/Audio Realtime 映射到 `speech.dialogue_realtime`：连接由 workspace/region 解析，输入固定 16 kHz PCM、输出 24 kHz PCM；Qwen 3.5 使用当前嵌套 `audio.input/output.format` session 结构、`qwen3-asr-flash-realtime` 输入转写和默认音色 `Tina`，历史 `qwen3-asr-flash`/`Cherry` 配置在 adapter 边界兼容归一化。每个已批准追问先通过 `session.update` 固定指令，再提交音频并创建 response，避免依赖不受支持的 response 级 instructions。S2S 出错只关闭表达轨，权威 STT 和级联播报继续工作。
+- `volcengine` provider 已从占位清单升级为可执行 adapter。Ark 域复用 OpenAI-compatible Chat/Embedding HTTP 合同，默认目录包含 Doubao Seed 2.1/2.0 与文本向量模型；Speech 域独立使用新版 `X-Api-Key`，不能把 Ark Key 混用为语音凭据。Seed ASR 2.0 通过官方二进制 Gzip WebSocket 帧映射 `stt.streaming`，极速版大模型录音文件识别以服务端私有音频 Base64 映射 `stt.batch`，两者只投影一个 authoritative final；Seed-TTS 2.0 单向流响应会拼接音频块、校验 Base64/错误码并交给既有私有表达音频边界。Seeduplex 使用当前 API v3 JSON event 会话映射 `speech.dialogue_realtime`，候选人 PCM 与批准后的 `speech_text_buffer.replacement` 分离；adapter 只让供应商朗读 `ApprovedConversationAct.spoken_text`，网关上层仍以逐字 final gate 决定音频是否可落盘。`response.cancel`、`session.close`、错误和握手超时均归一化，厂商帧与事件类型不进入 InterviewAgentRuntime。
 - `tencent_cloud_avatar` provider 使用 AppKey/AccessToken HMAC-SHA256 query 签名，按官方会话管理接口执行 HTTPS create-by-asset/stat/start/close，并在 start 后用携带 `requestid=SessionId` 的 WSS command channel 发送 `SEND_TEXT`、等待对应 ReqId 的播报状态确认。响应 `mode=webrtc`，包含 `webrtc://` 拉流地址、不透明 session ID 与 `tencent_web_player` 类型；候选人页用同源 TCPlayerLite 页面拉流，换流/离场调用关闭接口释放并发。供应商云渲染/SFU 承担视频媒体面，业务 WebSocket 不传视频帧。
 - `media_http` provider 已实现真实 HTTP 媒体调用：健康探针使用 Bearer API Key；`stt.batch` 把服务端读取的私有音频作为 multipart 上传并归一化 text/confidence/segments；`stt.streaming` 在统一流接口内安全缓存分片并在 finish 时调用同一真实转写端点，产出唯一 authoritative final；`avatar.speak` 发送 JSON 并接受 HTTPS `audio/video` 媒体。它是可部署的协议 adapter，不代表任何具体厂商账号已经验收，也不宣称提供低延迟 partial。
 - `stt.streaming` 已有 `StreamingSTTRequest/Event`、`ModelGateway.open_stream()`、有序 chunk/final 校验、建立前 fallback、硬超时、断流 batch 修复和独立 WebSocket 端到端测试；`stt.batch` 与 `tts.synthesize` 也有统一 schema、网关校验和调用审计。浏览器 SpeechRecognition 只用于本地展示/开发输入，不满足正式面试 readiness。
 - 路由的 retry、fallback_on、硬超时、数据库共享断路器、输出 schema 校验和成本上限在统一管线执行；每个 attempt 形成追加日志。多实例进程通过 Persistence 共用 `ModelCircuitState`，不再依赖进程内全局状态。
-- 除 `mock`、`openai`、`openai_compatible`、`deepseek`、`zhipuai`、`dashscope`、`media_http` 和 `tencent_cloud_avatar` 外，其它 provider 目前只有 `implemented=false` 的 manifest 和配置 schema，可展示和保存配置，但不能创建活动路由，也不应视为已接入真实厂商 API。豆包端到端实时语音虽有官方产品能力，但当前仓库尚未实现其二进制 StartConnection/StartSession 协议，也未证明能逐字保持批准追问，因此 `volcengine` 继续是显式 TODO。
+- 除 `mock`、`openai`、`openai_compatible`、`deepseek`、`zhipuai`、`dashscope`、`volcengine`、`media_http` 和 `tencent_cloud_avatar` 外，其它 provider 目前只有 `implemented=false` 的 manifest 和配置 schema，可展示和保存配置，但不能创建活动路由，也不应视为已接入真实厂商 API。
 - Provider credentials 通过 `ProviderSecretVault` 在 repository seam 使用 Fernet 密封；API 只返回 `credential_ref`。生产未配置 `INTERVIEWER_PROVIDER_SECRET_ENCRYPTION_KEY` 或遇到旧未密封值时失败关闭。
 
-仓库内 OpenAI/DashScope Realtime、DashScope ASR/TTS 与腾讯云数智人 WebRTC 的鉴权、请求、事件归一化、会话关闭、React PCM 播放和离线合同均已验证；真实外部调用仍需要对应账号、workspace/区域、模型授权、API Key、腾讯数智人形象资产/并发和目标浏览器网络后才能标记健康。`azure_speech`、`tencent_cloud_speech`、`volcengine` 仍为 `implemented=false`。当前国内选型不阻止继续在同一 provider seam 增加讯飞、火山或自建 WHEP/SFU。
+仓库内 OpenAI/DashScope/Volcengine Realtime、DashScope/Volcengine ASR/TTS 与腾讯云数智人 WebRTC 的鉴权、请求、事件归一化、会话关闭、React PCM 播放和离线合同均已验证；真实外部调用仍需要对应账号、workspace/区域、模型授权、API Key、语音 Resource ID、腾讯数智人形象资产/并发和目标浏览器网络后才能标记健康。`azure_speech` 与 `tencent_cloud_speech` 仍为 `implemented=false`。当前国内选型不阻止继续在同一 provider seam 增加讯飞或自建 WHEP/SFU。
 
 ## 目录建议
 
@@ -464,7 +465,7 @@ Model Invocation 校验 content type、最大大小、非空音频和 duration�
 `mode` 是媒体交付形态，`avatar_mode` 是预约选择后实际执行的策略，两者不能混用。约定：
 
 - `browser_speech`：本地 Mock 或最终降级模式，前端用系统语音合成朗读，并只展示明确的模拟说话状态。
-- `audio`：Provider 返回 `audio_uri`，前端播放音频并可根据 `visemes` 或音频能量驱动嘴型。
+- `audio`：Provider 返回 `audio_uri`。通用云 Avatar 预览可消费它的 `visemes`；仅按音量开合嘴只能标记为显式无障碍预览，不能通过正式自研 3D Avatar readiness。
 - `video`：Provider 返回可直接播放的数字人视频流地址。
 - `webrtc`：Provider 返回实时会话或信令入口；实际媒体使用 WebRTC，不能把视频帧塞入业务 WebSocket。
 
@@ -533,9 +534,13 @@ ProviderConnection 拥有其凭证和 ModelConfiguration 生命周期。删除�
 | `llm.chat_json` | `resume_review` | 脱敏简历和岗位要求；只返回可解释初筛与项目/技能证据，不接收受保护属性或生成问题 |
 | `llm.chat_json` | `resume_experience_question_generation` | 仅在生效结论符合后接收项目/技能证据；每题必须精确回引并点名输入证据标签 |
 | `stt.streaming` | `candidate_answer_transcription` | 候选人实时回答音频 |
+| `stt.streaming` | `warmup_calibration` | 入场试音；不评分且确认后删除试音证据 |
 | `stt.batch` | `candidate_answer_repair` | 失败轮次的完整私有音频 |
 | `llm.chat_json` | `answer_evaluation` | 冻结题目和最终转写 |
+| `llm.chat_json` | `interview_turn_understanding` | 最终转写与冻结能力点，用于结构化轮次理解 |
+| `llm.chat_json` | `controlled_followup` | 已验证理解、逐字证据和冻结能力点，用于受控追问 |
 | `llm.chat_json` | `interview_report` | 当前评分 revision 摘要 |
+| `tts.synthesize` | `interview_agent_expression` | 开场、追问与缺少可播放预生成资产时的主问题文本 |
 
 可选 `embedding.text/question_similarity_analysis` route 只服务后台题库治理。未配置、失败或删除向量数据都不能阻止题库 ready、计划批准、预约邀请、随机抽题、答案评分或报告生成。
 
@@ -570,7 +575,7 @@ ProviderConnection 拥有其凭证和 ModelConfiguration 生命周期。删除�
 路由匹配与执行顺序：
 
 1. 组织 + 能力 + purpose 精确匹配。
-2. 仅在 development/test 环境未找到组织路由时使用显式 mock fallback，保证离线闭环。
+2. 仅在 development/test 环境完全未找到组织路由时使用显式 mock fallback，保证离线闭环；一旦管理员创建了精确 route，该 route 必须通过近期健康探测，配置错误或过期不能再静默回落 mock。
 
 生产部署必须显式配置组织、能力和 purpose 路由；缺失时返回 `provider_route_missing` 并失败关闭，不能静默以 mock、浏览器 STT 或浏览器 TTS 参与真实邀请、面试或评分。
 
@@ -589,6 +594,14 @@ ProviderConnection 拥有其凭证和 ModelConfiguration 生命周期。删除�
 - route 引用的凭证未过期，成本上限、数据区域和留存配置满足组织策略。
 
 readiness 是带检查时间和有效期的事实，不是永久布尔值；超过有效期或 Provider 熔断后候选人 start 必须重新检查。`can_invite` 与 `can_start` 是两个不同门禁：前者不能等待尚未由候选人同意触发的简历题 TTS，后者必须校验预约级资产与冻结 profile 完全一致。业务服务只提交冻结 profile，Provider adapter 仍只负责厂商协议，不得自行回退到组织默认声音。
+
+完整实时智能体新增三个固定 purpose：`warmup_calibration`（临时 STT，结束即删除）、`interview_turn_understanding`（`llm.chat_json` + `interview_turn_understanding.v1`）和 `controlled_followup`（`llm.chat_json` + `controlled_followup.v1`），以及 `interview_agent_expression`（TTS 音频与时间戳）。所有 Prompt/Schema 只存在 `app/core/prompt/`；Provider adapter 只做厂商协议和原始 JSON 解析，统一校验失败映射为结构化 ProviderError。中英文确定性元意图在 LLM 前抑制重读、未说完、暂停和澄清；understanding Provider 不可用或 schema/证据校验失败时，只形成去敏 `UnderstandingProblem` 并进入澄清/暂停，原始响应不入领域对象，不自由聊天。
+
+`AvatarPerformance` 优先使用 TTS route 返回的词/音素/viseme 时间戳；统一 schema 强制 cue 单调、shape 为 15 个冻结值、结束不超过音频时长，通过后标记 `alignment_source=provider_timestamp`。缺失时进入服务端词组感知普通话＋英文技术实体 G2P seam，标记 `g2p_estimate`；它不冒充 Provider cue。静态图、CSS/音量假口型和 Provider 自由生成回复均不是正式自研 3D 表达。`<80ms` 同步与 30 FPS 仍必须使用真实音频/资产/目标设备验收。
+
+LiveKit 是非模型 media-plane adapter，不进入 ModelGateway；候选人音轨进入 `InterviewEvidenceChain` 后，STT 仍完全通过 `ModelGateway.open_stream(stt.streaming)` 和现有 Provider route 选择。receive-only subscriber 关闭自动订阅，只接受服务端冻结 candidate identity 的 microphone publication，并以 16 kHz/mono/20 ms PCM 顺序驱动私有持久 segment 和唯一 StreamingSTTSession；控制 WebSocket 重连不重建这条链。正式配置是 `database_fenced`：数据库时钟 lease/epoch/CandidateAnswer commit fence 控制权威效果，持久 command journal 由连接无关 owner executor 通过 DB polling＋Redis wake hint 执行，remote controller 只代理 terminal receipt。新 owner 可用已 seal/checksum 校验的 media checkpoint 重建 batch repair；服务端授权 gap 时，浏览器可在 30 秒/2 MiB/32 KiB 限额内以 JSON backfill 帧先落私有 FileObject，再由 owner 按 epoch/sequence/hash 注入同一证据链。Agent WebSocket 不接受二进制 PCM，旧候选人 STT/录音/Avatar 路由已删除。
+
+生产 readiness 除房间/TURN/Egress/私有存储、LiveKit RTC SDK 和 receive-only 探针外，还要求实时语音与 cascade TTS 两条显式健康的非 mock route，以及鲜活 HMAC 签名的 `realtime-interview-agent.acceptance.v2` 报告。报告绑定精确 deployment/release，以固定、无标签的指标词汇验证延迟、STT/理解/追问质量、Avatar、恢复、视频隐私、Chrome/Edge/Safari 和试点评分；Appointment Admission 与候选人签票还复核组织灰度名单。S2S Provider 原始音频在 final 与 ApprovedConversationAct 逐字一致前只缓冲，批准后复制到私有 AgentExpressionAudio；偏离即丢弃并走 cascade。仓库合同已实现，但目标媒体、商用 VRM、真实 Provider、金标数据和试点仍是 environment/data pending。
 
 ## 后台配置 API
 
@@ -739,6 +752,10 @@ token；ModelInvocationLog 在失败 attempt 也保存这些诊断，不记录�
 - OpenAI Realtime client events：<https://platform.openai.com/docs/api-reference/realtime-client-events/session>
 - 阿里云百炼千问 Realtime API：<https://help.aliyun.com/zh/model-studio/realtime>
 - 阿里云 Qwen Audio Realtime：<https://help.aliyun.com/zh/model-studio/qwen-audio-realtime-user-guides>
-- 火山引擎豆包端到端实时语音产品说明（当前仅作为后续 adapter 依据）：<https://www.volcengine.com/docs/6561/1594360?lang=zh>
+- 火山方舟官方 Python runtime（Chat/Embedding）：<https://github.com/volcengine/ark-runtime-python>
+- 豆包大模型流式语音识别 API：<https://www.volcengine.com/docs/6561/1354869?lang=zh>
+- 豆包极速版大模型录音文件识别 API：<https://www.volcengine.com/docs/6561/1631584?lang=zh>
+- 豆包语音合成大模型 2.0 单向流式 API：<https://www.volcengine.com/docs/6561/2528925?lang=zh>
+- 豆包端到端实时语音（Seeduplex）API：<https://docs.volcengine.com/docs/DoubaoVoice/endtoend-realtime-voice-full-duplex-version?lang=zh>
 
 外部文档只决定 adapter 的厂商协议转换；领域能力、route、日志、隐私和 readiness 仍以本仓库统一 schema 为准。

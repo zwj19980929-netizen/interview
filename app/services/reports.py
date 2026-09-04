@@ -33,9 +33,15 @@ class ReportService:
 
     def build_report(self, interview: Dict[str, Any], *, trigger_reason: str) -> Dict[str, Any]:
         evaluations_by_id = {item["id"]: item for item in interview.get("evaluation_revisions", [])}
+        turns_by_id = {item["id"]: item for item in interview.get("turns", [])}
+        score_bearing_answers = [
+            answer
+            for answer in interview.get("answers", [])
+            if not turns_by_id.get(answer.get("turn_id"), {}).get("is_followup", False)
+        ]
         current_evaluations = {
             answer["id"]: evaluations_by_id[answer["current_evaluation_id"]]
-            for answer in interview.get("answers", [])
+            for answer in score_bearing_answers
             if answer.get("current_evaluation_id") in evaluations_by_id
         }
         item_by_snapshot = {
@@ -47,7 +53,7 @@ class ReportService:
         completed_weight = 0.0
         dimension_totals: Dict[str, Dict[str, float]] = {}
 
-        for answer in interview.get("answers", []):
+        for answer in score_bearing_answers:
             evaluation = current_evaluations.get(answer["id"])
             if evaluation is None:
                 continue
@@ -74,6 +80,12 @@ class ReportService:
                     "covered_key_points": deepcopy(evaluation["covered_key_points"]),
                     "missing_key_points": deepcopy(evaluation["missing_key_points"]),
                     "evidence": [item["evidence"] for item in evaluation["covered_key_points"]],
+                    "evidence_answer_ids": deepcopy(
+                        evaluation.get("evidence_answer_ids") or [answer["id"]]
+                    ),
+                    "evidence_utterance_ids": deepcopy(
+                        evaluation.get("evidence_utterance_ids") or []
+                    ),
                     "summary": evaluation["feedback"],
                 }
             )

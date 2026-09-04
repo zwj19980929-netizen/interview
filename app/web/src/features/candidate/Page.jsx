@@ -1,9 +1,63 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { createAvatarDeliveryRuntime } from "../../../candidate/avatar-runtime.js";
-import { createCandidateInterviewRuntime, createLocalRecordingBackup } from "../../../candidate/runtime.js";
-import { createPcm16kStream, createPcmPlaybackQueue } from "../../../candidate/pcm-stream.js";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+
 import { useWorkbench } from "../../core/WorkbenchProvider.jsx";
 import { Empty, Field, Status } from "../../core/ui.jsx";
+import {
+  createCandidateInterviewExperience,
+  rememberPreflightReport,
+  reportCandidateRuntimeProblem,
+} from "./agent-experience.js";
+import {
+  peekPreparedCandidateMedia,
+  prepareCandidateMedia,
+  recordPreparedAvatarFps,
+  runCandidatePreflight,
+  verifySpeaker,
+} from "./preflight.js";
+
+const VrmAvatar = lazy(() => import("./VrmAvatar.jsx").then((module) => ({
+  default: module.VrmAvatar,
+})));
+
+const EMPTY_EXPERIENCE = {
+  phase: "connecting",
+  floor: "none",
+  session: null,
+  currentQuestion: null,
+  mediaStream: null,
+  mediaPolicy: null,
+  connection: { control: "connecting", media: "checking", recoveryAdapter: null },
+  microphone: { enabled: true, localDetected: false, level: 0 },
+  serverAudio: { received: false, receivedAt: null },
+  evidence: { requested: false, ready: false },
+  captions: { forming: false, recent: [], full: [] },
+  endpoint: { active: false, deadlineAt: null },
+  calibration: { status: "pending", transcript: "", confidence: null, retryRequired: false },
+  avatar: {
+    status: "idle",
+    performanceId: null,
+    viseme: "sil",
+    visemeWeight: 0,
+    gesture: "idle",
+    gestureIntensity: 0,
+  },
+  problem: null,
+  completion: null,
+  recovery: {
+    retainedFrames: 0,
+    unacknowledgedFrames: 0,
+    encryptedBytes: 0,
+    retentionMs: 30_000,
+  },
+};
 
 export default function CandidateFeaturePage() {
   const { route } = useWorkbench();
@@ -11,437 +65,587 @@ export default function CandidateFeaturePage() {
 }
 
 function InvitationPage() {
-  const { API, data, request, toast } = useWorkbench(); const [busy, setBusy] = useState(false); const [entering, setEntering] = useState(false); const invitation = data.invitation; const [confirmed, setConfirmed] = useState(invitation?.status === "registered"); const [now, setNow] = useState(Date.now());
-  useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 30000); return () => window.clearInterval(timer); }, []);
-  useEffect(() => { if (invitation?.status === "registered") setConfirmed(true); }, [invitation?.status]);
-  if (!invitation) return <PublicShell><Empty title="邀请链接不可用" copy="链接可能已过期、已使用或被撤销" /></PublicShell>;
-  const token = invitation.token || location.hash.split("/")[1]; const startAt = new Date(invitation.scheduled_start_at); const endAt = new Date(invitation.scheduled_end_at); const canEnter = now >= startAt.getTime() && now <= endAt.getTime();
-  const confirm = async (event) => { event.preventDefault(); setBusy(true); try { const form = new FormData(event.currentTarget); await request(`${API}/public/interview-invitations/${encodeURIComponent(token)}/intake`, { method: "POST", body: { name: form.get("name"), email: form.get("email"), phone: form.get("phone"), consent: { accepted: form.get("privacy_accepted") === "on", version: invitation.consent?.version || "v1", recording_accepted: form.get("recording_accepted") === "on" } } }); setConfirmed(true); toast("预约确认成功", "系统正在准备本次面试语音，并已安排面试前 30 分钟邮件提醒"); } catch (error) { toast("暂时无法确认预约", error.message, "error"); } finally { setBusy(false); } };
-  const enterInterview = async () => { setEntering(true); try { let granted = false; let stream; try { stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false }); granted = stream.getAudioTracks().length > 0; } finally { stream?.getTracks().forEach((track) => track.stop()); } const readiness = await request(`${API}/public/interview-invitations/${encodeURIComponent(token)}/readiness`, { method: "POST", body: { browser_supported: Boolean(navigator.mediaDevices && window.MediaRecorder), microphone_granted: granted, audio_content_type: supportedMimeType() } }); if (!readiness.can_start) throw new Error("麦克风或预约运行条件尚未就绪"); const result = await request(`${API}/public/interview-invitations/${encodeURIComponent(token)}/start`, { method: "POST" }); location.href = result.candidate_join_url; } catch (error) { toast("暂时无法进入面试", error.message, "error"); setEntering(false); } };
-  return <PublicShell><section className="panel candidate-invitation" style={{ maxWidth: 760, margin: "48px auto", padding: 28 }}><p className="eyebrow">候选人面试预约</p><h1>{invitation.position_name}</h1><div className="appointment-time-card"><span>预约时间</span><strong>{formatAppointmentTime(startAt)} — {formatAppointmentTime(endAt)}</strong></div>{confirmed ? <div className="appointment-confirmed"><Status value="预约已确认" tone="ready" /><h2>身份核验通过</h2><p>我们会在面试开始前 30 分钟向您的登记邮箱发送提醒。请保留当前邀请链接，到预约时间后再进入面试。</p><button className="button button-primary" type="button" disabled={!canEnter || entering} onClick={enterInterview}>{entering ? "正在检查设备…" : canEnter ? "检查设备并进入面试" : "尚未到面试时间"}</button></div> : <><p>{invitation.consent?.privacy_notice}</p><p className="form-hint">核验通过后即确认预约，不会立即启动面试。</p><form onSubmit={confirm}><div className="form-grid"><Field label="姓名" full><input className="form-input" name="name" required /></Field><Field label="邮箱"><input className="form-input" name="email" type="email" required /></Field><Field label="手机号"><input className="form-input" name="phone" required /></Field></div><label><input type="checkbox" name="privacy_accepted" required /> 我已阅读并同意隐私说明</label>{invitation.consent?.recording_required && <label style={{ display: "block", marginTop: 12 }}><input type="checkbox" name="recording_accepted" required /> 我同意录制答题音频用于转写、评分与复核</label>}<button className="button button-primary" type="submit" disabled={busy} style={{ marginTop: 24 }}>{busy ? "正在核验…" : "核验身份并确认预约"}</button></form></>}</section></PublicShell>;
+  const { API, data, request, route, toast } = useWorkbench();
+  const invitation = data.invitation;
+  const [busy, setBusy] = useState(false);
+  const [entering, setEntering] = useState(false);
+  const [confirmed, setConfirmed] = useState(invitation?.status === "registered");
+  const [now, setNow] = useState(Date.now());
+  const [preflight, setPreflight] = useState(null);
+  const [speakerPlayed, setSpeakerPlayed] = useState(false);
+  const previewRef = useRef(null);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  useEffect(() => {
+    if (invitation?.status === "registered") setConfirmed(true);
+  }, [invitation?.status]);
+  useEffect(() => {
+    if (previewRef.current && preflight?.stream) {
+      previewRef.current.srcObject = preflight.stream;
+    }
+  }, [preflight]);
+
+  if (!invitation) {
+    return <PublicShell><Empty title="邀请链接不可用" copy="链接可能已过期、已使用或被撤销" /></PublicShell>;
+  }
+
+  const token = invitation.token || route.invitationToken || location.hash.split("/")[1];
+  const startAt = new Date(invitation.scheduled_start_at);
+  const endAt = new Date(invitation.scheduled_end_at);
+  const canEnter = now >= startAt.getTime() && now <= endAt.getTime();
+  const requiredScopes = new Set(
+    invitation.consent?.required_scopes
+    || (invitation.consent?.recording_required ? ["audio_recording"] : []),
+  );
+
+  const confirm = async (event) => {
+    event.preventDefault();
+    setBusy(true);
+    try {
+      const form = new FormData(event.currentTarget);
+      await request(`${API}/public/interview-invitations/${encodeURIComponent(token)}/intake`, {
+        method: "POST",
+        body: {
+          name: form.get("name"),
+          email: form.get("email"),
+          phone: form.get("phone"),
+          consent: {
+            accepted: form.get("privacy_accepted") === "on",
+            version: invitation.consent?.version || "v1",
+            audio_recording: form.get("audio_recording") === "on",
+            video_recording: form.get("video_recording") === "on",
+          },
+        },
+      });
+      setConfirmed(true);
+      toast("预约确认成功", "系统正在准备本次面试语音，并已安排面试前 30 分钟邮件提醒");
+    } catch (error) {
+      toast("暂时无法确认预约", error.message, "error");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const beginPreflight = async () => {
+    setEntering(true);
+    try {
+      const result = await runCandidatePreflight({ probeUrl: "/healthz" });
+      setPreflight(result);
+    } catch (error) {
+      toast("设备预检未通过", error.message, "error");
+    } finally {
+      setEntering(false);
+    }
+  };
+
+  const playSpeakerTest = async () => {
+    try {
+      await verifySpeaker();
+      setSpeakerPlayed(true);
+    } catch (error) {
+      toast("扬声器检测失败", error.message, "error");
+    }
+  };
+
+  const finishPreflightAndEnter = async () => {
+    if (!preflight?.stream || !speakerPlayed) return;
+    setEntering(true);
+    try {
+      const report = { ...preflight.report, speaker_verified: true };
+      prepareCandidateMedia(preflight.stream, report);
+      rememberPreflightReport(report);
+      const readiness = await request(
+        `${API}/public/interview-invitations/${encodeURIComponent(token)}/readiness`,
+        { method: "POST", body: report },
+      );
+      if (!readiness.can_start) {
+        throw new Error("摄像头、扬声器、网络、WebRTC、AudioWorklet、WebGL 或模型服务尚未达到正式面试门槛");
+      }
+      const result = await request(
+        `${API}/public/interview-invitations/${encodeURIComponent(token)}/start`,
+        { method: "POST" },
+      );
+      location.href = result.candidate_join_url;
+    } catch (error) {
+      toast("暂时无法进入面试", error.message, "error");
+      setEntering(false);
+    }
+  };
+
+  return <PublicShell>
+    <section className="panel candidate-invitation">
+      <p className="eyebrow">候选人面试预约</p>
+      <h1>{invitation.position_name}</h1>
+      <div className="appointment-time-card">
+        <span>预约时间</span>
+        <strong>{formatAppointmentTime(startAt)} — {formatAppointmentTime(endAt)}</strong>
+      </div>
+      {confirmed ? <div className="appointment-confirmed">
+        <Status value="预约已确认" />
+        <h2>身份核验通过</h2>
+        <p>我们会在面试开始前 30 分钟向您的登记邮箱发送提醒。到预约时间后，请先完成一次完整设备预检。</p>
+        {!preflight ? <button
+          className="button button-primary"
+          type="button"
+          disabled={!canEnter || entering}
+          onClick={beginPreflight}
+        >
+          {entering ? "正在检查设备…" : canEnter ? "检查设备并进入面试" : "尚未到面试时间"}
+        </button> : <section className="candidate-preflight" aria-label="设备预检">
+          <div className="candidate-preflight-preview">
+            <video ref={previewRef} autoPlay muted playsInline aria-label="摄像头真实自拍预览" />
+            <span>仅本机预览{requiredScopes.has("video_recording") ? " · 同意后将加密录像" : " · 本场不上传视频"}</span>
+          </div>
+          <div className="candidate-preflight-checks">
+            <h3>设备预检</h3>
+            <DeviceCheck label="麦克风与摄像头" ready={preflight.report.microphone_granted && preflight.report.camera_granted} />
+            <DeviceCheck label="WebRTC 与 AudioWorklet" ready={preflight.report.webrtc_supported && preflight.report.audio_worklet_supported} />
+            <DeviceCheck label="基础 WebGL 渲染探测" ready={preflight.report.webgl_supported && Math.round(preflight.report.avatar_fps) >= 30} detail={`${Math.round(preflight.report.avatar_fps)} FPS`} />
+            <DeviceCheck label="入场服务 RTT / 抖动" ready={preflight.report.network_rtt_ms <= 500 && preflight.report.network_jitter_ms <= 100} detail={`${preflight.report.network_rtt_ms} / ${preflight.report.network_jitter_ms} ms`} />
+            <p className="form-hint">正式入场时还会用真实 VRM 模型和 LiveKit RTCStats 再做一次失败关闭校验。</p>
+            <button className="button button-secondary" type="button" onClick={playSpeakerTest}>
+              {speakerPlayed ? "重新播放测试音" : "播放扬声器测试音"}
+            </button>
+            <button className="button button-primary" type="button" disabled={!speakerPlayed || entering} onClick={finishPreflightAndEnter}>
+              {entering ? "正在建立安全会话…" : "我听到了测试音，进入面试"}
+            </button>
+          </div>
+        </section>}
+      </div> : <>
+        <div className="candidate-consent-copy">
+          <p>{invitation.consent?.privacy_notice}</p>
+          {invitation.consent?.takeover_notice && <p>{invitation.consent.takeover_notice}</p>}
+          {invitation.consent?.inference_notice && <p>{invitation.consent.inference_notice}</p>}
+        </div>
+        <p className="form-hint">核验通过后只确认预约，不会启动摄像头、麦克风或面试。</p>
+        <form onSubmit={confirm}>
+          <div className="form-grid">
+            <Field label="姓名" full><input className="form-input" name="name" required /></Field>
+            <Field label="邮箱"><input className="form-input" name="email" type="email" required /></Field>
+            <Field label="手机号"><input className="form-input" name="phone" required /></Field>
+          </div>
+          <label className="candidate-consent-check">
+            <input type="checkbox" name="privacy_accepted" required /> 我已阅读并同意隐私说明
+          </label>
+          {requiredScopes.has("audio_recording") && <label className="candidate-consent-check">
+            <input type="checkbox" name="audio_recording" required />
+            {invitation.consent?.audio_recording_notice || "我同意录制答题音频用于权威转写、评分与人工复核"}
+          </label>}
+          {requiredScopes.has("video_recording") && <label className="candidate-consent-check">
+            <input type="checkbox" name="video_recording" required />
+            {invitation.consent?.video_recording_notice || "我同意加密录制候选人视频轨用于人工复核"}
+          </label>}
+          <button className="button button-primary" type="submit" disabled={busy}>
+            {busy ? "正在核验…" : "核验身份并确认预约"}
+          </button>
+        </form>
+      </>}
+    </section>
+  </PublicShell>;
 }
 
 function CandidateRoom() {
-  const { API, data, route, request, setResource, toast } = useWorkbench();
+  const { API, data, request, route } = useWorkbench();
   const interview = data.selectedInterview;
   const token = data.candidateToken || route.candidateToken;
-  const current = interview?.turns?.find((item) => item.id === interview.current_turn_id);
-  const wantsVideo = Boolean(interview?.record_video ?? interview?.settings?.record_video ?? false);
-  const [stream, setStream] = useState(null);
-  const [devices, setDevices] = useState({ audio: [], video: [] });
-  const [selectedAudio, setSelectedAudio] = useState("");
-  const [selectedVideo, setSelectedVideo] = useState("");
-  const [avatarMedia, setAvatarMedia] = useState(null);
-  const [avatarSpeaking, setAvatarSpeaking] = useState(false);
-  const [phase, setPhase] = useState("idle");
-  const [storedAudioUri, setStoredAudioUri] = useState(null);
-  const [mimeType, setMimeType] = useState("audio/webm");
-  const [transcript, setTranscript] = useState("");
-  const [interim, setInterim] = useState("");
-  const [duration, setDuration] = useState(0);
-  const [audioEnabled, setAudioEnabled] = useState(true);
-  const [videoEnabled, setVideoEnabled] = useState(wantsVideo);
+  const [experience, setExperience] = useState(EMPTY_EXPERIENCE);
+  const [avatarReady, setAvatarReady] = useState(false);
+  const [expandedTranscript, setExpandedTranscript] = useState(false);
+  const [startingProblem, setStartingProblem] = useState(null);
+  const [previewStream] = useState(() => peekPreparedCandidateMedia()?.stream || null);
+  const runRef = useRef(null);
   const videoRef = useRef(null);
-  const streamRef = useRef(null);
-  const socketRef = useRef(null);
-  const sttSocketRef = useRef(null);
-  const pcmRef = useRef(null);
-  const timerRef = useRef(null);
-  const recognitionRef = useRef(null);
-  const startedAtRef = useRef(0);
-  const phaseRef = useRef("idle");
-  const interviewRef = useRef(interview);
-  const currentRef = useRef(current);
-  const pendingSubmissionRef = useRef(null);
-  const streamModeRef = useRef("none");
-  const streamBackupRef = useRef(null);
-  const submittingRef = useRef(false);
-  const spokenTurnRef = useRef(null);
-  const s2sTurnRef = useRef(null);
-  const s2sAudioReceivedRef = useRef(false);
-  interviewRef.current = interview;
-  currentRef.current = current;
 
-  const changePhase = useCallback((next) => { phaseRef.current = next; setPhase(next); }, []);
-  const candidateRequest = useCallback((suffix = "", options = {}) => request(`${API}/public/interviews/${encodeURIComponent(interviewRef.current?.id || route.selectedInterviewId)}${suffix}`, { ...options, headers: { ...(options.headers || {}), "X-Candidate-Session-Token": token || "" } }), [API, request, route.selectedInterviewId, token]);
-  const refreshInterview = useCallback(async () => {
-    const updated = await candidateRequest();
-    interviewRef.current = updated;
-    setResource("selectedInterview", updated);
-    return updated;
-  }, [candidateRequest, setResource]);
-  const runtime = useMemo(() => createCandidateInterviewRuntime({
-    onStateChange: (state) => { changePhase(state.phase); if (state.mimeType) setMimeType(state.mimeType); },
-    onRecoveryNeeded: (message) => toast("录音等待恢复", message, "error"),
-  }), [changePhase, toast]);
-  const backupRuntime = useMemo(() => createLocalRecordingBackup(), []);
-  const avatarRuntime = useMemo(() => createAvatarDeliveryRuntime({
-    onMediaChange: setAvatarMedia,
-    onSpeakingChange: setAvatarSpeaking,
-    closeSession: (media) => closeAvatarSession(media, API, interviewRef.current?.id || route.selectedInterviewId, token),
-  }), [API, route.selectedInterviewId, token]);
-  const pcmPlayback = useMemo(() => createPcmPlaybackQueue({
-    onStart: () => setAvatarSpeaking(true),
-    onEnd: () => setAvatarSpeaking(false),
-  }), []);
-
-  const resetAnswerUi = useCallback(() => {
-    clearInterval(timerRef.current);
-    recognitionRef.current?.stop?.();
-    recognitionRef.current = null;
-    pendingSubmissionRef.current = null;
-    streamBackupRef.current = null;
-    streamModeRef.current = "none";
-    submittingRef.current = false;
-    const socket = sttSocketRef.current;
-    sttSocketRef.current = null;
-    if (socket?.readyState === WebSocket.OPEN) socket.close();
-    pcmRef.current?.stop?.();
-    pcmRef.current = null;
-    setStoredAudioUri(null);
-    setTranscript("");
-    setInterim("");
-    setDuration(0);
-    runtime.reset();
-    backupRuntime.reset();
-  }, [backupRuntime, runtime]);
-
-  const submitStoredAnswer = useCallback(async (audioUri, contentType, metadata = pendingSubmissionRef.current) => {
-    if (!audioUri || !metadata?.turnId || submittingRef.current) return;
-    submittingRef.current = true;
-    setStoredAudioUri(audioUri);
-    changePhase("processing");
+  const candidateInterview = useMemo(
+    () => createCandidateInterviewExperience({ apiBase: API, request }),
+    [API, request],
+  );
+  const lastAvatarMetricAt = useRef(0);
+  const avatarLoaded = useCallback((details) => {
+    recordPreparedAvatarFps(details?.fps);
+    setAvatarReady(true);
+  }, []);
+  const avatarFpsObserved = useCallback((fps) => {
+    const now = Date.now();
+    if (now - lastAvatarMetricAt.current < 10_000) return;
+    lastAvatarMetricAt.current = now;
+    runRef.current?.act({
+      type: "telemetry.observe",
+      idempotencyKey: uniqueActionKey("avatar_fps"),
+      payload: { metric: "avatar_fps", value: Number(fps) },
+    }).catch(() => {});
+  }, []);
+  const pauseForFatalProblem = useCallback(async (error, fallbackCode = "CANDIDATE_RUNTIME_FAILED") => {
+    const problemCode = error?.candidateProblemCode || fallbackCode;
+    setStartingProblem({
+      code: error?.code || problemCode,
+      message: error.message || String(error),
+      recoverable: false,
+      pausePending: true,
+      pauseConfirmed: false,
+    });
+    runRef.current?.act({
+      type: "pause",
+      idempotencyKey: uniqueActionKey("avatar_fatal"),
+      payload: { reason: "avatar_renderer_fatal" },
+    }).catch(() => {});
     try {
-      await candidateRequest("/audio-answers", {
-        method: "POST",
-        body: {
-          turn_id: metadata.turnId,
-          audio_uri: audioUri,
-          content_type: contentType || metadata.mimeType || "audio/webm",
-          language: "zh-CN",
-          duration_seconds: metadata.duration,
-          ...(["localhost", "127.0.0.1"].includes(location.hostname) && metadata.transcript ? { development_transcript: metadata.transcript, development_confidence: .85 } : {}),
-        },
+      const result = await reportCandidateRuntimeProblem({
+        apiBase: API,
+        request,
+        interviewId: interview?.id,
+        candidateSessionToken: token,
+        code: problemCode,
       });
-      resetAnswerUi();
-      await refreshInterview();
-      toast("回答已接收", "追问或下一题已同步，评分正在后台进行");
-    } catch (error) {
-      submittingRef.current = false;
-      changePhase("submit_failed");
-      toast("回答提交失败", `${error.message}；完整录音仍保留，可重试提交`, "error");
-    }
-  }, [candidateRequest, changePhase, refreshInterview, resetAnswerUi, toast]);
-
-  const handleDialogueMedia = useCallback(async (event) => {
-    const payload = event.payload || {};
-    if (event.type === "output.audio.delta") {
-      s2sAudioReceivedRef.current = true;
-      await pcmPlayback.enqueue(event.audio_base64, event.sample_rate_hz || 24000);
-    } else if (event.type === "dialogue.error") {
-      if (!s2sAudioReceivedRef.current && s2sTurnRef.current) spokenTurnRef.current = null;
-      toast("实时语音已降级", "本轮将使用普通数字人语音播报", "error");
-    } else if (event.type.endsWith("audio.delta") && (payload.delivery || payload.audio_uri)) {
-      await avatarRuntime.play(payload.delivery || { mode: "audio", audio_uri: payload.audio_uri, avatar_mode: interviewRef.current?.avatar_mode || "local" });
-    }
-    if (event.type.endsWith("speech.interrupted") || event.type === "interview.paused") await avatarRuntime.stop();
-  }, [avatarRuntime, pcmPlayback, toast]);
-
-  const ensureSocket = useCallback(async () => {
-    const existing = socketRef.current;
-    if (existing?.readyState === WebSocket.OPEN) return existing;
-    if (existing?.readyState === WebSocket.CONNECTING) {
-      return new Promise((resolve, reject) => {
-        existing.addEventListener("open", () => resolve(existing), { once: true });
-        existing.addEventListener("error", () => reject(new Error("实时会话连接失败")), { once: true });
+      const pauseConfirmed = result?.status === "paused";
+      setStartingProblem({
+        code: error?.code || problemCode,
+        message: error.message || String(error),
+        recoverable: false,
+        pausePending: false,
+        pauseConfirmed,
       });
+      return { pauseConfirmed };
+    } catch {
+      setStartingProblem({
+        code: error?.code || problemCode,
+        message: error.message || String(error),
+        recoverable: false,
+        pausePending: false,
+        pauseConfirmed: false,
+      });
+      return { pauseConfirmed: false };
     }
-    return new Promise((resolve, reject) => {
-      const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-      const active = interviewRef.current;
-      const socket = new WebSocket(`${protocol}//${location.host}${API}/interviews/${encodeURIComponent(active.id)}/live?role=candidate&token=${encodeURIComponent(token)}`);
-      socketRef.current = socket;
-      socket.addEventListener("open", () => {
-        socket.send(JSON.stringify({ type: "session.ready", payload: { source: "react_candidate" } }));
-        resolve(socket);
-      }, { once: true });
-      socket.addEventListener("message", async ({ data: raw }) => {
-        const event = JSON.parse(raw);
-        if (event.type === "media.recording.stopped") {
-          runtime.acknowledgeMediaStored();
-          const uri = event.payload.audio_uri;
-          const type = event.payload.mime_type || "audio/webm";
-          setStoredAudioUri(uri);
-          setMimeType(type);
-          await submitStoredAnswer(uri, type);
+  }, [API, interview?.id, request, token]);
+
+  const fatalAvatarProblem = useCallback(
+    (error) => pauseForFatalProblem(error, "AVATAR_RENDERER_FAILED"),
+    [pauseForFatalProblem],
+  );
+
+  useEffect(() => {
+    if (!interview?.id || !token || !avatarReady) return undefined;
+    let active = true;
+    let unsubscribe = () => {};
+    candidateInterview.open({ interviewId: interview.id, ticket: token })
+      .then((run) => {
+        if (!active) {
+          run.close();
           return;
         }
-        if (event.type === "stt.transcript.partial") setInterim(event.payload?.text || "");
-        if (event.type === "stt.stream.error" && event.payload?.error_code === "stream_disconnected_batch_repaired") {
-          resetAnswerUi();
-          await refreshInterview();
-          toast("回答已恢复", "网络中断前的录音已由服务端修复并进入后台评分");
-        }
-        if (event.type === "error") toast("实时会话错误", event.payload?.message || event.payload?.code, "error");
-        await handleDialogueMedia(event);
-        if (event.type === "session.state.changed") {
-          const status = event.payload?.status;
-          if (["paused", "cancelled"].includes(status)) changePhase(status);
-          else if (status === "in_progress" && ["paused", "cancelled"].includes(phaseRef.current)) changePhase("idle");
-        }
-        if (
-          ["session.state.changed", "question.selected", "evaluation.completed", "interview.completed"].includes(event.type)
-          || event.type.startsWith("followup.")
-          || event.type.startsWith("transcription.")
-          || event.type.startsWith("evaluation.")
-        ) await refreshInterview();
+        runRef.current = run;
+        unsubscribe = run.subscribe(setExperience);
+      })
+      .catch((error) => {
+        if (active) pauseForFatalProblem(error, "CANDIDATE_RUNTIME_FAILED");
       });
-      socket.addEventListener("error", () => reject(new Error("实时会话连接失败")), { once: true });
-      socket.addEventListener("close", () => {
-        if (socketRef.current === socket) socketRef.current = null;
-        if (["recording", "stopping", "processing"].includes(phaseRef.current)) toast("实时连接中断", "完整录音保存在本地，连接恢复后可继续提交", "error");
-      });
-    });
-  }, [API, changePhase, handleDialogueMedia, refreshInterview, resetAnswerUi, runtime, submitStoredAnswer, toast, token]);
-
-  const uploadStreamBackup = useCallback(async () => {
-    const metadata = pendingSubmissionRef.current;
-    const recording = streamBackupRef.current || await backupRuntime.stop();
-    streamBackupRef.current = recording;
-    if (!recording?.size) throw new Error("实时识别中断且本地录音为空");
-    streamModeRef.current = "batch_upload";
-    await runtime.submitRecording({ recording, candidateSocket: await ensureSocket(), activeTurnId: metadata.turnId });
-  }, [backupRuntime, ensureSocket, runtime]);
-
-  const downgradeStreaming = useCallback(async (message, waitForServerRepair = false) => {
-    if (streamModeRef.current !== "streaming") return;
-    streamModeRef.current = "backup";
-    await pcmRef.current?.stop?.();
-    pcmRef.current = null;
-    const socket = sttSocketRef.current;
-    sttSocketRef.current = null;
-    if (socket?.readyState === WebSocket.OPEN) socket.close();
-    toast("实时转写已降级", `${message}；完整录音仍在本机保存，将在结束后自动提交批量转写`, "error");
-    if (phaseRef.current !== "recording") {
-      if (waitForServerRepair) {
-        await new Promise((resolve) => window.setTimeout(resolve, 800));
-        try {
-          const updated = await refreshInterview();
-          const turnId = pendingSubmissionRef.current?.turnId;
-          const repaired = updated.current_turn_id !== turnId || updated.answers?.some((answer) => answer.turn_id === turnId);
-          if (repaired) {
-            resetAnswerUi();
-            toast("回答已恢复", "服务端已保存完整音频并进入后台评分");
-            return;
-          }
-        } catch { /* local backup remains available */ }
-      }
-      await uploadStreamBackup();
-    }
-  }, [refreshInterview, resetAnswerUi, toast, uploadStreamBackup]);
-
-  const openSttStream = useCallback((turnId) => new Promise((resolve, reject) => {
-    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-    const socket = new WebSocket(`${protocol}//${location.host}${API}/interviews/${encodeURIComponent(interviewRef.current.id)}/stt-stream?token=${encodeURIComponent(token)}`);
-    socket.binaryType = "arraybuffer";
-    sttSocketRef.current = socket;
-    let ready = false;
-    socket.addEventListener("open", () => socket.send(JSON.stringify({ type: "stream.open", payload: { turn_id: turnId, content_type: "audio/pcm", sample_rate_hz: 16000, channels: 1, language: "zh-CN", enable_partial: true } })));
-    socket.addEventListener("message", async ({ data: raw }) => {
-      const event = JSON.parse(raw);
-      if (event.type === "stream.ready") { ready = true; resolve(socket); }
-      else if (event.type === "transcript.partial") setInterim(event.text || "");
-      else if (event.type === "transcript.final") { setTranscript(event.text || ""); setInterim(""); }
-      else if (event.type === "followup.selected" && event.delivery === "s2s") {
-        s2sTurnRef.current = event.payload?.turn_id || null;
-        s2sAudioReceivedRef.current = false;
-        if (s2sTurnRef.current) spokenTurnRef.current = s2sTurnRef.current;
-      } else if (event.type === "output.audio.delta" || event.type === "dialogue.error") {
-        await handleDialogueMedia(event);
-      } else if (event.type === "answer.accepted") {
-        resetAnswerUi();
-        await refreshInterview();
-        toast("回答已接收", "追问或下一题已同步，评分正在后台进行");
-      } else if (event.type === "interview.completed") await refreshInterview();
-      else if (event.type === "stream.error") {
-        const error = new Error(event.message || event.error_code || "实时转写失败");
-        if (!ready) reject(error);
-        else if (event.error_code !== "stream_failed_batch_repaired") await downgradeStreaming(error.message);
-      }
-    });
-    socket.addEventListener("error", () => { if (!ready) reject(new Error("实时转写通道连接失败")); else downgradeStreaming("实时转写通道连接失败"); }, { once: true });
-    socket.addEventListener("close", () => {
-      if (sttSocketRef.current === socket) sttSocketRef.current = null;
-      if (ready && streamModeRef.current === "streaming" && !["idle", "completed"].includes(phaseRef.current)) downgradeStreaming("实时转写通道已断开", true);
-    });
-  }), [API, downgradeStreaming, handleDialogueMedia, refreshInterview, resetAnswerUi, toast, token]);
-
-  useEffect(() => { if (videoRef.current) videoRef.current.srcObject = stream; }, [stream]);
-  useEffect(() => {
-    if (!interview?.id || !token) return undefined;
-    let heartbeat;
-    let active = true;
-    ensureSocket().then((socket) => {
-      if (!active) return;
-      heartbeat = window.setInterval(() => {
-        if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "ping", payload: {} }));
-      }, 20000);
-    }).catch((error) => toast("实时会话连接失败", error.message, "error"));
-    return () => { active = false; clearInterval(heartbeat); };
-  }, [ensureSocket, interview?.id, toast, token]);
-
-  const speak = useCallback(async (turnId = currentRef.current?.id) => {
-    if (!turnId || phaseRef.current !== "idle") return;
-    try {
-      const response = await candidateRequest("/avatar/speak", { method: "POST", body: { turn_id: turnId, language: "zh-CN", voice: "default" } });
-      if (currentRef.current?.id !== turnId) return;
-      await avatarRuntime.play(response);
-    } catch (error) { toast("数字人读题失败", error.message, "error"); }
-  }, [avatarRuntime, candidateRequest, toast]);
-
-  useEffect(() => {
-    if (!current?.id || current.status !== "asking" || interview?.status !== "in_progress" || spokenTurnRef.current === current.id) return;
-    spokenTurnRef.current = current.id;
-    speak(current.id);
-  }, [current?.id, current?.status, interview?.status, speak]);
-
-  useEffect(() => () => {
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    socketRef.current?.close();
-    sttSocketRef.current?.close();
-    pcmRef.current?.stop?.();
-    runtime.reset();
-    backupRuntime.reset();
-    clearInterval(timerRef.current);
-    recognitionRef.current?.stop?.();
-    avatarRuntime.stop();
-    pcmPlayback.stop();
-  }, [avatarRuntime, backupRuntime, pcmPlayback, runtime]);
-
-  if (!interview) return <PublicShell><Empty title="面试链接不可用" copy="请联系面试官重新发送链接" /></PublicShell>;
-  const completed = interview.turns?.filter((item) => item.status === "completed").length || 0;
-  const finished = ["completed", "report_generating", "report_ready"].includes(interview.status);
-  const cancelled = interview.status === "cancelled";
-  const interrupted = interview.status === "paused";
-
-  const openMedia = async (audioId = "", videoId = "", allowVideo = wantsVideo) => {
-    const constraints = {
-      audio: { ...(audioId ? { deviceId: { exact: audioId } } : {}), echoCancellation: true, noiseSuppression: true },
-      video: allowVideo ? { ...(videoId ? { deviceId: { exact: videoId } } : {}), width: { ideal: 1280 }, height: { ideal: 720 } } : false,
+    return () => {
+      active = false;
+      unsubscribe();
+      const run = runRef.current;
+      runRef.current = null;
+      run?.close();
     };
-    let next;
-    try { next = await navigator.mediaDevices.getUserMedia(constraints); }
-    catch (error) {
-      if (!allowVideo) throw error;
-      next = await navigator.mediaDevices.getUserMedia({ ...constraints, video: false });
-      toast("摄像头不可用", "已切换为仅麦克风模式，仍可继续面试", "error");
-    }
-    streamRef.current?.getTracks().forEach((track) => track.stop());
-    streamRef.current = next;
-    setStream(next);
-    setAudioEnabled(true);
-    setVideoEnabled(next.getVideoTracks().length > 0);
-    return next;
-  };
-  const enableMedia = async () => {
-    try {
-      const next = await openMedia();
-      const all = await navigator.mediaDevices.enumerateDevices();
-      const audio = all.filter((item) => item.kind === "audioinput");
-      const video = wantsVideo ? all.filter((item) => item.kind === "videoinput") : [];
-      setDevices({ audio, video });
-      setSelectedAudio(next.getAudioTracks()[0]?.getSettings?.().deviceId || audio[0]?.deviceId || "");
-      setSelectedVideo(next.getVideoTracks()[0]?.getSettings?.().deviceId || video[0]?.deviceId || "");
-      await ensureSocket();
-      toast("设备已就绪", next.getVideoTracks().length ? "麦克风和摄像头检查通过" : "麦克风检查通过，本场无需摄像头");
-    } catch (error) { toast("无法启用设备", error.message, "error"); }
-  };
-  const switchDevice = async (kind, deviceId) => {
-    if (phaseRef.current !== "idle") return;
-    const audioId = kind === "audio" ? deviceId : selectedAudio;
-    const videoId = kind === "video" ? deviceId : selectedVideo;
-    try {
-      await openMedia(audioId, videoId, wantsVideo);
-      if (kind === "audio") setSelectedAudio(deviceId); else setSelectedVideo(deviceId);
-      toast("设备已切换", kind === "audio" ? "麦克风已更新" : "摄像头已更新");
-    } catch (error) { toast("设备切换失败", error.message, "error"); }
-  };
-  const toggleAudio = () => { if (phaseRef.current !== "idle") return; const next = !audioEnabled; stream?.getAudioTracks().forEach((track) => { track.enabled = next; }); setAudioEnabled(next); };
-  const toggleVideo = () => { if (phaseRef.current !== "idle") return; const next = !videoEnabled; stream?.getVideoTracks().forEach((track) => { track.enabled = next; }); setVideoEnabled(next); };
+  }, [avatarReady, candidateInterview, interview?.id, pauseForFatalProblem, token]);
 
-  const startRecording = async () => {
-    const activeTurn = currentRef.current;
-    if (!stream || !audioEnabled || !activeTurn || activeTurn.status !== "asking" || phaseRef.current !== "idle") return;
-    changePhase("connecting");
-    setStoredAudioUri(null); setTranscript(""); setInterim(""); setDuration(0);
-    await avatarRuntime.stop();
-    startedAtRef.current = Date.now();
-    pendingSubmissionRef.current = { turnId: activeTurn.id, duration: 1, transcript: "", mimeType: "audio/webm" };
-    try {
-      const sttSocket = await openSttStream(activeTurn.id);
-      backupRuntime.start(stream);
-      streamModeRef.current = "streaming";
-      try {
-        pcmRef.current = await createPcm16kStream(stream, (chunk) => { if (sttSocket.readyState === WebSocket.OPEN) sttSocket.send(chunk); });
-      } catch (error) {
-        streamModeRef.current = "none";
-        sttSocket.close();
-        await backupRuntime.stop(); backupRuntime.reset();
-        throw error;
-      }
-      changePhase("recording");
-    } catch (streamError) {
-      try {
-        const socket = await ensureSocket();
-        runtime.start({ mediaStream: stream, candidateSocket: socket, activeTurnId: activeTurn.id });
-        streamModeRef.current = "batch";
-        startRecognition(setTranscript, setInterim, recognitionRef);
-        toast("实时转写已降级", "当前使用完整录音，结束后会自动提交批量转写");
-      } catch (error) {
-        changePhase("idle");
-        toast("无法开始录音", `${streamError.message}；${error.message}`, "error");
-        return;
-      }
+  useEffect(() => {
+    const stream = experience.mediaStream || previewStream;
+    if (videoRef.current && stream) {
+      videoRef.current.srcObject = stream;
     }
-    timerRef.current = setInterval(() => setDuration(Math.floor((Date.now() - startedAtRef.current) / 1000)), 1000);
-  };
-  const stopRecording = async () => {
-    if (phaseRef.current !== "recording") return;
-    changePhase("stopping");
-    clearInterval(timerRef.current);
-    recognitionRef.current?.stop?.();
-    const elapsed = Math.max(1, Math.floor((Date.now() - startedAtRef.current) / 1000));
-    setDuration(elapsed);
-    pendingSubmissionRef.current = { turnId: currentRef.current?.id, duration: elapsed, transcript: `${transcript} ${interim}`.trim(), mimeType };
-    if (streamModeRef.current === "streaming") {
-      await pcmRef.current?.stop?.(); pcmRef.current = null;
-      streamBackupRef.current = await backupRuntime.stop();
-      changePhase("processing");
-      const socket = sttSocketRef.current;
-      if (socket?.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "stream.finish", payload: { duration_seconds: elapsed } }));
-      else await uploadStreamBackup();
-    } else if (streamModeRef.current === "backup") {
-      streamBackupRef.current = await backupRuntime.stop();
-      await uploadStreamBackup();
-    } else runtime.stop();
-  };
-  const recover = async () => { try { await runtime.recover(await ensureSocket()); } catch (error) { toast("恢复失败", error.message, "error"); } };
-  const retrySubmit = async () => submitStoredAnswer(storedAudioUri, mimeType);
-  const answerDisabled = !stream || !audioEnabled || !current || current.status !== "asking" || phase !== "idle" || avatarSpeaking || interrupted;
+  }, [experience.mediaStream, previewStream]);
 
-  return <PublicShell><div className="candidate-room">{cancelled ? <section className="candidate-completion"><h1>面试已取消</h1><p>本场面试已由企业面试官结束，如有疑问请联系招聘人员。</p></section> : finished ? <section className="candidate-completion"><h1>面试已完成</h1><p>{interview.status === "report_generating" ? "回答已经提交，系统正在生成报告。" : "回答已经提交，报告将由企业人员审核。"}</p></section> : <><section className="candidate-stage-grid"><AvatarStage media={avatarMedia} mode={interview.avatar_mode} speaking={avatarSpeaking} onReplay={() => speak()} onEnded={() => avatarRuntime.stop()} disabled={!current || phase !== "idle" || interrupted} /><aside className="candidate-device-panel"><div className={`candidate-camera${wantsVideo ? "" : " is-audio-only"}`}>{wantsVideo ? <video ref={videoRef} autoPlay muted playsInline /> : <div className="candidate-audio-only"><strong>仅麦克风面试</strong><span>本场不采集摄像头画面</span></div>}{!stream && <button className="button button-primary" onClick={enableMedia}>检查设备</button>}</div>{stream && <><div className="device-controls"><button className="device-toggle" onClick={toggleAudio} disabled={phase !== "idle"}>{audioEnabled ? "麦克风开" : "麦克风关"}</button>{wantsVideo && stream.getVideoTracks().length > 0 && <button className="device-toggle" onClick={toggleVideo} disabled={phase !== "idle"}>{videoEnabled ? "摄像头开" : "摄像头关"}</button>}</div><Field label="麦克风"><select className="form-select" value={selectedAudio} disabled={phase !== "idle"} onChange={(event) => switchDevice("audio", event.target.value)}>{devices.audio.map((item, index) => <option key={item.deviceId} value={item.deviceId}>{item.label || `麦克风 ${index + 1}`}</option>)}</select></Field>{wantsVideo && devices.video.length > 0 && <Field label="摄像头"><select className="form-select" value={selectedVideo} disabled={phase !== "idle"} onChange={(event) => switchDevice("video", event.target.value)}>{devices.video.map((item, index) => <option key={item.deviceId} value={item.deviceId}>{item.label || `摄像头 ${index + 1}`}</option>)}</select></Field>}</>}</aside></section>{interrupted && <div className="candidate-session-notice" role="status"><strong>面试已暂停</strong><span>请等待企业面试官恢复，本地录音不会主动丢弃。</span></div>}<section className="candidate-question-band"><div className="candidate-question-head"><div><span>{current?.is_followup ? `第 ${current.order} 题 · 追问` : `第 ${current?.order || "-"} / ${interview.turns?.length} 题`}</span><h1>{current?.question_spoken_text || "等待下一题"}</h1>{current?.is_followup && <small>请针对上一题补充说明</small>}</div><span>{completed}/{interview.turns?.length}</span></div><textarea className="form-textarea" value={`${transcript}${interim ? ` ${interim}` : ""}`} readOnly placeholder="服务端实时转写将在这里显示" /><div className="candidate-processing-status" role="status">{candidatePhaseText(phase, duration)}</div><div className="candidate-answer-actions"><button className="button button-record" onClick={startRecording} disabled={answerDisabled}>开始回答</button><button className="button button-secondary" onClick={stopRecording} disabled={phase !== "recording"}>结束并自动提交</button>{phase === "recoverable" && <button className="button button-secondary" onClick={recover}>恢复提交录音</button>}{phase === "submit_failed" && <button className="button button-primary" onClick={retrySubmit}>重试提交</button>}</div></section></>}</div></PublicShell>;
+  const act = useCallback((type, payload = {}) => {
+    const run = runRef.current;
+    if (!run) return;
+    run.act({
+      type,
+      payload,
+      idempotencyKey: uniqueActionKey(type),
+      turnId: experience.currentQuestion?.turn_id,
+    }).catch((error) => setStartingProblem({
+      code: "CANDIDATE_ACTION_FAILED",
+      message: error.message || String(error),
+      recoverable: true,
+    }));
+  }, [experience.currentQuestion?.turn_id]);
+
+  const problem = experience.problem || startingProblem;
+  const session = experience.session || {};
+  const completion = experience.completion;
+  const calibration = experience.calibration || EMPTY_EXPERIENCE.calibration;
+  const currentQuestion = experience.currentQuestion;
+  const totalQuestions = Number(session.total_primary_questions || interview?.turns?.filter((item) => !item.is_followup).length || 0);
+  const answered = Number(session.completed_answers || interview?.answers?.length || 0);
+  const pauseConfirmed = problem?.pauseConfirmed === true || session.status === "paused";
+
+  if (!interview || !token) {
+    return <div className="candidate-room"><PublicHeader /><div className="candidate-loading" role="status">正在读取经授权的面试会话…</div></div>;
+  }
+  if (completion || ["completed", "report_generating", "report_ready"].includes(interview.status)) {
+    const receipt = completion || {
+      interview_id: interview.id,
+      submitted_at: interview.updated_at,
+      recording_retention_notice: "录音录像按邀请页同意范围和企业保留策略保存。",
+      human_review_required: true,
+    };
+    return <div className="candidate-room">
+      <PublicHeader />
+      <main className="candidate-completion">
+        <span className="completion-icon" aria-hidden="true">✓</span>
+        <h1>面试已提交</h1>
+        <p>谢谢你的参与。系统已生成不可重复提交的回执，企业人员将进行最终审核。</p>
+        <div className="candidate-receipt">
+          <span><small>面试编号</small><strong>{receipt.interview_id}</strong></span>
+          <span><small>提交时间</small><strong>{formatDateTime(receipt.submitted_at)}</strong></span>
+        </div>
+        <p>{receipt.recording_retention_notice}</p>
+        <p>自动评分仅提供辅助证据，不会自动决定录用或淘汰。</p>
+      </main>
+    </div>;
+  }
+
+  return <div className="candidate-room">
+    <PublicHeader>
+      <div className="candidate-header-meta">
+        <span className={`connection-dot is-${experience.connection.control}`} />
+        <span>{connectionText(experience.connection)}</span>
+        <span>{interview.record_video ? "音视频加密录制" : interview.record_audio !== false ? "仅音频加密录制" : "本场不录制"}</span>
+      </div>
+    </PublicHeader>
+    <main>
+      <div className="candidate-stage-grid">
+        <Suspense fallback={<div className="candidate-avatar-stage"><div className="vrm-avatar-gate" role="status">正在加载 3D 渲染模块…</div></div>}>
+          <VrmAvatar
+            apiBase={API}
+            interviewId={interview.id}
+            candidateSessionToken={token}
+            avatar={experience.avatar}
+            onReady={avatarLoaded}
+            onFps={avatarFpsObserved}
+            onFatalProblem={fatalAvatarProblem}
+          />
+        </Suspense>
+        <aside className="candidate-device-panel" aria-label="候选人设备状态">
+          <div className="candidate-camera">
+            <video ref={videoRef} autoPlay muted playsInline aria-label="候选人真实自拍预览" />
+            {!experience.mediaStream && !previewStream && <div className="device-permission" role="status">
+              <strong>正在连接已预检的摄像头</strong>
+              <span>没有真实预览时不会开始正式问答</span>
+            </div>}
+            <span className="camera-label">本机自拍预览</span>
+          </div>
+          <div className="candidate-signal-list">
+            <SignalState
+              label="本机检测到声音"
+              active={experience.microphone.localDetected}
+              detail={experience.microphone.localDetected ? "麦克风正在拾音" : "等待你开口"}
+            >
+              <span className="microphone-level" aria-hidden="true"><i style={{ width: `${Math.round(experience.microphone.level * 100)}%` }} /></span>
+            </SignalState>
+            <SignalState
+              label="服务器收到音频"
+              active={experience.serverAudio.received}
+              detail={experience.serverAudio.received ? "服务器已确认当前音频帧" : "尚未收到正式音频"}
+            />
+            <SignalState
+              label="正在形成实时字幕"
+              active={experience.captions.forming}
+              detail={experience.captions.forming ? "服务端正在转写" : "等待有效语音"}
+            />
+          </div>
+          <p className="privacy-note">
+            摄像头与麦克风不用于情绪、眼神、人格、诚信或能力推断。人工接管会被审计并明确显示。
+          </p>
+        </aside>
+      </div>
+
+      <section className="candidate-question-band">
+        {problem && <div className={`candidate-problem${problem.recoverable ? "" : " is-fatal"}`} role="alert">
+          <strong>{problem.recoverable
+            ? "实时链路需要注意"
+            : problem.pausePending
+              ? "正在安全暂停面试"
+              : pauseConfirmed
+                ? "面试已在服务器暂停，未退回问卷模式"
+                : "实时链路不可用，服务器暂停尚未确认"}</strong>
+          <span>{problem.message}</span>
+          {!problem.recoverable && <small>{pauseConfirmed
+            ? "请等待企业面试官监看或接管。"
+            : "请停止作答并联系企业面试官确认会话状态。"}</small>}
+        </div>}
+
+        {!experience.session ? <CandidateSessionGate problem={problem} /> : calibration.status !== "completed" ? <WarmupPanel calibration={calibration} experience={experience} act={act} /> : <>
+          <div className="candidate-question-head">
+            <div>
+              <p className="eyebrow">{currentQuestion?.is_followup ? "基于你刚才回答的追问" : `正式问题 ${currentQuestion?.order || answered + 1}`}</p>
+              <h1>{currentQuestion?.question_text || "面试官正在组织下一句话…"}</h1>
+            </div>
+            <div className="candidate-progress" aria-label={`已完成 ${answered}，共 ${totalQuestions} 个主问题`}>
+              {answered}/{totalQuestions || "—"}
+            </div>
+          </div>
+          <ConversationState phase={experience.phase} endpoint={experience.endpoint} />
+          <CaptionPanel
+            captions={experience.captions}
+            expanded={expandedTranscript}
+            onToggle={() => setExpandedTranscript((value) => !value)}
+          />
+          <div className="candidate-answer-actions">
+            <div className="recording-actions">
+              <button className="button button-secondary" type="button" onClick={() => act("request_repeat")}>
+                请再说一遍
+              </button>
+              <button className="button button-secondary" type="button" onClick={() => act("continue_speaking")} disabled={!experience.endpoint.active}>
+                继续补充
+              </button>
+            </div>
+            <button className="button button-danger" type="button" onClick={() => act("pause")}>暂停面试</button>
+          </div>
+        </>}
+      </section>
+    </main>
+  </div>;
 }
 
-function AvatarStage({ media, mode, speaking, onReplay, onEnded, disabled }) {
-  const selectedMode = media?.avatar_mode || mode || "cloud";
-  const label = selectedMode === "local" ? "自研数字人" : "云数字人";
-  const detail = media?.fallback_reason === "cloud_unavailable" ? "云服务不可用，已切换本地播放" : selectedMode === "local" ? "本地渲染 · 冻结语音" : "实时视频 · 云端驱动";
-  return <div className={`candidate-avatar-stage${speaking ? " is-speaking" : ""}`}>{media?.mode === "webrtc" ? <iframe title="实时数智人" allow="autoplay; fullscreen" src={`/web/webrtc-player.html?url=${encodeURIComponent(media.stream_url)}`} /> : media?.mode === "video" ? <video src={media.stream_url} autoPlay playsInline onEnded={onEnded} /> : <img src="/web/assets/digital-interviewer.png" alt="数字人面试官" />}<span className="avatar-speaking-indicator" aria-hidden="true"><span /><span /><span /><span /></span><div className="candidate-stage-caption"><span><strong>{label}</strong><small>{detail}</small></span><button className="button button-secondary" type="button" onClick={onReplay} disabled={disabled}>重新朗读</button></div></div>;
+function CandidateSessionGate({ problem }) {
+  return <div className="candidate-warmup" role="status">
+    <p className="eyebrow">实时安全会话</p>
+    <h1>{problem?.recoverable === false ? "会话尚未建立" : "正在建立实时安全会话"}</h1>
+    <p>{problem?.recoverable === false
+      ? "请按上方状态等待人工处理，不会提前进入自我介绍试音。"
+      : "正在核对 WebRTC、服务端录制轨、控制通道和 3D 表达能力。"}</p>
+    {!problem && <span className="spinner" aria-hidden="true" />}
+  </div>;
 }
 
-function PublicShell({ children }) { return <div className="candidate-room"><header className="candidate-header"><span className="candidate-brand"><strong>Interviewer</strong><small>智能面试</small></span></header>{children}</div>; }
-function candidatePhaseText(phase, duration) { return ({ idle: "准备就绪", connecting: "正在连接实时语音服务…", recording: `正在回答 · ${duration}s`, stopping: "正在结束录音…", processing: "回答已接收，正在生成追问并后台评分…", awaiting_server: "正在保存完整录音…", replaying: "正在恢复上传录音…", recoverable: "录音已保存在本机，等待恢复提交", submit_failed: "提交失败，完整录音仍可重试", paused: "面试已暂停", cancelled: "面试已取消" }[phase] || "正在处理…"); }
-function supportedMimeType() { return ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus"].find((value) => window.MediaRecorder?.isTypeSupported?.(value)) || "audio/webm"; }
-function formatAppointmentTime(value) { return Number.isNaN(value.getTime()) ? "待确认" : value.toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }); }
-function startRecognition(setTranscript, setInterim, ref) { const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition; if (!Recognition) return; const instance = new Recognition(); instance.lang = "zh-CN"; instance.continuous = true; instance.interimResults = true; instance.addEventListener("result", (event) => { let final = ""; let partial = ""; for (let index = event.resultIndex; index < event.results.length; index += 1) { if (event.results[index].isFinal) final += event.results[index][0].transcript; else partial += event.results[index][0].transcript; } if (final) setTranscript((value) => `${value} ${final}`.trim()); setInterim(partial); }); ref.current = instance; instance.start(); }
-function closeAvatarSession(media, API, interviewId, token) { if (!media?.session_id || !interviewId) return Promise.resolve(); return fetch(`${API}/public/interviews/${encodeURIComponent(interviewId)}/avatar/session/close`, { method: "POST", keepalive: true, headers: { "Content-Type": "application/json", "X-Candidate-Session-Token": token || "" }, body: JSON.stringify({ session_id: media.session_id }) }).catch(() => {}); }
+export function WarmupPanel({ calibration, experience, act }) {
+  const awaiting = calibration.status === "awaiting_confirmation";
+  const retryable = calibration.status === "retrying"
+    && (calibration.retryRequired === true || (
+      experience.problem?.recoverable === true
+      && experience.problem?.action === "retry_warmup"
+    ));
+  return <div className="candidate-warmup">
+    <p className="eyebrow">不评分试音</p>
+    <h1>{awaiting ? "请确认系统是否正确听懂了你" : "请用普通话做一句简短自我介绍，也可以夹带英文技术词"}</h1>
+    <p>试音音频仅用于当场校准，确认后删除，不进入答案、评分或报告。</p>
+    <ConversationState phase={experience.phase} endpoint={experience.endpoint} />
+    <CaptionPanel captions={experience.captions} expanded />
+    {(awaiting || retryable) && <div className="candidate-warmup-actions">
+      {awaiting && <button className="button button-primary" type="button" onClick={() => act("warmup.confirm")}>字幕正确，开始正式面试</button>}
+      <button className="button button-secondary" type="button" onClick={() => act("warmup.retry")}>
+        {retryable ? "重新试音" : "听写不对，重新试音"}
+      </button>
+    </div>}
+  </div>;
+}
+
+function CaptionPanel({ captions, expanded, onToggle }) {
+  const rows = expanded ? captions.full : captions.recent;
+  return <div className="candidate-transcript-wrap" aria-live="polite">
+    <div className="transcript-toolbar">
+      <span>{captions.forming ? "服务端实时字幕形成中" : "最近两行服务端字幕"}</span>
+      {onToggle && <button className="button button-ghost button-small" type="button" onClick={onToggle}>
+        {expanded ? "收起完整转写" : "展开完整转写"}
+      </button>}
+    </div>
+    <div className={`candidate-live-captions${expanded ? " is-expanded" : ""}`}>
+      {rows.length ? rows.map((row, index) => <p key={`${row.at || index}:${row.text}`} className={row.final ? "is-final" : "is-partial"}>{row.text}</p>) : <p className="is-empty">你开口后，服务端识别到的内容会在这里出现。</p>}
+    </div>
+  </div>;
+}
+
+function ConversationState({ phase, endpoint }) {
+  return <div className="candidate-waiting-row" role="status" aria-live="polite">
+    <span>
+      <strong>{phaseText(phase)}</strong>
+      <small>{endpoint.active ? "检测到连续静音；若 2.5 秒内没有继续说话，服务端将收口当前回答并判断是否追问。继续说话会取消本次收口，不会直接跳到下一题。" : phaseDetail(phase)}</small>
+    </span>
+    <span className={`conversation-phase is-${phase}`} aria-hidden="true" />
+  </div>;
+}
+
+function SignalState({ label, active, detail, children }) {
+  return <div className={`candidate-signal-state${active ? " is-active" : ""}`} role="status" aria-live="polite">
+    <span className="signal-state-dot" />
+    <span><strong>{label}</strong><small>{detail}</small>{children}</span>
+  </div>;
+}
+
+function DeviceCheck({ label, ready, detail }) {
+  return <div className={`preflight-check${ready ? " is-ready" : " is-failed"}`}>
+    <span aria-hidden="true">{ready ? "✓" : "!"}</span>
+    <strong>{label}</strong>
+    {detail && <small>{detail}</small>}
+  </div>;
+}
+
+function PublicShell({ children }) {
+  return <div className="candidate-room"><PublicHeader />{children}</div>;
+}
+
+function PublicHeader({ children }) {
+  return <header className="candidate-header">
+    <span className="candidate-brand">
+      <span className="brand-mark">I</span>
+      <span><strong>Interviewer</strong><small>实时智能面试</small></span>
+    </span>
+    {children}
+  </header>;
+}
+
+function phaseText(phase) {
+  return ({
+    connecting: "正在建立实时安全会话",
+    preparing: "正在准备语音识别",
+    listening: "正在听你说",
+    understanding: "回答已识别，正在判断下一步",
+    responding: "面试官正在回应，可随时开口打断",
+    paused: "面试已暂停",
+    completed: "面试已完成",
+  }[phase] || "正在同步面试状态");
+}
+
+function phaseDetail(phase) {
+  return ({
+    connecting: "正在核对 WebRTC、控制通道、录制轨和 3D 表达能力。",
+    preparing: "服务端正在打开权威语音识别流；就绪前不会误报正在听或提交本地 VAD 信号。",
+    listening: "无需点击开始；系统会自动识别你的发言。",
+    understanding: "可能生成追问，也可能进入下一道主问题；结果以服务端状态为准。",
+    responding: "检测到你开口后，数字人会在 200ms 目标内停止发言。",
+    paused: "系统不会退回静态图片和问卷，请等待人工处理。",
+  }[phase] || "所有状态均来自统一 InterviewAgentRuntime。");
+}
+
+function connectionText(connection) {
+  if (connection.control === "connected" && ["connected", "recovery"].includes(connection.media)) {
+    return connection.media === "recovery" ? "音频恢复通道" : "实时通道已连接";
+  }
+  if (connection.control === "recovering" || connection.media === "reconnecting") return "正在恢复连接";
+  return "正在连接";
+}
+
+function uniqueActionKey(type) {
+  return `${type}:${globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`}`;
+}
+
+function formatAppointmentTime(value) {
+  return Number.isNaN(value.getTime())
+    ? "待确认"
+    : value.toLocaleString("zh-CN", {
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+}
+
+function formatDateTime(value) {
+  if (!value) return "已提交";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "已提交" : date.toLocaleString("zh-CN");
+}

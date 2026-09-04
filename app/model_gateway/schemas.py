@@ -1,6 +1,6 @@
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ProviderMeta(BaseModel):
@@ -205,12 +205,44 @@ class TTSSynthesizeRequest(BaseModel):
     metadata: Dict[str, Any] = Field(default_factory=dict)
 
 
+class TTSVisemeCue(BaseModel):
+    """Provider timing contract before cues enter the avatar domain."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    at_ms: int = Field(ge=0)
+    duration_ms: int = Field(gt=0, le=10_000)
+    shape: Literal[
+        "sil", "PP", "FF", "TH", "DD", "kk", "CH", "SS",
+        "nn", "RR", "aa", "E", "ih", "oh", "ou",
+    ]
+    weight: float = Field(ge=0, le=1)
+
+
 class TTSSynthesizeResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     audio_uri: str = Field(min_length=1)
     content_type: str
     duration_ms: int = Field(gt=0)
     content_hash: str = Field(min_length=1)
+    visemes: List[TTSVisemeCue] = Field(default_factory=list, max_length=10_000)
+    alignment_source: Literal["provider_timestamp", "none"] = "none"
     provider: ProviderMeta
+
+    @model_validator(mode="after")
+    def validate_viseme_timing(self) -> "TTSSynthesizeResponse":
+        if not self.visemes:
+            if self.alignment_source != "none":
+                raise ValueError("provider_timestamp requires non-empty visemes")
+            return self
+        positions = [cue.at_ms for cue in self.visemes]
+        if positions != sorted(positions):
+            raise ValueError("provider viseme cues must be monotonic")
+        if any(cue.at_ms + cue.duration_ms > self.duration_ms for cue in self.visemes):
+            raise ValueError("provider viseme cue exceeds authoritative audio duration")
+        self.alignment_source = "provider_timestamp"
+        return self
 
 
 class AvatarSpeakRequest(BaseModel):
@@ -226,18 +258,38 @@ class AvatarSpeakRequest(BaseModel):
 
 
 class AvatarSpeakResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     speech_id: str
     status: str = "ready"
     mode: Literal["browser_speech", "audio", "video", "webrtc"]
     text: str
     stream_url: Optional[str] = None
     audio_uri: Optional[str] = None
+    duration_ms: Optional[int] = Field(default=None, gt=0)
     session_id: Optional[str] = None
     player_kind: Literal["native_url", "whep", "tencent_web_player"] = "native_url"
     avatar_mode: Literal["local", "cloud"] = "cloud"
     fallback_reason: Optional[Literal["cloud_unavailable"]] = None
-    visemes: List[Dict[str, Any]] = Field(default_factory=list)
+    visemes: List[TTSVisemeCue] = Field(default_factory=list, max_length=10_000)
+    alignment_source: Literal["provider_timestamp", "none"] = "none"
     provider: ProviderMeta
+
+    @model_validator(mode="after")
+    def validate_viseme_timing(self) -> "AvatarSpeakResponse":
+        if not self.visemes:
+            if self.alignment_source != "none":
+                raise ValueError("provider_timestamp requires non-empty visemes")
+            return self
+        positions = [cue.at_ms for cue in self.visemes]
+        if positions != sorted(positions):
+            raise ValueError("provider viseme cues must be monotonic")
+        if self.duration_ms is not None and any(
+            cue.at_ms + cue.duration_ms > self.duration_ms for cue in self.visemes
+        ):
+            raise ValueError("provider viseme cue exceeds authoritative audio duration")
+        self.alignment_source = "provider_timestamp"
+        return self
 
 
 class ProviderContext(BaseModel):

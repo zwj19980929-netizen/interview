@@ -15,9 +15,27 @@ npm run build
 cd ../..
 ```
 
+本地跑完整的 3D 实时面试时，先启动仓库自带的 LiveKit、Egress 和专用 Redis：
+
 ```bash
-.venv/bin/python main.py
+./scripts/local-media.sh up
 ```
+
+后端只需增加一个配置参数：
+
+```bash
+INTERVIEWER_LOCAL_MEDIA=true .venv/bin/python main.py
+```
+
+如果使用 PyCharm，把 `INTERVIEWER_LOCAL_MEDIA=true` 填到后端 Run Configuration 的“环境变量”即可。`.env.example` 只是中文配置说明，应用不会从它读取运行配置，也不需要新建 `.env.local`。本地 Participant Egress 录像写入 `data/private-files/interview-captures/`；它会记录为 `local_private_development`，不会伪装成已启用静态加密。查看或停止媒体服务：
+
+```bash
+./scripts/local-media.sh status
+./scripts/local-media.sh logs
+./scripts/local-media.sh down
+```
+
+未设置该开关时，开发环境的正式面试准入会直接显示 LiveKit/Egress 未配置，不再先进入候选人页面后才因 OSS 缺失而暂停。生产环境即使误设这个开关也会失败关闭，仍必须显式配置 LiveKit、权威收音和 AES256/KMS 阿里云 OSS。
 
 默认服务地址：
 
@@ -44,7 +62,7 @@ curl http://127.0.0.1:8000/healthz
 curl http://127.0.0.1:8000/readyz
 ```
 
-`/healthz` 只表示进程存活；`/readyz` 只读检查数据库、Redis，以及生产模式下的密钥、私有 OSS 和恶意文件扫描器，任一硬依赖缺失时返回 `503`。
+`/healthz` 只表示进程存活；`/readyz` 只读检查数据库、Redis，以及生产模式下的密钥、私有 OSS 和恶意文件扫描器。设置 `INTERVIEWER_LOCAL_MEDIA=true` 后还会真实探测本地 LiveKit/Egress 和服务端收音连接，任一硬依赖缺失时返回 `503`。
 
 ## 生产配置预检
 
@@ -78,7 +96,7 @@ set +a
 
 React 工作台一次确认生成并启用计划，基于冻结的 execution v2 槽位创建预约；底层 API 仍可显式生成草稿供职责分离客户端编辑审批。不存在管理员直接创建/START 会话或客户端文本答案入口。
 
-候选人房间需要浏览器允许摄像头和麦克风权限。开发模式录音默认写入 `data/media/`；生产模式强制通过 `PrivateFileStorage` 形成 `candidate_answer_audio` FileObject，并要求阿里云 OSS 等私有对象存储。浏览器 Speech Recognition 只显示开发预览，保存的音频回答仍通过服务端 STT final 后评分。`avatar.speak` 可返回浏览器语音、音频或 HTTPS 视频；React 候选人房间会播放真实 `audio/video` 响应。
+候选人房间需要浏览器允许摄像头和麦克风权限。本地正式 Participant Egress 写入 `data/private-files/interview-captures/`，权威答案音频仍由服务端 Evidence 链保存；生产模式强制使用带 AES256/KMS 证明的阿里云 OSS。浏览器 final 不会形成答案，保存的音频回答仍通过服务端 STT final 后评分。
 
 默认 `INTERVIEWER_RUNTIME_ENV=development`，允许 mock STT/TTS 闭环。设置为 `production` 后，联系人/供应商凭证加密、Bearer RBAC、至少 32 字符的 `INTERVIEWER_CANDIDATE_TOKEN_SECRET`、Redis 公开端点限流、文件签名密钥、恶意文件扫描器、`INTERVIEWER_MEDIA_RECORDING_BACKEND=private`、阿里云 OSS，以及非 mock 且近期健康的 `stt.streaming`、`stt.batch`、TTS/评分路由均成为硬门槛；不会静默使用浏览器 final、mock 语音、本地录音或公开文件路径。
 

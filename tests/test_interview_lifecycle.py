@@ -159,6 +159,9 @@ def test_last_evaluation_requests_report_without_transport_decision() -> None:
         command(LifecycleCommandType.ANSWER_SUBMITTED, answer=answer("ans_1", "turn_1")),
         now="2026-08-24T00:00:03Z",
     )
+    assert submitted.session["status"] == "in_progress"
+    assert submitted.session["candidate_input_completed_at"] == "2026-08-24T00:00:03Z"
+    assert submitted.session["answers"][0]["evaluation_status"] == "pending"
     completed = lifecycle.execute(
         submitted.session,
         command(

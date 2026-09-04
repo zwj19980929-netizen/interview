@@ -1,0 +1,38 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    restart: unless-stopped
+
+  livekit:
+    image: livekit/livekit-server:v1.13.1
+    command:
+      - --config
+      - /etc/livekit/livekit.yaml
+      - --node-ip
+      - ${INTERVIEWER_LOCAL_LIVEKIT_NODE_IP:-127.0.0.1}
+    volumes:
+      - ./livekit.yaml:/etc/livekit/livekit.yaml:ro
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "7882:7882/udp"
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  egress:
+    image: livekit/egress:v1.13.0
+    environment:
+      EGRESS_CONFIG_FILE: /etc/livekit/egress.yaml
+    volumes:
+      - ./egress.yaml:/etc/livekit/egress.yaml:ro
+      - ../../data/private-files:/recordings
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    depends_on:
+      - redis
+      - livekit
+    restart: unless-stopped

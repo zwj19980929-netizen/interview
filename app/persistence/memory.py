@@ -1,5 +1,6 @@
 from contextlib import contextmanager
 from copy import deepcopy
+from datetime import datetime, timezone
 from threading import RLock
 from typing import Dict, Iterator, List, Optional
 
@@ -25,6 +26,12 @@ DOCUMENT_COLLECTIONS = (
     "candidate_intakes",
     "candidates",
     "interviews",
+    "interview_media_captures",
+    "agent_tickets",
+    "evidence_ownerships",
+    "evidence_commands",
+    "evidence_media_streams",
+    "evidence_media_segments",
     "turns",
     "answers",
     "evaluations",
@@ -44,6 +51,9 @@ class _MemoryTransactionBackend(TransactionBackend):
         self.work_items = deepcopy(store.outbox_work_items)
         self.secrets = deepcopy(store.provider_secrets)
         self.invocations = deepcopy(store.model_invocations)
+
+    def database_now(self) -> datetime:
+        return datetime.now(timezone.utc)
 
     def get_document(self, collection: str, item_id: str) -> Optional[Document]:
         return deepcopy(self.documents[collection].get(item_id))

@@ -44,6 +44,33 @@ INTERVIEWER_OSS_ACCESS_KEY_SECRET=from-deployment-secret
 INTERVIEWER_OSS_SSE=AES256
 ```
 
+自托管 LiveKit 权威收音还需要以下独立部署配置。`API_SECRET` 与 OSS 密钥只能来自部署 Secret；正式模式只接受数据库租约/fence/journal/checkpoint 驱动的 `database_fenced`：
+
+```bash
+INTERVIEWER_LIVEKIT_URL=wss://livekit.internal
+INTERVIEWER_LIVEKIT_API_KEY=from-deployment-secret
+INTERVIEWER_LIVEKIT_API_SECRET=from-deployment-secret
+INTERVIEWER_LIVEKIT_EGRESS_URL=https://livekit-egress.internal
+INTERVIEWER_LIVEKIT_INGRESS_ENABLED=true
+INTERVIEWER_LIVEKIT_INGRESS_MODE=database_fenced
+INTERVIEWER_LIVEKIT_INGRESS_GRACE_SECONDS=30
+INTERVIEWER_LIVEKIT_INGRESS_LEASE_SECONDS=15
+INTERVIEWER_LIVEKIT_INGRESS_RENEW_SECONDS=5
+INTERVIEWER_DEPLOYMENT_ID=prod-us-west-2
+INTERVIEWER_RELEASE_REVISION=git-deadbeef
+INTERVIEWER_REALTIME_AGENT_ENABLED_ORGANIZATIONS=org_a,org_b
+INTERVIEWER_AGENT_ACCEPTANCE_REPORT=/run/secrets/realtime-agent-acceptance.json
+INTERVIEWER_AGENT_ACCEPTANCE_REPORT_SECRET=from-deployment-secret
+```
+
+灰度名单必须逐个列出 organization ID，生产不接受 `*`。acceptance v2 报告由离线 runner 原子写入，必须精确绑定本次 deployment/revision；邀请、start、候选人票据签发与票据消费会重复验证，不能仅靠一次 `/readyz` 结果长期放行。
+
+`EvidenceOwnershipRepository` 使用独立 `evidence_ownerships` document collection，不把高频续租写入 InterviewSession JSON，因此不与 Floor、AgentEvent、评分或报告的聚合 version 竞争。Memory/SQLite Adapter 保持同一事务合同；PostgreSQL 使用 `SELECT ... FOR UPDATE` 锁定所有权行、`clock_timestamp()` 作为唯一 lease 时钟，首次并发 INSERT 唯一冲突后重读胜者。候选人答案事务以固定锁顺序先读所有权行、再读 InterviewSession，并同时验证 owner instance、lease ID、epoch 和未到期。
+
+`EvidenceCommandJournal` 使用独立 `evidence_commands` collection。命令 ID 是 organization/interview/idempotency key 的 SHA-256 派生值，原始 key 不落库；request fingerprint 防止同 key 更换命令。记录包含 control generation、target/claimed owner fence、deadline、available/claim expiry、attempt、状态和严格 allow-list outcome。claim 事务先锁当前 ownership，再锁选中的 command；claim 超时可 at-least-once 重领，complete/fail 必须重新验证当前 fence 与 claim ID。Memory 与 SQLite 已运行同一 journal round-trip 合同；PostgreSQL 继续使用通用 documents/RLS/`FOR UPDATE` 语义。
+
+当前这些 collection 仍使用通用 PostgreSQL `documents` 物理表及其 tenant RLS，但是独立行/独立版本；目标压测若显示 lease renew 或 command scan 成为热点，再迁入专用物理表/索引而不改上层 Interface。Redis 仍不是 lease、命令或结果真相。
+
 PostgreSQL schema 必须先由 `INTERVIEWER_POSTGRES_MIGRATION_DSN` 对应的 migration owner 执行 `python -m app.migrations.postgresql`；Web/worker 使用 `INTERVIEWER_DB_BACKEND=postgresql` 与最小权限 `INTERVIEWER_POSTGRES_DSN`，启动时只读校验 schema，不自动执行 DDL。Redis 跨实例事件使用 `INTERVIEWER_REDIS_URL`，Celery broker 使用独立的 `INTERVIEWER_CELERY_BROKER_URL`/逻辑 DB 或命名空间，不能和领域状态混为一体。生产还必须提供联系人/Provider 凭证加密密钥、媒体签名密钥，以及 `INTERVIEWER_FILE_SCANNER_COMMAND` 或内部 `INTERVIEWER_FILE_SCANNER_CLAMD_HOST/PORT`；clamd TCP 无认证/加密，只能部署在受信网络。不能复用开发默认值、公开本地目录或把 OSS bucket 设为公开读。
 
 ## 当前代码边界
@@ -68,7 +95,7 @@ app/persistence/postgresql.py
 migrations/001_postgresql_persistence.sql
 ```
 
-当前事务工作区已有 `JobPositionRepository`、`KnowledgeBaseRepository`、`QuestionRepository`、`QuestionSpeechAssetRepository`、`CandidateProfileRepository`、`ResumeDocumentRepository`、`FileObjectRepository`、`AuditEventRepository`、`ResumeReviewRepository`、`ExperienceQuestionRepository`、`RoleRequirementRepository`、`InterviewPlanRepository`、`InterviewAppointmentRepository`、`CandidateIntakeRepository`、`InterviewSessionRepository`、`ModelCircuitStateRepository`、模型配置/路由/调用、加密凭证和 Outbox repository。它们通过同一个 versioned document interface 暴露，Memory、SQLite 与 PostgreSQL adapter 共用事务语义；Question Catalog 的租户、岗位、题库、状态/readiness、技能、难度和题型条件由 backend contract 执行。旧 `VectorDocumentRepository` 与 Memory/SQLite 向量集合已删除，关系型题库查询不持久化向量 projection。
+当前事务工作区已有 `JobPositionRepository`、`KnowledgeBaseRepository`、`QuestionRepository`、`QuestionSpeechAssetRepository`、`CandidateProfileRepository`、`ResumeDocumentRepository`、`FileObjectRepository`、`AuditEventRepository`、`ResumeReviewRepository`、`ExperienceQuestionRepository`、`RoleRequirementRepository`、`InterviewPlanRepository`、`InterviewAppointmentRepository`、`CandidateIntakeRepository`、`InterviewSessionRepository`、`EvidenceOwnershipRepository`、`EvidenceCommandRepository`、`ModelCircuitStateRepository`、模型配置/路由/调用、加密凭证和 Outbox repository。它们通过同一个 versioned document interface 暴露，Memory、SQLite 与 PostgreSQL adapter 共用事务语义；Question Catalog 的租户、岗位、题库、状态/readiness、技能、难度和题型条件由 backend contract 执行。旧 `VectorDocumentRepository` 与 Memory/SQLite 向量集合已删除，关系型题库查询不持久化向量 projection。
 
 联系人在写入前使用 Fernet 加密并以租户绑定 HMAC 查找，API 只返回掩码；Provider 凭证也在 repository seam 密封。`ResumeDocument` 只接受 PDF，引用原件与解析文本两个私有 FileObject；SQLite JSON 不再保存新简历正文。开发模式可用受控本地媒体 adapter；生产回答音频写入 `candidate_answer_audio` FileObject，绑定组织、面试与轮次，并通过短期签名 token 回读和记录授权/下载审计。SQLite 仍只用于开发/测试；生产租户边界由 PostgreSQL `organization_id + FORCE RLS` 提供第二道防线。
 
@@ -102,8 +129,11 @@ class PrivateFileStorage(Protocol):
 
 - `LocalPrivateFileAdapter`：本地开发使用，写入 `data/private-files/{organization_id}/...`；先写随机临时文件，校验哈希后原子移动到最终 key。文件不通过 `/web` 或普通静态目录暴露，回读必须经过鉴权接口。
 - `AliyunOssFileAdapter`：使用阿里云 OSS 私有 bucket、固定 endpoint、服务端加密和受限凭证；下载使用最长 15 分钟签名 URL。离线 fake-bucket contract 已验证接口与 SSE/header 语义，真实 RAM/bucket/网络仍需环境验收；业务 module 不直接 import `oss2`，也不拼接 bucket URL。
+- `LocalPrivateFileAdapter`：只在 `development + INTERVIEWER_LOCAL_MEDIA=true` 时接受 LiveKit Egress 录像，写入 `data/private-files/interview-captures/` 并验证路径边界、对象存在性、hash 和字节数；其保护结论是 `local_private_development`，`encryption` 保持空值，不能被生产环境当作 OSS 加密证明。
 
 `store` 返回 `file_object_id/object_key/content_hash/size_bytes/content_type/backend` 等受控元数据。`ResumeDocument` 只引用 `file_object_id`，因此从本地迁移到 OSS 时可以复制物理对象并更新文件对象定位，不改简历、审阅和面试历史的业务 ID。
+
+题目 TTS 与动态 Agent 表达在调用 `store` 之前共用 `PrivateAssetImporter`。该 seam 对 WAV 做 RIFF chunk、fmt/data 唯一性、边界、padding 与 block alignment 校验；只处理已识别的 signed-limit RIFF/data 流式占位组合，以及 child chunk 完整到 EOF 后恰好漏计四字节 WAVE form type 的 outer size，并以规范化字节重新计算 checksum。其他长度偏差和畸形容器失败关闭；其他音频格式保持既有受控导入，声明为 WAV 却不具备 WAVE 魔数、或以其他 MIME 伪装 WAV 的响应拒绝写入。FileObject 一经被 QuestionSpeechAsset、AgentExpressionAudio 或历史会话引用仍不可原地修改，修复通过新对象和既有版本/预约冻结流程完成。
 
 ## 目标 Repository 边界
 
@@ -222,7 +252,7 @@ outbox_work_items(...)
 audit_events(...)
 ```
 
-`speech_dialogue_mode`、`followup_policy` 和追问 parent/root/depth/weight 进入现有预约/会话/轮次 document/JSONB 表达，不新增第二套“实时对话表”。追问仍是 `interview_turns`，其 CandidateAnswer 与 AnswerEvaluation 使用同一唯一约束。答案提交与 `answer.evaluate:{answer_id}:{revision}` Outbox 幂等键原子提交；请求线程不执行评分。S2S 音频 delta 是瞬时传输数据，不持久化为评分证据；原始候选人录音、权威 STT final 和 Provider invocation 脱敏元数据继续按既有表保存。
+`speech_dialogue_mode`、`followup_policy` 和追问 parent/root/depth/weight 进入现有预约/会话/轮次 document/JSONB 表达，不新增第二套“实时对话表”。追问仍是 `interview_turns`，其 CandidateAnswer 与 AnswerEvaluation 使用同一唯一约束。答案提交与 `answer.evaluate:{answer_id}:{revision}` Outbox 幂等键原子提交；请求线程不执行评分。S2S 原始音频 delta 只在逐字批准前进入有界内存缓冲；批准后输出与动态 TTS 一样复制为 `purpose=agent_expression_audio` 的私有 FileObject，会话只持久化不泄密的 `agent-expression://file_id`。它不构成评分证据；原始候选人录音、权威 STT final 和 Provider invocation 脱敏元数据继续按既有表保存。
 
 当前 JSON document adapter 把同一关系存为 `JobPosition.knowledge_base_ids`，并把历史 `KnowledgeBase.job_position_id` 投影为初始关联。规范化 PostgreSQL 使用 `job_position_knowledge_bases`；两种存储都只引用题库，不复制 Question、KnowledgeBaseSpeechProfile 或 QuestionSpeechAsset。
 
@@ -267,8 +297,8 @@ transcript-artifacts/{organization_id}/{interview_id}/{turn_id}/{revision}.json
 - 简历、回答音频和转写按组织策略级联到期；题目语音可按题目版本保留，但被历史面试引用的资产在对应面试留存期内不能删除。
 - 最新岗位初筛的生效结论全部为 `unqualified` 时，CandidateProfile 写入 `retention_reason=screening_unqualified` 和 7 天后的 `retention_expires_at`；人工复核或新审阅使任一岗位符合/待复核时在同一事务取消该期限。
 - Provider 返回的临时 TTS URL 必须复制到系统对象存储后才可标记资产 `ready`。
-- `POST /api/v1/admin/retention/run` 默认 dry-run；显式执行时先删除私有对象/本地录音，再清空候选人密文与关联简历、审阅、经历题、转写、评分和报告敏感内容，最后写 `retention.purge.completed` 审计。失败不能伪标完成。
-- `app.workers.retention.run_screening_retention` 由 Celery Beat 周期唤醒，只处理已到期的 `screening_unqualified` 候选人并复用相同删除顺序；完成写 `retention.screening_auto_purge.completed`，符合或待复核候选人不会进入该扫描结果。
+- `POST /api/v1/admin/retention/run` 默认 dry-run；显式执行时先删除私有对象/本地录音（含 LiveKit Egress object、CandidateAnswer 音频和全部 Evidence capture revision），再清空候选人密文与关联简历、审阅、经历题、转写、对话理解/动作、评分和报告敏感内容，最后写批次审计与一次 `retention.candidate_evidence_purged` 候选人审计。失败不能伪标完成，对象键只以 SHA-256 进入审计。
+- `app.workers.retention.run_screening_retention` 由 Celery Beat 周期唤醒，只处理已到期的 `screening_unqualified` 候选人并复用相同删除顺序；同一周期还运行 Evidence media GC，先删除 `capture_revision < current` 的私有对象，再硬删 segment、tombstone FileObject 并写 `retention.evidence_media_gc.completed`。重复运行是幂等的，符合或待复核候选人的当前 revision 不会进入 GC。
 - 单份简历显式删除采用两阶段清理：同一事务做 version 校验、历史引用保护、取消尚未运行的摄取/审阅 Outbox 并写 `deleting`；事务外删除隔离文件和 Private File Storage 对象；随后把 FileObject/ResumeReview/派生经历题标为删除或归档、清空敏感证据并把 ResumeDocument 写为 `deleted`。已进入 InterviewPlan 或 InterviewSession 快照的版本拒绝删除，运行中工作不做强制终止。
 
 简历本地上传与 URL 导入共用同一持久工作流：
@@ -411,3 +441,17 @@ finish/token 诊断；活动进度、后续 merge 和停止/恢复只处理替�
 - 题库/简历异步流水线、STT 修复、评分和报告在崩溃与重复投递后可恢复。
 - 模型供应商配置、每次 attempt、音频下载和人工转写修改可审计。
 - 测试至少覆盖岗位题库结构化候选池、题目语音、简历审阅、候选人匹配、一次性预约、随机抽题幂等、服务端 STT final/batch 修复、逐题评分、报告和企业音频复核授权。可选向量 projection 不能成为这些主流程测试的必需 fixture。
+
+### 实时 Agent 新增持久事实
+
+`agent_tickets` 保存一次性 ticket 的 SHA-256、organization/interview/connection/participant identity、角色、状态、60 秒到期时间和不含 bearer 的媒体投影；消费使用状态/version CAS，重复或过期票据不能重新打开通道。`interview_sessions.agent_runtime` 保存 floor、事件 sequence、`replay_history_floor`、有限 idempotency key、暖场删除边界、active performance、takeover lease，以及一次冻结的 `authoritative_media_binding(provider/room/candidate_identity/connection_id/bound_at/version)`。binding 不保存 LiveKit bearer，后续控制重连不得改变 room/identity。
+
+`agent_events` 最多保留 1000 条 replayable 最小安全载荷：每种事件有显式字段 allow-list，未知字段不进入历史；`session.snapshot` 只保留空占位并在连接时从当前领域状态按角色重建。lease/actor、私有媒体 URI/object key、加密元数据、证据 binding、内部能力点和 Provider 原始输出不会进入共享 replay 或 Redis Pub/Sub。裁剪时推进 `replay_history_floor`，过旧 cursor 必须完整重同步，不能从残缺历史继续。
+
+`InterviewTurn` 的 `utterances/current_understanding/conversation_acts` 是聚合内版本化 JSON 事实；服务端 final 和录音 URI 必须同时存在才能把 utterance 标为 authoritative。root evidence group 通过根/子 turn 与 answer 引用构造，不复制或覆盖原始音频；evaluation revision 保存使用的 answer/utterance revision 集合。
+
+`interview_media_captures` 独立记录 requested/consented scopes、LiveKit room/participant/Egress、私有 object key/URI、SHA-256、字节数、`storage_protection`、可选 `encryption`、保留期、状态与失败原因，并以 `(organization_id, interview_id)` 唯一。开发环境可记录 `local_private_development` 且不声称静态加密；生产只能在对象级 AES256/KMS 元数据复核通过后完成。对象存储路径只含清洗后的 tenant/interview/capture ID；候选人和普通 AgentEvent 不得到 object key 或私有 URI。Egress webhook 在签名和 body hash 验证后通过 idempotent provider result 推进 capture，完整 hash 未读取成功时保持 `hash_pending`。
+
+`evidence_media_streams` 以 interview/turn 的确定性 ID 保存当前 capture revision、连续 segment/frame checkpoint、完整标记与 repair 音频引用；`evidence_media_segments` 以 stream/revision/ordinal 唯一保存 frame 范围、checksum、byte count 与 `candidate_evidence_segment` FileObject 引用。reset 只单调推进 stream revision，旧 revision 由周期 GC 删除；候选人 purge 删除全部 revision，并把 stream/capture 清成最小 `retention_purged` tombstone，避免被放弃片段或直写 Egress object 脱离 FileObject 留存链路。
+
+Memory、SQLite 与 PostgreSQL 通用 documents/RLS adapter 已实现上述 collection 合同。数据库时钟 ownership lease、单调 epoch、control generation、CandidateAnswer 事务 commit fence 与持久 command submit/claim/result journal 已由连接无关 owner executor 执行：数据库 polling 是正确性路径，Redis 只作 wake hint，remote controller 只等待 terminal receipt。LiveKit subscriber、StreamingSTTSession 与端点 timer 是当前 owner 的进程态，但新 owner 可从已 seal 的私有 segment/checkpoint 重建并执行 batch repair；未 seal 的内存后缀不冒充已持久化证据，必要时只接受服务端授权 sequence gap 内的浏览器私有 backfill。目标 PostgreSQL/RLS 并发、Redis/LiveKit 故障注入和真实 Egress 对象一致性仍必须由绑定当前 release 的外部验收报告证明，因此实时 Agent 状态继续为 `in_progress`。

@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import struct
 
 from fastapi.testclient import TestClient
 
@@ -99,7 +100,15 @@ def test_candidate_patch() -> None:
 
 class _RealTTSGateway:
     async def invoke(self, capability, request, *, route=None):
-        content = b"RIFF-private-audio"
+        pcm = b"\x01\x00\x02\x00"
+        wave_body = (
+            b"WAVEfmt "
+            + struct.pack("<IHHIIHH", 16, 1, 1, 24_000, 48_000, 2, 16)
+            + b"data"
+            + struct.pack("<I", len(pcm))
+            + pcm
+        )
+        content = b"RIFF" + struct.pack("<I", len(wave_body)) + wave_body
         return TTSSynthesizeResponse(
             audio_uri="data:audio/wav;base64,%s" % base64.b64encode(content).decode("ascii"),
             content_type="audio/wav",
@@ -150,4 +159,7 @@ def test_real_tts_asset_is_copied_to_private_storage(tmp_path) -> None:
     assert asset["production_ready"] is True
     assert asset["audio_uri"].startswith("private-file://")
     assert asset["content_hash"] == file_object["checksum"]
-    assert storage.open(file_object["object_key"]) == b"RIFF-private-audio"
+    stored = storage.open(file_object["object_key"])
+    assert stored[:4] == b"RIFF"
+    assert struct.unpack_from("<I", stored, 4)[0] == len(stored) - 8
+    assert stored[8:12] == b"WAVE"

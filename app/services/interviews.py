@@ -17,6 +17,8 @@ from app.domain.interview_lifecycle import (
     LifecycleCommandType,
     LifecycleDecision,
 )
+from app.domain.interview_agent import ConversationUtterance
+from app.domain.evidence_coordination import EvidenceCommitFence
 from app.model_gateway import capabilities as cap
 from app.model_gateway.gateway import ModelGateway
 from app.model_gateway.schemas import BatchSTTRequest
@@ -24,8 +26,11 @@ from app.persistence.interface import Persistence, new_work_item
 from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
 from app.services.evaluation import EvaluationService
+from app.services.evidence_coordination import assert_current_evidence_fence
+from app.services.conversation_understanding import ConversationUnderstandingService
 from app.services.plan_assembly import InterviewPlanAssembly
 from app.services.reports import ReportService
+from app.services.livekit_room_binding import interview_room_name
 
 
 class InterviewService:
@@ -44,6 +49,9 @@ class InterviewService:
         self.gateway = ModelGateway(store, persistence=self.persistence)
         self.lifecycle = InterviewSessionLifecycle()
         self.evaluation = EvaluationService(store, persistence=self.persistence)
+        self.conversation = ConversationUnderstandingService(
+            store, gateway=self.gateway, persistence=self.persistence
+        )
         self.reports = ReportService(store, persistence=self.persistence)
         self.plan_assembly = InterviewPlanAssembly(store, persistence=self.persistence)
 
@@ -148,7 +156,11 @@ class InterviewService:
                 "candidate_intake_id": (candidate_intake or {}).get("id"),
                 "consent_version": (candidate_intake or {}).get("consent_version"),
                 "privacy_accepted": (candidate_intake or {}).get("privacy_accepted"),
-                "recording_accepted": (candidate_intake or {}).get("recording_accepted"),
+                "media_consent_scopes": deepcopy((candidate_intake or {}).get("media_consent_scopes") or []),
+                "audio_recording_accepted": (candidate_intake or {}).get("audio_recording_accepted", False),
+                "video_recording_accepted": (candidate_intake or {}).get(
+                    "video_recording_accepted", False
+                ),
                 "consent_notice_hash": (candidate_intake or {}).get("notice_hash"),
                 "consented_at": (candidate_intake or {}).get("consented_at"),
                 "created_at": now,
@@ -212,6 +224,9 @@ class InterviewService:
                         "question_spoken_text": question_snapshot["spoken_text"],
                         "started_at": None,
                         "completed_at": None,
+                        "utterances": [],
+                        "current_understanding": None,
+                        "conversation_acts": [],
                     }
                 )
 
@@ -256,6 +271,7 @@ class InterviewService:
                 "settings": deepcopy(payload.get("settings", {})),
                 "followup_policy": self._followup_policy(plan),
                 "scheduled_at": payload.get("scheduled_at"),
+                "scheduled_end_at": appointment.get("scheduled_end_at"),
                 "current_turn_id": None,
                 "turn_ids": [turn["id"] for turn in turns],
                 "turns": turns,
@@ -266,8 +282,20 @@ class InterviewService:
                 "report_id": None,
                 "lifecycle_events": [],
                 "interruption": None,
+                "agent_runtime": {
+                    "floor": "none",
+                    "floor_reason": "not_connected",
+                    "last_sequence": 0,
+                    "processed_signal_keys": [],
+                    "active_performance_id": None,
+                    "takeover": None,
+                    "calibration_status": "pending",
+                    "calibration_updated_at": now,
+                },
+                "agent_events": [],
                 "last_activity_at": now,
                 "started_at": None,
+                "candidate_input_completed_at": None,
                 "completed_at": None,
                 "created_at": now,
                 "updated_at": now,
@@ -283,6 +311,48 @@ class InterviewService:
                 now=now,
             )
             session = transaction.interview_sessions.add(decision.session)
+            if payload.get("settings", {}).get("record_audio", True) or payload.get("settings", {}).get("record_video", False):
+                requested_scopes = [
+                    scope
+                    for scope, enabled in (
+                        ("audio_recording", payload.get("settings", {}).get("record_audio", True)),
+                        ("video_recording", payload.get("settings", {}).get("record_video", False)),
+                    )
+                    if enabled
+                ]
+                transaction.interview_media_captures.add(
+                    {
+                        "id": new_id("media_capture"),
+                        "organization_id": organization_id,
+                        "interview_id": interview_id,
+                        "candidate_id": candidate["id"],
+                        "provider": "livekit",
+                        "room_name": interview_room_name(
+                            organization_id, interview_id
+                        ),
+                        "participant_identity": None,
+                        "requested_scopes": requested_scopes,
+                        "consented_scopes": deepcopy(candidate.get("media_consent_scopes", [])),
+                        "status": "pending",
+                        "egress_id": None,
+                        "private_uri": None,
+                        "content_hash": None,
+                        "encryption": None,
+                        "encryption_verified_at": None,
+                        "encryption_policy": None,
+                        "encryption_policy_verified_at": None,
+                        "storage_protection": None,
+                        "storage_protection_verified_at": None,
+                        "storage_protection_policy": None,
+                        "storage_protection_policy_verified_at": None,
+                        "retention_expires_at": candidate_profile.get("retention_expires_at"),
+                        "started_at": None,
+                        "stopped_at": None,
+                        "failure_code": None,
+                        "created_at": now,
+                        "updated_at": now,
+                    }
+                )
             appointment = transaction.interview_appointments.get(appointment_id)
             if appointment is None or appointment["status"] != "registered":
                 raise ApiError(
@@ -343,6 +413,84 @@ class InterviewService:
         organization_id: str = "org_default",
     ) -> Dict[str, Any]:
         return self._control(interview_id, LifecycleCommandType.PAUSE, reason, organization_id)
+
+    def report_candidate_runtime_problem(
+        self,
+        interview_id: str,
+        token: Optional[str],
+        code: str,
+        organization_id: str = "org_default",
+    ) -> Dict[str, Any]:
+        """Validate the candidate and persist a real fail-closed pause.
+
+        The browser sends only one allow-listed code. Raw renderer/provider
+        messages are deliberately excluded from lifecycle facts and logs.
+        """
+
+        reasons = {
+            "AVATAR_ASSET_UNAVAILABLE": "candidate_avatar_asset_unavailable",
+            "AVATAR_MODEL_LOAD_FAILED": "candidate_avatar_model_load_failed",
+            "AVATAR_RENDERER_FAILED": "candidate_avatar_renderer_failed",
+            "CANDIDATE_RUNTIME_FAILED": "candidate_runtime_failed",
+        }
+        reason = reasons.get(str(code or ""))
+        if reason is None:
+            raise ApiError(
+                "CANDIDATE_RUNTIME_PROBLEM_INVALID",
+                "Candidate runtime problem code is not supported.",
+                status_code=422,
+            )
+        self.validate_candidate_token(interview_id, token, organization_id)
+        session = self.pause_interview(
+            interview_id, reason=reason, organization_id=organization_id
+        )
+        interruption = session.get("interruption") or {}
+        return {
+            "interview_id": interview_id,
+            "accepted": True,
+            "status": session.get("status"),
+            "problem_code": code,
+            "action": "await_human_takeover",
+            "paused_at": interruption.get("occurred_at"),
+        }
+
+    def record_agent_problem(
+        self,
+        interview_id: str,
+        payload: Dict[str, Any],
+        organization_id: str = "org_default",
+    ) -> Dict[str, Any]:
+        """Persist privileged runtime diagnostics without requiring a channel.
+
+        Media ownership renewal, repair and fatal ingress monitoring deliberately
+        outlive one AgentChannel. Keeping this operation on InterviewService lets
+        those connection-independent workers fail the domain session closed
+        without retaining a stale WebSocket object.
+        """
+
+        with self.persistence.transaction(organization_id) as transaction:
+            session = self._required(
+                transaction.interview_sessions.get(interview_id)
+            )
+            problems = session.setdefault("agent_runtime", {}).setdefault(
+                "problems", []
+            )
+            problems.append(
+                {
+                    "code": str(
+                        payload.get("code") or "AGENT_RUNTIME_PROBLEM"
+                    )[:128],
+                    "message": str(payload.get("message") or "")[:500],
+                    "recoverable": bool(payload.get("recoverable")),
+                    "action": str(payload.get("action") or "")[:128],
+                    "occurred_at": utc_now(),
+                }
+            )
+            del problems[:-20]
+            session["updated_at"] = utc_now()
+            return transaction.interview_sessions.update(
+                session, expected_version=session["version"]
+            )
 
     def timeout_interview(
         self,
@@ -435,6 +583,9 @@ class InterviewService:
             "status": session["status"],
             "phase": session.get("phase"),
             "avatar_mode": session.get("settings", {}).get("avatar_mode", "cloud"),
+            "record_audio": bool(
+                session.get("settings", {}).get("record_audio", True)
+            ),
             "record_video": bool(session.get("settings", {}).get("record_video", False)),
             "speech_dialogue_mode": session.get("settings", {}).get(
                 "speech_dialogue_mode", "cascade"
@@ -519,38 +670,6 @@ class InterviewService:
         encoded = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
         return "candidate.%s" % encoded
 
-    async def submit_candidate_audio_answer(
-        self,
-        interview_id: str,
-        token: Optional[str],
-        payload: Dict[str, Any],
-        organization_id: str = "org_default",
-    ) -> Dict[str, Any]:
-        self.validate_candidate_token(interview_id, token, organization_id)
-        session = self.get_interview(interview_id, organization_id)
-        turn_id = self._resolve_turn_id(session, payload.get("turn_id"), None)
-        audio_uri = str(payload.get("audio_uri") or "")
-        expected_prefix = "/media/%s/%s/" % (interview_id, turn_id)
-        private_scope_valid = False
-        if audio_uri.startswith("private-file://"):
-            file_id = audio_uri.removeprefix("private-file://")
-            with self.persistence.transaction(organization_id) as transaction:
-                file_object = transaction.file_objects.get(file_id)
-            private_scope_valid = bool(
-                file_object
-                and file_object.get("purpose") == "candidate_answer_audio"
-                and file_object.get("interview_id") == interview_id
-                and file_object.get("turn_id") == turn_id
-                and file_object.get("status") == "ready"
-            )
-        if not audio_uri.startswith(expected_prefix) and not private_scope_valid:
-            raise ApiError(
-                "CANDIDATE_AUDIO_SCOPE_INVALID",
-                "Candidate audio must belong to the active interview turn.",
-                status_code=403,
-            )
-        return await self.submit_audio_answer(interview_id, payload, organization_id)
-
     def record_heartbeat(
         self,
         interview_id: str,
@@ -572,6 +691,8 @@ class InterviewService:
         interview_id: str,
         payload: Dict[str, Any],
         organization_id: str = "org_default",
+        *,
+        evidence_fence: Optional[EvidenceCommitFence] = None,
     ) -> Dict[str, Any]:
         transcript_source = payload.get("transcript_source")
         provider = payload.get("stt_provider") or {}
@@ -586,55 +707,150 @@ class InterviewService:
                 status_code=409,
             )
         with self.persistence.transaction(organization_id) as transaction:
+            if evidence_fence is not None:
+                assert_current_evidence_fence(transaction, evidence_fence)
+            source_session = self._required(transaction.interview_sessions.get(interview_id))
+            starting_event_sequence = len(source_session.get("lifecycle_events", []))
+            turn_id = self._resolve_turn_id(
+                source_session, payload.get("turn_id"), payload.get("question_id")
+            )
+            source_turn = self.lifecycle.require_active_turn(
+                source_session, turn_id, allowed_statuses=("asking", "transcribing")
+            )
+
+        now = utc_now()
+        utterance = ConversationUtterance(
+            utterance_id=new_id("utterance"),
+            revision=1,
+            speaker="candidate",
+            text=str(payload["final_transcript"]).strip(),
+            is_final=True,
+            authoritative=True,
+            audio_uri=str(payload["audio_uri"]),
+            stt_confidence=float(payload.get("stt_confidence", 1.0)),
+            source=transcript_source,
+            created_at=now,
+        )
+        understanding = await self.conversation.understand(
+            utterance, source_turn, source_session
+        )
+        if understanding.intent != "answer" or understanding.suggested_action in {
+            "clarify", "repeat", "continue_listening", "pause"
+        }:
+            understanding_problem = (
+                understanding.problem.model_dump(mode="json")
+                if understanding.problem is not None
+                else None
+            )
+            with self.persistence.transaction(organization_id) as transaction:
+                if evidence_fence is not None:
+                    assert_current_evidence_fence(transaction, evidence_fence)
+                session = self._required(transaction.interview_sessions.get(interview_id))
+                turn = self.lifecycle.require_active_turn(
+                    session, turn_id, allowed_statuses=("transcribing",)
+                )
+                mutable = self._turn_by_id(session, turn["id"])
+                mutable.setdefault("utterances", []).append(
+                    utterance.model_dump(mode="json")
+                )
+                mutable["current_understanding"] = understanding.model_dump(mode="json")
+                decision, _ = self._decide_and_persist(
+                    transaction,
+                    session,
+                    LifecycleCommand(
+                        LifecycleCommandType.UTTERANCE_REJECTED,
+                        {
+                            "turn_id": turn["id"],
+                            "utterance_id": utterance.utterance_id,
+                            "intent": understanding.intent,
+                            "suggested_action": understanding.suggested_action,
+                            "confidence": understanding.confidence,
+                            "problem": understanding_problem,
+                        },
+                    ),
+                    organization_id,
+                )
+            return {
+                "accepted": False,
+                "answer": None,
+                "understanding": understanding.model_dump(mode="json"),
+                "conversation_action": understanding.suggested_action,
+                "understanding_problem": understanding_problem,
+                "evaluation": None,
+                "evaluation_work_id": None,
+                "next_turn_id": turn_id,
+                "status": decision.session["status"],
+                "report": self._current_report(decision.session),
+                "followup": None,
+                "events": [
+                    deepcopy(item)
+                    for item in decision.session.get("lifecycle_events", [])
+                    if item["sequence"] > starting_event_sequence
+                ],
+            }
+
+        followup_decision = await self.conversation.select_followup(
+            source_session, source_turn, utterance, understanding
+        )
+        answer = {
+            "id": new_id("ans"),
+            "organization_id": organization_id,
+            "interview_id": interview_id,
+            "turn_id": source_turn["id"],
+            "question_id": source_turn["question_id"],
+            "question_snapshot_id": source_turn["question_snapshot_id"],
+            "utterance_id": utterance.utterance_id,
+            "understanding_id": understanding.understanding_id,
+            "root_turn_id": source_turn.get("root_turn_id") or source_turn["id"],
+            "raw_transcript": payload.get("raw_transcript") or payload["final_transcript"],
+            "final_transcript": payload["final_transcript"],
+            "audio_uri": payload.get("audio_uri"),
+            "stt_confidence": payload.get("stt_confidence", 1.0),
+            "transcript_source": transcript_source,
+            "stt_provider": deepcopy(payload.get("stt_provider")),
+            "transcript_segments": deepcopy(payload.get("transcript_segments", [])),
+            "media_evidence": deepcopy(payload.get("media_evidence")),
+            "transcript_revisions": [
+                {
+                    "revision": 1,
+                    "text": payload["final_transcript"],
+                    "source": transcript_source,
+                    "created_at": now,
+                }
+            ],
+            "language": payload.get("language", "zh-CN"),
+            "duration_seconds": payload.get("duration_seconds", 0),
+            "evaluation_status": "pending",
+            "current_evaluation_id": None,
+            "evaluation_id": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+        selected_followup_id: Optional[str] = None
+        with self.persistence.transaction(organization_id) as transaction:
+            # This is the authoritative effect boundary.  The ownership row is
+            # locked before InterviewSession by the PostgreSQL Adapter, so a
+            # delayed old STT final cannot create a CandidateAnswer after a
+            # newer owner has claimed the interview.
+            if evidence_fence is not None:
+                assert_current_evidence_fence(transaction, evidence_fence)
             session = self._required(transaction.interview_sessions.get(interview_id))
-            starting_event_sequence = len(session.get("lifecycle_events", []))
-            turn_id = self._resolve_turn_id(session, payload.get("turn_id"), payload.get("question_id"))
             turn = self.lifecycle.require_active_turn(
                 session, turn_id, allowed_statuses=("asking", "transcribing")
             )
-            now = utc_now()
-            answer = {
-                "id": new_id("ans"),
-                "organization_id": organization_id,
-                "interview_id": interview_id,
-                "turn_id": turn["id"],
-                "question_id": turn["question_id"],
-                "question_snapshot_id": turn["question_snapshot_id"],
-                "raw_transcript": payload.get("raw_transcript") or payload["final_transcript"],
-                "final_transcript": payload["final_transcript"],
-                "audio_uri": payload.get("audio_uri"),
-                "stt_confidence": payload.get("stt_confidence", 1.0),
-                "transcript_source": transcript_source,
-                "stt_provider": deepcopy(payload.get("stt_provider")),
-                "transcript_segments": deepcopy(payload.get("transcript_segments", [])),
-                "transcript_revisions": [
-                    {
-                        "revision": 1,
-                        "text": payload["final_transcript"],
-                        "source": transcript_source,
-                        "created_at": now,
-                    }
-                ],
-                "language": payload.get("language", "zh-CN"),
-                "duration_seconds": payload.get("duration_seconds", 0),
-                "evaluation_status": "pending",
-                "current_evaluation_id": None,
-                "evaluation_id": None,
-                "created_at": now,
-                "updated_at": now,
-            }
-            followup_decision = self.evaluation.decide_followup(
-                session,
-                turn,
-                answer,
-                now=now,
-            )
+            mutable = self._turn_by_id(session, turn["id"])
+            mutable.setdefault("utterances", []).append(utterance.model_dump(mode="json"))
+            mutable["current_understanding"] = understanding.model_dump(mode="json")
             decision, work_items = self._decide_and_persist(
                 transaction,
                 session,
                 LifecycleCommand(
                     LifecycleCommandType.ANSWER_SUBMITTED,
-                    {"answer": answer, "trigger_reason": "initial_scoring"},
+                    {
+                        "answer": answer,
+                        "trigger_reason": "initial_scoring",
+                        "hold_for_followup": bool(followup_decision.get("selected")),
+                    },
                 ),
                 organization_id,
             )
@@ -646,6 +862,7 @@ class InterviewService:
                     followup_decision,
                     now=now,
                 )
+                selected_followup_id = followup_turn["id"]
                 decision, followup_work = self._decide_and_persist(
                     transaction,
                     decision.session,
@@ -653,7 +870,7 @@ class InterviewService:
                         LifecycleCommandType.FOLLOWUP_REQUESTED,
                         {
                             "answer_id": answer["id"],
-                            "root_turn_id": turn["id"],
+                            "root_turn_id": followup_decision["root_turn_id"],
                             "followup_turn": followup_turn,
                             "decision": deepcopy(followup_decision),
                         },
@@ -671,12 +888,14 @@ class InterviewService:
             (
                 item
                 for item in session.get("turns", [])
-                if item.get("is_followup") and item.get("root_turn_id") == turn["id"]
+                if item.get("id") == selected_followup_id
             ),
             None,
         )
         return {
+            "accepted": True,
             "answer": persisted_answer,
+            "understanding": understanding.model_dump(mode="json"),
             "evaluation": {
                 "status": "pending",
                 "work_item_id": evaluation_work["id"],
@@ -698,6 +917,8 @@ class InterviewService:
         interview_id: str,
         payload: Dict[str, Any],
         organization_id: str = "org_default",
+        *,
+        evidence_fence: Optional[EvidenceCommitFence] = None,
     ) -> Dict[str, Any]:
         if (
             payload.get("development_transcript")
@@ -710,21 +931,25 @@ class InterviewService:
             )
         session = self.get_interview(interview_id, organization_id)
         turn_id = self._resolve_turn_id(session, payload.get("turn_id"), None)
-        self.lifecycle.require_active_turn(session, turn_id, allowed_statuses=("asking",))
-        self._apply_command(
-            interview_id,
-            LifecycleCommand(
-                LifecycleCommandType.TRANSCRIPTION_STARTED,
-                {
-                    "turn_id": turn_id,
-                    "recording": {
-                        "audio_uri": payload["audio_uri"],
-                        "content_type": payload.get("content_type", "audio/webm;codecs=opus"),
-                    },
-                },
-            ),
-            organization_id,
+        active_turn = self.lifecycle.require_active_turn(
+            session, turn_id, allowed_statuses=("asking", "transcribing")
         )
+        if active_turn.get("status") == "asking":
+            self._apply_command(
+                interview_id,
+                LifecycleCommand(
+                    LifecycleCommandType.TRANSCRIPTION_STARTED,
+                    {
+                        "turn_id": turn_id,
+                        "recording": {
+                            "audio_uri": payload["audio_uri"],
+                            "content_type": payload.get("content_type", "audio/webm;codecs=opus"),
+                        },
+                    },
+                ),
+                organization_id,
+                evidence_fence=evidence_fence,
+            )
         try:
             try:
                 audio_bytes = read_managed_audio(
@@ -761,6 +986,7 @@ class InterviewService:
                     {"turn_id": turn_id, "error": str(exc)},
                 ),
                 organization_id,
+                evidence_fence=evidence_fence,
             )
             raise
         result = await self._accept_authoritative_transcript(
@@ -776,8 +1002,10 @@ class InterviewService:
                 "transcript_source": response.source,
                 "stt_provider": response.provider.model_dump(),
                 "transcript_segments": [item.model_dump() for item in response.segments],
+                "media_evidence": deepcopy(payload.get("media_evidence")),
             },
             organization_id,
+            evidence_fence=evidence_fence,
         )
         result["transcription"] = response.model_dump()
         return result
@@ -787,6 +1015,8 @@ class InterviewService:
         interview_id: str,
         payload: Dict[str, Any],
         organization_id: str = "org_default",
+        *,
+        evidence_fence: Optional[EvidenceCommitFence] = None,
     ) -> Dict[str, Any]:
         """Accept only a validated provider final from the server-side stream module."""
         provider = payload.get("provider") or {}
@@ -798,21 +1028,25 @@ class InterviewService:
             )
         session = self.get_interview(interview_id, organization_id)
         turn_id = self._resolve_turn_id(session, payload.get("turn_id"), None)
-        self.lifecycle.require_active_turn(session, turn_id, allowed_statuses=("asking",))
-        self._apply_command(
-            interview_id,
-            LifecycleCommand(
-                LifecycleCommandType.TRANSCRIPTION_STARTED,
-                {
-                    "turn_id": turn_id,
-                    "recording": {
-                        "audio_uri": payload["audio_uri"],
-                        "content_type": payload.get("content_type", "audio/webm;codecs=opus"),
-                    },
-                },
-            ),
-            organization_id,
+        active_turn = self.lifecycle.require_active_turn(
+            session, turn_id, allowed_statuses=("asking", "transcribing")
         )
+        if active_turn.get("status") == "asking":
+            self._apply_command(
+                interview_id,
+                LifecycleCommand(
+                    LifecycleCommandType.TRANSCRIPTION_STARTED,
+                    {
+                        "turn_id": turn_id,
+                        "recording": {
+                            "audio_uri": payload["audio_uri"],
+                            "content_type": payload.get("content_type", "audio/webm;codecs=opus"),
+                        },
+                    },
+                ),
+                organization_id,
+                evidence_fence=evidence_fence,
+            )
         return await self._accept_authoritative_transcript(
             interview_id,
             {
@@ -826,8 +1060,10 @@ class InterviewService:
                 "transcript_source": "server_streaming",
                 "stt_provider": deepcopy(provider),
                 "transcript_segments": deepcopy(payload.get("segments", [])),
+                "media_evidence": deepcopy(payload.get("media_evidence")),
             },
             organization_id,
+            evidence_fence=evidence_fence,
         )
 
     async def regrade_answer(
@@ -930,13 +1166,36 @@ class InterviewService:
                 )
                 session = decision.session
                 answer = deepcopy(self._answer_by_id(session, answer_id))
-            question_snapshot = deepcopy(self._turn_by_id(session, answer["turn_id"])["question_snapshot"])
+            evidence_answer_ids = list(
+                payload.get("evidence_answer_ids")
+                or answer.get("current_evidence_answer_ids")
+                or [answer_id]
+            )
+            if len(evidence_answer_ids) > 1:
+                answer = self._merged_authoritative_answer(
+                    session,
+                    root_answer_id=answer_id,
+                    evidence_answer_ids=evidence_answer_ids,
+                )
+            question_snapshot = deepcopy(
+                self._turn_by_id(session, answer["turn_id"])["question_snapshot"]
+            )
 
         try:
             evaluation = await self.evaluation.evaluate_answer(
                 answer,
                 question_snapshot,
                 session.get("plan_snapshot", {}).get("role_requirement"),
+            )
+            evaluation["evidence_answer_ids"] = list(evidence_answer_ids)
+            evaluation["evidence_utterance_ids"] = [
+                item
+                for item in answer.get("evidence_utterance_ids", [])
+                if item
+            ] or ([answer["utterance_id"]] if answer.get("utterance_id") else [])
+            evaluation["evidence_root_turn_id"] = answer.get("root_turn_id") or answer["turn_id"]
+            evaluation["evidence_mode"] = (
+                "root_with_followups" if len(evidence_answer_ids) > 1 else "single_answer"
             )
         except Exception as exc:
             with self.persistence.transaction(organization_id) as transaction:
@@ -970,6 +1229,7 @@ class InterviewService:
                         "evaluation": evaluation,
                         "revision": int(payload["revision"]),
                         "trigger_reason": payload.get("trigger_reason", "initial_scoring"),
+                        "evidence_answer_ids": list(evidence_answer_ids),
                     },
                 ),
                 organization_id,
@@ -979,6 +1239,7 @@ class InterviewService:
                 item for item in decision.session["evaluation_revisions"] if item["id"] == evaluation["id"]
             )
 
+        await self._process_evidence_group_effects(work_items, organization_id)
         self._process_report_effects(work_items, organization_id)
         return deepcopy(persisted_evaluation)
 
@@ -1049,8 +1310,12 @@ class InterviewService:
         interview_id: str,
         command: LifecycleCommand,
         organization_id: str,
+        *,
+        evidence_fence: Optional[EvidenceCommitFence] = None,
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         with self.persistence.transaction(organization_id) as transaction:
+            if evidence_fence is not None:
+                assert_current_evidence_fence(transaction, evidence_fence)
             session = self._required(transaction.interview_sessions.get(interview_id))
             decision, work_items = self._decide_and_persist(
                 transaction,
@@ -1095,6 +1360,10 @@ class InterviewService:
                     "revision": payload["revision"],
                     "trigger_reason": payload["trigger_reason"],
                 }
+                if payload.get("evidence_answer_ids"):
+                    work_payload["evidence_answer_ids"] = list(
+                        payload["evidence_answer_ids"]
+                    )
             elif effect["type"] == "report.requested":
                 kind = "interview.report.generate"
                 idempotency_key = "interview.report:%s:%s" % (interview_id, payload["revision"])
@@ -1118,6 +1387,30 @@ class InterviewService:
         for item in work_items:
             if item["kind"] == "interview.report.generate":
                 self._process_report_work(item["id"], organization_id)
+
+    async def _process_evidence_group_effects(
+        self,
+        work_items: List[Dict[str, Any]],
+        organization_id: str,
+    ) -> None:
+        """Finish a newly settled evidence group in the same worker turn when possible.
+
+        The dependent work is durable before this optimization runs. If another
+        worker owns it or its provider fails, the normal outbox retry path remains
+        authoritative and the already-completed child evaluation is not rolled back.
+        """
+
+        for item in work_items:
+            if (
+                item.get("kind") != "answer.evaluate"
+                or item.get("payload", {}).get("trigger_reason")
+                != "followup_evidence_merged"
+            ):
+                continue
+            try:
+                await self._process_evaluation_work(item["id"], organization_id)
+            except Exception:
+                continue
 
     def _work_by_kind(self, work_items: List[Dict[str, Any]], kind: str) -> Optional[Dict[str, Any]]:
         return next((item for item in work_items if item["kind"] == kind), None)
@@ -1167,26 +1460,111 @@ class InterviewService:
 
     def _followup_policy(self, plan: Dict[str, Any]) -> Dict[str, Any]:
         source = plan.get("selection_policy") or plan.get("assembly_policy") or {}
+        primary_count = len(plan.get("bank_slots", [])) + len(
+            plan.get("experience_question_snapshots", [])
+        )
         return {
-            "max_depth": 1,
-            "max_total": max(0, int(source.get("max_followups_total", 2))),
-            "max_per_root": min(1, max(0, int(source.get("max_followups_per_root", 1)))),
-            "min_answer_chars": max(1, int(source.get("followup_min_answer_chars", 24))),
-            "max_answer_chars": max(1, int(source.get("followup_max_answer_chars", 1200))),
-            "min_remaining_seconds": max(0, int(source.get("followup_min_remaining_seconds", 45))),
+            "max_depth": 2,
+            "max_total": min(4, max(0, primary_count)),
+            "max_per_root": 2,
+            "min_answer_chars": max(1, int(source.get("followup_min_answer_chars", 4))),
+            "max_answer_chars": max(1, int(source.get("followup_max_answer_chars", 4000))),
+            "min_remaining_seconds": max(90, int(source.get("followup_min_remaining_seconds", 90))),
             "max_probe_chars": min(300, max(40, int(source.get("followup_max_probe_chars", 180)))),
+            "low_confidence_threshold": 0.65,
         }
+
+    def _merged_authoritative_answer(
+        self,
+        session: Dict[str, Any],
+        *,
+        root_answer_id: str,
+        evidence_answer_ids: List[str],
+    ) -> Dict[str, Any]:
+        """Build an ephemeral score input from a frozen root evidence group.
+
+        Only persisted server-authoritative answers belonging to the same root
+        chain can enter the aggregate. The synthetic transcript is never accepted
+        as a new CandidateAnswer; it exists solely at the evaluation seam.
+        """
+
+        root_answer = deepcopy(self._answer_by_id(session, root_answer_id))
+        root_turn = self._turn_by_id(session, root_answer["turn_id"])
+        if root_turn.get("is_followup"):
+            raise ApiError(
+                "EVIDENCE_GROUP_ROOT_INVALID",
+                "A merged evidence evaluation must target a primary answer.",
+                status_code=409,
+            )
+        requested = list(dict.fromkeys(str(item) for item in evidence_answer_ids))
+        if not requested or requested[0] != root_answer_id:
+            raise ApiError(
+                "EVIDENCE_GROUP_INVALID",
+                "Merged evidence must start with the root answer.",
+                status_code=409,
+            )
+        answers_by_id = {item["id"]: item for item in session.get("answers", [])}
+        try:
+            evidence = [deepcopy(answers_by_id[item_id]) for item_id in requested]
+        except KeyError as exc:
+            raise ApiError(
+                "EVIDENCE_GROUP_INVALID",
+                "Merged evidence refers to an answer that does not exist.",
+                status_code=409,
+            ) from exc
+        root_turn_id = root_turn["id"]
+        turn_order = {
+            item["id"]: int(item.get("order", 0)) for item in session.get("turns", [])
+        }
+        if any(
+            (item.get("root_turn_id") or item.get("turn_id")) != root_turn_id
+            or not str(item.get("final_transcript") or "").strip()
+            or not item.get("audio_uri")
+            for item in evidence
+        ):
+            raise ApiError(
+                "EVIDENCE_GROUP_INVALID",
+                "Merged scoring accepts only persisted authoritative answers from one root chain.",
+                status_code=409,
+            )
+        ordered = sorted(evidence, key=lambda item: turn_order.get(item["turn_id"], 0))
+        if [item["id"] for item in ordered] != requested:
+            raise ApiError(
+                "EVIDENCE_GROUP_ORDER_INVALID",
+                "Merged evidence is not in frozen interview turn order.",
+                status_code=409,
+            )
+        sections = []
+        for index, item in enumerate(ordered):
+            label = "主回答" if index == 0 else "追问%d回答" % index
+            sections.append("【%s】\n%s" % (label, str(item["final_transcript"]).strip()))
+        merged = deepcopy(root_answer)
+        merged["final_transcript"] = "\n\n".join(sections)
+        merged["raw_transcript"] = merged["final_transcript"]
+        merged["stt_confidence"] = min(
+            float(item.get("stt_confidence", 1.0)) for item in ordered
+        )
+        merged["transcript_source"] = "server_authoritative_evidence_group"
+        merged["evidence_answer_ids"] = requested
+        merged["evidence_utterance_ids"] = [
+            item.get("utterance_id") for item in ordered if item.get("utterance_id")
+        ]
+        merged["root_turn_id"] = root_turn_id
+        return merged
 
     def _build_followup_turn(
         self,
         session: Dict[str, Any],
-        root_turn: Dict[str, Any],
+        parent_turn: Dict[str, Any],
         answer: Dict[str, Any],
         decision: Dict[str, Any],
         *,
         now: str,
     ) -> Dict[str, Any]:
-        stable_key = "%s:%s:%s" % (session["id"], root_turn["id"], answer["id"])
+        root_turn_id = str(decision.get("root_turn_id") or parent_turn.get("root_turn_id") or parent_turn["id"])
+        root_turn = self._turn_by_id(session, root_turn_id)
+        followup_depth = int(decision.get("followup_depth", int(parent_turn.get("followup_depth", 0)) + 1))
+        stable_key = "%s:%s:%s" % (session["id"], parent_turn["id"], answer["id"])
         digest = hashlib.sha256(stable_key.encode("utf-8")).hexdigest()[:24]
         question_id = "followup_question_%s" % digest
         snapshot_id = "followup_snapshot_%s" % digest
@@ -1202,7 +1580,7 @@ class InterviewService:
             "source_question_id": question_id,
             "source_question_version": 1,
             "source_type": "followup",
-            "parent_question_snapshot_id": root_snapshot["id"],
+            "parent_question_snapshot_id": parent_turn["question_snapshot_id"],
             "title": "澄清追问",
             "question_text": decision["question_text"],
             "spoken_text": decision["question_text"],
@@ -1222,21 +1600,26 @@ class InterviewService:
             "question_id": question_id,
             "question_snapshot_id": snapshot_id,
             "question_snapshot": question_snapshot,
-            "phase": root_turn.get("phase", "position_bank"),
+            "phase": parent_turn.get("phase", "position_bank"),
             "is_followup": True,
-            "parent_turn_id": root_turn["id"],
-            "root_turn_id": root_turn["id"],
-            "followup_depth": 1,
+            "parent_turn_id": parent_turn["id"],
+            "root_turn_id": root_turn_id,
+            "followup_depth": followup_depth,
             "followup_reason": decision["reason"],
             "target_key_points": deepcopy(decision.get("target_key_points", [])),
             "probe_source": decision.get("probe_source", "deterministic_template"),
-            "allow_followup": False,
+            "allow_followup": followup_depth < 2,
             "weight": 0.0,
             "expected_minutes": 1,
             "status": "pending",
             "question_spoken_text": decision["question_text"],
             "started_at": None,
             "completed_at": None,
+            "utterances": [],
+            "current_understanding": None,
+            "conversation_acts": [deepcopy(decision["conversation_act"])]
+            if decision.get("conversation_act")
+            else [],
         }
 
     @staticmethod

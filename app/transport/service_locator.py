@@ -1,11 +1,17 @@
+import inspect
+from functools import wraps
 from typing import Any, Dict, Type
 
+from app.core.auth import current_principal
 from app.repositories.provider import get_store
 from app.services.appointments import AppointmentService
+from app.services.agent_ticket import InterviewAgentTicketService
 from app.services.avatar import AvatarService
 from app.services.catalog import CatalogService
 from app.services.fairness import FairnessEvaluationService
 from app.services.interviews import InterviewService
+from app.services.interview_agent import InterviewAgentRuntime
+from app.services.media_capture import InterviewMediaCaptureService
 from app.services.knowledge_base_speech import KnowledgeBaseSpeechService
 from app.services.model_admin import ModelAdminService
 from app.services.operations import OperationsService
@@ -31,9 +37,12 @@ _SERVICE_FACTORIES: Dict[str, Type[Any]] = {
     "plan_assembly": InterviewPlanAssembly,
     "plans": InterviewPlanService,
     "interviews": InterviewService,
+    "agent_runtime": InterviewAgentRuntime,
     "avatar": AvatarService,
     "reports": ReportService,
     "appointments": AppointmentService,
+    "agent_tickets": InterviewAgentTicketService,
+    "media_captures": InterviewMediaCaptureService,
     "review": EnterpriseReviewService,
     "resume_ingestion": ResumeIngestionService,
     "operations": OperationsService,
@@ -55,8 +64,41 @@ class ServiceLocator:
         if factory is None:
             raise KeyError(name)
         if name not in self._instances:
-            self._instances[name] = factory(self._store)
+            self._instances[name] = _OrganizationBoundService(factory(self._store))
         return self._instances[name]
+
+
+class _OrganizationBoundService:
+    """Bind every HTTP service call to the authenticated deployment tenant.
+
+    Service APIs retain explicit ``organization_id`` parameters for workers
+    and tests.  Transport adapters no longer silently fall back to
+    ``org_default`` when a production deployment is configured for another
+    tenant.
+    """
+
+    def __init__(self, service: Any) -> None:
+        self._service = service
+
+    def __getattr__(self, name: str) -> Any:
+        target = getattr(self._service, name)
+        if not callable(target):
+            return target
+        try:
+            signature = inspect.signature(target)
+        except (TypeError, ValueError):
+            return target
+        if "organization_id" not in signature.parameters:
+            return target
+
+        @wraps(target)
+        def call(*args: Any, **kwargs: Any) -> Any:
+            bound = signature.bind_partial(*args, **kwargs)
+            if "organization_id" not in bound.arguments:
+                kwargs["organization_id"] = current_principal().organization_id
+            return target(*args, **kwargs)
+
+        return call
 
 
 def services() -> ServiceLocator:

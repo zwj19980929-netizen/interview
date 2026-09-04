@@ -50,6 +50,45 @@ class MockProvider:
         if capability == cap.LLM_CHAT_JSON and isinstance(request, ChatJSONRequest):
             if request.purpose == "answer_evaluation":
                 data = evaluate_answer(request.metadata)
+            elif request.purpose == "interview_turn_understanding":
+                transcript = str(request.metadata.get("transcript") or "").strip()
+                points = [str(item) for item in request.metadata.get("capability_points") or []]
+                covered = [item for item in points if item.casefold() in transcript.casefold()]
+                missing = [item for item in points if item not in covered]
+                evidence = [transcript[: min(120, len(transcript))]] if transcript else []
+                data = {
+                    "intent": "answer",
+                    "answer_summary": transcript[:800],
+                    "claims": (
+                        [{"claim": transcript[:600], "evidence_quote": evidence[0]}]
+                        if evidence
+                        else []
+                    ),
+                    "evidence_quotes": evidence,
+                    "covered_capability_points": covered,
+                    "missing_capability_points": missing,
+                    "ambiguities": [],
+                    "contradictions": [],
+                    "confidence": 0.9,
+                    "suggested_action": "followup" if missing else "next",
+                }
+            elif request.purpose == "controlled_followup":
+                evidence = [str(item) for item in request.metadata.get("evidence_quotes") or []]
+                targets = [str(item) for item in request.metadata.get("target_capability_points") or []]
+                data = {
+                    "selected": bool(evidence and targets),
+                    "question_text": (
+                        "请结合刚才的做法，具体说明你如何验证%s？" % targets[0]
+                        if targets
+                        else ""
+                    ),
+                    "evidence_quote": evidence[0] if evidence else "",
+                    "target_capability_points": targets[:1],
+                    "rationale": "验证候选人已提及但尚未充分覆盖的冻结能力点" if targets else "",
+                    "difficulty": str(request.metadata.get("difficulty") or "mid"),
+                    "sensitive_attribute_inference": False,
+                    "leaks_answer": False,
+                }
             elif request.purpose == "resume_review":
                 phase = request.metadata.get("resume_review_phase", "single_pass")
                 if phase == "evidence_map":

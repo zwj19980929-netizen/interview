@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from app.file_storage.interface import StoredFile
+from app.file_storage.interface import RecordingProtection, StoredFile
 from app.file_storage.signing import FileAccessSigner
 
 
@@ -17,6 +17,31 @@ class LocalPrivateFileAdapter:
     def healthcheck(self) -> None:
         if not self.root.is_dir():
             raise RuntimeError("Local private file root is unavailable.")
+
+    def verify_encryption(self, object_key: Optional[str] = None) -> str:
+        raise RuntimeError(
+            "Local private storage does not provide verifiable encryption at rest."
+        )
+
+    def verify_recording_protection(
+        self, object_key: Optional[str] = None
+    ) -> RecordingProtection:
+        """本地录像只允许开发环境使用，并明确标记为未验证静态加密。"""
+
+        runtime = os.getenv("INTERVIEWER_RUNTIME_ENV", "development").strip().lower()
+        local_media = os.getenv("INTERVIEWER_LOCAL_MEDIA", "false").strip().lower()
+        if runtime != "development" or local_media not in {"1", "true", "yes", "on"}:
+            raise RuntimeError(
+                "Local recording storage requires development mode and INTERVIEWER_LOCAL_MEDIA=true."
+            )
+        self.healthcheck()
+        if object_key is not None and not self._path(object_key).is_file():
+            raise RuntimeError("Local recording object is unavailable.")
+        return RecordingProtection(
+            descriptor="local_private_development",
+            encryption=None,
+            development_only=True,
+        )
 
     def store(
         self,

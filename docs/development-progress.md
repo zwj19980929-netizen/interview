@@ -1,5 +1,64 @@
 # 开发进度
 
+## 2026-09-03：试音握手、VAD、Range 与 FPS 收口（verified（仓库），目标环境复验 pending）
+
+- 候选人 Evidence 控制面改为 `open requested → server ready` 两阶段因果握手。服务端实际开流或确认幂等 existing-open 后，以同 `causation_id` 的 transient floor 事件应答；客户端只接受当前连接本次命令的匹配 ACK。握手前页面显示“准备识别”而不是“正在听”，普通 VAD 不发送 speech start/stop；握手期间持续讲话会在 ready 后承接。断线只做有界 reassert，其他标签页广播的 ACK 只能推进 cursor，不能打开本地 gate 或 flush speech。
+- AudioWorklet level 现在携带采样数/采样率，VAD 起止按累计毫秒而非回调次数判断；数字人播放期使用更高能量与持续门槛抑制扬声器回声，确认后的真实 barge-in 仍在 200ms 内静音，静音 stop 使用稳定窗口避免几十毫秒抖动。
+- 暖场 final/seal 失败只 destructive finalize 一次并保留首个真实错误，原子持久化 `calibration_retry_required`；服务端 gate 未清时拒绝 Evidence open。UI 只在候选人显式“重新试音”后发送 reset；owner 完成 reset 后，live transient `warmup_retry` 或 snapshot 的 `retrying + retry_required=false` 都允许当前 control 用新 causation open/reassert。客户端记忆已消费 retry cause，服务端以 generation fence 与 existing-open 幂等 ACK 防止刷新、heartbeat、断线和多连接恢复重复创建付费 STT。
+- 本地私有文件交付补齐 `GET/HEAD` 单 Range：无 Range 为 200，合法 closed/open-ended/suffix 为 206，不可满足、畸形或多段为无正文 416；HEAD 与 GET 的状态和相关头一致，原 token/租户/审计边界不变。VRM FPS gate 与界面共同使用显示整数 `Math.round(fps)`，门槛 30 时 29.5 通过、29.4 失败。
+- 本项不改变抽题、题目/计划冻结、服务端权威证据和答案、评分、追问、S2S/cascade 或人工接管业务逻辑。后端全量 `439 passed, 5 skipped`、前端全量 `74 passed`、production build、compileall 与 diff check 均已通过，状态为 `verified（仓库）`；仍须在新会话复验目标浏览器、LiveKit/STT、私有媒体 seek/range、扬声器回声与真实打断，完成前不提升生产状态。
+
+## 2026-09-03：正式语音打断竞态与 WAV 容器完整性修复
+
+- 实际事故的正式开场 TTS 调用成功且私有音频请求返回 200；候选人听到姓名后本地 VAD 触发正常 barge-in，播放器在 1ms 内静音，但清空旧 `<audio>.src` 产生的迟到 `error` 被无条件映射为 `CANDIDATE_RUNTIME_FAILED`，才使服务器在约两秒后暂停。`runtime-problems` 的 200 响应是错误上报后的持久暂停回执，不是音频接口失败。
+- CandidateInterviewExperience 新增单一 `activePlayback` identity。play/ended/error、RAF 与异步 `play()` rejection 只有在 identity 仍为当前项时才有作用；停止先原子失效 identity，再解绑监听、pause 并卸载 src。服务端 interrupt 携带 ID 时只匹配对应 performance；自然结束只确认一次，当前正式音频的真实加载/解码错误仍保持 fail-closed。
+- QuestionSpeechAsset 与 AgentExpressionAudio 共用的 PrivateAssetImporter 现严格解析 RIFF/WAVE、fmt/data、未知 chunks、odd padding、PCM geometry 与 block alignment。只规范化实际观测到的 signed-limit RIFF/data 流式占位组合，以及全部 child chunks 完整到 EOF 后外层 RIFF 恰好漏计四字节 WAVE form type；任意其他截断、长度偏差、重复/错序 chunk、尾随垃圾及 MIME/魔数冲突返回 `TTS_ASSET_FORMAT_INVALID`。checksum 对规范化后的字节计算。
+- 本机只读语料核对了 64 个私有 WAV：23 个为 signed-limit 流式占位，41 个为 GLM-TTS 的 outer-size 少四字节；全部在内存规范化后可由 Python wave 完整读取且声明帧字节等于实读字节，没有改写历史 FileObject。事故开场原文件正文为 24kHz/单声道/16-bit PCM、18.88 秒，但原头把 RIFF/data 声明为约 2GiB，证明 decoder 能播放开头不等于容器完整。
+- 回归结果：WAV/题目语音/动态表达/Agent 定向后端 `100 passed`；完整后端 `431 passed, 5 skipped`；前端 7 个测试文件 `62 passed`，其中播放生命周期合同 `16 passed`；Vite production build 成功并仅保留既有 VRM chunk 体积告警。compileall 与最终 diff check 通过。API 与 Celery Worker/Beat 已加载修复重新启动；`healthz=ok`、`readyz.ready=true`，一个 Worker 节点在线且 active/reserved 为空。
+- 面试状态机、题目/计划冻结、服务端权威答案、评分、S2S/cascade 决策、追问和人工接管逻辑均未改变。已暂停且 token 暴露的事故会话不恢复，历史冻结音频不原地修补；应通过既有 regenerate 生成新的不可变题目语音，并用新邀请/会话复验。
+
+## 2026-09-03：本机实时开场、收音与端点状态修复
+
+- 修复候选人刷新后 LiveKit 发布 identity 与服务端冻结 Evidence identity 不一致的问题：重连只更换控制连接和 backfill epoch，继续复用权威媒体身份，避免真实麦克风轨已进房间却被订阅器过滤。
+- 开场和动态表达继续统一走 `interview_agent_expression`；主问题预生成结果若只是开发占位，会自动回落到相同受管 TTS，仍禁止浏览器朗读，不再直接暂停整场。
+- 候选人端删除本地 2475ms 假进度切换；2.5 秒现在明确表示服务端在连续静音后收口本轮回答并进入 final/理解，继续说话会取消收口，不表示自动下一题。暂停/完成快照会清除端点与 VAD 状态，服务端也拒绝暂停会话重新触发开场或媒体命令。
+- LiveKit 在 STT WebSocket 握手期间产生的静音帧现由关闭的 Evidence 门无锁丢弃；暖场 `evidence.seal` 不再错误要求正式 `turn_id`。端点成立后先关闭证据门并释放链锁再等待 final；DashScope duplex 的 PCM 发送和 vendor event 接收各由独立后台任务负责，并以两秒音频字节预算失败关闭，避免网络抖动填满 LiveKit sink。
+- 本机现有 DashScope TTS、流式 ASR 与 LLM 配置已绑定到开场表达、暖场识别、正式答案识别、轮次理解和受控追问五个精确 purpose，五条真实探针均为 healthy。隔离 SQLite 副本上的真实 LiveKit/TTS/STT 合成语音闭环已验证开场私有音频、服务端收音、暖场 partial/final、2.5 秒端点、正式题目音频和正式 authoritative final。
+- 同一次闭环暴露 `qwen3.7-plus` 的轮次理解连续两次命中 30 秒超时；DashScope adapter 现对实时理解/追问默认关闭 Qwen 深度思考，并保留管理员中文开关覆盖。关闭后的外部复测因执行权限服务异常未实际发出，仍需在重启后的新会话确认追问分支。
+- 自动化基线已更新为后端 `413 passed, 5 skipped`、前端 `58 passed`；Vite production build、compileall、Provider manifest JSON 与 diff check 全部通过，build 仅保留既有 VRM chunk 体积告警。
+
+## 2026-09-02：本地 VRM 资产接入与候选人失败关闭修复
+
+- `model/interviewer.vrm` 已作为默认本地数字人资产接入；去敏 manifest 冻结 SHA-256、VRM 1.0、权利人、`personalProfit` 使用范围、肖像许可、署名与禁止修改约束，不保存截图中的联系方式。
+- 资产检查修复了 VRM 1.0 表情分类误判：标准 `aa/ih/oh/ou` 允许位于 preset，辅音可位于 custom，并以两者并集校验 15 个口型；实际 18 MiB 模型同时通过 humanoid、lookAt、blink、hash 和许可字段检查。
+- 本地模式不再因为 development 环境绕过 VRM readiness；`/readyz`、预约 admission 和候选人 avatar grant 使用同一事实。云模式不被无关的本地资产检查阻断。
+- 候选人端新增 allow-list `runtime-problems` 命令。VRM 获取、加载、WebGL renderer 或统一 facade 致命失败时，服务端验证 token 并真实推进 lifecycle pause；UI 仅在收到持久 `paused` 回执后显示已暂停，原始浏览器异常不上传。
+- “自我介绍生成异常”实为 session snapshot 到达前过早渲染 warm-up；页面现先显示实时安全会话 gate，只有服务端快照确认暖场状态后才展示自我介绍。
+- 真实浏览器首次验收发现模型虽以 60 FPS 正常加载但仍保持导出 T-Pose、镜头偏远；renderer 现固定自然下垂的克制上半身姿态并改为胸像面试构图，避免“合同已过但画面仍像制作态”。
+- 实际 Uvicorn access log 可能打印私有模型查询 grant 或私有文件/媒体/邀请 path token；启动期现安装统一过滤器，遮蔽敏感 path segment 与 `grant/token/ticket/signature/access_token` 查询值，同时保留路由后缀、非敏感查询和状态码，避免短期 bearer 进入日志。
+- 定向回归已覆盖真实资产、许可/hash/viseme、无开发绕过、故障暂停幂等/错误 token/去敏响应、新 API、前端错误映射与暂停文案；完整验证结果见 `VRM-ASSET-RUNTIME-001` 变更日志。
+
+## 2026-09-02：火山引擎豆包 Provider 仓库实现
+
+- `volcengine` 已由不可路由的占位 manifest 升级为可执行 Provider，继续位于统一 Model Invocation deep module 后方；InterviewAgentRuntime、评分、题库和 React 不依赖任何火山协议类型。
+- Ark Chat/Embedding 使用独立 `ark_api_key` 和官方 OpenAI-compatible API v3；Seed ASR 2.0 streaming 使用二进制 Gzip 帧、极速版录音识别使用服务端私有字节、Seed-TTS 2.0 使用单向流 HTTP，三条语音链路只使用独立 `speech_api_key`。
+- Seeduplex API v3 已映射为 `speech.dialogue_realtime`：16 kHz 候选人 PCM、24 kHz 输出、受控 `speech_text_buffer.replacement`、`response.cancel` 和 `session.close`。供应商只表达冻结 ApprovedConversationAct，输出仍要经过上层逐字批准和私有 AgentExpressionAudio 门禁。
+- 离线协议合同覆盖 Ark/Speech 凭据隔离、官方端点/Resource ID、批量私有音频、TTS 分块、ASR 二进制 final/error、Seeduplex 批准文本和注册表/manifest。没有真实火山账号、模型/语音资源授权、并发与网络指标，本项只标记 `repository_verified / environment_pending`。
+
+## 2026-09-02：完整实时面试智能体仓库实现收口
+
+- `InterviewAgentRuntime/AgentChannel` 已成为唯一正式控制面，统一拥有 Floor、barge-in、暖场、自动端点、幂等恢复、结构化理解、受控追问和人工接管；旧 `/live`、`/stt-stream`、`audio-answers`、`avatar/speak`、avatar close 及前端多通道 runtime 已物理删除。
+- CandidateInterviewExperience 统一一次设备申请、真实自拍、AudioWorklet VAD、三层收音状态、两行字幕、2.5 秒可取消端点、30 秒 AES-GCM 缓冲和资源关闭。正式入场在发布麦克风后读取 LiveKit RTCStats 复核 RTT/jitter，真实 VRM 连续 FPS 覆盖基础 WebGL 探测；未同意视频的 grant 不含 camera。
+- `AuthoritativeEvidenceIngress` 已接通数据库时钟 ownership/fencing、持久 command journal、连接无关 owner executor、DB polling/Redis wake hint、remote receipt proxy、私有 segment/checkpoint、owner-loss batch repair 和授权 gap 的浏览器 backfill；旧 owner、旧 control、重复 finish 与重发帧不能形成重复 CandidateAnswer。
+- Participant Egress capture 具备明确同意、私有 URI、hash、存储保护/加密核验、保留与审计；本地开发可由单一 `INTERVIEWER_LOCAL_MEDIA=true` 启用仓库 LiveKit/Egress 并写入私有目录，生产仍强制对象级 AES256/KMS。`starting` 崩溃后的 provider 结果不明时不会重复启动录像，而是暂停等待人工核对。试音媒体在正式开始前删除，不进入答案/评分/报告。
+- `ApprovedConversationAct` 追问必须绑定冻结 root、深度、非空原文证据与能力点，Expression 不能补建；AI 动作恒非评价性并拒绝正误暗示。根题合并主回答与最多两层追问证据，评分 revision 异步，不阻塞下一句话。
+- Realtime Speech Provider 音频 delta 在 final 文本与批准动作逐字一致前隔离缓冲；批准后和动态 TTS 一样写入加密私有 AgentExpressionAudio，只在角色安全投影时签发短期地址。偏离或故障丢弃 S2S 音频并以批准文本走 cascade。
+- 本地 Three.js/VRM 路径校验真实 GLB 的 VRM 1.0、15 viseme、blink、lookAt、humanoid bones、hash、商用与肖像授权；统一音频时钟、动作、barge-in、WebGL context loss 与 FPS 失败关闭均有合同，未提供授权资产时不展示静态图替代。
+- 人工接管租约、发言事务复核和媒体 permit 全部使用数据库时钟；普通企业连接只订阅，接管者只获得 15 秒 microphone grant，释放/丢租/结束均移除 participant 且不自动恢复 AI。
+- production admission 同时要求精确绑定 deployment/release 的签名 acceptance v2 report、Chrome/Edge/Safari 桌面矩阵、全部硬指标及显式组织灰度名单；`/readyz`、预约邀请/start 与候选人签票均失败关闭。
+- 当前完整后端为 `391 passed, 5 skipped`，Vitest `54 passed`；豆包切片的定向 Provider 合同为 `33 passed`，最终 compileall、Vite build 与 diff check 以对应变更日志为准。
+- 工作项仍为 `in_progress（仓库实现已收口，目标环境/数据验收 pending）`。本机专属 VRM 已在 `personalProfit` 范围通过合同；真实 G2P/TTS 时间戳、目标使用范围许可、LiveKit/TURN/Egress/OSS、真实 Provider 路由、目标 PostgreSQL/Redis 多实例故障注入、桌面浏览器矩阵、金标与候选人试点无法由仓库伪造；未生成匹配当前 release 的合格报告前不称 production ready。
+
 ## 2026-08-31：简历题预约确认后按题库音色生成
 
 - ExperienceQuestion 批准后不再走 `voice_default_cn` 或组织默认 TTS route，而是进入 `deferred` 并可直接冻结到计划；未确认预约不创建语音工作。
@@ -15,11 +74,11 @@
 
 ## 2026-08-30：受控实时语音追问与异步评分
 
-- 实际面试已形成两条可选表达链路：`cascade` 保留服务端 STT → 受控追问 → TTS/本地或云数字人的兼容路径；`s2s` 使用统一 `speech.dialogue_realtime` stream，把已经由服务端规则批准的追问通过 OpenAI Realtime 或阿里云百炼 Qwen Realtime 以 PCM delta 尽快下发。两条路径复用同一 Interview Lifecycle、追问决策、题目快照、事件和前端播放状态机。
+- 实际面试已形成两条可选表达链路：`cascade` 保留服务端 STT → 受控追问 → TTS/本地或云数字人的路径；`s2s` 使用统一 `speech.dialogue_realtime` stream 预生成 OpenAI Realtime 或阿里云百炼 Qwen Realtime 音频，但 PCM delta 在 final transcript 与冻结 ApprovedConversationAct 逐字一致前只存在于有界缓冲，通过后才物化私有表达音频并下发。两条路径复用同一 Interview Lifecycle、追问决策、题目快照、事件和前端播放状态机。
 - S2S 不取代证据链：同一份候选人 PCM 仍进入权威 streaming/batch STT，唯一 final 形成 CandidateAnswer；完整 LLM 评分由 DurableWorkItem/Outbox 异步执行，先返回 `answer.accepted + evaluation.queued`，评分完成后再广播 `evaluation.completed` 并刷新报告。实时语音输出、浏览器 partial 和 Provider 自由生成文本都不能直接入库为答案或评分。
-- 追问是零权重子轮次，带 `parent/root/depth`，只允许深度 1、每道原题 1 次、会话默认最多 2 次，并受回答时间/长度门槛约束。候选人投影只显示“请补充说明”，不暴露目标关键点、标准答案、内部原因或评分。
+- 当时的 compatibility 追问是零权重子轮次，带 `parent/root/depth`，只允许深度 1、每道原题 1 次、会话默认最多 2 次，并受回答时间/长度门槛约束；2026-09-01 的正式 Agent 已用证据绑定、最多两层且全场 `min(4, 主问题数)` 的受控策略取代。候选人投影始终不暴露目标关键点、标准答案、内部原因或评分。
 - 候选人运行时同时修复了自动播题、16 kHz PCM 与私有媒体格式、完整本地录音备份、断线等待后 batch repair、心跳、企业实时事件、`record_video=false` 麦克风降级、异步评分状态和重复播报/提交。
-- 新增 OpenAI 官方 provider（Chat/Embedding/TTS/batch STT/Realtime）和 DashScope Qwen Realtime 模型目录/adapter。火山引擎豆包实时语音仅记录为后续扩展：仓库没有把未完成的二进制会话协议伪装成可用 route。
+- 当时新增 OpenAI 官方 provider（Chat/Embedding/TTS/batch STT/Realtime）和 DashScope Qwen Realtime 模型目录/adapter；火山引擎豆包在 2026-09-02 的独立工作项中完成，不回写本段历史时间线。
 
 ## 2026-08-29：API response/marshal seam 与 transport 拆分
 
@@ -68,11 +127,11 @@
 | --- | --- | --- | --- |
 | 0 项目骨架 | ✅ verified | FastAPI、统一错误、健康检查、启动/worker 命令、自动化测试 | 生产观测平台由部署环境选择 |
 | 1 题库管理 | ✅ verified | CRUD/归档、JSON 批量 import、rebuild/build job、语音重建 | 批量 UI 仍以 API 为主 |
-| 2 模型网关 | ✅ closed（配置 v2 + Prompt 治理） | `chat_json/chat_text/embedding/STT/TTS/avatar/realtime_speech` schema、invoke/open_stream/open_speech_dialogue、重试/fallback/超时/共享断路器、加密凭证；已实现 OpenAI Realtime、DashScope Qwen Realtime/ASR 与腾讯云数智人 WebRTC adapter | 真实凭据、区域、模型/形象授权、并发和健康测试待联调；豆包二进制实时会话 adapter 为 TODO |
+| 2 模型网关 | ✅ closed（配置 v2 + Prompt 治理） | `chat_json/chat_text/embedding/STT/TTS/avatar/realtime_speech` schema、invoke/open_stream/open_speech_dialogue、重试/fallback/超时/共享断路器、加密凭证；已实现 OpenAI Realtime、DashScope Qwen Realtime/ASR、Volcengine Ark/Seed ASR/Seed-TTS/Seeduplex 与腾讯云数智人 WebRTC adapter | 真实凭据、区域、模型/语音 Resource ID、形象授权、并发和健康测试待联调 |
 | 3 结构化题库查询 | ✅ closed | Question Catalog、Memory/SQLite/PostgreSQL 下推实现、跨岗位拒绝；旧 QuestionService/向量 repository 已删除 | 真实 PostgreSQL 查询计划待环境验收 |
 | 4 岗位要求与计划 | ✅ closed | execution v2 canonical slots、显式一次性迁移、候选池冻结、覆盖/难度/去重、权重/时长守恒、审批不可变 | 部署旧数据时先运行迁移命令 |
 | 5 会话与实时事件 | ✅ verified | 生命周期、持久事件、WebSocket、Redis 跨实例 adapter、心跳超时恢复、浏览器 16k PCM 实时 STT、统一 Avatar Delivery Runtime、腾讯 WebRTC/SFU 播放与会话回收 | 目标网络/浏览器与腾讯并发仍需外部验收 |
-| 6 数字人与语音 | ✅ verified（仓库） | 预约级 local/cloud、cascade/s2s 选择，冻结 TTS 签名播放、浏览器本地形象、云失败复用 local 降级、OpenAI/DashScope realtime speech、DashScope streaming/batch STT、真实 TTS、腾讯云数智人 WebRTC | OpenAI/阿里/腾讯真实凭据、音质/WER/首音/打断/费用和生产 route 未验收；自研形象后续可扩展口型/3D |
+| 6 数字人与语音 | ✅ verified（仓库与本机资产） | 预约级 local/cloud、cascade/s2s 选择，冻结 TTS 签名播放、OpenAI/DashScope/Volcengine realtime speech、DashScope/Volcengine streaming/batch STT、真实 TTS、腾讯云数智人 WebRTC；本地 VRM 1.0/15-viseme 资产、hash、许可 manifest、真实失败暂停和快照前 gate 已验证 | OpenAI/阿里/火山/腾讯真实凭据、音质/WER/首音/打断/费用和生产 route 未验收；当前 VRM 仅确认 `personalProfit` 范围，真实 G2P/TTS 时间戳、目标设备指标及其他部署许可仍待验收 |
 | 7 评分与报告 | ✅ verified | 可解释评分、append-only revision、current-only 汇总、JSON/CSV 导出、脱敏人工金标一致性/公平性校准 API | 真实脱敏金标尚未提供，不能形成业务校准结论 |
 | 8 岗位题库构建 | ✅ verified | import/rebuild/build、结构校验、Outbox、语音版本/readiness | 真实 TTS 音质与区域策略待联调 |
 | 9 企业简历库 | ✅ verified | multipart/URL、SSRF、隔离/扫描、保留页边界解析、原件/解析文本私有 FileObject、候选人及简历版本 CRUD、异步单次/Map-Reduce 可解释初筛、AI/人工个人题库 CRUD/审核/归档、版本化 0–59/60–74/75–100 分数带、人工复核/7 天自动留存、本地/OSS contract、加密联系人 | 真实 OSS/扫描器、目标模型上下文预算与真实简历初筛校准待环境验收 |
@@ -136,9 +195,9 @@
 - 模型管理已拆分为 `ProviderConnection → ModelConfiguration → ModelRoute`：Provider manifest 声明连接/凭证及 `llm/embedding/tts/stt/avatar/realtime_speech` 模型表单，管理 UI 通用渲染；模型测试更新健康事实，route target 只引用 ready 的模型配置。连接和模型使用独立 `configuration_revision` 区分配置语义与探针 version，所有可执行模型类型共用 latest-version command，探针完成后编辑/删除不会因旧 version 误冲突，真实并发配置变化仍失败关闭。未知字段返回 422、同组织重复 capability/purpose 返回冲突、predefined 目录外模型返回冲突；生产缺少精确 route 时返回 `provider_route_missing`。
 - OpenAI-compatible 共享 transport 默认不继承环境代理，只有显式 `use_environment_proxy=true` 才读取代理变量；缺少 SOCKS transport 等初始化错误映射为 `provider_transport_unavailable`，不再泄漏原始 500。测试 helper 强制新建内存 store；当前全量 `220` 项通过测试不会触碰开发 SQLite。
 - `ModelGateway.open_stream()` 只在音频接受前允许 fallback；`ValidatedSTTStream` 校验 chunk/总量、事件序号和唯一 authoritative final。`open_speech_dialogue()` 使用同一 route/断路/调用日志策略，但只承载受控追问表达。
-- `stt-stream` WebSocket 保存音频，stream final 立即形成 CandidateAnswer 并排队完整评分；final 缺失/断流时使用 `stt.batch` 修复。S2S 输出 delta 不形成答案，也不绕过评分 Prompt/Schema。
+- 正式 `AuthoritativeEvidenceIngress` 从 LiveKit candidate microphone 轨保存私有音频，stream final 立即形成 CandidateAnswer 并排队完整评分；final 缺失/断流时从已 seal checkpoint 使用 `stt.batch` 修复，必要时接收服务端授权 gap 的浏览器 backfill。S2S 输出不形成答案，也不绕过评分 Prompt/Schema。
 - 非 mock TTS 结果必须从 data URI/受控 HTTP(S) 复制到 PrivateFileStorage 并形成 FileObject，才可标 `production_ready`。
-- 生产邀请/start 要求 streaming STT、batch STT、评分和题目语音 route 为非 mock、已实现且健康事实未过期。
+- 生产邀请/start 要求 streaming/batch STT、理解、受控追问、评分、表达 TTS 和 Realtime Speech route 为非 mock、已实现且健康事实未过期，并要求授权 VRM、LiveKit/私有存储、当前 release 的签名 acceptance v2 与逐组织灰度门禁全部通过。
 
 ### 数据、安全与多实例
 
@@ -165,14 +224,14 @@
 | Redis 多实例广播 | `local_integration_verified / target_pending` | 本机 Redis 7 已通过；目标集群拓扑/故障策略不同 | 跨实例 Pub/Sub、正常关闭和生产限流真实测试 |
 | 阿里云 OSS | `environment_pending` | 官方 `oss2` SDK 与 adapter 已可加载，但没有 bucket、RAM 凭据和区域 | SDK 依赖、OSS adapter、SSE/签名 fake-bucket contract、`/readyz` 只读 bucket 鉴权探针 |
 | 恶意文件扫描器 | `local_integration_verified / target_pending` | 官方 ClamAV Debian arm64 daemon 已用隔离 EICAR 签名库通过 PING、干净样本与 FOUND；目标环境完整病毒库、freshclam 更新和告警仍未提供 | command/clamd 双 adapter、生产连接 readiness、env-gated 真实 EICAR 测试 |
-| OpenAI/OpenAI-compatible/DeepSeek/智谱/DashScope 模型服务 | `partial_real_verified / target_pending` | 当前 DeepSeek 凭据已完成一次真实智能生题；OpenAI Realtime 与 DashScope Qwen Realtime 只有离线协议合同，智谱 TTS 仍被账户 429 拒绝，其他目标模型的区域、授权、费用/延迟和长期稳定性数据仍不完整 | 离线 HTTP/WebSocket 合同、声明式模型目录、动态 route UI、真实 DeepSeek 候选题审核批次、私有 TTS copy/hash 与 readiness |
-| OpenAI / DashScope 实时语音追问 | `repository_verified / environment_pending` | 统一 `speech.dialogue_realtime`、受控逐字追问、PCM delta、打断/降级和 S2S 早于评分 ack 的端到端合同已实现；没有 API Key/Workspace、模型权限和真实网络指标 | 配置 `candidate_followup_dialogue` route，实测首音、抖动、barge-in、音质、成本和长期连接；S2S 失败必须继续 cascade |
+| OpenAI/OpenAI-compatible/DeepSeek/智谱/DashScope/Volcengine 模型服务 | `partial_real_verified / target_pending` | 当前 DeepSeek 凭据已完成一次真实智能生题；OpenAI、DashScope 与 Volcengine Realtime 只有离线协议合同，智谱 TTS 仍被账户 429 拒绝，其他目标模型的区域、授权、费用/延迟和长期稳定性数据仍不完整 | 离线 HTTP/WebSocket 合同、声明式模型目录、动态 route UI、真实 DeepSeek 候选题审核批次、私有 TTS copy/hash 与 readiness |
+| OpenAI / DashScope / Volcengine 实时语音追问 | `repository_verified / environment_pending` | 统一 `speech.dialogue_realtime`、冻结追问文本约束、批准前 PCM 隔离缓冲、批准后私有 AgentExpressionAudio、打断/降级和 S2S 不等待评分 ack 的端到端合同已实现；没有 API Key/Workspace/Resource ID、模型权限和真实网络指标 | 配置 `candidate_followup_dialogue` route，实测首音、抖动、barge-in、音质、成本和长期连接；S2S 偏离/失败必须丢弃原始音频并继续批准文本 cascade |
 | DashScope 真实 STT | `repository_verified / environment_pending` | Qwen-Audio 3.0 duplex streaming、Qwen3-ASR batch、16k PCM 浏览器链路与离线合同已实现；没有 Workspace/API Key/录音金标 | 配置连接与两条 purpose route，真实测 WER、partial/final 延迟、断流修复、费用和健康 TTL |
-| 火山引擎豆包实时语音 | `not_implemented / optional` | 已确认官方产品能力，但尚未实现其二进制 StartConnection/StartSession 协议，也未证明能严格表达服务端批准的追问 | 保持 manifest 不可路由；后续按官方完整协议新增 adapter、合同测试和真实网络验收 |
+| 火山引擎豆包语音与 Ark | `repository_verified / environment_pending` | Ark Chat/Embedding、Seed ASR streaming/batch、Seed-TTS 2.0 与 Seeduplex API v3 adapter/离线合同已实现；没有真实 Ark/Speech API Key、语音 Resource ID、模型授权、配额和目标网络样本 | 逐个测试 ModelConfiguration，再配置 `candidate_answer_transcription`、`candidate_answer_repair`、`question_speech_generation`、`candidate_followup_dialogue` 等 route；实测 WER、英文技术实体召回、final/首音、打断、音质、并发和费用 |
 | 腾讯云 WebRTC 数智人 | `repository_verified / environment_pending` | HTTPS create/stat/start/close、签名 WSS SEND_TEXT、TCPlayerLite 拉流和会话回收已实现；没有 AppKey/AccessToken/形象资产/并发 | 配置连接、形象与 avatar route，在目标浏览器验证建流/口型/延迟/离场回收和并发计费 |
 | 评分/公平性金标 | `repository_verified / data_pending` | 脱敏 current-evaluation 校准 API、分层指标、样本量告警与审计已实现 | 企业提供经授权的真实脱敏 evaluation ID + 人工分 + opaque cohort，至少 30 条且每 cohort 至少 10 条 |
 | 邮件提醒/短信邀请 | `environment_pending` / `external_choice_required` | SMTP adapter 与 30 分钟提醒已实现，但授权码、发件域名和目标服务未配置；短信通道未选择 | 一次性邀请 token/API 与手工安全分发保持可用；配置 `INTERVIEWER_SMTP_*` 后由 Celery 投递提醒 |
-| 其它 WebRTC/SFU 或数字人厂商 | `optional` | 当前选定腾讯云托管 SFU；自建 LiveKit/Janus/WHEP 尚未选择 | 只需新增 provider/player adapter，不改变面试编排 |
+| 自托管 LiveKit/TURN/Egress | `repository_verified / local_stack_verified / production_environment_pending` | ADR-0002 的房间/最小权限票据/Egress/webhook、浏览器发布、receive-only Evidence subscriber、`database_fenced` ownership、连接无关 owner executor/remote receipt、DB polling/Redis wake hint、持久媒体 repair 与授权 gap backfill 均已有仓库合同；固定版本本地 LiveKit/Egress/Redis 栈已用单参数启动，真实 Participant Egress 生成含 H.264 视频和 AAC 音频的本地 MP4，应用 `/readyz` 的媒体与权威音频探针均通过 | 生产仍需最小权限 LiveKit/OSS secret、当前 deployment/revision、组织灰度名单、TURN/公网网络、30 秒断流/零重复答案、浏览器矩阵与并发验收 |
 
 ## 已关闭的兼容边界
 

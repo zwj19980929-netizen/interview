@@ -10,6 +10,7 @@ from app.persistence.interface import Persistence
 from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
 from app.services.catalog import CatalogService
+from app.services.agent_expression_audio import expression_audio_reference
 from app.services.interviews import InterviewService
 
 
@@ -51,16 +52,22 @@ class LocalAvatarDelivery:
                 asset = transaction.question_speech_assets.get(speech_asset_id)
         if asset and asset.get("status") == "ready":
             try:
-                grant = self.catalog.issue_speech_access(
-                    asset["id"],
-                    actor_id=actor_id,
-                    organization_id=organization_id,
-                )
                 return AvatarSpeakResponse(
                     speech_id=asset["id"],
                     mode="audio",
                     text=turn["question_spoken_text"],
-                    audio_uri=grant["url"],
+                    # Persist only an opaque reference in AgentEvent history.
+                    # The runtime projection mints a fresh, participant-scoped
+                    # read grant for initial delivery and every reconnect.
+                    audio_uri=expression_audio_reference(
+                        str(asset["file_object_id"])
+                    ),
+                    duration_ms=(
+                        int(asset["duration_ms"])
+                        if asset.get("duration_ms")
+                        else None
+                    ),
+                    visemes=list(asset.get("visemes") or []),
                     avatar_mode="local",
                     fallback_reason=fallback_reason,
                     provider=ProviderMeta.model_validate(asset["provider"]),

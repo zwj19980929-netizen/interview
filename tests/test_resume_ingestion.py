@@ -91,6 +91,62 @@ def test_pdf_upload_worker_private_access_and_idempotency(tmp_path, monkeypatch)
     assert download.status_code == 200
     assert download.content == content
     assert download.headers["cache-control"] == "private, no-store"
+    assert download.headers["accept-ranges"] == "bytes"
+    assert download.headers["content-length"] == str(len(content))
+
+    full_head = api.head(grant.json()["url"])
+    assert full_head.status_code == 200
+    assert full_head.content == b""
+    assert full_head.headers["content-length"] == str(len(content))
+    assert full_head.headers["accept-ranges"] == "bytes"
+
+    partial = api.get(grant.json()["url"], headers={"Range": "bytes=2-7"})
+    assert partial.status_code == 206
+    assert partial.content == content[2:8]
+    assert partial.headers["content-range"] == "bytes 2-7/%d" % len(content)
+    assert partial.headers["content-length"] == "6"
+    assert partial.headers["accept-ranges"] == "bytes"
+
+    case_insensitive = api.get(
+        grant.json()["url"], headers={"Range": "BYTES=2-7"}
+    )
+    assert case_insensitive.status_code == 206
+    assert case_insensitive.content == content[2:8]
+
+    open_ended = api.get(grant.json()["url"], headers={"Range": "bytes=7-"})
+    assert open_ended.status_code == 206
+    assert open_ended.content == content[7:]
+    assert open_ended.headers["content-range"] == "bytes 7-%d/%d" % (
+        len(content) - 1,
+        len(content),
+    )
+
+    suffix = api.get(grant.json()["url"], headers={"Range": "bytes=-5"})
+    assert suffix.status_code == 206
+    assert suffix.content == content[-5:]
+    assert suffix.headers["content-range"] == "bytes %d-%d/%d" % (
+        len(content) - 5,
+        len(content) - 1,
+        len(content),
+    )
+
+    head = api.head(grant.json()["url"], headers={"Range": "bytes=2-7"})
+    assert head.status_code == 206
+    assert head.content == b""
+    assert head.headers["content-range"] == "bytes 2-7/%d" % len(content)
+    assert head.headers["content-length"] == "6"
+
+    for invalid_range in (
+        "bytes=999999999-",
+        "bytes=0-1,3-4",
+        "bytes=" + "9" * 5000 + "-",
+    ):
+        invalid = api.get(grant.json()["url"], headers={"Range": invalid_range})
+        assert invalid.status_code == 416
+        assert invalid.content == b""
+        assert invalid.headers["content-range"] == "bytes */%d" % len(content)
+        assert invalid.headers["accept-ranges"] == "bytes"
+        assert invalid.headers["content-length"] == "0"
     with persistence_for(get_store()).transaction("org_default") as transaction:
         events = transaction.audit_events.list()
         raw_resume = transaction.resume_documents.get(resume_id)
@@ -308,7 +364,8 @@ def test_url_import_uses_the_same_verified_private_pipeline(tmp_path) -> None:
     assert "temporary=redacted" not in str(get_store().outbox_work_items)
 
 
-def test_aliyun_oss_private_storage_contract() -> None:
+def test_aliyun_oss_private_storage_contract(monkeypatch) -> None:
+    monkeypatch.setenv("INTERVIEWER_OSS_SSE", "AES256")
     class Download:
         def __init__(self, content: bytes) -> None:
             self.content = content
@@ -338,6 +395,17 @@ def test_aliyun_oss_private_storage_contract() -> None:
         def get_bucket_info(self):
             return {"name": "private-resumes"}
 
+        def get_bucket_encryption(self):
+            return type("Encryption", (), {"sse_algorithm": "AES256"})()
+
+        def get_object_meta(self, key):
+            assert key in self.objects
+            return type(
+                "ObjectMeta",
+                (),
+                {"headers": {"x-oss-server-side-encryption": "AES256"}},
+            )()
+
     bucket = Bucket()
     adapter = AliyunOssFileAdapter(bucket=bucket, bucket_name="private-resumes")
     adapter.healthcheck()
@@ -352,6 +420,7 @@ def test_aliyun_oss_private_storage_contract() -> None:
     assert adapter.open(stored.object_key) == content
     assert bucket.last_headers["x-oss-server-side-encryption"] == "AES256"
     assert bucket.last_headers["x-oss-meta-sha256"] == "abc"
+    assert adapter.verify_encryption(stored.object_key) == "aliyun_oss_aes256"
     assert adapter.issue_read_access(stored.object_key, expires_seconds=3600).startswith("https://oss.example/")
     adapter.delete(stored.object_key)
     assert stored.object_key not in bucket.objects

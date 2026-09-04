@@ -30,7 +30,7 @@ def _admission_inputs(now: datetime) -> tuple[dict, dict, dict]:
     intake = {
         "consent_evidence_status": "verified",
         "privacy_accepted": True,
-        "recording_accepted": True,
+        "media_consent_scopes": ["audio_recording"],
     }
     readiness = {
         "can_start": True,
@@ -44,8 +44,8 @@ def _admission_inputs(now: datetime) -> tuple[dict, dict, dict]:
     [
         (lambda appointment, intake, readiness, now: intake.update(privacy_accepted=False), "CONSENT_REQUIRED"),
         (
-            lambda appointment, intake, readiness, now: intake.update(recording_accepted=False),
-            "RECORDING_CONSENT_REQUIRED",
+            lambda appointment, intake, readiness, now: intake.update(media_consent_scopes=[]),
+            "AUDIO_RECORDING_CONSENT_REQUIRED",
         ),
         (
             lambda appointment, intake, readiness, now: appointment.update(

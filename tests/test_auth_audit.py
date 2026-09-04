@@ -113,6 +113,67 @@ def test_production_bearer_rbac_and_request_audit(monkeypatch) -> None:
     assert any(item["actor_id"] == "anonymous" and item["metadata"]["status_code"] == 401 for item in audited)
 
 
+def test_custom_single_tenant_production_binds_http_services_to_authenticated_org(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("INTERVIEWER_RUNTIME_ENV", "production")
+    monkeypatch.setenv("INTERVIEWER_ORGANIZATION_ID", "org_alpha")
+    monkeypatch.setenv(
+        "INTERVIEWER_CONTACT_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii")
+    )
+    monkeypatch.setenv(
+        "INTERVIEWER_CONTACT_LOOKUP_SECRET",
+        "lookup-secret-at-least-thirty-two-characters",
+    )
+    monkeypatch.setenv(
+        "INTERVIEWER_WEBSOCKET_TICKET_SECRET",
+        "websocket-ticket-secret-at-least-thirty-two",
+    )
+    monkeypatch.setenv(
+        "INTERVIEWER_API_TOKENS_JSON",
+        json.dumps(
+            {
+                "alpha-token": {
+                    "actor_id": "interviewer_alpha",
+                    "organization_id": "org_alpha",
+                    "roles": ["interviewer"],
+                },
+                "beta-token": {
+                    "actor_id": "interviewer_beta",
+                    "organization_id": "org_beta",
+                    "roles": ["interviewer"],
+                },
+            }
+        ),
+    )
+    reset_store_for_tests()
+    api = TestClient(create_app())
+
+    created = api.post(
+        "/api/v1/job-positions",
+        headers={"Authorization": "Bearer alpha-token"},
+        json={"code": "alpha-platform", "name": "Alpha Platform"},
+    )
+    assert created.status_code == 200
+    assert created.json()["organization_id"] == "org_alpha"
+    listed = api.get(
+        "/api/v1/job-positions",
+        headers={"Authorization": "Bearer alpha-token"},
+    )
+    assert [item["id"] for item in listed.json()["items"]] == [
+        created.json()["id"]
+    ]
+    assert (
+        api.get(
+            "/api/v1/job-positions",
+            headers={"Authorization": "Bearer beta-token"},
+        ).status_code
+        == 403
+    )
+    with persistence_for(get_store()).transaction("org_default") as transaction:
+        assert transaction.job_positions.list() == []
+
+
 def test_provider_secrets_are_encrypted_at_the_repository_seam(monkeypatch) -> None:
     monkeypatch.setenv("INTERVIEWER_PROVIDER_SECRET_ENCRYPTION_KEY", Fernet.generate_key().decode("ascii"))
     reset_store_for_tests()

@@ -172,7 +172,8 @@ Interview Plan Assembly 接收岗位、岗位要求、岗位题库、候选人�
 生产回答链路固定为：
 
 ```text
-candidate audio -> realtime gateway -> stt.streaming
+candidate LiveKit microphone track -> receive-only server subscriber
+-> private recording + InterviewEvidenceChain -> stt.streaming
 -> transcript.partial/final -> CandidateAnswer -> evaluation
 ```
 
@@ -183,16 +184,28 @@ candidate audio -> realtime gateway -> stt.streaming
 - 不同 Provider 的 partial 不能拼接。fallback 只能在流会话边界重开，或用 batch 对完整音频修复。
 - 不提供客户端文本兜底；服务端 streaming 失败后只能用完整录音执行 `stt.batch` 修复。补转写仍失败时保持 `transcribing`/可恢复失败态并请求人工处理，不能伪造 CandidateAnswer。
 - `stt_confidence` 低于语言/Provider 校准阈值时可继续评分，但评分置信度设上限并进入人工复核。
+- 正式 Agent ticket 选择 `livekit_server_subscriber` 时，浏览器 PCM 不再复制到控制 WebSocket；服务端用冻结 candidate identity 精确订阅麦克风轨。该 subscriber、录音、StreamingSTTSession 和 endpoint timer 独立于控制连接，在 30 秒重连 grace 内连续工作；重复 publication/finish 或旧连接命令不得生成重复 CandidateAnswer。
+- 正式 Evidence 链在建流时冻结 `EvidenceCommitFence`。STT 与 TurnUnderstanding 可在事务外运行，但形成非答案 utterance 或 CandidateAnswer 前必须在同一事务重新验证数据库 lease/epoch；旧 owner 的迟到 final 只可被拒绝，不得进入评分 Outbox。
+- 每个 PCM 帧同时写入有界 `EvidenceMediaSegment`，只有已 seal、序号连续且 checksum 通过的 checkpoint 能由新 ownership epoch 重建为 batch repair 录音。内存中未 seal suffix 不得标记持久。
+- 浏览器的 30 秒 AES-GCM 环形缓冲只用于服务端授权的精确 gap。ticket 冻结 source connection/audio epoch/2 MiB/32 KiB 上限；JSON `evidence.recovery.begin/chunk/complete` 中每帧先写私有 FileObject，journal 只引用 file ID/hash/epoch/sequence，由当前 owner 以 `ack_through` 去重后注入原 Evidence chain。它不是常态 WebSocket PCM 备用通道。
 
-回答结束由候选人提交、服务端静音检测、最长时限或面试官结束触发。服务端必须在音频 flush 完成后等待 final；不能在 `candidate.media.stop` 到达时直接拿客户端文本评分。
+回答结束优先由服务端语义/静音端点触发 2.5 秒可取消倒计时，也可由最长时限、候选人明确结束或面试官结束触发。服务端必须在音频 flush 与私有录音持久化完成后等待 final；不能在客户端 `speech.stopped/evidence.finish` 到达时直接拿浏览器文本评分。
 
 ## 受控澄清追问与低延迟双轨
 
-追问不等待 AnswerEvaluation，也不让 S2S 模型自行决定问什么。权威 STT final 到达后，`EvaluationService.decide_followup` 先用冻结关键点做确定性覆盖判断；只对未覆盖关键点选择题目已审核的 `followup_probes`，没有 probe 时使用固定澄清模板。策略固定 `max_depth=1`、每根题最多 1 次、全场默认最多 2 次、追问权重为 0，并检查回答长度和剩余时间。追问子轮次保存 parent/root、目标关键点和判定来源用于企业审计，但 Candidate Session Projection 只返回父子关系与题干。
+正式追问不等待 AnswerEvaluation，也不让 S2S 模型自行决定问什么，统一使用 `TurnUnderstanding -> controlled_followup` 两步合同；追问子轮次保存 parent/root、目标能力点和证据来源用于企业审计，候选人投影只返回安全题干与父子关系。旧深度 1 模板 runtime 及其候选人调用链已删除，不维护双策略。
 
-`cascade` 模式使用 `权威 STT -> 追问策略 -> Avatar/TTS`；`s2s` 模式从录音开始就维持第二条 Realtime Speech Dialogue 流，在追问文本批准后通过版本化 Prompt 要求 Provider 逐字播报，并把 PCM delta 立即送到浏览器。S2S transcript 必须与批准文本规范化一致；不一致、断流或缺 route 只触发表达轨降级，不能写 CandidateAnswer、不能改变关键点判定、不能给分。
+`cascade` 模式使用 `权威 STT -> 追问策略 -> Avatar/TTS`；`s2s` 模式从录音开始就维持第二条 Realtime Speech Dialogue 流，但 Provider PCM delta 在有界内存中隔离，直到 final transcript 与已冻结 ApprovedConversationAct 逐字一致才复制成私有表达音频并下发。不一致时整段丢弃，断流或缺 route 只触发批准文本的 cascade 降级；两者都不能写 CandidateAnswer、改变关键点判定或给分。
 
 CandidateAnswer、`answer.evaluate` DurableWorkItem 和生命周期事件在同一事务提交。HTTP/WebSocket 随即返回 `evaluation.status=pending` / `evaluation.queued`；完整 LLM 评分由 worker 执行，完成后才写 append-only AnswerEvaluation 并广播安全摘要。因此评分吞吐或模型抖动不会延长追问首包语音延迟，也不会丢失证据链。
+
+REALTIME-AGENT-001 将追问提升为两步结构化合同。`interview_turn_understanding.v1` 先对服务端 final 生成意图、摘要、主张、逐字证据、冻结能力点覆盖/缺失、歧义、矛盾、置信度和建议动作；确定性中英文元意图优先识别重读、未说完、暂停和澄清，这些话语不进入 CandidateAnswer。低置信度不得自动提交或追问，只能澄清或重说。Provider 不可用时形成 `UNDERSTANDING_PROVIDER_UNAVAILABLE`，schema/证据/冻结能力点校验失败形成 `UNDERSTANDING_RESULT_REJECTED`；两者只投影去敏 `UnderstandingProblem` 并限定为澄清或暂停，不持久原始模型输出。
+
+只有理解通过 Schema、原文证据和冻结能力点校验后，`controlled_followup.v1` 才能建议并持久化追问。gate 固定最多深度 2、每个 root 最多 2 次、全场最多 `min(4, 主问题数)`、剩余不足 90 秒停止新增，并校验难度、180 字长度、敏感属性、标准答案泄漏、暗示性正误评价和已追问能力点。Expression 必须精确复用带 root/depth/非空证据/能力点的冻结 act，找不到时失败关闭，不能临时补建。安全模型失败时只允许证据绑定的确定性 probe；无安全 probe 直接下一题，绝不自由聊天。
+
+每个 follow-up 仍是零权重子轮次。评分输入按 `root_turn_id` 合并根回答与所有权威追问回答，保留各自音频/转写引用和逐字证据，产生新的 root evaluation revision；报告不得把追问当独立题加权。完整评分通过 Outbox 异步执行，下一对话动作不等待评分 worker。
+
+离线 shadow 评估必须使用取得授权并脱敏的历史录音与人工标注，至少报告普通话技术语料 WER、英文技术实体召回、meta-intent macro F1、能力点覆盖 macro F1、无关追问率、泄题/敏感/超预算计数和 AI/人工评分一致性。运维 acceptance v2 runner 同时 gate 延迟、Avatar FPS/音画偏差/冻结、30 秒恢复无丢失/重复答案、未同意视频上行字节为 0、Chrome/Edge/Safari 桌面矩阵与试点问卷；报告必须带数据集 SHA-256、样本下限、时间、精确 deployment/release scope 和 HMAC 签名，30 天后失效。仓库只提供合同/合成样本和验收模块；真实金标、目标设备与试点仍为 `data_pending`，没有鲜活合格签名报告时不得声称达标。
 
 ## 岗位题逐题评分
 

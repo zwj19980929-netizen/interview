@@ -116,8 +116,9 @@ describe("React workbench shell", () => {
     for (let attempt = 0; attempt < 30 && !create; attempt += 1) { await new Promise((resolve) => setTimeout(resolve, 10)); create = [...host.querySelectorAll("button")].find((node) => node.textContent === "创建预约"); }
     await act(async () => create.click());
     const dialog = document.querySelector('[role="dialog"][aria-label="创建面试预约"]');
-    expect(dialog.textContent).toContain("自研数字人（推荐，低成本）");
-    expect(dialog.textContent).toContain("云数字人（实时视频，需配置服务）");
+    expect(dialog.textContent).toContain("自研实时 3D 数字人（正式路径）");
+    expect(dialog.textContent).toContain("云数字人 Provider（需单独验收）");
+    expect(dialog.textContent).toContain("不会退回静态图片");
     expect(dialog.querySelector('[name="avatar_mode"]').value).toBe("local");
     const start = dialog.querySelector('[name="scheduled_start_at"]');
     const end = dialog.querySelector('[name="scheduled_end_at"]');
@@ -131,6 +132,7 @@ describe("React workbench shell", () => {
     await act(async () => copy.click());
     expect(writeText).toHaveBeenCalledWith(`${window.location.origin}/#invite/token_123`);
     expect(appointmentBodies[0].settings.avatar_mode).toBe("local");
+    expect(appointmentBodies[0].settings.record_video).toBe(false);
     expect(copy.textContent).toBe("已复制");
     await act(async () => root.unmount());
   });
@@ -139,7 +141,18 @@ describe("React workbench shell", () => {
     window.history.replaceState(null, "", "#invite/token_confirm");
     const getUserMedia = vi.fn();
     Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: { getUserMedia } });
-    const invitation = { position_name: "后端工程师", status: "invited", scheduled_start_at: "2099-09-02T01:00:00.000Z", scheduled_end_at: "2099-09-02T02:00:00.000Z", consent: { version: "v1", privacy_notice: "隐私说明", recording_required: true } };
+    const invitation = {
+      position_name: "后端工程师",
+      status: "invited",
+      scheduled_start_at: "2099-09-02T01:00:00.000Z",
+      scheduled_end_at: "2099-09-02T02:00:00.000Z",
+      consent: {
+        version: "v1",
+        privacy_notice: "隐私说明",
+        audio_recording_notice: "我同意录制答题音频",
+        required_scopes: ["audio_recording"],
+      },
+    };
     const requests = [];
     globalThis.fetch = async (path, options = {}) => {
       const url = String(path);
@@ -154,10 +167,16 @@ describe("React workbench shell", () => {
     const setValue = (name, value) => { const input = form.querySelector(`[name="${name}"]`); input.value = value; input.dispatchEvent(new Event("input", { bubbles: true })); };
     setValue("name", "候选人甲"); setValue("email", "candidate@example.com"); setValue("phone", "13800138000");
     form.querySelector('[name="privacy_accepted"]').checked = true;
-    form.querySelector('[name="recording_accepted"]').checked = true;
+    form.querySelector('[name="audio_recording"]').checked = true;
     await act(async () => form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
     for (let attempt = 0; attempt < 30 && !host.textContent.includes("预约已确认"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
     expect(requests[0]).toMatchObject({ name: "候选人甲", email: "candidate@example.com", phone: "13800138000" });
+    expect(requests[0].consent).toEqual({
+      accepted: true,
+      version: "v1",
+      audio_recording: true,
+      video_recording: false,
+    });
     expect(host.textContent).toContain("身份核验通过");
     expect(host.textContent).toContain("面试开始前 30 分钟");
     expect(getUserMedia).not.toHaveBeenCalled();

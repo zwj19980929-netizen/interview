@@ -13,7 +13,19 @@ def private_file_storage() -> PrivateFileStorage:
     global _storage
     if _storage is not None:
         return _storage
-    backend = os.getenv("INTERVIEWER_FILE_STORAGE_BACKEND", "local").lower()
+    runtime = os.getenv("INTERVIEWER_RUNTIME_ENV", "development").strip().lower()
+    local_media = os.getenv("INTERVIEWER_LOCAL_MEDIA", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    # 单一开发开关明确选择本地私有存储，不再要求再配第二个后端参数。
+    backend = (
+        "local"
+        if local_media and runtime == "development"
+        else os.getenv("INTERVIEWER_FILE_STORAGE_BACKEND", "local").strip().lower()
+    )
     if backend == "local":
         _storage = LocalPrivateFileAdapter()
     elif backend in {"aliyun", "aliyun_oss", "oss"}:

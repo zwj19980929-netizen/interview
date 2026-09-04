@@ -24,6 +24,10 @@ def prompt_contract(name: str, context: Dict[str, Any]) -> PromptContract:
         return _question_generation(context)
     if name == "answer_evaluation":
         return _answer_evaluation(context)
+    if name == "interview_turn_understanding":
+        return _interview_turn_understanding(context)
+    if name == "controlled_followup":
+        return _controlled_followup(context)
     if name == "resume_review":
         return _resume_review(context)
     if name == "resume_evidence_map":
@@ -277,10 +281,145 @@ def _answer_evaluation(context: Dict[str, Any]) -> PromptContract:
                 "summary": {"type": "string", "minLength": 1},
                 "suggested_followup": {"type": ["string", "null"]},
             },
+            "additionalProperties": False,
         },
     )
 
 
+def _interview_turn_understanding(context: Dict[str, Any]) -> PromptContract:
+    """Fast semantic pass over authoritative transcript evidence only."""
+
+    user_prompt = (
+        "请理解这一轮结构化面试话语。只引用候选人原文中的连续片段作为证据，不推断敏感属性、"
+        "情绪、人格或诚信。\n题目：%s\n冻结能力点：%s\n候选人服务端最终转写：%s"
+        % (
+            context.get("question_text", ""),
+            json.dumps(context.get("capability_points") or [], ensure_ascii=False),
+            context.get("transcript", ""),
+        )
+    )
+    non_empty = {"type": "string", "minLength": 1, "maxLength": 600}
+    claim = {
+        "type": "object",
+        "required": ["claim", "evidence_quote"],
+        "properties": {
+            "claim": non_empty,
+            "evidence_quote": {"type": "string", "minLength": 1, "maxLength": 300},
+        },
+        "additionalProperties": False,
+    }
+    return PromptContract(
+        version="interview_turn_understanding.v1",
+        messages=[
+            ChatMessage(
+                role="system",
+                content=(
+                    "你是实时结构化面试理解器，只输出合同 JSON。不得评分、泄露标准答案、推断敏感属性，"
+                    "也不得把请求重读、暂停或尚未说完当作正式答案。"
+                ),
+            ),
+            ChatMessage(role="user", content=user_prompt),
+        ],
+        response_schema={
+            "type": "object",
+            "required": [
+                "intent", "answer_summary", "claims", "evidence_quotes",
+                "covered_capability_points", "missing_capability_points",
+                "ambiguities", "contradictions", "confidence", "suggested_action",
+            ],
+            "properties": {
+                "intent": {
+                    "type": "string",
+                    "enum": [
+                        "answer", "request_repeat", "not_finished", "pause",
+                        "clarification_request", "off_topic",
+                    ],
+                },
+                "answer_summary": {"type": "string", "maxLength": 800},
+                "claims": {"type": "array", "maxItems": 12, "items": claim},
+                "evidence_quotes": {
+                    "type": "array", "maxItems": 12,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 300},
+                },
+                "covered_capability_points": {
+                    "type": "array", "maxItems": 20,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 240},
+                },
+                "missing_capability_points": {
+                    "type": "array", "maxItems": 20,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 240},
+                },
+                "ambiguities": {
+                    "type": "array", "maxItems": 8,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 300},
+                },
+                "contradictions": {
+                    "type": "array", "maxItems": 8,
+                    "items": {"type": "string", "minLength": 1, "maxLength": 300},
+                },
+                "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "suggested_action": {
+                    "type": "string",
+                    "enum": ["accept", "clarify", "repeat", "continue_listening", "pause", "followup", "next"],
+                },
+            },
+            "additionalProperties": False,
+        },
+    )
+
+
+def _controlled_followup(context: Dict[str, Any]) -> PromptContract:
+    """Generate a candidate-specific probe without exposing a model answer."""
+
+    user_prompt = (
+        "基于候选人的原文证据生成一个短追问。追问只能验证冻结能力点，不能暗示正确答案，不能评价候选人，"
+        "不能询问年龄、性别、婚育、民族、健康、宗教、政治等敏感属性。\n"
+        "根问题：%s\n候选人摘要：%s\n可引用证据：%s\n目标能力点：%s\n允许难度：%s\n最大长度：%s"
+        % (
+            context.get("question_text", ""),
+            context.get("answer_summary", ""),
+            json.dumps(context.get("evidence_quotes") or [], ensure_ascii=False),
+            json.dumps(context.get("target_capability_points") or [], ensure_ascii=False),
+            context.get("difficulty", "mid"),
+            int(context.get("max_probe_chars", 180)),
+        )
+    )
+    bounded = {"type": "string", "minLength": 1, "maxLength": 240}
+    return PromptContract(
+        version="controlled_followup.v1",
+        messages=[
+            ChatMessage(
+                role="system",
+                content=(
+                    "你是受控结构化追问生成器。只输出合同 JSON；标准答案从未提供给你。"
+                    "任何越界、敏感属性、泄题或无法绑定证据的情况都必须返回 selected=false。"
+                ),
+            ),
+            ChatMessage(role="user", content=user_prompt),
+        ],
+        response_schema={
+            "type": "object",
+            "required": [
+                "selected", "question_text", "evidence_quote", "target_capability_points",
+                "rationale", "difficulty", "sensitive_attribute_inference", "leaks_answer",
+            ],
+            "properties": {
+                "selected": {"type": "boolean"},
+                "question_text": {"type": "string", "maxLength": int(context.get("max_probe_chars", 180))},
+                "evidence_quote": {"type": "string", "maxLength": 300},
+                "target_capability_points": {
+                    "type": "array", "maxItems": 2, "items": bounded,
+                },
+                "rationale": {"type": "string", "maxLength": 400},
+                "difficulty": {
+                    "type": "string", "enum": ["junior", "mid", "senior", "expert"],
+                },
+                "sensitive_attribute_inference": {"type": "boolean"},
+                "leaks_answer": {"type": "boolean"},
+            },
+            "additionalProperties": False,
+        },
+    )
 def _experience_question_schema() -> Dict[str, Any]:
     def bounded_string(max_length: int) -> Dict[str, Any]:
         return {"type": "string", "minLength": 1, "maxLength": max_length}

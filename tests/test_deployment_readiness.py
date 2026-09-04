@@ -2,6 +2,7 @@ import asyncio
 
 from fastapi.testclient import TestClient
 
+from app.adapters.livekit_media import LiveKitMediaPlane
 from app.core.readiness import deployment_readiness
 from app.main import create_app
 from app.repositories.memory import InMemoryStore
@@ -16,6 +17,29 @@ def test_development_readiness_uses_local_adapters(monkeypatch) -> None:
 
     assert result["ready"] is True
     assert result["runtime_environment"] == "development"
+
+
+def test_local_media_readiness_probes_egress_and_authoritative_ingress(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("INTERVIEWER_RUNTIME_ENV", "development")
+    monkeypatch.setenv("INTERVIEWER_LOCAL_MEDIA", "true")
+    monkeypatch.delenv("INTERVIEWER_REDIS_URL", raising=False)
+
+    async def ready(*args, **kwargs) -> bool:
+        return True
+
+    monkeypatch.setattr(LiveKitMediaPlane, "healthcheck", ready)
+    monkeypatch.setattr(
+        LiveKitMediaPlane, "authoritative_ingress_healthcheck", ready
+    )
+
+    result = asyncio.run(deployment_readiness(InMemoryStore()))
+    checks = {item["name"]: item["ready"] for item in result["checks"]}
+
+    assert result["ready"] is True
+    assert checks["livekit_media_and_egress"] is True
+    assert checks["livekit_authoritative_audio_ingress"] is True
 
 
 def test_production_readiness_reports_missing_dependencies_without_secrets(monkeypatch) -> None:

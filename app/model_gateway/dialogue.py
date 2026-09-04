@@ -45,7 +45,11 @@ class ValidatedSpeechDialogueStream:
         self.max_total_bytes = int(
             os.getenv("INTERVIEWER_DIALOGUE_STREAM_MAX_BYTES", "52428800")
         )
+        self.max_output_bytes = int(
+            os.getenv("INTERVIEWER_DIALOGUE_OUTPUT_MAX_BYTES", "20971520")
+        )
         self.byte_count = 0
+        self.output_byte_count = 0
         self._last_sequence = 0
         self._closed = False
         self.ready_events = self._validate(provider_stream.ready_events)
@@ -89,19 +93,14 @@ class ValidatedSpeechDialogueStream:
             )
         events: List[RealtimeSpeechDialogueEvent] = []
 
-        async def validate_and_emit(raw: RealtimeSpeechDialogueEvent) -> None:
+        async def validate_and_collect(raw: RealtimeSpeechDialogueEvent) -> None:
             validated = self._validate([raw])
             events.extend(validated)
-            if on_event:
-                await on_event(validated[0])
 
-        returned = await self._stream.commit(command, on_event=validate_and_emit)
+        returned = await self._stream.commit(command, on_event=validate_and_collect)
         if returned:
             validated = self._validate(returned)
             events.extend(validated)
-            if on_event:
-                for event in validated:
-                    await on_event(event)
         final_text = "".join(
             item.text for item in events if item.type == "output.transcript.final"
         ).strip()
@@ -119,6 +118,13 @@ class ValidatedSpeechDialogueStream:
             )
         if any(item.type == "dialogue.closed" for item in events):
             self._closed = True
+        # Provider audio is withheld until its final transcript has been
+        # checked against the exact ApprovedConversationAct.  This deliberately
+        # trades speculative playback for the guarantee that unapproved speech
+        # can never reach the candidate.
+        if on_event:
+            for event in events:
+                await on_event(event)
         return events
 
     async def interrupt(self) -> List[RealtimeSpeechDialogueEvent]:
@@ -159,6 +165,13 @@ class ValidatedSpeechDialogueStream:
                         "provider_schema_invalid",
                         "Speech dialogue audio delta is empty.",
                         retryable=True,
+                    )
+                self.output_byte_count += len(decoded)
+                if self.output_byte_count > self.max_output_bytes:
+                    raise ProviderError(
+                        "provider_output_audio_too_large",
+                        "Speech dialogue output audio exceeds the limit.",
+                        retryable=False,
                     )
             if event.type == "output.transcript.final" and (not event.is_final or not event.text.strip()):
                 raise ProviderError(

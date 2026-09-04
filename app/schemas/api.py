@@ -289,14 +289,26 @@ class InterviewControlCommand(BaseModel):
     reason: str = "manual"
 
 
-class AudioAnswerSubmit(BaseModel):
-    turn_id: Optional[str] = None
-    audio_uri: str = Field(min_length=1)
-    content_type: str = "audio/webm;codecs=opus"
-    language: str = "zh-CN"
-    duration_seconds: int = Field(default=0, ge=0)
-    development_transcript: Optional[str] = None
-    development_confidence: float = Field(default=0.9, ge=0.0, le=1.0)
+class CandidateRuntimeProblemReport(BaseModel):
+    """Narrow public fail-closed report; raw browser errors are not accepted."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: Literal[
+        "AVATAR_ASSET_UNAVAILABLE",
+        "AVATAR_MODEL_LOAD_FAILED",
+        "AVATAR_RENDERER_FAILED",
+        "CANDIDATE_RUNTIME_FAILED",
+    ]
+
+
+class TakeoverMediaPermitCreate(BaseModel):
+    """CAS-bound exchange for an active human takeover microphone grant."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    lease_id: str = Field(min_length=1, max_length=128)
+    expected_version: int = Field(ge=1)
 
 
 class InterviewAppointmentSettings(BaseModel):
@@ -345,9 +357,12 @@ class InterviewInvitationCreate(BaseModel):
 
 
 class CandidateConsentCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     accepted: bool
     version: str = Field(min_length=1)
-    recording_accepted: bool = False
+    audio_recording: Optional[bool] = None
+    video_recording: Optional[bool] = None
 
 
 class CandidateIntakeCreate(BaseModel):
@@ -358,9 +373,21 @@ class CandidateIntakeCreate(BaseModel):
 
 
 class CandidateReadinessCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     browser_supported: bool
     microphone_granted: bool
     audio_content_type: str = Field(min_length=1)
+    camera_granted: bool
+    speaker_verified: bool
+    webrtc_supported: bool
+    audio_worklet_supported: bool
+    webgl_supported: bool
+    media_recorder_supported: bool
+    network_rtt_ms: float = Field(ge=0, le=60_000)
+    network_jitter_ms: float = Field(ge=0, le=60_000)
+    avatar_fps: float = Field(ge=0, le=240)
+    video_content_type: Optional[str] = Field(default=None, min_length=1)
 
 
 class TranscriptCorrection(BaseModel):
@@ -395,20 +422,6 @@ class ScoreCalibrationRun(BaseModel):
 
     labels: List[ScoreCalibrationLabel] = Field(min_length=2, max_length=5000)
     dataset_version: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
-
-
-class AvatarSpeakCommand(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    turn_id: Optional[str] = None
-    language: str = "zh-CN"
-    voice: str = "default"
-
-
-class AvatarSessionClose(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    session_id: str = Field(min_length=1, max_length=256)
 
 
 class ProviderConnectionCreate(BaseModel):

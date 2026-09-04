@@ -193,14 +193,82 @@ async def get_file_ingestion_job(work_item_id: str) -> Dict[str, Any]:
     return services()["resume_ingestion"].get_job(work_item_id)
 
 
-@router.get("/api/v1/private-files/{token}", include_in_schema=False)
-async def get_private_file(token: str) -> Response:
+@router.api_route(
+    "/api/v1/private-files/{token}",
+    methods=["GET", "HEAD"],
+    include_in_schema=False,
+)
+async def get_private_file(token: str, request: Request) -> Response:
     opened = services()["resume_ingestion"].open_local_grant(token)
+    content = opened["content"]
+    total_bytes = len(content)
+    byte_range = _single_byte_range(request.headers.get("range"), total_bytes)
+    base_headers = {
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "private, no-store",
+    }
+    if byte_range is False:
+        return Response(
+            status_code=416,
+            headers={
+                **base_headers,
+                "Content-Range": "bytes */%d" % total_bytes,
+                "Content-Length": "0",
+            },
+        )
+    if byte_range is None:
+        return Response(
+            content=b"" if request.method == "HEAD" else content,
+            media_type=opened["content_type"],
+            headers={**base_headers, "Content-Length": str(total_bytes)},
+        )
+    start, end = byte_range
+    length = end - start + 1
     return Response(
-        content=opened["content"],
+        content=b"" if request.method == "HEAD" else content[start : end + 1],
+        status_code=206,
         media_type=opened["content_type"],
-        headers={"Cache-Control": "private, no-store"},
+        headers={
+            **base_headers,
+            "Content-Range": "bytes %d-%d/%d" % (start, end, total_bytes),
+            "Content-Length": str(length),
+        },
     )
+
+
+def _single_byte_range(value: Optional[str], total_bytes: int) -> Any:
+    """Parse one RFC byte range without exposing storage paths in failures."""
+
+    if value is None:
+        return None
+    raw = value.strip()
+    if raw[:6].lower() != "bytes=" or "," in raw or total_bytes < 1:
+        return False
+    specification = raw[6:]
+    if specification.count("-") != 1:
+        return False
+    first, last = specification.split("-", 1)
+    if not first:
+        if not last.isdigit() or len(last) > 20:
+            return False
+        suffix_length = int(last)
+        if suffix_length < 1:
+            return False
+        start = max(0, total_bytes - suffix_length)
+        return start, total_bytes - 1
+    if (
+        not first.isdigit()
+        or len(first) > 20
+        or (last and (not last.isdigit() or len(last) > 20))
+    ):
+        return False
+    start = int(first)
+    if start >= total_bytes:
+        return False
+    end = total_bytes - 1 if not last else min(int(last), total_bytes - 1)
+    if end < start:
+        return False
+    return start, end
 
 
 @router.post("/api/v1/question-speech-assets/{asset_id}/content-url")

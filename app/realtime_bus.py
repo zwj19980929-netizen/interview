@@ -10,6 +10,7 @@ RemoteEventHandler = Callable[[str, Dict[str, Any]], Awaitable[None]]
 
 class RealtimeEventBus(Protocol):
     enabled: bool
+    instance_id: str
 
     async def publish(self, interview_id: str, event: Dict[str, Any]) -> None: ...
 
@@ -20,6 +21,9 @@ class RealtimeEventBus(Protocol):
 
 class LocalEventBus:
     enabled = False
+
+    def __init__(self) -> None:
+        self.instance_id = new_id("instance")
 
     async def publish(self, interview_id: str, event: Dict[str, Any]) -> None:
         return None

@@ -12,6 +12,7 @@ from app.file_storage.provider import reset_private_file_storage_for_tests
 from app.main import create_app
 from app.persistence.provider import persistence_for
 from app.repositories.provider import reset_store_for_tests
+from app.services.interviews import InterviewService
 from app.workers.outbox import OutboxWorker
 from app.repositories.provider import get_store
 
@@ -43,6 +44,7 @@ def _pdf(text: str) -> bytes:
 
 
 def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("INTERVIEWER_LOCAL_MEDIA", "true")
     monkeypatch.setenv("INTERVIEWER_PRIVATE_FILE_ROOT", str(tmp_path / "private"))
     monkeypatch.setenv("INTERVIEWER_FILE_QUARANTINE_ROOT", str(tmp_path / "quarantine"))
     reset_private_file_storage_for_tests()
@@ -289,7 +291,7 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
             "name": "张三",
             "email": "zhangsan@example.com",
             "phone": "13800138000",
-            "consent": {"accepted": False, "version": "v1", "recording_accepted": False},
+            "consent": {"accepted": False, "version": "v1", "audio_recording": False},
         },
     )
     assert rejected_consent.status_code == 409
@@ -303,7 +305,7 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
             "name": "张三",
             "email": "zhangsan@example.com",
             "phone": "13800138000",
-            "consent": {"accepted": True, "version": "outdated", "recording_accepted": True},
+            "consent": {"accepted": True, "version": "outdated", "audio_recording": True},
         },
     )
     assert wrong_consent_version.status_code == 409
@@ -315,11 +317,11 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
             "name": "张三",
             "email": "zhangsan@example.com",
             "phone": "13800138000",
-            "consent": {"accepted": True, "version": "v1", "recording_accepted": False},
+            "consent": {"accepted": True, "version": "v1", "audio_recording": False},
         },
     )
     assert rejected_recording.status_code == 409
-    assert rejected_recording.json()["error"]["code"] == "RECORDING_CONSENT_REQUIRED"
+    assert rejected_recording.json()["error"]["code"] == "AUDIO_RECORDING_CONSENT_REQUIRED"
 
     wrong = api.post(
         f"/api/v1/public/interview-invitations/{token}/intake",
@@ -327,7 +329,7 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
             "name": "张三",
             "email": "wrong@example.com",
             "phone": "10000000000",
-            "consent": {"accepted": True, "version": "v1", "recording_accepted": True},
+            "consent": {"accepted": True, "version": "v1", "audio_recording": True},
         },
     )
     assert wrong.status_code == 403
@@ -337,7 +339,7 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
             "name": "张三",
             "email": "zhangsan@example.com",
             "phone": "13800138000",
-            "consent": {"accepted": True, "version": "v1", "recording_accepted": True},
+            "consent": {"accepted": True, "version": "v1", "audio_recording": True},
         },
     )
     assert registered.status_code == 200, registered.text
@@ -365,6 +367,15 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
         json={
             "browser_supported": True,
             "microphone_granted": True,
+            "camera_granted": True,
+            "speaker_verified": True,
+            "webrtc_supported": True,
+            "audio_worklet_supported": True,
+            "webgl_supported": True,
+            "media_recorder_supported": True,
+            "network_rtt_ms": 20,
+            "network_jitter_ms": 3,
+            "avatar_fps": 60,
             "audio_content_type": "audio/webm;codecs=opus",
         },
     )
@@ -398,6 +409,15 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
         json={
             "browser_supported": True,
             "microphone_granted": True,
+            "camera_granted": True,
+            "speaker_verified": True,
+            "webrtc_supported": True,
+            "audio_worklet_supported": True,
+            "webgl_supported": True,
+            "media_recorder_supported": True,
+            "network_rtt_ms": 20,
+            "network_jitter_ms": 3,
+            "avatar_fps": 60,
             "audio_content_type": "audio/webm;codecs=opus",
         },
     )
@@ -420,7 +440,7 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
     assert started.json()["status"] == "in_progress"
     session = api.get(f"/api/v1/interviews/{interview_id}").json()
     assert session["candidate"]["privacy_accepted"] is True
-    assert session["candidate"]["recording_accepted"] is True
+    assert session["candidate"]["audio_recording_accepted"] is True
     assert session["candidate"]["consent_notice_hash"]
     assert session["turns"][0]["question_id"] == question_ids[1]
     assert len(session["question_selections"]) == 1
@@ -433,18 +453,19 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
         session = api.get(f"/api/v1/interviews/{interview_id}").json()
         turn = next(item for item in session["turns"] if item["id"] == session["current_turn_id"])
         assert turn["phase"] == expected_phase
-        answer = api.post(
-            f"/api/v1/interviews/{interview_id}/audio-answers",
-            json={
+        answer = asyncio.run(
+            InterviewService(get_store()).submit_audio_answer(
+                interview_id,
+                {
                 "turn_id": turn["id"],
                 "audio_uri": f"/media/{interview_id}/{turn['id']}.webm",
                 "development_transcript": turn["question_snapshot"]["standard_answer"],
                 "duration_seconds": 10,
-            },
+                },
+            )
         )
-        assert answer.status_code == 200, answer.text
-        assert answer.json()["answer"]["transcript_source"] == "server_batch"
-        assert answer.json()["evaluation"]["status"] == "pending"
+        assert answer["answer"]["transcript_source"] == "server_batch"
+        assert answer["evaluation"]["status"] == "pending"
         asyncio.run(OutboxWorker(get_store()).run_once())
         after_root = api.get(f"/api/v1/interviews/{interview_id}").json()
         if after_root.get("current_turn_id"):
@@ -453,16 +474,18 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
                 if item["id"] == after_root["current_turn_id"]
             )
             if followup.get("is_followup"):
-                followup_answer = api.post(
-                    f"/api/v1/interviews/{interview_id}/audio-answers",
-                    json={
+                followup_answer = asyncio.run(
+                    InterviewService(get_store()).submit_audio_answer(
+                        interview_id,
+                        {
                         "turn_id": followup["id"],
                         "audio_uri": f"/media/{interview_id}/{followup['id']}.webm",
                         "development_transcript": followup["question_snapshot"]["standard_answer"],
                         "duration_seconds": 8,
-                    },
+                        },
+                    )
                 )
-                assert followup_answer.status_code == 200, followup_answer.text
+                assert followup_answer["answer"]["turn_id"] == followup["id"]
                 asyncio.run(OutboxWorker(get_store()).run_once())
 
     report = api.get(f"/api/v1/interviews/{interview_id}/report")
@@ -529,7 +552,7 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
             "name": "张三",
             "email": "zhangsan@example.com",
             "phone": "13800138000",
-            "consent": {"accepted": True, "version": "v1", "recording_accepted": False},
+            "consent": {"accepted": True, "version": "v1", "audio_recording": False},
         },
     )
     assert no_recording_intake.status_code == 200, no_recording_intake.text

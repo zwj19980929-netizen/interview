@@ -1,0 +1,21 @@
+{
+  "schema": "interviewer-vrm-license.v1",
+  "asset": "interviewer.vrm",
+  "asset_sha256": "31618ee757bca4cf33a65f5baf1a107845e267214b7687401669dc5500f32e9f",
+  "vrm_spec": "1.0",
+  "name": "面试官",
+  "version": "1.0",
+  "authors": [
+    "张文君"
+  ],
+  "rights_holder": "张文君",
+  "copyright": "© 2026 张文君",
+  "license_id": "self-authored-interviewer-vrm-2026-v1",
+  "commercial_use": true,
+  "commercial_use_scope": "personalProfit",
+  "likeness_use_authorized": true,
+  "avatar_permission": "onlySeparatelyLicensedPerson",
+  "credit_required": true,
+  "modification_allowed": false,
+  "license_source": "embedded_vrm_meta_and_rights_holder_confirmation"
+}

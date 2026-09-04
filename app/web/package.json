@@ -10,8 +10,11 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@pixiv/three-vrm": "3.4.4",
+    "livekit-client": "2.15.15",
     "react": "19.1.1",
-    "react-dom": "19.1.1"
+    "react-dom": "19.1.1",
+    "three": "0.180.0"
   },
   "devDependencies": {
     "@vitejs/plugin-react": "4.7.0",

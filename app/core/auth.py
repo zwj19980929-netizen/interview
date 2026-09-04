@@ -98,7 +98,7 @@ def authenticate_request(request: Request) -> Union[Principal, Response]:
     principal = _principal_for_token(supplied)
     if principal is None:
         return _auth_error("AUTHENTICATION_INVALID", "Bearer token is invalid.", 401)
-    if principal.organization_id != configured_org or configured_org != "org_default":
+    if principal.organization_id != configured_org:
         return _auth_error(
             "ORGANIZATION_SCOPE_UNAVAILABLE",
             "This deployment is not configured for the token organization.",

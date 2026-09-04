@@ -15,6 +15,7 @@ from app.providers.openai_compatible.provider import OpenAICompatibleProvider
 from app.providers.dashscope.provider import DashScopeProvider
 from app.providers.deepseek.provider import DeepSeekProvider
 from app.providers.zhipuai.provider import ZhipuAIProvider
+from app.providers.volcengine.provider import VolcengineProvider
 
 
 def test_provider_catalog_loads_provider_json_manifests() -> None:
@@ -28,6 +29,7 @@ def test_provider_catalog_loads_provider_json_manifests() -> None:
     assert "dashscope" in provider_ids
     assert "azure_speech" in provider_ids
     assert "tencent_cloud_speech" in provider_ids
+    assert "volcengine" in provider_ids
     assert provider_exists("mock")
     assert not provider_exists("missing_provider")
 
@@ -69,6 +71,7 @@ def test_provider_registry_loads_runtime_adapters_from_manifest_entrypoints() ->
     assert isinstance(registry.adapter("deepseek", cap.LLM_CHAT_JSON), DeepSeekProvider)
     assert isinstance(registry.adapter("zhipuai", cap.LLM_CHAT_TEXT), ZhipuAIProvider)
     assert isinstance(registry.adapter("zhipuai", cap.TTS_SYNTHESIZE), ZhipuAIProvider)
+    assert isinstance(registry.adapter("volcengine", cap.STT_STREAMING), VolcengineProvider)
 
 
 def test_provider_manifest_validation_rejects_empty_predefined_catalog(tmp_path) -> None:

@@ -15,6 +15,8 @@ Predicate = Callable[[Document], bool]
 
 
 class TransactionBackend(Protocol):
+    def database_now(self) -> datetime: ...
+
     def get_document(self, collection: str, item_id: str) -> Optional[Document]: ...
 
     def list_documents(self, collection: str) -> List[Document]: ...
@@ -387,6 +389,8 @@ class ModelInvocationRepository:
 
 class PersistenceTransaction:
     def __init__(self, backend: TransactionBackend, organization_id: str) -> None:
+        self._backend = backend
+        self.organization_id = organization_id
         self.job_positions = VersionedDocumentRepository(
             backend, organization_id, collection="job_positions", entity_name="JobPosition"
         )
@@ -442,6 +446,42 @@ class PersistenceTransaction:
         self.interview_sessions = VersionedDocumentRepository(
             backend, organization_id, collection="interviews", entity_name="InterviewSession"
         )
+        self.interview_media_captures = VersionedDocumentRepository(
+            backend,
+            organization_id,
+            collection="interview_media_captures",
+            entity_name="InterviewMediaCapture",
+        )
+        self.agent_tickets = VersionedDocumentRepository(
+            backend,
+            organization_id,
+            collection="agent_tickets",
+            entity_name="AgentTicket",
+        )
+        self.evidence_ownerships = VersionedDocumentRepository(
+            backend,
+            organization_id,
+            collection="evidence_ownerships",
+            entity_name="EvidenceOwnership",
+        )
+        self.evidence_commands = VersionedDocumentRepository(
+            backend,
+            organization_id,
+            collection="evidence_commands",
+            entity_name="EvidenceCommand",
+        )
+        self.evidence_media_streams = VersionedDocumentRepository(
+            backend,
+            organization_id,
+            collection="evidence_media_streams",
+            entity_name="EvidenceMediaStream",
+        )
+        self.evidence_media_segments = VersionedDocumentRepository(
+            backend,
+            organization_id,
+            collection="evidence_media_segments",
+            entity_name="EvidenceMediaSegment",
+        )
         self.provider_connections = VersionedDocumentRepository(
             backend, organization_id, collection="provider_connections", entity_name="ProviderConnection"
         )
@@ -457,6 +497,14 @@ class PersistenceTransaction:
         self.outbox = OutboxRepository(backend, organization_id)
         self.provider_secrets = ProviderSecretRepository(backend, organization_id)
         self.model_invocations = ModelInvocationRepository(backend, organization_id)
+
+    def database_now(self) -> datetime:
+        """Return the transaction database clock used by distributed leases."""
+
+        value = self._backend.database_now()
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
 
 
 class Persistence(Protocol):

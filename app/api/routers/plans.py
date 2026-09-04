@@ -4,11 +4,9 @@ from fastapi import APIRouter, Header
 from fastapi.responses import JSONResponse
 
 from app.schemas.api import (
-    AudioAnswerSubmit,
-    AvatarSessionClose,
-    AvatarSpeakCommand,
     CandidateIntakeCreate,
     CandidateReadinessCreate,
+    CandidateRuntimeProblemReport,
     InterviewAppointmentCreate,
     InterviewAppointmentPatch,
     InterviewInvitationCreate,
@@ -17,12 +15,8 @@ from app.schemas.api import (
     RoleRequirementCreate,
 )
 from app.services.plan_assembly import PlanAssemblyPolicy, PlanAssemblyRequest
-from app.transport.http.fields.public_interview import (
-    PUBLIC_AUDIO_ANSWER_FIELDS,
-    PUBLIC_INTERVIEW_FIELDS,
-)
+from app.transport.http.fields.public_interview import PUBLIC_INTERVIEW_FIELDS
 from app.transport.http.responses import ApiJSONResponse, api_response, collection_response
-from app.transport.realtime import broadcast_answer_result
 from app.transport.service_locator import services
 
 
@@ -131,7 +125,9 @@ async def get_public_interview_invitation(token: str) -> Dict[str, Any]:
 
 @router.post("/api/v1/public/interview-invitations/{token}/intake")
 async def submit_candidate_intake(token: str, payload: CandidateIntakeCreate) -> Dict[str, Any]:
-    return services()["appointments"].intake(token, payload.model_dump())
+    return services()["appointments"].intake(
+        token, payload.model_dump(exclude_unset=True)
+    )
 
 
 @router.post("/api/v1/public/interview-invitations/{token}/readiness")
@@ -141,7 +137,7 @@ async def get_candidate_readiness(
 ) -> Dict[str, Any]:
     return services()["appointments"].readiness(
         token,
-        payload.model_dump() if payload is not None else None,
+        payload.model_dump(exclude_unset=True) if payload is not None else None,
     )
 
 
@@ -159,40 +155,33 @@ async def get_public_candidate_interview(
     return api_response(result, fields=PUBLIC_INTERVIEW_FIELDS)
 
 
-@router.post("/api/v1/public/interviews/{interview_id}/audio-answers")
-async def submit_public_candidate_audio_answer(
+@router.post("/api/v1/public/interviews/{interview_id}/agent-ticket")
+async def issue_public_candidate_agent_ticket(
     interview_id: str,
-    payload: AudioAnswerSubmit,
     x_candidate_session_token: str = Header(alias="X-Candidate-Session-Token"),
-) -> JSONResponse:
-    result = await services()["interviews"].submit_candidate_audio_answer(
+) -> Dict[str, Any]:
+    return services()["agent_tickets"].issue_candidate(
+        interview_id, x_candidate_session_token
+    )
+
+
+@router.post("/api/v1/public/interviews/{interview_id}/runtime-problems")
+async def report_public_candidate_runtime_problem(
+    interview_id: str,
+    payload: CandidateRuntimeProblemReport,
+    x_candidate_session_token: str = Header(alias="X-Candidate-Session-Token"),
+) -> Dict[str, Any]:
+    result = services()["interviews"].report_candidate_runtime_problem(
         interview_id,
         x_candidate_session_token,
-        payload.model_dump(),
+        payload.code,
     )
-    await broadcast_answer_result(interview_id, result)
-    return api_response(result, fields=PUBLIC_AUDIO_ANSWER_FIELDS)
-
-
-@router.post("/api/v1/public/interviews/{interview_id}/avatar/speak")
-async def speak_public_candidate_question(
-    interview_id: str,
-    payload: AvatarSpeakCommand,
-    x_candidate_session_token: str = Header(alias="X-Candidate-Session-Token"),
-) -> Dict[str, Any]:
-    services()["interviews"].validate_candidate_token(interview_id, x_candidate_session_token)
-    return await services()["avatar"].speak(
-        interview_id,
-        payload.model_dump(),
-        actor_id="candidate_session:%s" % interview_id,
-    )
-
-
-@router.post("/api/v1/public/interviews/{interview_id}/avatar/session/close")
-async def close_public_candidate_avatar_session(
-    interview_id: str,
-    payload: AvatarSessionClose,
-    x_candidate_session_token: str = Header(alias="X-Candidate-Session-Token"),
-) -> Dict[str, Any]:
-    services()["interviews"].validate_candidate_token(interview_id, x_candidate_session_token)
-    return await services()["avatar"].close(interview_id, payload.session_id)
+    try:
+        await services()["agent_runtime"].publish_snapshot(interview_id)
+        result["snapshot_broadcasted"] = True
+    except Exception:
+        # The lifecycle pause was already committed. A transient event-bus
+        # failure must not turn a confirmed fail-closed result into a false
+        # negative for the candidate; reconnect reads the persisted snapshot.
+        result["snapshot_broadcasted"] = False
+    return result

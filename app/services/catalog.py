@@ -192,7 +192,11 @@ class CatalogService:
             candidate_ids = self._candidate_ids_for_position(transaction, position_id)
         retention = self.retention or RetentionService(self.store, persistence=self.persistence)
         for candidate_id in candidate_ids:
-            retention.purge_candidate(candidate_id, organization_id)
+            retention.purge_candidate(
+                candidate_id,
+                organization_id,
+                actor_id=actor_id,
+            )
         with self.persistence.transaction(organization_id) as transaction:
             position = transaction.job_positions.get(position_id)
             position["status"] = "archived"
@@ -1175,6 +1179,10 @@ class CatalogService:
                     "audio_format": response.content_type,
                     "speaking_rate": float((profile or {}).get("speaking_rate", 1.0)),
                     "duration_ms": response.duration_ms,
+                    "visemes": [
+                        cue.model_dump(mode="json") for cue in response.visemes
+                    ],
+                    "viseme_alignment_source": response.alignment_source,
                     "content_hash": private_file.checksum if private_file else response.content_hash,
                     "provider": response.provider.model_dump(),
                     "status": "ready",

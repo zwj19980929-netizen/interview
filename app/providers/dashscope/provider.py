@@ -38,7 +38,31 @@ class DashScopeProvider(OpenAICompatibleProvider):
     async def invoke(self, capability: str, request: Any, context: ProviderContext) -> Any:
         if capability == cap.STT_BATCH and isinstance(request, BatchSTTRequest):
             return await self._transcribe_batch(request, context)
+        if (
+            capability in {cap.LLM_CHAT_JSON, cap.LLM_CHAT_TEXT}
+            and context.purpose
+            in {"interview_turn_understanding", "controlled_followup"}
+            and context.model.lower().startswith("qwen")
+            and "enable_thinking" not in context.config
+        ):
+            # 实时轮转优先确定性低延迟。Qwen 混合思考模型若使用默认深度
+            # 思考，短 JSON 合同也可能超过 30 秒；管理员显式配置时仍尊重其值。
+            context = context.model_copy(
+                update={
+                    "model_settings": {
+                        **context.model_settings,
+                        "enable_thinking": False,
+                    }
+                }
+            )
         return await super().invoke(capability, request, context)
+
+    def _chat_request_options(
+        self, config: Dict[str, Any], model: str
+    ) -> Dict[str, Any]:
+        if model.lower().startswith("qwen") and "enable_thinking" in config:
+            return {"enable_thinking": bool(config["enable_thinking"])}
+        return {}
 
     async def open_stream(self, request: StreamingSTTRequest, context: ProviderContext) -> Any:
         if context.capability != cap.STT_STREAMING:
@@ -273,6 +297,34 @@ class DashScopeSTTStream:
         self.partial_text = ""
         self.request_id = ""
         self.ready_events = [self._event("stream.ready")]
+        # 厂商下行事件必须由独立任务持续接收。候选人上行每 20ms 一帧，
+        # 不能在 send_audio 中为每一帧等待 WebSocket 下行，否则会把
+        # LiveKit 的两秒证据缓冲耗尽并触发失败关闭。
+        self._reader_queue: asyncio.Queue = asyncio.Queue(maxsize=512)
+        self._reader_task: Optional[asyncio.Task] = None
+        self._reader_error: Optional[Exception] = None
+        self._task_finished = False
+        # WebSocket send 可能偶发阻塞几十毫秒。用独立发送任务承接 PCM，
+        # 并用“最多两秒原始音频字节”限制内存；LiveKit 收帧路径只入队。
+        self._sender_queue: asyncio.Queue = asyncio.Queue()
+        self._sender_task: Optional[asyncio.Task] = None
+        self._sender_error: Optional[Exception] = None
+        self._pending_audio_bytes = 0
+        backpressure_seconds = max(
+            0.25,
+            float(context.config.get("stream_send_backpressure_seconds", 2.0)),
+        )
+        self._max_pending_audio_bytes = max(
+            1024,
+            int(
+                request.audio.sample_rate_hz
+                * request.audio.channels
+                * 2
+                * backpressure_seconds
+            ),
+        )
+        self._sender_drained = asyncio.Event()
+        self._sender_drained.set()
 
     @classmethod
     async def open(cls, provider: DashScopeProvider, request: StreamingSTTRequest, context: ProviderContext) -> "DashScopeSTTStream":
@@ -319,62 +371,192 @@ class DashScopeSTTStream:
         if first != "task-started":
             await stream.abort()
             raise ProviderError("provider_stream_open_failed", "DashScope ASR did not acknowledge task start.", retryable=True)
+        stream._reader_task = asyncio.create_task(stream._read_vendor_events())
+        stream._sender_task = asyncio.create_task(stream._send_audio_frames())
         return stream
 
     async def send_audio(self, chunk: bytes) -> List[StreamingSTTEvent]:
         if self.closed:
             raise ProviderError("provider_stream_closed", "DashScope ASR stream is already closed.", retryable=False)
-        await self.socket.send(chunk)
-        return await self._drain(timeout=0.001)
+        self._raise_reader_error()
+        self._raise_sender_error()
+        pending = self._pending_audio_bytes + len(chunk)
+        if pending > self._max_pending_audio_bytes:
+            raise ProviderError(
+                "provider_backpressure_exceeded",
+                "DashScope ASR audio send backlog exceeded the two-second safety budget.",
+                retryable=True,
+            )
+        self._pending_audio_bytes = pending
+        self._sender_drained.clear()
+        self._sender_queue.put_nowait(chunk)
+        # 不在持有 Evidence 锁的收帧路径中主动等待调度或网络；后台发送、
+        # 接收任务会在下一次事件循环机会运行，partial 由后续帧或 finish 排出。
+        self._raise_sender_error()
+        events = self._drain_available()
+        if self._task_finished:
+            raise ProviderError("provider_stream_closed", "DashScope ASR stream ended before finish was requested.", retryable=True)
+        return events
 
     async def finish(self) -> List[StreamingSTTEvent]:
         if self.closed:
             return []
-        await self.socket.send(json.dumps({
-            "header": {"action": "finish-task", "task_id": self.task_id, "streaming": "duplex"},
-            "payload": {"input": {}},
-        }))
-        deadline = asyncio.get_running_loop().time() + max(1, float(self.context.timeout_s))
-        events: List[StreamingSTTEvent] = []
-        while asyncio.get_running_loop().time() < deadline:
-            vendor_event = await self._receive_one(timeout=max(0.01, deadline - asyncio.get_running_loop().time()))
-            if vendor_event == "task-finished":
-                break
-            events.extend(self._project_result())
-        else:
+        try:
+            self._raise_reader_error()
+            self._raise_sender_error()
+            try:
+                await asyncio.wait_for(
+                    self._sender_drained.wait(),
+                    timeout=max(1, float(self.context.timeout_s)),
+                )
+            except asyncio.TimeoutError as exc:
+                raise ProviderError(
+                    "provider_timeout",
+                    "DashScope ASR audio send backlog did not drain before finish.",
+                    retryable=True,
+                ) from exc
+            self._raise_sender_error()
+            await self.socket.send(json.dumps({
+                "header": {"action": "finish-task", "task_id": self.task_id, "streaming": "duplex"},
+                "payload": {"input": {}},
+            }))
+            deadline = asyncio.get_running_loop().time() + max(1, float(self.context.timeout_s))
+            events = self._drain_available()
+            while not self._task_finished:
+                remaining = deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    raise ProviderError("provider_timeout", "DashScope ASR final transcript timed out.", retryable=True)
+                try:
+                    item = await asyncio.wait_for(self._reader_queue.get(), timeout=remaining)
+                except asyncio.TimeoutError as exc:
+                    raise ProviderError("provider_timeout", "DashScope ASR final transcript timed out.", retryable=True) from exc
+                events.extend(self._consume_reader_item(item))
+            self._raise_reader_error()
+            text = "".join(item.text for item in self.committed).strip() or self.partial_text.strip()
+            if not text:
+                raise ProviderError("provider_final_transcript_missing", "DashScope ASR returned no final transcript.", retryable=True)
+            events.append(self._event("transcript.final", text=text, is_final=True, segments=self.committed or [TranscriptSegment(text=text)]))
+            events.append(self._event("stream.closed"))
+            self.closed = True
+            await self._stop_sender()
+            await self._stop_reader()
+            await self.socket.close()
+            return events
+        except Exception:
             await self.abort()
-            raise ProviderError("provider_timeout", "DashScope ASR final transcript timed out.", retryable=True)
-        text = "".join(item.text for item in self.committed).strip() or self.partial_text.strip()
-        if not text:
-            await self.abort()
-            raise ProviderError("provider_final_transcript_missing", "DashScope ASR returned no final transcript.", retryable=True)
-        events.append(self._event("transcript.final", text=text, is_final=True, segments=self.committed or [TranscriptSegment(text=text)]))
-        events.append(self._event("stream.closed"))
-        self.closed = True
-        await self.socket.close()
-        return events
+            raise
 
     async def abort(self) -> None:
         if not self.closed:
             self.closed = True
+            await self._stop_sender()
+            await self._stop_reader()
             await self.socket.close()
 
-    async def _drain(self, timeout: float) -> List[StreamingSTTEvent]:
+    async def _send_audio_frames(self) -> None:
+        try:
+            while not self.closed:
+                chunk = await self._sender_queue.get()
+                try:
+                    await self.socket.send(chunk)
+                finally:
+                    self._pending_audio_bytes = max(
+                        0, self._pending_audio_bytes - len(chunk)
+                    )
+                    self._sender_queue.task_done()
+                    if self._pending_audio_bytes == 0:
+                        self._sender_drained.set()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._sender_error = exc
+            self._sender_drained.set()
+
+    async def _read_vendor_events(self) -> None:
+        try:
+            while not self.closed:
+                vendor_event = await self._receive_one(timeout=None)
+                if vendor_event == "result-generated":
+                    projected = self._project_result()
+                    # heartbeat 或禁用 partial 时没有可见事件，无需占用有界队列。
+                    if projected:
+                        await self._reader_queue.put((vendor_event, projected))
+                elif vendor_event == "task-finished":
+                    await self._reader_queue.put((vendor_event, []))
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._reader_error = exc
+            try:
+                self._reader_queue.put_nowait(("reader-error", []))
+            except asyncio.QueueFull:
+                # 消费方还会在下一次 send/finish 前直接读取 _reader_error。
+                pass
+
+    async def _stop_reader(self) -> None:
+        task = self._reader_task
+        self._reader_task = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _stop_sender(self) -> None:
+        task = self._sender_task
+        self._sender_task = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    def _drain_available(self) -> List[StreamingSTTEvent]:
         events: List[StreamingSTTEvent] = []
         while True:
             try:
-                vendor_event = await self._receive_one(timeout=timeout)
-            except asyncio.TimeoutError:
+                item = self._reader_queue.get_nowait()
+            except asyncio.QueueEmpty:
                 break
-            if vendor_event == "result-generated":
-                events.extend(self._project_result())
-            elif vendor_event == "task-finished":
-                break
-            timeout = 0.001
+            events.extend(self._consume_reader_item(item))
         return events
 
-    async def _receive_one(self, timeout: float) -> str:
-        raw = await asyncio.wait_for(self.socket.recv(), timeout=timeout)
+    def _consume_reader_item(self, item: Any) -> List[StreamingSTTEvent]:
+        vendor_event, projected = item
+        if vendor_event == "reader-error":
+            self._raise_reader_error()
+        if vendor_event == "task-finished":
+            self._task_finished = True
+        return projected
+
+    def _raise_reader_error(self) -> None:
+        if self._reader_error is None:
+            return
+        error = self._reader_error
+        if isinstance(error, ProviderError):
+            raise error
+        raise ProviderError("provider_stream_failed", "DashScope ASR WebSocket receive failed.", retryable=True) from error
+
+    def _raise_sender_error(self) -> None:
+        if self._sender_error is None:
+            return
+        error = self._sender_error
+        if isinstance(error, ProviderError):
+            raise error
+        raise ProviderError("provider_stream_failed", "DashScope ASR WebSocket send failed.", retryable=True) from error
+
+    async def _receive_one(self, timeout: Optional[float]) -> str:
+        if timeout is None:
+            raw = await self.socket.recv()
+        else:
+            raw = await asyncio.wait_for(self.socket.recv(), timeout=timeout)
         try:
             payload = json.loads(raw)
         except (TypeError, json.JSONDecodeError) as exc:

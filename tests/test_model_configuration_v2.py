@@ -70,6 +70,37 @@ def test_dashscope_manifest_keeps_qwen_plus_and_recommends_current_llms() -> Non
         assert structured_output["default"] == "prompt"
 
 
+def test_volcengine_manifest_exposes_separate_ark_and_speech_domains() -> None:
+    manifest = get_provider_manifest("volcengine")
+
+    assert manifest["implemented"] is True
+    assert {field["name"] for field in manifest["credential_form"]["fields"]} == {
+        "ark_api_key",
+        "speech_api_key",
+    }
+    assert set(manifest["capabilities"]) == {
+        "llm.chat_json",
+        "llm.chat_text",
+        "embedding.text",
+        "stt.streaming",
+        "stt.batch",
+        "tts.synthesize",
+        "speech.dialogue_realtime",
+    }
+    defaults = {
+        model["model_type"]: model["model_id"]
+        for model in manifest["models"]
+        if model.get("default") is True
+    }
+    assert defaults == {
+        "llm": "doubao-seed-2-1-pro-260628",
+        "embedding": "doubao-embedding-text-240715",
+        "stt": "doubao-seed-asr-2.0",
+        "tts": "doubao-seed-tts-2.0",
+        "realtime_speech": "1.2.6.1",
+    }
+
+
 def test_dynamic_form_validation_rejects_unknown_and_invalid_values() -> None:
     schema = {
         "fields": [

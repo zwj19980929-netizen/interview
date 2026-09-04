@@ -64,45 +64,6 @@ def test_router_and_http_modules_preserve_auth_and_role_interfaces() -> None:
     )
 
 
-def test_candidate_runtime_replays_complete_local_audio_after_disconnect() -> None:
-    runtime = _data_module(ROOT / "app/web/candidate/runtime.js")
-    run_node(
-        f"""
-        import assert from 'node:assert/strict';
-        import {{ createCandidateInterviewRuntime }} from {runtime!r};
-        globalThis.window = {{ setTimeout, clearTimeout }};
-        globalThis.WebSocket = {{ OPEN: 1 }};
-        globalThis.MediaStream = class {{ constructor(tracks) {{ this.tracks = tracks; }} }};
-        class Recorder {{
-          static last;
-          static isTypeSupported() {{ return true; }}
-          constructor() {{ this.mimeType = 'audio/webm;codecs=opus'; this.state = 'inactive'; this.listeners = {{}}; Recorder.last = this; }}
-          addEventListener(type, fn) {{ this.listeners[type] = fn; }}
-          start() {{ this.state = 'recording'; }}
-          stop() {{ this.state = 'inactive'; this.listeners.stop(); }}
-          emit(blob) {{ this.listeners.dataavailable({{ data: blob }}); }}
-        }}
-        globalThis.MediaRecorder = Recorder;
-        const phases = [];
-        const firstSocket = {{ readyState: 1, sent: [], send(value) {{ this.sent.push(value); }} }};
-        const candidate = createCandidateInterviewRuntime({{ onStateChange: state => phases.push(state.phase), stopAckTimeoutMs: 100000 }});
-        candidate.start({{ mediaStream: {{ getAudioTracks: () => [{{}}] }}, candidateSocket: firstSocket, activeTurnId: 'turn_1' }});
-        Recorder.last.emit(new Blob(['complete-audio']));
-        firstSocket.readyState = 3;
-        candidate.stop();
-        assert.equal(candidate.getSnapshot().phase, 'recoverable');
-        const recoveredSocket = {{ readyState: 1, sent: [], send(value) {{ this.sent.push(value); }} }};
-        await candidate.recover(recoveredSocket);
-        assert.equal(candidate.getSnapshot().phase, 'awaiting_server');
-        assert.equal(typeof recoveredSocket.sent[0], 'string');
-        assert.ok(recoveredSocket.sent[1] instanceof ArrayBuffer);
-        assert.equal(typeof recoveredSocket.sent[2], 'string');
-        candidate.acknowledgeMediaStored();
-        assert.equal(candidate.getSnapshot().phase, 'stored');
-        """
-    )
-
-
 def test_workspace_query_uses_fixed_route_level_requests_without_catalog_n_plus_one() -> None:
     workspace = _data_module(ROOT / "app/web/core/workspace.js")
     run_node(
@@ -163,7 +124,40 @@ def test_react_entrypoint_and_bundles_are_served_by_fastapi() -> None:
         response = api.get(path)
         assert response.status_code == 200, path
     assert api.get("/web/vendor/lucide.min.js").status_code == 200
-    assert api.get("/web/assets/digital-interviewer.png").status_code == 200
+    assert api.get("/web/assets/digital-interviewer.png").status_code == 404
+    assert not (ROOT / "app/web/candidate/runtime.js").exists()
+    assert not (ROOT / "app/transport/realtime.py").exists()
+
+
+def test_formal_interview_pages_use_unified_agent_without_static_avatar_fallback() -> None:
+    candidate_page = (ROOT / "app/web/src/features/candidate/Page.jsx").read_text()
+    candidate_facade = (
+        ROOT / "app/web/src/features/candidate/agent-experience.js"
+    ).read_text()
+    enterprise_page = (
+        ROOT / "app/web/src/features/interviews/Page.jsx"
+    ).read_text()
+    enterprise_monitor = (
+        ROOT / "app/web/src/features/interviews/agent-monitor.js"
+    ).read_text()
+
+    assert "createCandidateInterviewExperience" in candidate_page
+    assert "<VrmAvatar" in candidate_page
+    assert "!experience.session ? <CandidateSessionGate" in candidate_page
+    assert "reportCandidateRuntimeProblem" in candidate_page
+    assert "digital-interviewer.png" not in candidate_page
+    assert "/stt-stream" not in candidate_page
+    assert "/avatar/speak" not in candidate_page
+    assert "/live?" not in candidate_page
+    assert '"media.published"' in candidate_facade
+    assert "evidence.audio.chunk" not in candidate_facade
+
+    assert "createEnterpriseInterviewMonitor" in enterprise_page
+    assert "digital-interviewer.png" not in enterprise_page
+    assert "/live?" not in enterprise_page
+    assert "takeover.acquire" in enterprise_monitor
+    assert "takeover.renew" in enterprise_monitor
+    assert "unscored_intervention" in enterprise_page
 
 
 def _data_module(path: Path) -> str:

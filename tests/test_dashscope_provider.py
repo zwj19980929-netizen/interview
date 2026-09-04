@@ -87,6 +87,42 @@ async def test_dashscope_qwen_chat_uses_openai_compatible_contract() -> None:
 
 
 @pytest.mark.anyio
+async def test_dashscope_realtime_understanding_disables_qwen_thinking_by_default() -> None:
+    seen = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["payload"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            json={
+                "id": "qwen_realtime_understanding",
+                "choices": [{"message": {"content": json.dumps({"intent": "answer"})}}],
+                "usage": {},
+            },
+        )
+
+    request = ChatJSONRequest(
+        purpose="interview_turn_understanding",
+        messages=[ChatMessage(role="user", content="理解本轮回答")],
+        json_schema={
+            "type": "object",
+            "required": ["intent"],
+            "properties": {"intent": {"type": "string"}},
+            "additionalProperties": False,
+        },
+    )
+    await make_provider(handler).invoke(
+        cap.LLM_CHAT_JSON,
+        request,
+        context(cap.LLM_CHAT_JSON, "qwen3.7-plus").model_copy(
+            update={"purpose": "interview_turn_understanding"}
+        ),
+    )
+
+    assert seen["payload"]["enable_thinking"] is False
+
+
+@pytest.mark.anyio
 async def test_dashscope_qwen_tts_returns_expiring_asset_url_for_private_copy() -> None:
     seen = {}
 
@@ -238,6 +274,53 @@ class FakeDashScopeSocket:
         self.closed = True
 
 
+class QuietDashScopeSocket(FakeDashScopeSocket):
+    """模拟长时间没有 partial 的真实 ASR，确保上行不会逐帧等待下行。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.recv_calls = 0
+
+    async def send(self, value):
+        self.sent.append(value)
+        if not isinstance(value, bytes) and json.loads(value)["header"]["action"] == "finish-task":
+            self.received.put_nowait(json.dumps({
+                "header": {"event": "result-generated", "task_id": "vendor_task"},
+                "payload": {"output": {"sentence": {
+                    "text": "没有逐帧阻塞。", "sentence_end": True, "begin_time": 0, "end_time": 1200,
+                }}},
+            }))
+            self.received.put_nowait(json.dumps({"header": {"event": "task-finished", "task_id": "vendor_task"}, "payload": {}}))
+
+    async def recv(self):
+        self.recv_calls += 1
+        return await self.received.get()
+
+
+class BlockingSendDashScopeSocket(QuietDashScopeSocket):
+    """模拟厂商 WebSocket 上行短暂阻塞，验证 LiveKit 收帧不会被连带卡住。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.send_started = asyncio.Event()
+        self.release_send = asyncio.Event()
+
+    async def send(self, value):
+        self.sent.append(value)
+        if isinstance(value, bytes):
+            self.send_started.set()
+            await self.release_send.wait()
+            return
+        if json.loads(value)["header"]["action"] == "finish-task":
+            self.received.put_nowait(json.dumps({
+                "header": {"event": "result-generated", "task_id": "vendor_task"},
+                "payload": {"output": {"sentence": {
+                    "text": "发送恢复后完成。", "sentence_end": True, "begin_time": 0, "end_time": 900,
+                }}},
+            }))
+            self.received.put_nowait(json.dumps({"header": {"event": "task-finished", "task_id": "vendor_task"}, "payload": {}}))
+
+
 @pytest.mark.anyio
 async def test_dashscope_stream_maps_duplex_events_to_one_authoritative_final() -> None:
     socket = FakeDashScopeSocket()
@@ -260,12 +343,72 @@ async def test_dashscope_stream_maps_duplex_events_to_one_authoritative_final() 
         ),
     )
     partial = await stream.send_audio(b"\x00\x01")
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    partial.extend(await stream.send_audio(b"\x00\x02"))
     finished = await stream.finish()
 
     assert partial[0].type == "transcript.partial"
     assert [item.type for item in finished].count("transcript.final") == 1
     assert next(item for item in finished if item.type == "transcript.final").text == "实时转写完成。"
     assert socket.closed is True
+
+
+@pytest.mark.anyio
+async def test_dashscope_stream_does_not_wait_for_vendor_receive_on_every_audio_frame() -> None:
+    socket = QuietDashScopeSocket()
+
+    async def connect(url, **kwargs):
+        return socket
+
+    provider = DashScopeProvider(websocket_connect=connect)
+    stream = await provider.open_stream(
+        StreamingSTTRequest(
+            interview_id="iv_1", turn_id="turn_1",
+            audio=StreamingAudioConfig(content_type="audio/pcm", sample_rate_hz=16000, channels=1),
+        ),
+        context(cap.STT_STREAMING, "qwen-audio-3.0-asr-flash-streaming"),
+    )
+
+    for _ in range(80):
+        assert await stream.send_audio(b"\x00\x00" * 320) == []
+
+    # 一次握手接收 + 一个后台阻塞接收；不能退化为 80 次按帧 recv/timeout。
+    assert socket.recv_calls <= 3
+    finished = await stream.finish()
+    assert next(item for item in finished if item.type == "transcript.final").text == "没有逐帧阻塞。"
+    assert socket.closed is True
+
+
+@pytest.mark.anyio
+async def test_dashscope_stream_queues_audio_while_vendor_send_is_temporarily_blocked() -> None:
+    socket = BlockingSendDashScopeSocket()
+
+    async def connect(url, **kwargs):
+        return socket
+
+    stream = await DashScopeProvider(websocket_connect=connect).open_stream(
+        StreamingSTTRequest(
+            interview_id="iv_1", turn_id="turn_1",
+            audio=StreamingAudioConfig(content_type="audio/pcm", sample_rate_hz=16000, channels=1),
+        ),
+        context(cap.STT_STREAMING, "qwen-audio-3.0-asr-flash-streaming"),
+    )
+
+    # send_audio 只进入有界发送队列，即使底层 socket.send 正在等待也必须立即返回。
+    assert await asyncio.wait_for(
+        stream.send_audio(b"\x00\x00" * 320), timeout=0.05
+    ) == []
+    await asyncio.wait_for(socket.send_started.wait(), timeout=0.05)
+    for _ in range(20):
+        assert await stream.send_audio(b"\x00\x00" * 320) == []
+
+    finishing = asyncio.create_task(stream.finish())
+    await asyncio.sleep(0)
+    assert finishing.done() is False
+    socket.release_send.set()
+    finished = await asyncio.wait_for(finishing, timeout=1)
+    assert next(item for item in finished if item.type == "transcript.final").text == "发送恢复后完成。"
 
 
 class FakeQwenRealtimeSocket:

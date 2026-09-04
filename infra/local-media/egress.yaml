@@ -1,0 +1,8 @@
+api_key: interviewer-local-dev
+api_secret: interviewer-local-dev-secret-change-me
+ws_url: ws://livekit:7880
+redis:
+  address: redis:6379
+health_port: 8080
+logging:
+  level: info

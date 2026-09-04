@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import re
 import secrets
 from copy import deepcopy
@@ -30,7 +31,10 @@ from app.services.interviews import InterviewService
 CONSENT_NOTICE_CATALOG = {
     "v1": {
         "privacy_notice": "我们仅为本次面试处理您提交的身份信息、回答、转写和评分，并按企业留存策略限制访问与删除。",
-        "recording_notice": "面试将录制音频，用于服务端转写、评分与授权复核；录音不用于自动作出录用或淘汰决定。",
+        "audio_recording_notice": "面试将录制音频，用于服务端转写、文本证据评分与授权复核。",
+        "video_recording_notice": "本场面试将单独录制摄像头视频，仅供授权人员复核；未同意时摄像头画面只在本机预览且不得上行。",
+        "takeover_notice": "授权企业面试官可以监看、暂停并以审计留痕的方式人工接管。",
+        "inference_notice": "摄像头、声音、表情、眼神和情绪不用于诚信、人格或能力推断；最终录用决定由企业人员作出。",
     }
 }
 
@@ -97,7 +101,26 @@ class AppointmentService:
             frozen_notice = {
                 "version": consent_version,
                 "privacy_notice": notice_content["privacy_notice"],
-                "recording_notice": notice_content["recording_notice"] if settings["record_audio"] else None,
+                "audio_recording_notice": (
+                    notice_content["audio_recording_notice"] if settings["record_audio"] else None
+                ),
+                "video_recording_notice": (
+                    notice_content["video_recording_notice"] if settings["record_video"] else None
+                ),
+                "takeover_notice": notice_content["takeover_notice"],
+                "inference_notice": notice_content["inference_notice"],
+                "required_scopes": [
+                    scope
+                    for scope, required in (
+                        ("audio_recording", settings["record_audio"]),
+                        ("video_recording", settings["record_video"]),
+                    )
+                    if required
+                ],
+                # Compatibility projection only; new clients must use scopes.
+                "recording_notice": (
+                    notice_content["audio_recording_notice"] if settings["record_audio"] else None
+                ),
                 "recording_required": bool(settings["record_audio"]),
             }
             notice_hash = hashlib.sha256(
@@ -268,10 +291,25 @@ class AppointmentService:
                 raise ApiError("CONSENT_REQUIRED", "Privacy consent is required.", status_code=409)
             if str(consent.get("version", "")) != str(notice.get("version", "")):
                 raise ApiError("CONSENT_VERSION_INVALID", "Consent version is not accepted.", status_code=409)
-            if notice.get("recording_required") and not consent.get("recording_accepted"):
+            required_scopes = set(notice.get("required_scopes") or [])
+            accepted_scopes = {
+                scope
+                for scope, accepted in (
+                    ("audio_recording", consent.get("audio_recording")),
+                    ("video_recording", consent.get("video_recording")),
+                )
+                if accepted is True
+            }
+            if "audio_recording" in required_scopes and "audio_recording" not in accepted_scopes:
                 raise ApiError(
-                    "RECORDING_CONSENT_REQUIRED",
-                    "Recording consent is required for this appointment.",
+                    "AUDIO_RECORDING_CONSENT_REQUIRED",
+                    "Explicit audio recording consent is required for this appointment.",
+                    status_code=409,
+                )
+            if "video_recording" in required_scopes and "video_recording" not in accepted_scopes:
+                raise ApiError(
+                    "VIDEO_RECORDING_CONSENT_REQUIRED",
+                    "Explicit video recording consent is required for this appointment.",
                     status_code=409,
                 )
             candidate = transaction.candidate_profiles.get(appointment["candidate_profile_id"])
@@ -331,7 +369,9 @@ class AppointmentService:
                     "phone_lookup_hash": self._lookup_hash(organization_id, phone),
                     "consent_version": consent["version"],
                     "privacy_accepted": True,
-                    "recording_accepted": bool(consent.get("recording_accepted", False)),
+                    "media_consent_scopes": sorted(accepted_scopes),
+                    "audio_recording_accepted": "audio_recording" in accepted_scopes,
+                    "video_recording_accepted": "video_recording" in accepted_scopes,
                     "notice_hash": notice["notice_hash"],
                     "consent_evidence_status": "verified",
                     "consented_at": now,
@@ -380,15 +420,46 @@ class AppointmentService:
             readiness = self._readiness(transaction, plan, appointment=appointment, now=now_dt)
             if payload is not None:
                 content_type = str(payload.get("audio_content_type", "")).strip().lower()
-                device_ready = bool(payload.get("browser_supported")) and bool(
-                    payload.get("microphone_granted")
-                ) and content_type.startswith("audio/")
+                settings = appointment.get("settings") or {}
+                device_ready = all(
+                    (
+                        bool(payload.get("browser_supported")),
+                        bool(payload.get("microphone_granted")),
+                        bool(payload.get("camera_granted")),
+                        bool(payload.get("speaker_verified")),
+                        bool(payload.get("webrtc_supported")),
+                        bool(payload.get("audio_worklet_supported")),
+                        bool(payload.get("webgl_supported")),
+                        bool(payload.get("media_recorder_supported")),
+                        content_type.startswith("audio/"),
+                        float(payload.get("network_rtt_ms", 60_001)) <= 500,
+                        float(payload.get("network_jitter_ms", 60_001)) <= 100,
+                        float(payload.get("avatar_fps", 0)) >= 30,
+                        (
+                            not settings.get("record_video")
+                            or str(payload.get("video_content_type") or "").startswith("video/")
+                        ),
+                    )
+                )
+                readiness_contract = "realtime_agent_v1"
                 ttl = int(appointment.get("admission_policy", {}).get("device_readiness_ttl_seconds", 300))
                 appointment["device_readiness"] = {
                     "ready": device_ready,
+                    "contract": readiness_contract,
                     "browser_supported": bool(payload.get("browser_supported")),
                     "microphone_granted": bool(payload.get("microphone_granted")),
+                    "camera_granted": bool(payload.get("camera_granted")),
+                    "speaker_verified": bool(payload.get("speaker_verified")),
+                    "webrtc_supported": bool(payload.get("webrtc_supported")),
+                    "audio_worklet_supported": bool(payload.get("audio_worklet_supported")),
+                    "webgl_supported": bool(payload.get("webgl_supported")),
+                    "media_recorder_supported": bool(payload.get("media_recorder_supported")),
+                    "network_rtt_ms": payload.get("network_rtt_ms"),
+                    "network_jitter_ms": payload.get("network_jitter_ms"),
+                    "avatar_fps": payload.get("avatar_fps"),
                     "audio_content_type": content_type,
+                    "video_content_type": payload.get("video_content_type"),
+                    "video_upstream_permitted": bool(settings.get("record_video")),
                     "checked_at": format_utc(now_dt),
                     "expires_at": format_utc(now_dt + timedelta(seconds=max(1, ttl))),
                 }

@@ -1,7 +1,8 @@
 from datetime import datetime, timedelta, timezone
+import hashlib
 import os
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from app.core.errors import ApiError
 from app.core.ids import new_id
@@ -48,7 +49,11 @@ class RetentionService:
         candidate_ids = [item["id"] for item in candidates]
         if not dry_run:
             for candidate_id in candidate_ids:
-                self._purge_candidate(candidate_id, organization_id)
+                self._purge_candidate(
+                    candidate_id,
+                    organization_id,
+                    actor_id=actor_id,
+                )
         with self.persistence.transaction(organization_id) as transaction:
             event = transaction.audit_events.add(
                 {
@@ -75,9 +80,19 @@ class RetentionService:
             "audit_event_id": event["id"],
         }
 
-    def purge_candidate(self, candidate_id: str, organization_id: str = "org_default") -> None:
+    def purge_candidate(
+        self,
+        candidate_id: str,
+        organization_id: str = "org_default",
+        *,
+        actor_id: str = "system:retention",
+    ) -> Dict[str, Any]:
         """Purge one candidate through the same privacy boundary used by scheduled retention."""
-        self._purge_candidate(candidate_id, organization_id)
+        return self._purge_candidate(
+            candidate_id,
+            organization_id,
+            actor_id=actor_id,
+        )
 
     def run_screening_retention(
         self,
@@ -100,7 +115,15 @@ class RetentionService:
             ]
         candidate_ids = [item["id"] for item in candidates]
         for candidate_id in candidate_ids:
-            self._purge_candidate(candidate_id, organization_id)
+            self._purge_candidate(
+                candidate_id,
+                organization_id,
+                actor_id=actor_id,
+            )
+        evidence_gc = self.run_evidence_media_gc(
+            actor_id=actor_id,
+            organization_id=organization_id,
+        )
         with self.persistence.transaction(organization_id) as transaction:
             event = transaction.audit_events.add(
                 {
@@ -114,6 +137,10 @@ class RetentionService:
                         "candidate_count": len(candidate_ids),
                         "candidate_ids": candidate_ids,
                         "reconciled_candidate_ids": reconciled_candidate_ids,
+                        "evidence_gc": {
+                            "segment_count": evidence_gc["segment_count"],
+                            "file_object_count": evidence_gc["file_object_count"],
+                        },
                         "cutoff": cutoff.isoformat(),
                     },
                     "created_at": utc_now(),
@@ -124,6 +151,7 @@ class RetentionService:
             "candidate_count": len(candidate_ids),
             "candidate_ids": candidate_ids,
             "reconciled_candidate_ids": reconciled_candidate_ids,
+            "evidence_gc": evidence_gc,
             "audit_event_id": event["id"],
         }
 
@@ -162,59 +190,173 @@ class RetentionService:
                 reconciled_candidate_ids.append(candidate["id"])
         return reconciled_candidate_ids
 
-    def _purge_candidate(self, candidate_id: str, organization_id: str) -> None:
+    def run_evidence_media_gc(
+        self,
+        *,
+        actor_id: str = "system:evidence-media-gc",
+        organization_id: str = "org_default",
+    ) -> Dict[str, Any]:
+        """Delete sealed objects belonging to abandoned capture revisions.
+
+        Reset advances ``capture_revision`` in the database before this worker
+        runs.  A segment from any smaller revision is therefore permanently
+        unreachable by authoritative repair and can be removed without racing
+        the current writer.  Object deletion precedes database tombstoning so
+        a storage error never produces a false deletion fact.
+        """
+
         with self.persistence.transaction(organization_id) as transaction:
-            candidate = transaction.candidate_profiles.get(candidate_id)
-            if candidate is None:
-                return
-            resumes = [item for item in transaction.resume_documents.list() if item.get("candidate_profile_id") == candidate_id]
-            experience_ids = {
-                item["id"]
-                for item in transaction.experience_questions.list()
-                if item.get("candidate_profile_id") == candidate_id
+            streams = {
+                str(item["id"]): item
+                for item in transaction.evidence_media_streams.list()
             }
-            speech_assets = [
+            segments = [
                 item
-                for item in transaction.question_speech_assets.list()
-                if item.get("owner_type") == "experience_question" and item.get("owner_id") in experience_ids
+                for item in transaction.evidence_media_segments.list()
+                if self._segment_is_abandoned(item, streams.get(str(item.get("stream_id"))))
             ]
             file_ids = {
-                str(file_id)
-                for resume in resumes
-                for file_id in (resume.get("file_object_id"), resume.get("parsed_text_file_object_id"))
-                if file_id
+                str(item["file_id"])
+                for item in segments
+                if item.get("file_id")
             }
-            file_ids.update(
-                str(item["file_object_id"])
-                for item in speech_assets
-                if item.get("file_object_id")
-            )
-            files = [transaction.file_objects.get(file_id) for file_id in file_ids]
-            interviews = [
+            file_objects = [
                 item
-                for item in transaction.interview_sessions.list()
-                if item.get("candidate_id") == candidate_id
-                or item.get("plan_snapshot", {}).get("candidate_profile_id") == candidate_id
+                for item in (transaction.file_objects.get(file_id) for file_id in file_ids)
+                if item is not None
+                and item.get("purpose") == "candidate_evidence_segment"
             ]
-        for file_object in files:
-            if file_object and file_object.get("object_key"):
-                self.storage.delete(str(file_object["object_key"]))
-        for interview in interviews:
-            for answer in interview.get("answers", []):
-                audio_uri = answer.get("audio_uri")
-                if isinstance(audio_uri, str) and audio_uri.startswith("private-file://"):
-                    file_ids.add(audio_uri.removeprefix("private-file://"))
-                else:
-                    self._delete_local_audio(audio_uri)
+        object_keys = {
+            str(item["object_key"])
+            for item in file_objects
+            if item.get("object_key")
+        }
+        for object_key in sorted(object_keys):
+            self.storage.delete(object_key)
+
         with self.persistence.transaction(organization_id) as transaction:
-            private_audio_files = [transaction.file_objects.get(file_id) for file_id in file_ids]
-        for file_object in private_audio_files:
-            if file_object and file_object.get("purpose") == "candidate_answer_audio" and file_object.get("object_key"):
-                self.storage.delete(str(file_object["object_key"]))
-        with self.persistence.transaction(organization_id) as transaction:
-            current = transaction.candidate_profiles.get(candidate_id)
+            current_streams = {
+                str(item["id"]): item
+                for item in transaction.evidence_media_streams.list()
+            }
+            deleted_segment_ids: List[str] = []
+            deleted_file_ids: Set[str] = set()
+            tombstoned_file_ids: List[str] = []
             now = utc_now()
-            current.update(
+            for segment in segments:
+                current = transaction.evidence_media_segments.get(str(segment["id"]))
+                if current is None or not self._segment_is_abandoned(
+                    current,
+                    current_streams.get(str(current.get("stream_id"))),
+                ):
+                    continue
+                transaction.evidence_media_segments.delete(
+                    current["id"], expected_version=current["version"]
+                )
+                deleted_segment_ids.append(str(current["id"]))
+                if current.get("file_id"):
+                    deleted_file_ids.add(str(current["file_id"]))
+            for file_id in sorted(deleted_file_ids):
+                current = transaction.file_objects.get(file_id)
+                if current is None or current.get("purpose") != "candidate_evidence_segment":
+                    continue
+                if current.get("object_key") not in {None, *object_keys}:
+                    raise ApiError(
+                        "RETENTION_OBJECT_CHANGED",
+                        "An Evidence object changed while its abandoned revision was being collected.",
+                        status_code=409,
+                    )
+                if self._update_document(
+                    transaction.file_objects,
+                    current,
+                    {
+                        "status": "deleted",
+                        "object_key": None,
+                        "checksum": None,
+                        "byte_count": 0,
+                        "deleted_at": current.get("deleted_at") or now,
+                    },
+                    now,
+                ):
+                    tombstoned_file_ids.append(file_id)
+            audit_event_id = None
+            if deleted_segment_ids or tombstoned_file_ids:
+                event = transaction.audit_events.add(
+                    {
+                        "id": new_id("audit"),
+                        "organization_id": organization_id,
+                        "actor_id": actor_id,
+                        "action": "retention.evidence_media_gc.completed",
+                        "resource_type": "evidence_media_segment",
+                        "resource_id": "abandoned_revision_batch",
+                        "metadata": {
+                            "segment_count": len(deleted_segment_ids),
+                            "file_object_count": len(tombstoned_file_ids),
+                            "stream_ids": sorted(
+                                {
+                                    str(item.get("stream_id"))
+                                    for item in segments
+                                    if item.get("stream_id")
+                                }
+                            ),
+                            "object_key_hashes": self._object_key_hashes(object_keys),
+                        },
+                        "created_at": now,
+                    }
+                )
+                audit_event_id = event["id"]
+        return {
+            "segment_count": len(deleted_segment_ids),
+            "file_object_count": len(tombstoned_file_ids),
+            "audit_event_id": audit_event_id,
+        }
+
+    def _purge_candidate(
+        self,
+        candidate_id: str,
+        organization_id: str,
+        *,
+        actor_id: str,
+    ) -> Dict[str, Any]:
+        with self.persistence.transaction(organization_id) as transaction:
+            scope = self._candidate_scope(transaction, candidate_id)
+        if scope is None:
+            return {
+                "candidate_id": candidate_id,
+                "changed": False,
+                "audit_event_id": None,
+            }
+
+        object_keys = set(scope["object_keys"])
+        local_audio_uris = set(scope["local_audio_uris"])
+        for object_key in sorted(object_keys):
+            self.storage.delete(object_key)
+        for audio_uri in sorted(local_audio_uris):
+            self._delete_local_audio(audio_uri)
+
+        with self.persistence.transaction(organization_id) as transaction:
+            current_scope = self._candidate_scope(transaction, candidate_id)
+            if current_scope is None:
+                return {
+                    "candidate_id": candidate_id,
+                    "changed": False,
+                    "audit_event_id": None,
+                }
+            late_object_keys = set(current_scope["object_keys"]) - object_keys
+            late_local_audio = set(current_scope["local_audio_uris"]) - local_audio_uris
+            if late_object_keys or late_local_audio:
+                raise ApiError(
+                    "RETENTION_SCOPE_CHANGED",
+                    "Candidate media changed while retention deletion was in progress; retry the purge.",
+                    status_code=409,
+                )
+
+            now = utc_now()
+            changed = False
+            candidate = current_scope["candidate"]
+            changed |= self._update_document(
+                transaction.candidate_profiles,
+                candidate,
                 {
                     "name": "[retention_purged]",
                     "email_encrypted": None,
@@ -226,26 +368,37 @@ class RetentionService:
                     "external_ref": None,
                     "metadata": {},
                     "status": "retention_purged",
-                    "retention_purged_at": now,
-                    "updated_at": now,
-                }
+                    "retention_purged_at": candidate.get("retention_purged_at") or now,
+                },
+                now,
             )
-            transaction.candidate_profiles.update(current, expected_version=current["version"])
-            for resume in transaction.resume_documents.list():
-                if resume.get("candidate_profile_id") != candidate_id:
-                    continue
-                resume.update({"status": "retention_purged", "processing_error": None, "updated_at": now})
-                transaction.resume_documents.update(resume, expected_version=resume["version"])
-            for file_id in file_ids:
+            for resume in current_scope["resumes"]:
+                changed |= self._update_document(
+                    transaction.resume_documents,
+                    resume,
+                    {"status": "retention_purged", "processing_error": None},
+                    now,
+                )
+            for file_id in sorted(current_scope["file_ids"]):
                 file_object = transaction.file_objects.get(file_id)
                 if file_object is None:
                     continue
-                file_object.update({"status": "deleted", "object_key": None, "deleted_at": now, "updated_at": now})
-                transaction.file_objects.update(file_object, expected_version=file_object["version"])
-            for review in transaction.resume_reviews.list():
-                if review.get("candidate_profile_id") != candidate_id:
-                    continue
-                review.update(
+                changed |= self._update_document(
+                    transaction.file_objects,
+                    file_object,
+                    {
+                        "status": "deleted",
+                        "object_key": None,
+                        "checksum": None,
+                        "byte_count": 0,
+                        "deleted_at": file_object.get("deleted_at") or now,
+                    },
+                    now,
+                )
+            for review in current_scope["reviews"]:
+                changed |= self._update_document(
+                    transaction.resume_reviews,
+                    review,
                     {
                         "status": "retention_purged",
                         "project_evidence": [],
@@ -256,64 +409,353 @@ class RetentionService:
                         "matched_requirements": [],
                         "unmet_requirements": [],
                         "human_review_note": None,
-                        "updated_at": now,
-                    }
+                    },
+                    now,
                 )
-                transaction.resume_reviews.update(review, expected_version=review["version"])
-            for question in transaction.experience_questions.list():
-                if question.get("candidate_profile_id") != candidate_id:
-                    continue
-                question.update(
+            for question in current_scope["experience_questions"]:
+                changed |= self._update_document(
+                    transaction.experience_questions,
+                    question,
                     {
                         "question_text": "[retention_purged]",
                         "standard_answer": "[retention_purged]",
                         "key_points": [],
                         "evidence_refs": [],
                         "status": "archived",
-                        "updated_at": now,
-                    }
+                    },
+                    now,
                 )
-                transaction.experience_questions.update(question, expected_version=question["version"])
-            for asset in transaction.question_speech_assets.list():
-                if asset.get("owner_type") != "experience_question" or asset.get("owner_id") not in experience_ids:
-                    continue
-                asset.update(
+            for asset in current_scope["speech_assets"]:
+                changed |= self._update_document(
+                    transaction.question_speech_assets,
+                    asset,
                     {
                         "audio_uri": None,
                         "status": "deleted",
                         "production_ready": False,
-                        "deleted_at": now,
-                        "updated_at": now,
+                        "deleted_at": asset.get("deleted_at") or now,
+                    },
+                    now,
+                )
+            for intake in current_scope["intakes"]:
+                sanitized = dict(intake)
+                for key in ("name", "email", "phone", "email_hash", "phone_hash"):
+                    sanitized.pop(key, None)
+                sanitized["retention_purged_at"] = (
+                    intake.get("retention_purged_at") or now
+                )
+                changed |= self._replace_document_if_changed(
+                    transaction.candidate_intakes,
+                    intake,
+                    sanitized,
+                    now,
+                )
+            for interview in current_scope["interviews"]:
+                sanitized = self._sanitize_interview(interview, now)
+                changed |= self._replace_document_if_changed(
+                    transaction.interview_sessions,
+                    interview,
+                    sanitized,
+                    now,
+                )
+            for capture in current_scope["media_captures"]:
+                changed |= self._update_document(
+                    transaction.interview_media_captures,
+                    capture,
+                    {
+                        "status": "retention_purged",
+                        "participant_identity": None,
+                        "connection_id": None,
+                        "requested_scopes": [],
+                        "consented_scopes": [],
+                        "egress_id": None,
+                        "object_key": None,
+                        "private_uri": None,
+                        "content_hash": None,
+                        "byte_count": 0,
+                        "provider_start": None,
+                        "provider_result": None,
+                        "failure_code": None,
+                        "failure_type": None,
+                        "retention_purged_at": capture.get("retention_purged_at") or now,
+                    },
+                    now,
+                )
+            for stream in current_scope["media_streams"]:
+                changed |= self._update_document(
+                    transaction.evidence_media_streams,
+                    stream,
+                    {
+                        "status": "retention_purged",
+                        "complete": False,
+                        "last_sealed_ordinal": 0,
+                        "last_sealed_frame_sequence": 0,
+                        "sealed_byte_count": 0,
+                        "recovered_audio_uri": None,
+                        "recovered_byte_count": 0,
+                        "recovered_source_pcm_byte_count": 0,
+                        "abandoned_captures": [],
+                        "retention_purged_at": stream.get("retention_purged_at") or now,
+                    },
+                    now,
+                )
+            deleted_segment_ids: List[str] = []
+            for segment in current_scope["media_segments"]:
+                current = transaction.evidence_media_segments.get(segment["id"])
+                if current is None:
+                    continue
+                transaction.evidence_media_segments.delete(
+                    current["id"], expected_version=current["version"]
+                )
+                deleted_segment_ids.append(str(current["id"]))
+                changed = True
+
+            audit_event_id = None
+            if changed:
+                event = transaction.audit_events.add(
+                    {
+                        "id": new_id("audit"),
+                        "organization_id": organization_id,
+                        "actor_id": actor_id,
+                        "action": "retention.candidate_evidence_purged",
+                        "resource_type": "candidate_profile",
+                        "resource_id": candidate_id,
+                        "metadata": {
+                            "interview_count": len(current_scope["interviews"]),
+                            "media_capture_count": len(current_scope["media_captures"]),
+                            "evidence_stream_count": len(current_scope["media_streams"]),
+                            "evidence_segment_count": len(deleted_segment_ids),
+                            "file_object_count": len(current_scope["file_ids"]),
+                            "external_object_count": len(object_keys),
+                            "local_audio_count": len(local_audio_uris),
+                            "object_key_hashes": self._object_key_hashes(object_keys),
+                        },
+                        "created_at": now,
                     }
                 )
-                transaction.question_speech_assets.update(asset, expected_version=asset["version"])
-            for intake in transaction.candidate_intakes.list():
-                if intake.get("matched_candidate_profile_id") != candidate_id:
-                    continue
-                for key in ("name", "email", "phone", "email_hash", "phone_hash"):
-                    intake.pop(key, None)
-                intake["retention_purged_at"] = now
-                intake["updated_at"] = now
-                transaction.candidate_intakes.update(intake, expected_version=intake["version"])
-            for interview in transaction.interview_sessions.list():
-                if interview.get("candidate_id") != candidate_id and interview.get("plan_snapshot", {}).get("candidate_profile_id") != candidate_id:
-                    continue
-                interview["candidate"].update({"name": "[retention_purged]", "email": None, "phone": None, "metadata": {}})
-                for answer in interview.get("answers", []):
-                    answer.update(
-                        {
-                            "audio_uri": None,
-                            "raw_transcript": "[retention_purged]",
-                            "final_transcript": "[retention_purged]",
-                            "transcript_revisions": [],
-                        }
-                    )
-                interview["evaluation_revisions"] = []
-                interview["report_revisions"] = []
-                interview["current_report_id"] = None
-                interview["retention_purged_at"] = now
-                interview["updated_at"] = now
-                transaction.interview_sessions.update(interview, expected_version=interview["version"])
+                audit_event_id = event["id"]
+        return {
+            "candidate_id": candidate_id,
+            "changed": changed,
+            "audit_event_id": audit_event_id,
+            "external_object_count": len(object_keys),
+            "evidence_segment_count": len(deleted_segment_ids),
+        }
+
+    def _candidate_scope(self, transaction: Any, candidate_id: str) -> Optional[Dict[str, Any]]:
+        candidate = transaction.candidate_profiles.get(candidate_id)
+        if candidate is None:
+            return None
+        resumes = [
+            item
+            for item in transaction.resume_documents.list()
+            if item.get("candidate_profile_id") == candidate_id
+        ]
+        experience_questions = [
+            item
+            for item in transaction.experience_questions.list()
+            if item.get("candidate_profile_id") == candidate_id
+        ]
+        experience_ids = {str(item["id"]) for item in experience_questions}
+        speech_assets = [
+            item
+            for item in transaction.question_speech_assets.list()
+            if item.get("owner_type") == "experience_question"
+            and str(item.get("owner_id")) in experience_ids
+        ]
+        interviews = [
+            item
+            for item in transaction.interview_sessions.list()
+            if item.get("candidate_id") == candidate_id
+            or item.get("plan_snapshot", {}).get("candidate_profile_id") == candidate_id
+        ]
+        interview_ids = {str(item["id"]) for item in interviews}
+        media_captures = [
+            item
+            for item in transaction.interview_media_captures.list()
+            if item.get("candidate_id") == candidate_id
+            or str(item.get("interview_id")) in interview_ids
+        ]
+        media_streams = [
+            item
+            for item in transaction.evidence_media_streams.list()
+            if str(item.get("interview_id")) in interview_ids
+        ]
+        stream_ids = {str(item["id"]) for item in media_streams}
+        media_segments = [
+            item
+            for item in transaction.evidence_media_segments.list()
+            if str(item.get("stream_id")) in stream_ids
+            or str(item.get("interview_id")) in interview_ids
+        ]
+        file_ids: Set[str] = {
+            str(file_id)
+            for resume in resumes
+            for file_id in (
+                resume.get("file_object_id"),
+                resume.get("parsed_text_file_object_id"),
+            )
+            if file_id
+        }
+        file_ids.update(
+            str(item["file_object_id"])
+            for item in speech_assets
+            if item.get("file_object_id")
+        )
+        file_ids.update(
+            str(item["file_id"])
+            for item in media_segments
+            if item.get("file_id")
+        )
+        local_audio_uris: Set[str] = set()
+        for interview in interviews:
+            for answer in interview.get("answers", []):
+                audio_uri = answer.get("audio_uri")
+                if isinstance(audio_uri, str) and audio_uri.startswith("private-file://"):
+                    file_ids.add(audio_uri.removeprefix("private-file://"))
+                elif isinstance(audio_uri, str) and audio_uri.startswith("/media/"):
+                    local_audio_uris.add(audio_uri)
+        for file_object in transaction.file_objects.list():
+            if (
+                str(file_object.get("interview_id")) in interview_ids
+                and file_object.get("purpose")
+                in {
+                    "candidate_answer_audio",
+                    "candidate_evidence_segment",
+                    "agent_expression_audio",
+                }
+            ):
+                file_ids.add(str(file_object["id"]))
+        file_objects = [
+            item
+            for item in (transaction.file_objects.get(file_id) for file_id in file_ids)
+            if item is not None
+        ]
+        object_keys = {
+            str(item["object_key"])
+            for item in file_objects
+            if item.get("object_key")
+        }
+        object_keys.update(
+            str(item["object_key"])
+            for item in media_captures
+            if item.get("object_key")
+        )
+        return {
+            "candidate": candidate,
+            "resumes": resumes,
+            "reviews": [
+                item
+                for item in transaction.resume_reviews.list()
+                if item.get("candidate_profile_id") == candidate_id
+            ],
+            "experience_questions": experience_questions,
+            "speech_assets": speech_assets,
+            "intakes": [
+                item
+                for item in transaction.candidate_intakes.list()
+                if item.get("matched_candidate_profile_id") == candidate_id
+            ],
+            "interviews": interviews,
+            "interview_ids": interview_ids,
+            "media_captures": media_captures,
+            "media_streams": media_streams,
+            "media_segments": media_segments,
+            "file_ids": file_ids,
+            "object_keys": object_keys,
+            "local_audio_uris": local_audio_uris,
+        }
+
+    @staticmethod
+    def _sanitize_interview(interview: Dict[str, Any], now: str) -> Dict[str, Any]:
+        sanitized = dict(interview)
+        candidate = dict(sanitized.get("candidate") or {})
+        candidate.update(
+            {"name": "[retention_purged]", "email": None, "phone": None, "metadata": {}}
+        )
+        sanitized["candidate"] = candidate
+        answers = []
+        for answer in sanitized.get("answers", []):
+            item = dict(answer)
+            item.update(
+                {
+                    "audio_uri": None,
+                    "raw_transcript": "[retention_purged]",
+                    "final_transcript": "[retention_purged]",
+                    "transcript_revisions": [],
+                }
+            )
+            answers.append(item)
+        sanitized["answers"] = answers
+        turns = []
+        for turn in sanitized.get("turns", []):
+            item = dict(turn)
+            item["utterances"] = []
+            item["current_understanding"] = None
+            item["conversation_acts"] = []
+            turns.append(item)
+        sanitized["turns"] = turns
+        runtime = dict(sanitized.get("agent_runtime") or {})
+        runtime["authoritative_media_binding"] = None
+        runtime["takeover"] = None
+        runtime["processed_signal_keys"] = []
+        runtime["active_performance_id"] = None
+        sanitized["agent_runtime"] = runtime
+        sanitized["agent_events"] = []
+        sanitized["evaluation_revisions"] = []
+        sanitized["report_revisions"] = []
+        sanitized["current_report_id"] = None
+        sanitized["report_id"] = None
+        sanitized["retention_purged_at"] = interview.get("retention_purged_at") or now
+        return sanitized
+
+    @staticmethod
+    def _update_document(
+        repository: Any,
+        current: Dict[str, Any],
+        updates: Dict[str, Any],
+        now: str,
+    ) -> bool:
+        if all(current.get(key) == value for key, value in updates.items()):
+            return False
+        updated = dict(current)
+        updated.update(updates)
+        updated["updated_at"] = now
+        repository.update(updated, expected_version=current["version"])
+        return True
+
+    @staticmethod
+    def _replace_document_if_changed(
+        repository: Any,
+        current: Dict[str, Any],
+        replacement: Dict[str, Any],
+        now: str,
+    ) -> bool:
+        comparable = dict(replacement)
+        comparable["updated_at"] = current.get("updated_at")
+        if comparable == current:
+            return False
+        updated = dict(replacement)
+        updated["updated_at"] = now
+        repository.update(updated, expected_version=current["version"])
+        return True
+
+    @staticmethod
+    def _segment_is_abandoned(
+        segment: Dict[str, Any], stream: Optional[Dict[str, Any]]
+    ) -> bool:
+        if stream is None or stream.get("status") == "retention_purged":
+            return True
+        return int(segment.get("capture_revision", 1)) < int(
+            stream.get("capture_revision", 1)
+        )
+
+    @staticmethod
+    def _object_key_hashes(object_keys: Set[str]) -> List[str]:
+        return [
+            "sha256:%s" % hashlib.sha256(value.encode("utf-8")).hexdigest()
+            for value in sorted(object_keys)
+        ]
 
     def _delete_local_audio(self, audio_uri: Any) -> None:
         if not isinstance(audio_uri, str) or not audio_uri.startswith("/media/"):

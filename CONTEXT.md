@@ -25,20 +25,48 @@ _Avoid_: GlobalTTSSetting、VoiceDropdownValue、ModelRouteAlias
 _Avoid_: ForLoopTTS、BulkButtonRequest、CeleryJob
 
 **QuestionSpeechAsset**:
-由题目版本和 KnowledgeBaseSpeechProfile revision 确定、异步生成的不可变读题语音，供数字人或音频降级路径读取。
+由题目版本和 KnowledgeBaseSpeechProfile revision 确定、异步生成的不可变读题语音，供数字人或音频降级路径读取；真实 WAV 只有通过 RIFF 完整性校验与安全的流式长度规范化后才能成为 ready 资产。
 _Avoid_: BrowserSpeech、TemporaryTTS、AudioURL
 
 **AvatarDelivery**:
-按 InterviewAppointment 冻结的 `avatar_mode` 把当前轮次题干交付给候选人的统一边界；LocalAvatarDelivery 复用 QuestionSpeechAsset 和浏览器形象，CloudAvatarDelivery 复用模型路由与 WebRTC/SFU，两者共享响应与播放/关闭合同。
-_Avoid_: AvatarProviderSwitch、ReactAudioFallback、TencentService
+按 InterviewAppointment 冻结的 `avatar_mode` 把批准话语表达给候选人的统一交付边界；LocalAvatarDelivery 使用可中断的本地 3D 形象，CloudAvatarDelivery 使用远端实时形象，两者共享 AvatarPerformance 合同。
+_Avoid_: StaticPortrait、AvatarProviderSwitch、ReactAudioFallback、TencentService
 
 **RealtimeSpeechDialogue**:
-面试实时表达轨的供应商无关语音到语音流；它与权威 STT 并行接收候选人 PCM，只能逐字播报业务策略批准的追问，输出音频和 transcript 不构成评分证据。
+面试实时表达轨的供应商无关语音到语音流；它与权威 STT 并行接收候选人 PCM，原始音频 delta 先隔离缓冲，只有 Provider final 与已冻结 ApprovedConversationAct 逐字一致后才私有落盘并表达，输出音频和 transcript 不构成评分证据。
 _Avoid_: ScoringS2S、ProviderConversation、AudioTruth
 
+**ConversationUtterance**:
+实时面试中一次具有明确起止和意图的候选人话语；它可以是回答、重读请求、澄清请求、继续补充或暂停请求，只有被批准为回答时才形成 CandidateAnswer。
+_Avoid_: AudioChunk、BrowserTranscript、CandidateAnswer
+
+**TurnUnderstanding**:
+针对一个 ConversationUtterance 形成的版本化结构化理解，记录原文证据、能力点覆盖、歧义、矛盾、置信度与建议动作；它服务于对话决策，不等同于 AnswerEvaluation。
+_Avoid_: Score、LLMThought、FollowUpText
+
+**ApprovedConversationAct**:
+实时面试策略在预算、安全与证据校验后批准的唯一下一动作及其可播报文本；追问必须绑定冻结根轮次、非空原文证据、能力点和正深度，表达层不得临时补建追问；所有 AI 动作恒为非评价性，数字人和语音 Provider 只能表达它，不能自行决定追问或评价。
+_Avoid_: ProviderReply、FreeChat、RawModelOutput
+
+**InteractionFloor**:
+实时面试中当前被授权发言的一方，只能是数字人、候选人、接管中的企业面试官或无人；打断、恢复和接管都必须先改变该事实。
+_Avoid_: PlayingFlag、MicrophoneState、SpeakerCSS
+
+**AvatarPerformance**:
+一个 ApprovedConversationAct 对应的可中断数字人表达，冻结私有音频引用、`pre_generated/cascade/s2s` 交付类型、口型时间线、姿态动作和播放身份；候选人端只允许当前播放代次的回调改变状态，已被打断或替换的旧播放器没有领域效果；VRM 标准元音 preset 与 custom 表情共同满足口型合同，它不拥有对话内容决策权。
+_Avoid_: AudioURL、SpeakingAnimation、StaticImage
+
+**CandidateRuntimeProblem**:
+候选人页面以短期会话 token 报告的 allow-list 致命运行故障；主动 barge-in、表达替换或关闭及其迟到播放器回调不属于故障；服务端把稳定 code 映射为去敏原因并推进真实生命周期暂停，只有持久暂停确认后 UI 才显示“已暂停”。
+_Avoid_: BrowserError、StackTrace、ToastPause、ClientOnlyFailure
+
+**AgentExpressionAudio**:
+经批准数字人话语对应的私有 FileObject；领域只持久化 `agent-expression://file_id`，每次角色安全投影才签发短期读取地址。S2S 缓冲和动态 TTS 都必须先通过音频容器完整性门禁并落入此边界，不能把 data URI、Provider 临时 URL 或长期签名 URL写入会话与事件历史。
+_Avoid_: PublicTTSURL、ProviderAudioDelta、DurableSignedURL
+
 **FollowUpTurn**:
-针对一个根 InterviewTurn 缺失关键点形成的深度 1、权重 0 澄清子轮次；有严格的每题/全场/时间预算，不能递归，也不能改变批准计划分值。
-_Avoid_: NewPlanQuestion、LLMFreeQuestion、SecondScore
+针对一个根 InterviewTurn 的原文证据、歧义、矛盾或缺失能力点形成的受控澄清子轮次；最多深入到会话冻结策略允许的深度 2，权重 0，并受每题、全场和时间预算约束，不能改变批准计划分值。
+_Avoid_: NewPlanQuestion、LLMFreeQuestion、IndependentScore
 
 **QuestionGenerationBatch**:
 一次面向指定 KnowledgeBase、基于题库定位、标签和可选要求形成的候选题生成与人工审核集合；确认导入前不属于正式题库。
@@ -117,7 +145,7 @@ _Avoid_: InterviewSession、CalendarEvent、JoinLink
 _Avoid_: ExperienceQuestionSpeechStatus、DefaultVoiceGeneration、PlanApprovalSpeech
 
 **CandidateIntake**:
-候选人通过一次性邀请提交姓名、邮箱、手机号、明确隐私同意和所需录音同意形成的登记记录，用于和该预约绑定的 CandidateProfile 精确匹配；成功事务也是预约级简历题语音的成本触发点。
+候选人通过一次性邀请提交姓名、邮箱、手机号、明确隐私同意和音频/视频分别授权的媒体同意形成的登记记录，用于和该预约绑定的 CandidateProfile 精确匹配；成功事务也是预约级简历题语音的成本触发点。
 _Avoid_: CandidateProfile、RegistrationForm、AnonymousSignup
 
 **QuestionCandidatePool**:
@@ -156,9 +184,49 @@ _Avoid_: PlanCopy、CurrentPlan
 某一轮候选人回答及其音频与权威服务端 final transcript；partial 或浏览器识别不能成为生产评分输入。
 _Avoid_: BrowserTranscript、PartialAnswer、ClientScoreInput
 
+**AuthoritativeMediaBinding**:
+InterviewSession 首次正式媒体连接时冻结的 LiveKit provider、room、服务端签发 candidate identity 与原始 connection 事实；控制通道重连不得替换它，也不得从客户端 track name/metadata 推断。
+_Avoid_: CurrentWebSocketIdentity、ClientTrackBinding、ReconnectToken
+
+**AuthoritativeEvidenceIngress**:
+由当前 EvidenceOwnershipEpoch 所有者运行的 receive-only 候选人麦克风订阅与 Evidence 链，拥有私有录音、音频序号、StreamingSTTSession、端点计时和 batch repair；生命周期独立于 Agent 控制 WebSocket。`LiveKitEvidenceIngress` 是该领域能力的当前媒体 Adapter，不是领域真相名称。
+_Avoid_: BrowserPCMUpload、LiveKitRoomState、AgentSocketAudio、LiveKitDomainOwner
+
+**EvidenceOwnershipEpoch**:
+某个服务实例取得一场 AuthoritativeEvidenceIngress 所有权时，由持久层单调递增的 fencing token；续租不变，owner 更换必须递增。只有当前 epoch 可以形成正式 final、CandidateAnswer 和其领域副作用。
+_Avoid_: TakeoverLeaseVersion、WebSocketGeneration、RedisLockToken
+
+**EvidenceControlGeneration**:
+候选人控制通道每次 attach 时单调递增的命令所有权；新控制连接建立后，旧连接命令与迟到 detach 都必须被拒绝。它不代表媒体 owner 更换。
+_Avoid_: EvidenceOwnershipEpoch、AgentRecoveryCursor、ControlReconnectGrace
+
+**EvidenceCommandJournal**:
+权威 Evidence 控制命令与最小安全结果的数据库持久日志；以面试范围的确定性命令 ID 和请求指纹支持同幂等键回放，以 claim TTL 支持 at-least-once 重投，并同时绑定 EvidenceControlGeneration 与 EvidenceOwnershipEpoch。它不保存音频、转写、票据、候选人 identity 或 Provider 对象；Redis 只能发送唤醒提示，不能替代该日志。
+_Avoid_: RedisCommandQueue、AgentSignalHistory、AudioReplayBuffer
+
+**ControlReconnectGrace**:
+候选人控制 WebSocket 断开后保留同一 AuthoritativeEvidenceIngress 与发言端点的有限窗口；新控制连接只能接管命令与安全投影，不能重建或替换权威音频链。当前正式值为 30 秒。
+_Avoid_: MediaReconnect、AnswerTimeout、NewEvidenceSession
+
+**InterviewMediaCapture**:
+一次 InterviewSession 内经明确媒体同意形成的私有音频或视频捕获事实，记录轨道、完整性、存储保护（生产为可验证加密，本地开发为受控私有目录）、文件引用、保留期限和人工访问审计；它本身不构成评分证据。
+_Avoid_: CameraPreview、PublicRecordingURL、EmotionSignal
+
+**EvidenceMediaSegment**:
+AuthoritativeEvidenceIngress 为一个 InterviewTurn 按 capture revision 顺序封存的私有候选人音频片段；只有当前 revision 的连续完整集合可进入修复，较旧 revision 一经 reset 即成为待清理数据。
+_Avoid_: BrowserAudioChunk、CandidateAnswer、PermanentRecording
+
+**EvidenceMediaGarbageCollection**:
+按持久 capture revision 识别并物理删除已放弃 EvidenceMediaSegment 的周期隐私清理；对象删除成功后才删除 segment 事实并 tombstone FileObject，重复执行不重复删除当前 revision。
+_Avoid_: AudioRepair、DatabaseVacuum、BestEffortTempCleanup
+
 **StreamingSTTSession**:
 由 ModelGateway 打开的服务端流式识别会话，拥有音频序号、partial/final 校验和断流后 batch 修复语义；每个会话只能提交一个权威 final。
 _Avoid_: BrowserRecognition、WebSocketTranscript、ProviderSocket
+
+**RoleSafeAgentReplay**:
+AgentEvent 的有界共享历史，只保存按事件类型 allow-list 收敛的最小载荷；最新 snapshot、接管/媒体特权字段和内部能力点必须从当前领域状态按角色重新投影，不能跨角色复用。
+_Avoid_: WebSocketBacklog、PrivilegedSnapshotCache、RawRedisEvent
 
 **AnswerEvaluation**:
 基于 CandidateAnswer 的指定 transcript revision 与 InterviewQuestionSnapshot 形成的不可变评分 revision；重评不覆盖旧评分。

@@ -27,6 +27,7 @@ PUBLIC_INTERVIEW_FIELDS = {
     "status": string(),
     "phase": raw(default=None),
     "avatar_mode": string(default="local"),
+    "record_audio": raw(default=True),
     "record_video": raw(default=False),
     "speech_dialogue_mode": string(default="cascade"),
     "current_turn_id": raw(default=None),
@@ -35,11 +36,4 @@ PUBLIC_INTERVIEW_FIELDS = {
     "answers": list_of(nested(PUBLIC_ANSWER_FIELDS), default=[]),
     "created_at": raw(default=None),
     "updated_at": raw(default=None),
-}
-
-PUBLIC_AUDIO_ANSWER_FIELDS = {
-    "status": string(),
-    "next_turn_id": raw(default=None),
-    "answer": nested(PUBLIC_ANSWER_FIELDS, default={}),
-    "evaluation": nested({"status": string(default="completed")}, default={}),
 }

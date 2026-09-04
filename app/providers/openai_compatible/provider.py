@@ -136,6 +136,7 @@ class OpenAICompatibleProvider:
             "temperature": request.temperature,
             "max_tokens": request.max_output_tokens,
         }
+        payload.update(self._chat_request_options(config, model))
         if request.json_schema:
             output_mode = str(config.get("structured_output_mode") or self.structured_output_mode)
             if output_mode == "json_schema":
@@ -219,6 +220,13 @@ class OpenAICompatibleProvider:
             ),
         )
 
+    def _chat_request_options(
+        self, config: Dict[str, Any], model: str
+    ) -> Dict[str, Any]:
+        """供应商子类可在这里映射明确声明的聊天请求参数。"""
+
+        return {}
+
     def _schema_prompt_messages(self, messages: list[Dict[str, Any]], json_schema: Dict[str, Any]) -> list[Dict[str, Any]]:
         instruction = structured_output_instruction(json_schema)
         return [{"role": "system", "content": instruction}, *messages]
@@ -271,6 +279,7 @@ class OpenAICompatibleProvider:
                 "messages": [message.model_dump() for message in request.messages],
                 "temperature": request.temperature,
                 "max_tokens": request.max_output_tokens,
+                **self._chat_request_options(config, model),
             },
             api_key=_api_key(credentials),
             timeout_s=timeout_s,

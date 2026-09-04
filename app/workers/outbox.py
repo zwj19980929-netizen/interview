@@ -14,8 +14,7 @@ from app.services.question_generation import QuestionGenerationService
 from app.services.talent import TalentService
 from app.services.resume_ingestion import ResumeIngestionService
 from app.services.appointment_reminders import AppointmentReminderService
-from app.transport.realtime import live_connections, realtime_event
-from app.services.realtime import RealtimeInterviewSession
+from app.services.interview_agent import InterviewAgentRuntime
 
 
 class OutboxWorker:
@@ -30,6 +29,7 @@ class OutboxWorker:
         self.talent = TalentService(store, persistence=self.persistence, catalog=self.catalog)
         self.resume_ingestion = ResumeIngestionService(store, persistence=self.persistence)
         self.interviews = InterviewService(store, persistence=self.persistence)
+        self.agent_runtime = InterviewAgentRuntime(store)
         self.appointment_reminders = AppointmentReminderService(store, persistence=self.persistence)
 
     async def run_once(
@@ -105,29 +105,12 @@ class OutboxWorker:
         interview_id = str((item.get("payload") or {}).get("interview_id") or item.get("aggregate_id") or "")
         if not interview_id:
             return
-        events: List[Dict[str, Any]] = []
-        if item["kind"] == "answer.evaluate":
-            session = self.interviews.get_interview(interview_id, item.get("organization_id", "org_default"))
-            answer_id = str(result.get("answer_id") or (item.get("payload") or {}).get("answer_id") or "")
-            answer = next((value for value in session.get("answers", []) if value.get("id") == answer_id), {})
-            events.append(
-                realtime_event(
-                    interview_id,
-                    "evaluation.completed",
-                    {
-                        "answer_id": answer_id,
-                        "turn_id": answer.get("turn_id"),
-                        "evaluation_id": result.get("id"),
-                        "score": result.get("score"),
-                        "confidence": result.get("confidence"),
-                        "status": "completed",
-                    },
-                    turn_id=answer.get("turn_id"),
-                )
-            )
-        projection = RealtimeInterviewSession(self.store, interview_id)
-        events.extend(projection.state_change_events())
-        await live_connections.broadcast(interview_id, events)
+        # Evaluation details remain an enterprise REST projection. Realtime
+        # clients receive only the stable, role-projected Agent snapshot.
+        await self.agent_runtime.publish_snapshot(
+            interview_id,
+            item.get("organization_id", "org_default"),
+        )
 
     async def run_forever(
         self,

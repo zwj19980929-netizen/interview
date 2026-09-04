@@ -14,7 +14,7 @@
 - 交互式客户端对可能被后台模型任务推进 version 的资源使用统一 latest-version command：提交前 GET 最新资源，仅当配置 revision 或命令相关业务字段未改变时采用最新 version；读写间再次冲突最多重读一次。真实语义变化返回本地 `RESOURCE_SEMANTIC_CONFLICT` 并要求重新确认，不能按供应商或模型类型写特例。
 - 明确建模为异步工作的接口（题库 import/rebuild/build、PDF 摄取等）返回 `202 Accepted` 和 `job_id`，通过工作项接口查询状态。
 - 创建题目、题目语音重建和题库语音配置切换不得在 HTTP 请求内调用 TTS；它们只提交 DurableWorkItem 并由 `app/workers/` 中的 Celery task 执行。
-- `GET /healthz` 只表示进程存活；`GET /readyz` 对数据库/Redis 和生产密钥、OSS bucket 鉴权、扫描器执行只读探针，未就绪返回 `503` 与不含密钥值的逐项结果。业务模型 route readiness 仍由预约准入按组织、purpose 和健康 TTL 判断。
+- `GET /healthz` 只表示进程存活；`GET /readyz` 对数据库/Redis、生产密钥、OSS bucket 鉴权、扫描器和 LiveKit/Egress 执行只读探针；开发环境设置 `INTERVIEWER_LOCAL_MEDIA=true` 后也会真实探测本地 Egress 与 receive-only Evidence ingress。生产还要求 30 天内、HMAC 签名且精确绑定当前 deployment/release 的实时 Agent acceptance v2 report；任一未就绪返回 `503` 与不含凭据/候选人数据的逐项结果。预约邀请/start 和候选人 Agent ticket 同样校验媒体配置、报告与组织灰度名单，不能把 `/readyz` 当作可绕过的运维提示。
 - 成功资源响应保持资源本身为顶层对象，避免为已有客户端引入破坏性的二次 `data` 包络；集合响应统一为 `{"items": [...], "next_cursor": null|string}`，即使当前实现尚未分页也保留 cursor 槽位；异步命令统一返回 `202`。二进制文件、音频和 CSV 导出不套 JSON 格式。
 - JSON 输出统一经过 `app/transport/http/responses.py`；需要防止内部字段泄露的投影在 `app/transport/http/fields/` 声明 allow-list 并由 `marshal` 执行。字段声明只负责 transport 投影，不承载领域计算；服务层不能依赖 transport fields。`app/api/routes.py` 只总装 `app/api/routers/` 下按业务域拆分的 router，不放 response、module 构造或实时连接 implementation。
 
@@ -43,7 +43,7 @@
 - `/#positions`、`/#knowledge-bases`、`/#candidates`、`/#plans`、`/#appointments`、`/#interviews`：后台工作区。
 - `/#invite/{invitation_token}`：公开邀请、姓名/邮箱/手机号填报、授权和设备检查。
 - start 响应首次导航可在 URL fragment 中携带 `candidate_session_token`；前端立即转存到 `sessionStorage` 并用 `history.replaceState` 清除 fragment 中的 token，随后进入 `/#candidate/{interview_id}`。
-- 候选人 HTTP 请求通过 `X-Candidate-Session-Token` header 调用 public 窄接口；WebSocket 握手使用同一短期 token。后台 Bearer API 不接受候选人 token。
+- 候选人 HTTP 请求通过 `X-Candidate-Session-Token` header 调用 public 窄接口；候选人必须先用它换取 60 秒、一次性 Agent ticket，WebSocket URL 只放 ticket，不放 candidate session token。后台 Bearer API 不接受候选人 token。
 - 后台工作台只按当前角色和当前路由加载允许访问的资源；`interviewer/reviewer` 不得因为无权读取 `/admin/*` 而导致整个工作台加载失败。
 
 当前代码已实现本文主流程中的岗位/题库批量 import/rebuild/build 查询、题目更新/归档/语音重建、候选人 PATCH、PDF multipart 与 HTTPS URL 摄取、简历版本/短期访问、经历题审核与语音重建、候选人专属计划、预约 PATCH/邀请、公开填报、readiness、self-start、服务端 streaming/batch STT、企业复核、签名音频、重评和 JSON/CSV 报告导出接口。旧 JSON `resume_text` 上传已删除，非 multipart 请求返回 `415 RESUME_MULTIPART_REQUIRED`。持久 Outbox 提供状态/指标、指数退避、dead-letter 与人工重放；题库导入、重建和 PDF 摄取默认返回 `202`。
@@ -59,7 +59,7 @@
 | ID | 接口保持/调整 | 完成条件 |
 | --- | --- | --- |
 | `PLAN-001` | `PATCH /interview-plans/{plan_id}` 只编辑 canonical 槽位、候选池、经历问题和策略；schema 拒绝 `items` | 预约 start 执行批准的 execution v2 revision，审批重新计算完整 readiness |
-| `CONSENT-001` | intake 使用 `consent.accepted/version/recording_accepted`；服务端校验允许版本并记录告知 hash 和服务端时间 | 缺失隐私同意返回 `CONSENT_REQUIRED`；要求录音但未同意返回 `RECORDING_CONSENT_REQUIRED`，且无持久副作用 |
+| `CONSENT-001` | intake 使用 `consent.accepted/version/audio_recording/video_recording`；服务端校验允许版本、预约必需 scope，并记录告知 hash 和服务端时间 | 隐私、音频或视频 scope 缺失分别失败关闭；无同意的视频 participant grant 不含 camera，网络验收必须证明视频上行字节为 0 |
 | `APPOINTMENT-001` | readiness 形成带有效期的设备事实；start 通过统一 admission command 校验 token、登记、同意、时间窗和全部 readiness | 窗口前返回 `APPOINTMENT_TOO_EARLY`，窗口后返回 `APPOINTMENT_WINDOW_CLOSED`；并发/重复 start 只返回一个会话 |
 | `REPORT-001` | 报告响应结构不变，`evaluation_ids` 明确等于生成时各答案的当前评分指针集合 | 分数、证据、风险和 `manual_review` 只使用这些 current revisions |
 | `SEARCH-001` | `/questions/search` 固定为有岗位/题库 scope 的关键词和结构化查询；相似题只能使用显式治理 purpose | 公开搜索与计划候选池跨同一个 Question Catalog seam，未配置 embedding 时仍可用 |
@@ -160,6 +160,8 @@ SpeechBuild 的 `failed` 计数和 `failed_items` 只包含已经进入 `dead_le
 ```
 
 父工作项在 Celery worker 中冻结活动 Question ID/version 清单并分批创建题目级工作项，进度投影至少包含 `total/pending/running/ready/failed/superseded`。切换到 revision 4 后，revision 3 的迟到结果不得成为当前资产。已批准计划或历史会话引用的旧 QuestionSpeechAsset 不删除、不覆盖。
+
+TTS 响应进入 FileObject 前必须经过共享私有音频导入合同。`audio/wav` 要求 RIFF/WAVE、唯一且完整的 fmt/data 结构和 PCM block alignment；已识别的 signed-limit RIFF/data 流式占位组合可在最终 data 直达 HTTP EOF 时安全收口，完整 chunk walker 证明正文无缺失后也可纠正恰好漏计四字节 WAVE form type 的 outer size，随后按规范化字节重算 checksum。其他截断、任意长度偏差或畸形 WAV 返回结构化 `TTS_ASSET_FORMAT_INVALID`，不得产生 ready QuestionSpeechAsset/AgentExpressionAudio。既有冻结资产不被该导入命令原地改写。
 
 KnowledgeBase 的 version 也会因后台构建状态推进而变化。配置页面不能长期复用打开弹窗时的 version：提交前先读取最新 KnowledgeBase；若最新 speech profile 的 revision、模型配置 ID/version、声音、语言、格式和语速与打开时一致，可用最新 version 提交；若这些字段已经变化，必须刷新并要求用户重新确认。提交与读取之间的极窄竞态最多按同一规则重读并重试一次，不能无条件覆盖他人的语音配置。
 
@@ -456,7 +458,7 @@ React 岗位卡片根据该岗位是否已有要求，显示“添加岗位要�
 
 `settings.avatar_mode` 只接受 `local | cloud`。新预约省略时默认 `local`；`local` 复用计划冻结的 `QuestionSpeechAsset` 并由候选人浏览器渲染形象，`cloud` 调用已配置的 `avatar.speak/interview_question_delivery` route。已持久化但没有该字段的历史预约/会话按 `cloud` 解释，避免升级后改变旧场次。`PATCH` 只合并显式提供的 settings 字段。
 
-`settings.speech_dialogue_mode` 只接受 `cascade | s2s`，默认 `cascade`。`cascade` 保留 `STT -> 受控追问策略 -> Avatar/TTS`；`s2s` 让同一 PCM 并行进入 `speech.dialogue_realtime/candidate_followup_dialogue`，但仍以服务端 STT final 和策略批准文本为真相。S2S route 不可用或输出不符合批准文本时自动回到 cascade，不能影响 CandidateAnswer 或评分。
+`settings.speech_dialogue_mode` 只接受 `cascade | s2s`，默认 `cascade`。`cascade` 保留 `STT -> 受控追问策略 -> Avatar/TTS`；`s2s` 让同一 PCM 并行进入 `speech.dialogue_realtime/candidate_followup_dialogue`，但原始音频只在有界内存缓冲，Provider final 必须与已冻结动作逐字一致才会私有落盘并表达。S2S route 不可用或文本不一致时丢弃原始 delta 并回到批准文本的 cascade，不能影响 CandidateAnswer 或评分。
 
 预约的 `settings.voice_profile_id/language` 由计划冻结的 `speech_profile_snapshot` 派生。创建或修改时显式提交另一音色返回 `409 APPOINTMENT_SPEECH_PROFILE_MISMATCH`，不能让简历题和岗位题出现两套声音。
 
@@ -493,12 +495,13 @@ React 工作台必须在这个一次性响应弹窗中提供“复制链接”�
   "consent": {
     "accepted": true,
     "version": "v1",
-    "recording_accepted": true
+    "audio_recording": true,
+    "video_recording": false
   }
 }
 ```
 
-姓名、邮箱和手机号三项均为必填。GET 邀请响应返回服务端冻结的实际隐私/录音告知正文、允许版本、`recording_required` 和内容 hash；客户端只能回传该版本，不能自定义告知。服务端只与预约绑定的 `CandidateProfile` 比较；至少邮箱或手机号之一精确匹配，姓名联合校验。成功后预约进入 `registered`，表示身份核验和预约确认已经完成，而不是面试已经开始；同一事务创建 `appointment.reminder.email` 和按经历题版本、预约 ID、profile 指纹幂等的 `question.speech.generate` DurableWorkItem。已有完全匹配资产可以复用。响应返回预约时间、安全的提醒状态和聚合 `speech_preparation` 进度，不返回简历内容、内部工作项 ID、题目或联系方式。失败响应不能说明哪个字段不匹配。
+姓名、邮箱和手机号三项均为必填。GET 邀请响应返回服务端冻结的隐私、音频录制和视频录制告知正文、允许版本、`required_consent_scopes` 和内容 hash；客户端只能回传同一版本和明确的 `audio_recording/video_recording` 布尔值。音频与视频不得合并成一个“录制已同意”字段；重复 intake 不能将已核验 scope 降级。服务端只与预约绑定的 `CandidateProfile` 比较；至少邮箱或手机号之一精确匹配，姓名联合校验。成功后预约进入 `registered`，同一事务创建提醒与经历题语音工作，响应不返回简历、题目、内部工作 ID 或联系方式。
 
 登记成功响应示例：
 
@@ -533,15 +536,16 @@ React 工作台必须在这个一次性响应弹窗中提供“复制链接”�
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/api/v1/public/interviews/{interview_id}` | 返回候选人姓名、会话状态、`avatar_mode` 和安全轮次投影；未来题干和所有答案/rubric/候选池均隐藏 |
-| `POST` | `/api/v1/public/interviews/{interview_id}/audio-answers` | 提交当前轮次录音；媒体 URI 必须属于该会话和轮次，服务端从受控本地媒体或 `private-file://` FileObject 读取音频并经 STT 后评分；接口不向 Provider 暴露对象存储凭据 |
-| `POST` | `/api/v1/public/interviews/{interview_id}/avatar/speak` | 读取当前安全题干并通过 Avatar Delivery seam 朗读；响应兼容 `browser_speech/audio/video/webrtc`，并返回实际 `avatar_mode`；WebRTC 响应带不透明 `session_id/player_kind` |
-| `POST` | `/api/v1/public/interviews/{interview_id}/avatar/session/close` | 关闭当前候选人已取得的数智人会话，释放云渲染/SFU 并发；要求候选人 token |
+| `POST` | `/api/v1/public/interviews/{interview_id}/agent-ticket` | 用 candidate session token 换取 60 秒、一次性 Agent/LiveKit 票据及冻结 recovery capability |
+| `GET` | `/api/v1/public/interviews/{interview_id}/avatar-config` | 仅对当前候选人返回授权 VRM 配置、hash 和短期模型 grant |
+| `GET` | `/api/v1/public/interviews/{interview_id}/avatar-model?grant=...` | 私有、不缓存交付经 hash/许可校验的 VRM；grant 与候选人/面试绑定 |
+| `POST` | `/api/v1/public/interviews/{interview_id}/runtime-problems` | 报告 allow-list 的候选人致命运行故障；校验 token 后真实暂停会话并返回最小确认，不接受浏览器错误文本 |
 
-候选人 token 由至少 32 字符的 `INTERVIEWER_CANDIDATE_TOKEN_SECRET` 对会话 ID 与创建时间做 HMAC-SHA256 派生，不明文持久化或出现在后台详情；验证使用常量时间比较，错误 token 返回 403。候选人 WebSocket 继续使用 `/interviews/{id}/live?role=candidate&token=...`，连接后只能发送设备就绪、媒体开始/分片/停止、未受信 partial 和心跳事件。
+候选人 token 由至少 32 字符的 `INTERVIEWER_CANDIDATE_TOKEN_SECRET` 对会话 ID 与创建时间做 HMAC-SHA256 派生，不明文持久化或出现在后台详情；验证使用常量时间比较，错误 token 返回 403。正式页面用它换取一次性 Agent/LiveKit ticket。`runtime-problems` 只接受 `AVATAR_ASSET_UNAVAILABLE/AVATAR_MODEL_LOAD_FAILED/AVATAR_RENDERER_FAILED/CANDIDATE_RUNTIME_FAILED`，由服务端映射去敏原因并幂等调用生命周期 pause；响应只含状态、问题码、动作和暂停时间，原始 JS/WebGL/网络异常既不上传也不持久化。候选人端不存在可直接提交录音、转写、Avatar 播报或云会话 close 的第二套业务接口。
 
-Avatar Delivery 响应额外包含 `avatar_mode=local|cloud` 和可空的 `fallback_reason=cloud_unavailable`。自研模式的 `audio_uri` 必须是当前轮次冻结语音的五分钟签名地址，不能返回 `private-file://`、对象键或供应商临时 URL。云模式缺少真实 route 或调用失败时不再次复制播放分支，而是调用同一个 local adapter；此时 `avatar_mode=local` 且设置 fallback reason。只有返回 `session_id` 的云媒体需要调用 close。
+短期本地 grant 指向隐藏的 `GET|HEAD /api/v1/private-files/{token}`。无 `Range` 时返回 `200`；一个合法的 `bytes=start-end`、`bytes=start-` 或 `bytes=-suffix` 返回 `206`，并携带 `Accept-Ranges: bytes`、精确 `Content-Range` 和所选区间 `Content-Length`；不可满足、畸形或多段范围返回空体 `416`、`Content-Range: bytes */{total}` 与 `Content-Length: 0`。`HEAD` 与等价 `GET` 返回相同状态、媒体类型和长度头但不返回正文。该传输合同适用于受同一 grant 保护的简历和音频，不暴露 object key，也不放宽 token、审计、`private, no-store` 或租户校验。
 
-真实流式转写使用 `/api/v1/interviews/{interview_id}/stt-stream?token=...`：客户端先发送 `stream.open`（正式 Web 端为 `audio/pcm + 16000 Hz + mono`），随后发送二进制 PCM chunk，最后发送 `stream.finish`。服务端返回 `stream.ready/transcript.partial/transcript.final/stream.closed`，且只有唯一 `transcript.final` 可创建 CandidateAnswer；随后立即返回 `answer.accepted + evaluation.queued`，不等待评分。S2S 预约还会返回 `dialogue.ready`、安全的 `followup.selected`、`output.transcript.*`、流式 `output.audio.delta/done` 或 `dialogue.error`。连接或 Provider 失败后使用已保存录音走 `stt.batch`，不信任浏览器 SpeechRecognition。
+生产签票还会重检 `INTERVIEWER_REALTIME_AGENT_ENABLED_ORGANIZATIONS`、`INTERVIEWER_DEPLOYMENT_ID`、`INTERVIEWER_RELEASE_REVISION` 和签名 acceptance v2 report；组织名单只接受逐个 organization ID，不支持 `*` 全量放开。报告不匹配或组织未启用时返回 `REALTIME_AGENT_RELEASE_NOT_READY`，且不会创建 ticket；60 秒票据在 WebSocket 消费事务中还会用数据库时钟再次验证同一门禁，期间报告失效或组织被移出名单会把票据标记为 revoked。报告的输入矩阵必须覆盖 Chrome/Edge/Safari，每类至少 10 个全部通过的桌面案例；它只输出聚合指标与数据集 hash。
 
 ## 面试会话、逐题评分与企业复核 API
 
@@ -608,65 +612,46 @@ API 不根据 `job_fit_level` 自动写入录用/淘汰结果；若未来接 ATS
 
 每次生成报告时，`evaluation_ids` 必须与生成瞬间每个答案的 `current_evaluation_id` 集合完全一致；`overall_score`、岗位证据、风险和 `manual_review` 都只从该集合推导。历史评分仅由引用它的历史报告展示，不能污染当前 revision。
 
-## 实时 WebSocket API
+## 统一实时面试 Agent 合同
 
-状态通道：
+正式候选人和企业监看控制通道为 `WS /api/v1/interviews/{interview_id}/agent?ticket=...`。候选人先用 `POST /api/v1/public/interviews/{interview_id}/agent-ticket` 和 `X-Candidate-Session-Token` 换取 60 秒、一次性、只限当前房间/轨道的票据；企业人员用 `POST /api/v1/interviews/{interview_id}/agent-ticket`，reviewer 只能订阅，admin/interviewer 才能发布人工麦克风。应用 ticket 只以 SHA-256 hash 持久化，LiveKit participant token 不落库。
 
-`GET /api/v1/interviews/{interview_id}/live?token={candidate_session_token}`
-
-服务端流式 STT 通道：`GET /api/v1/interviews/{interview_id}/stt-stream?token={candidate_session_token}`。客户端先发送 `stream.open`，再发送二进制音频帧，最后发送 `stream.finish`；服务端返回 `stream.ready`、`stt.transcript.partial`、唯一 `stt.transcript.final` 或 `stream.error`。final 缺失/断流时保存音频并触发 `stt.batch` 修复，不把不同 provider 的 partial 拼成 final。
-
-事件包络：
+WebSocket 第一条消息必须是 `session.open`，只包含 `recovery_cursor` 和设备能力。之后 JSON 信号使用 `type/idempotency_key/turn_id/causation_id/payload`，单条不得超过 64 KiB；Agent WebSocket 始终拒绝二进制帧，音视频的正常路径唯一是票据授权的 LiveKit WebRTC。正式事件统一为：
 
 ```json
 {
-  "type": "stt.transcript.final",
-  "request_id": "req_01J...",
-  "interview_id": "iv_01J...",
+  "event_id": "agent_event_01J...",
+  "session_sequence": 42,
+  "type": "transcript.final",
   "turn_id": "turn_01J...",
-  "ts": "2026-09-01T02:10:00Z",
+  "causation_id": "candidate_01J...",
+  "occurred_at": "2026-09-01T02:10:00Z",
+  "replayability": "replayable",
   "payload": {}
 }
 ```
 
-### 客户端到服务端
+稳定类型仅为 `session.snapshot`、`floor.changed`、`speech.started/stopped`、`transcript.partial/final`、`conversation.act.selected`、`avatar.performance.*`、`takeover.changed`、`problem`、`completed`。共享 replay/Redis 载荷按事件类型使用字段 allow-list；未知字段失败关闭。每次连接只接收一次按当前角色重建的最新 `session.snapshot`，旧 snapshot 不回放；cursor 早于 `replay_history_floor` 时返回恢复问题并要求重新同步。候选人 snapshot 额外投影 durable `calibration_retry_required`，使刷新、heartbeat 或 transient 事件丢失后仍能恢复“必须人工重试”的暖场 gate；它不包含暖场音频或转写。候选人、reviewer/observer 与 interviewer/admin 使用不同 projection，标准答案、rubric、内部缺失点、Provider 原始内容、未来题目、接管 actor/lease、私有媒体 URI 和证据绑定不得进入低权限投影。`speech.started` 的服务器收音确认携带 `media_transport=livekit_server_subscriber/ingress_sequence`，不能与浏览器本地 VAD 或字幕状态合并为一个图标。
 
-| 事件 | 发送方 | 说明 |
-| --- | --- | --- |
-| `session.ready` | 候选人/面试官 | 页面和设备就绪；不等于 STT readiness |
-| `candidate.media.start` | 候选人 | 声明当前轮次、MIME、采样率和语言 |
-| binary frame | 候选人 | Opus/WebM、Ogg 或约定 WebRTC 音频 |
-| `candidate.media.stop` | 候选人 | 结束录音并返回受当前会话/轮次约束的媒体 URI；随后调用 public audio-answers 或 streaming STT |
-| `candidate.transcript.partial` | 候选人 | 可选的未受信浏览器辅助字幕，只用于界面广播 |
-| `interviewer.control.pause/resume/recover/skip/complete/cancel` | 面试官 | 与 REST 共用生命周期命令 |
-| `ping` | 任意 | 心跳 |
+候选人控制信号包括 `client.ready`、`media.published`、`speech.started/stopped`、`evidence.stream.open`、`evidence.finish`、`evidence.recovery.begin/chunk/complete`、`request_repeat`、`continue_speaking`、`warmup.confirm/retry`、`pause`、`avatar.performance.stopped` 和无 PII 的 `telemetry.observe`。票据的 `media.evidence_transport` 在候选人角色必须为 `livekit_server_subscriber`；`media.recovery.server_checkpoint` 声明服务端持久 checkpoint，`browser_backfill` 冻结 source connection、audio epoch、30 秒/2 MiB/32 KiB 限额。backfill chunk 是有界 JSON base64，每帧先写私有 FileObject，不会放宽 WebSocket 二进制禁令。人工控制包括 `takeover.acquire/renew/release` 与 `human.speech`；acquire 必须含原因，renew/release 必须含 lease ID 和 expected version，人工话语永远是 `unscored_intervention`。
 
-客户端不能发送 `candidate.transcript.final` 或 `candidate.answer.text`；两者均返回 `REALTIME_EVENT_UNSUPPORTED`。浏览器 SpeechRecognition 可以在本地界面显示未受信 partial，但不能创建答案或置信度。
+`evidence.stream.open` 是两阶段 causation handshake：客户端发送后只能标记 `requested=true/ready=false`；单一 fenced owner 在 Provider stream 已实际打开、且 command receipt 尚未完成时，必须经 Hub 投影同 causation 的 transient `floor.changed(reason=warmup_stream_open|evidence_stream_open)`，发起命令的客户端匹配后才标记 ready。同一候选人的其他 controller 也可能收到这条广播，但只能推进 cursor 和安全共享状态，不能据此打开本地 gate。即使 floor 已经是 candidate，或者幂等重提命中已打开的同一 stream，也必须重新投影这条 ready ACK；ACK 不进入 replay history。控制连接在 ACK 前断开时，新连接可对同一未确认 open 有界重提一次并等待新 causation，旧 ACK 不得打开新连接的 gate。ready 前普通 VAD 不发送 `speech.started/stopped`，页面显示“准备识别”；ready 时若本地 capture 仍持续 speaking，再承接 start。唯一例外是 agent 播放期间已经过更高幅度和持续时间确认的 barge-in，它仍须在 200ms 目标内先静音并立即通知服务端。
 
-### 服务端到客户端
+`avatar.performance.started` 在候选人 facade 中建立与 `performance_id` 绑定的单一当前播放代次。`avatar.performance.interrupted` 携带 ID 时只能中断同一代次；旧 ID 的迟到事件以及已因 barge-in/replaced/close 失效播放器的 `error`、`ended` 或 `play()` 拒绝全部忽略。当前代次自然结束只发送一次 `avatar.performance.stopped`；当前代次真实加载/解码/播放错误仍提交 `CANDIDATE_RUNTIME_FAILED` 并等待服务端持久暂停回执。
 
-| 事件 | 说明 |
-| --- | --- |
-| `session.state.changed` | 会话状态变化 |
-| `question.selection.started` | 开始为岗位题槽位抽题 |
-| `question.selected` | 返回冻结后的安全题干和阶段，不返回答案 |
-| `avatar.speech.started/completed` | 预生成语音或数字人读题状态 |
-| `media.recording.started/stopped` | 服务端录音状态 |
-| `stt.transcript.partial` | 服务端 STT 临时转写，只用于展示 |
-| `stt.transcript.final` | 服务端权威 final、置信度和片段时间戳 |
-| `stt.repair.pending/completed` | 流式识别失败后的批量修复 |
-| `answer.accepted` / `evaluation.queued` | 权威答案已落库，评分工作已持久化；响应不包含分数 |
-| `followup.selected` | 安全追问投影，只含父子轮次与题干，不含内部缺失关键点 |
-| `dialogue.ready/error/closed` | S2S 表达轨状态；失败不改变证据轨 |
-| `output.transcript.delta/final` | S2S 实际播报文本，用于可观察性与批准文本校验 |
-| `output.audio.delta/done` | Base64 PCM 语音分片；候选人端按采样率排队播放 |
-| `evaluation.started/completed/failed` | 当前题评分状态和安全摘要 |
-| `interview.phase.changed` | `position_bank` 切换到 `resume_experience` |
-| `interview.completed` | 问答完成，报告可能仍在生成 |
-| `report.ready` | 新报告 revision 可查看 |
-| `error` | 统一可恢复/不可恢复错误 |
+权威 Evidence 命令受 `EvidenceControlGeneration` 保护：新 control attach 后旧连接命令返回 `409 EVIDENCE_CONTROL_STALE`，迟到 detach 不能启动新 grace。正式 STT/final 另受 `EvidenceOwnershipEpoch` 保护；旧 owner 提交返回 `409 EVIDENCE_OWNER_FENCED`。`EvidenceCommandJournal` 在返回 receipt 前持久化安全命令，同 idempotency key 返回同一 terminal outcome；当前数据库 fenced owner executor 通过 DB polling 和 Redis wake hint 执行，非 owner 控制连接作为 remote receipt proxy，不创建第二证据链。claim 过期/崩溃时由新 epoch 重领，effect receipt 与 CandidateAnswer commit fence 阻止重复效果；Redis 永远不是命令或所有权真相。
 
-服务端音频路径：`binary/WebRTC -> stt.streaming -> partial/final -> CandidateAnswer -> evaluation`。如果 stream 失败，先持久化音频并发出 `stt.repair.pending`，通过 `stt.batch` 得到 final 后再评分；不同 provider 的 partial 不得拼接成一个 final。
+`GET /api/v1/public/interviews/{interview_id}/avatar-config` 只在许可清单的实际使用范围、VRM 1.0 与 SHA-256 一致时返回 ready 配置；标准元音 `aa/ih/oh/ou` 可位于 VRM preset，其余必需口型可位于 custom，检查两者并集。模型用候选人/面试绑定的短期 grant 通过 `GET /api/v1/public/interviews/{interview_id}/avatar-model` 交付，响应 `private, no-store`。LiveKit Egress webhook 为 `POST /api/v1/public/livekit/egress-webhook`，必须校验 JWT 签名、issuer、时间、body hash，再从 provider 绑定解析组织；不得相信请求体 tenant/room，随后才可幂等推进 `InterviewMediaCapture`。
+
+`CandidateConsentCreate` 的正式字段只有 `audio_recording` 与 `video_recording`，旧的合并录制字段已从 schema 删除。`CandidateReadinessCreate` 包含 camera、microphone、speaker、WebRTC、AudioWorklet、WebGL、MediaRecorder、网络 RTT/jitter 和 avatar FPS。VRM 持续帧率 gate 与候选人可见值使用同一整数判定 `Math.round(fps) >= minimum_fps`，避免页面显示 30 FPS、底层却因 29.5 左右的原始浮点值失败；29.5/29.4 边界由前端合同固定。录像场次缺少 video consent/camera/LiveKit Egress 时 start 失败关闭；未授权视频的 participant grant 不含 camera。
+
+`media.published` 只建立 Evidence subscriber，暖场试音不录制且不进入评分。暖场 final/seal 是 destructive-once：Provider final 失败后原 stream 已消费，journal 保留第一次真实错误，不能二次进入同一流并用通用 turn 错误覆盖。此时 runtime 原子写入 `calibration_status=retrying + calibration_retry_required=true`；服务端在 durable gate 未清时拒绝 `evidence.stream.open`。候选人页面只展示显式“重新试音”；owner 执行 `warmup.retry` 并清 gate 后投影 transient 同 causation `floor.changed(reason=warmup_retry)`。任一当前 control 收到这条 live reset 事实，或从 snapshot 读到 `retrying + calibration_retry_required=false`，都可用新 causation open/reassert；相同 retry causation 的重复 ACK 不得清掉已请求/ready 的新流。旧 control 由 generation fence 拒绝，existing-open 只重新 ACK，不重复创建 Provider 流，因此刷新、heartbeat 或断线恢复不会绕过显式 retry 反复调用付费 STT。`warmup.confirm` 删除暖场音频/转写并启动必需 Egress；启动失败进入暂停/接管。最后回答接受后 runtime 先停 Evidence/Egress，再播放 `closing` act；收到 `avatar.performance.stopped` 或有界超时后才发唯一 `completed` 回执，包含提交确认、录制留存和人工审核声明。
+
+人工接管 lease 为 60 秒 CAS 事实。普通企业 Agent ticket 只能订阅；获得 lease 的 admin/interviewer 调用 `POST /api/v1/interviews/{interview_id}/takeover/media-permit`，以 `lease_id + expected_version` 一次换取最长 15 秒、限房间/限 microphone/禁止订阅的 LiveKit permit。获取、续租、发言复核、释放、过期与 permit 均使用数据库时钟；lease 释放、过期或会话终止立即移除 participant，并保持 AI 暂停。
+
+旧 `/live`、`/stt-stream`、候选人/企业 `audio-answers`、`avatar/speak` 和 avatar close 路由已删除；旧候选人 runtime/PCM 发送器也已删除。安全的历史记录修复仍可在内部 `InterviewEvidenceChain -> stt.batch` seam 执行，但不是另一个候选人入口。当前仓库合同不等于生产验收；目标 LiveKit/TURN/Egress/OSS、商用 VRM、真实 Provider、金标与试点仍需生成鲜活、合格、绑定当前 release 的 HMAC 签名 `realtime-interview-agent.acceptance.v2` 报告。
+
+`REALTIME-WARMUP-VAD-RANGE-003` 已达到“verified（仓库），目标环境复验 pending”，以上合同不得表述为目标浏览器和真实 Provider 已验收。该项不修改题目抽取、冻结证据、答案/评分、追问、S2S/cascade 或人工接管 API 与领域语义。
 
 ## 模型网关和后台配置 API
 
@@ -702,6 +687,8 @@ class ModelGateway:
 低延迟追问可额外配置 `speech.dialogue_realtime/candidate_followup_dialogue`。对应 ModelConfiguration 使用 `realtime_speech` 类型；没有 schema、可执行 adapter 和通过健康测试的模型不能进入 active route，缺 route 时面试继续使用 cascade。
 
 模型管理分为三层：`ProviderConnection` 只保存组织级厂商连接、API Key 引用和区域等连接参数；`ModelConfiguration` 选择 `llm/embedding/tts/stt/avatar/realtime_speech` 类型及厂商模型，并保存该模型的专属设置和统一默认参数；`ModelRoute` 只引用模型配置。插件 manifest 返回 `connection_form`、`credential_form` 与各模型类型的 `configuration_form`，前端使用通用控件渲染器，不内置任何厂商字段。
+
+火山引擎连接在同一 ProviderConnection 中明确区分 `ark_api_key` 与 `speech_api_key`：前者只用于 Ark Chat/Embedding Bearer 请求，后者只用于 Seed ASR、Seed-TTS 与 Seeduplex 的 `X-Api-Key`。连接级探针验证 Ark 端点并确认语音凭据已配置；每个语音 ModelConfiguration/Route 的握手或最小调用探针才验证具体 Resource ID、模型授权和会话参数。API 永不回读两种密钥明文。
 
 ProviderConnection 与 ModelConfiguration 响应增加单调递增的 `configuration_revision`。创建为 1；连接参数/凭据或模型 settings/default parameters/启用状态/显示名修改时增加；凭据校验和任意能力健康探针只推进通用 `version` 与健康事实，不改变 `configuration_revision`。因此 LLM、Embedding、STT、TTS、实时语音和数字人的编辑/删除页面都可以安全吸收探针造成的新 version，同时拒绝覆盖真正的并发配置修改。
 

@@ -4,11 +4,19 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 
+from app.core.errors import ApiError
 from app.main import create_app
 from app.persistence.provider import persistence_for
 from app.repositories.provider import get_store, reset_store_for_tests
 from app.services.interviews import InterviewService
 from app.workers.outbox import OutboxWorker
+
+
+@pytest.fixture(autouse=True)
+def _enable_formal_local_media(monkeypatch: pytest.MonkeyPatch) -> None:
+    """聚合 API 场景显式声明使用本地正式媒体配置。"""
+
+    monkeypatch.setenv("INTERVIEWER_LOCAL_MEDIA", "true")
 
 
 def api_client() -> TestClient:
@@ -100,14 +108,36 @@ def admit_plan(api: TestClient, plan: dict) -> dict:
             "consent": {
                 "accepted": True,
                 "version": notice["version"],
-                "recording_accepted": True,
+                "audio_recording": True,
             },
         },
     )
     assert intake.status_code == 200, intake.text
+    incomplete_readiness = api.post(
+        "/api/v1/public/interview-invitations/%s/readiness" % token,
+        json={
+            "browser_supported": True,
+            "microphone_granted": True,
+            "audio_content_type": "audio/webm",
+        },
+    )
+    assert incomplete_readiness.status_code == 422
     readiness = api.post(
         "/api/v1/public/interview-invitations/%s/readiness" % token,
-        json={"browser_supported": True, "microphone_granted": True, "audio_content_type": "audio/webm"},
+        json={
+            "browser_supported": True,
+            "microphone_granted": True,
+            "camera_granted": True,
+            "speaker_verified": True,
+            "webrtc_supported": True,
+            "audio_worklet_supported": True,
+            "webgl_supported": True,
+            "media_recorder_supported": True,
+            "network_rtt_ms": 20,
+            "network_jitter_ms": 3,
+            "avatar_fps": 60,
+            "audio_content_type": "audio/webm",
+        },
     )
     assert readiness.status_code == 200, readiness.text
     started = api.post("/api/v1/public/interview-invitations/%s/start" % token)
@@ -116,15 +146,17 @@ def admit_plan(api: TestClient, plan: dict) -> dict:
 
 
 def audio_answer(api: TestClient, interview: dict, transcript: str):
-    return api.post(
-        "/api/v1/interviews/%s/audio-answers" % interview["id"],
-        json={
+    return asyncio.run(
+        InterviewService(get_store()).submit_audio_answer(
+            interview["id"],
+            {
             "turn_id": interview["current_turn_id"],
             "audio_uri": "private-test://answer.webm",
             "content_type": "audio/webm",
             "development_transcript": transcript,
             "duration_seconds": 5,
-        },
+            },
+        )
     )
 
 
@@ -191,9 +223,8 @@ def test_evaluation_and_report_revisions_are_append_only() -> None:
     assert approved.status_code == 200, approved.text
     interview = admit_plan(api, approved.json())
     answer = audio_answer(api, interview, "避免长事务，并用 Outbox 分阶段提交。")
-    assert answer.status_code == 200, answer.text
-    answer_id = answer.json()["answer"]["id"]
-    assert answer.json()["evaluation"]["status"] == "pending"
+    answer_id = answer["answer"]["id"]
+    assert answer["evaluation"]["status"] == "pending"
     asyncio.run(OutboxWorker(get_store()).run_once())
     first_evaluation_id = api.get(
         "/api/v1/interviews/%s/answers/%s/evaluations" % (interview["id"], answer_id)
@@ -250,16 +281,18 @@ def test_lifecycle_controls_and_durable_events_share_one_seam() -> None:
     assert timed_out.json()["status"] == "paused"
     assert timed_out.json()["interruption"]["kind"] == "timeout"
 
-    blocked_answer = api.post(
-        "/api/v1/interviews/%s/audio-answers" % interview["id"],
-        json={
-            "turn_id": turn_id,
-            "audio_uri": "private-test://paused.webm",
-            "development_transcript": "暂停期间不应接受回答",
-        },
-    )
-    assert blocked_answer.status_code == 409
-    assert blocked_answer.json()["error"]["code"] == "INTERVIEW_NOT_IN_PROGRESS"
+    with pytest.raises(ApiError) as blocked:
+        asyncio.run(
+            InterviewService(get_store()).submit_audio_answer(
+                interview["id"],
+                {
+                    "turn_id": turn_id,
+                    "audio_uri": "private-test://paused.webm",
+                    "development_transcript": "暂停期间不应接受回答",
+                },
+            )
+        )
+    assert blocked.value.code == "INTERVIEW_NOT_IN_PROGRESS"
 
     recovered = api.post(
         "/api/v1/interviews/%s/recover" % interview["id"],

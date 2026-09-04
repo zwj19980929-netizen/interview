@@ -1,6 +1,7 @@
 import json
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Iterator, List, Optional
 
 from app.persistence.interface import Document, PersistenceTransaction, Predicate, TransactionBackend
@@ -10,6 +11,14 @@ from app.repositories.sqlite import SQLiteStore
 class _SQLiteTransactionBackend(TransactionBackend):
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
+
+    def database_now(self) -> datetime:
+        row = self.connection.execute(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS now"
+        ).fetchone()
+        return datetime.fromisoformat(str(row["now"]).replace("Z", "+00:00")).astimezone(
+            timezone.utc
+        )
 
     def get_document(self, collection: str, item_id: str) -> Optional[Document]:
         row = self.connection.execute(

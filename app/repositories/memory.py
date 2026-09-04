@@ -25,6 +25,12 @@ class InMemoryStore:
         self.candidate_intakes: Dict[str, Dict[str, Any]] = {}
         self.candidates: Dict[str, Dict[str, Any]] = {}
         self.interviews: Dict[str, Dict[str, Any]] = {}
+        self.interview_media_captures: Dict[str, Dict[str, Any]] = {}
+        self.agent_tickets: Dict[str, Dict[str, Any]] = {}
+        self.evidence_ownerships: Dict[str, Dict[str, Any]] = {}
+        self.evidence_commands: Dict[str, Dict[str, Any]] = {}
+        self.evidence_media_streams: Dict[str, Dict[str, Any]] = {}
+        self.evidence_media_segments: Dict[str, Dict[str, Any]] = {}
         self.turns: Dict[str, Dict[str, Any]] = {}
         self.answers: Dict[str, Dict[str, Any]] = {}
         self.evaluations: Dict[str, Dict[str, Any]] = {}

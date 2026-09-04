@@ -2,7 +2,7 @@
   "schema_version": "2",
   "provider_id": "dashscope",
   "display_name": "阿里云百炼（千问 / Qwen）",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "capabilities": ["llm.chat_json", "llm.chat_text", "embedding.text", "speech.dialogue_realtime", "stt.streaming", "stt.batch", "tts.synthesize"],
   "model_selection": "customizable",
   "defaults": {
@@ -25,7 +25,9 @@
     ]
   },
   "model_types": {
-    "llm": {"label": "大语言模型", "selection_mode": "customizable", "capabilities": ["llm.chat_json", "llm.chat_text"], "configuration_form": {"fields": []}},
+    "llm": {"label": "大语言模型", "selection_mode": "customizable", "capabilities": ["llm.chat_json", "llm.chat_text"], "configuration_form": {"fields": [
+      {"name": "enable_thinking", "label": "启用深度思考", "control": "switch", "required": false, "help": "开启后模型会进行更长的推理，适合复杂离线任务；实时面试理解和追问默认关闭，以避免短 JSON 请求超过轮转时限。"}
+    ]}},
     "embedding": {"label": "Embedding", "selection_mode": "customizable", "capabilities": ["embedding.text"], "configuration_form": {"fields": [
       {"name": "dimensions", "label": "期望向量维度", "control": "number", "required": false, "min": 1}
     ]}},
@@ -73,6 +75,7 @@
       "dialogue_input_transcription_model": {"type": "string"},
       "dialogue_default_voice": {"type": "string"},
       "use_environment_proxy": {"type": "boolean"}
+      ,"enable_thinking": {"type": "boolean"}
     }
   },
   "credential_schema": {

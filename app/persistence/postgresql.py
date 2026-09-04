@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, List, Optional
 
@@ -20,6 +21,15 @@ MIGRATIONS = [
 class _PostgreSQLTransactionBackend(TransactionBackend):
     def __init__(self, connection: psycopg.Connection) -> None:
         self.connection = connection
+
+    def database_now(self) -> datetime:
+        row = self.connection.execute(
+            "SELECT clock_timestamp() AS now"
+        ).fetchone()
+        value = row["now"]
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
 
     def get_document(self, collection: str, item_id: str) -> Optional[Document]:
         row = self.connection.execute(

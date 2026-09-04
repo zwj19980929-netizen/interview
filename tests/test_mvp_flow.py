@@ -1,10 +1,12 @@
 import asyncio
 
+import pytest
 from fastapi.testclient import TestClient
 from datetime import datetime, timedelta, timezone
 
 from app.main import create_app
 from app.repositories.provider import get_store, reset_store_for_tests
+from app.services.interviews import InterviewService
 from app.workers.outbox import OutboxWorker
 
 
@@ -52,9 +54,7 @@ def test_web_console_and_static_assets() -> None:
     assert icon_library.status_code == 200
     assert "javascript" in icon_library.headers["content-type"]
 
-    avatar = api.get("/web/assets/digital-interviewer.png")
-    assert avatar.status_code == 200
-    assert avatar.headers["content-type"] == "image/png"
+    assert api.get("/web/assets/digital-interviewer.png").status_code == 404
 
 
 def test_provider_connection_updates_require_current_version() -> None:
@@ -255,7 +255,8 @@ def test_mock_model_configuration_can_be_tested() -> None:
     assert tested.json()["provider"]["provider_id"] == "mock"
 
 
-def test_question_to_report_mvp_flow() -> None:
+def test_question_to_report_mvp_flow(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("INTERVIEWER_LOCAL_MEDIA", "true")
     api = client()
     position = api.post(
         "/api/v1/job-positions",
@@ -388,13 +389,26 @@ def test_question_to_report_mvp_flow() -> None:
             "name": "候选人 A",
             "email": "candidate@example.com",
             "phone": "13800138004",
-            "consent": {"accepted": True, "version": notice["version"], "recording_accepted": True},
+            "consent": {"accepted": True, "version": notice["version"], "audio_recording": True},
         },
     )
     assert intake.status_code == 200, intake.text
     readiness = api.post(
         f"/api/v1/public/interview-invitations/{token}/readiness",
-        json={"browser_supported": True, "microphone_granted": True, "audio_content_type": "audio/webm"},
+        json={
+            "browser_supported": True,
+            "microphone_granted": True,
+            "camera_granted": True,
+            "speaker_verified": True,
+            "webrtc_supported": True,
+            "audio_worklet_supported": True,
+            "webgl_supported": True,
+            "media_recorder_supported": True,
+            "network_rtt_ms": 20,
+            "network_jitter_ms": 3,
+            "avatar_fps": 60,
+            "audio_content_type": "audio/webm",
+        },
     )
     assert readiness.status_code == 200, readiness.text
     started = api.post(f"/api/v1/public/interview-invitations/{token}/start")
@@ -415,18 +429,18 @@ def test_question_to_report_mvp_flow() -> None:
         if item["id"] == current_turn_id
     )
 
-    answer = api.post(
-        f"/api/v1/interviews/{interview_id}/audio-answers",
-        json={
+    answer_body = asyncio.run(
+        InterviewService(get_store()).submit_audio_answer(
+            interview_id,
+            {
             "turn_id": current_turn_id,
             "audio_uri": "private-test://mvp.webm",
             "content_type": "audio/webm",
             "development_transcript": active_turn["question_snapshot"]["standard_answer"],
             "duration_seconds": 20,
-        },
+            },
+        )
     )
-    assert answer.status_code == 200, answer.text
-    answer_body = answer.json()
     assert answer_body["evaluation"]["status"] == "pending"
     assert answer_body["evaluation_work_id"]
     worker_results = asyncio.run(OutboxWorker(get_store()).run_once())

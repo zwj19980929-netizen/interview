@@ -1,7 +1,7 @@
 import os
 from typing import Any, Optional
 
-from app.file_storage.interface import StoredFile
+from app.file_storage.interface import RecordingProtection, StoredFile
 
 
 class AliyunOssFileAdapter:
@@ -24,8 +24,51 @@ class AliyunOssFileAdapter:
         self.bucket = oss2.Bucket(oss2.Auth(access_key_id, access_key_secret), endpoint, self.bucket_name)
 
     def healthcheck(self) -> None:
-        """Perform a read-only bucket/authentication probe."""
+        """Probe authentication and the default encryption used by Egress."""
         self.bucket.get_bucket_info()
+        self.verify_encryption()
+
+    def verify_encryption(self, object_key: Optional[str] = None) -> str:
+        expected = os.getenv("INTERVIEWER_OSS_SSE", "").strip().upper()
+        if expected not in {"AES256", "KMS"}:
+            raise RuntimeError("INTERVIEWER_OSS_SSE must be AES256 or KMS.")
+        if object_key:
+            result = self.bucket.get_object_meta(object_key)
+            headers = getattr(result, "headers", {}) or {}
+            actual = str(
+                headers.get("x-oss-server-side-encryption")
+                or headers.get("X-Oss-Server-Side-Encryption")
+                or ""
+            ).upper()
+            kms_key_id = str(
+                headers.get("x-oss-server-side-encryption-key-id")
+                or headers.get("X-Oss-Server-Side-Encryption-Key-Id")
+                or ""
+            )
+        else:
+            result = self.bucket.get_bucket_encryption()
+            actual = str(getattr(result, "sse_algorithm", "") or "").upper()
+            kms_key_id = str(getattr(result, "kms_master_keyid", "") or "")
+        if actual != expected:
+            raise RuntimeError(
+                "OSS server-side encryption does not match the required policy."
+            )
+        if expected == "KMS":
+            expected_key = os.getenv("INTERVIEWER_OSS_KMS_KEY_ID", "").strip()
+            if expected_key and kms_key_id != expected_key:
+                raise RuntimeError("OSS KMS key does not match the required policy.")
+            return "aliyun_oss_kms%s" % (":%s" % kms_key_id if kms_key_id else "")
+        return "aliyun_oss_aes256"
+
+    def verify_recording_protection(
+        self, object_key: Optional[str] = None
+    ) -> RecordingProtection:
+        encryption = self.verify_encryption(object_key)
+        return RecordingProtection(
+            descriptor=encryption,
+            encryption=encryption,
+            development_only=False,
+        )
 
     def store(
         self,
