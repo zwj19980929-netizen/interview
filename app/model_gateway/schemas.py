@@ -1,6 +1,7 @@
+import math
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator, field_validator
 
 
 class ProviderMeta(BaseModel):
@@ -96,8 +97,18 @@ class StreamingSTTRequest(BaseModel):
     language: str = "zh-CN"
     enable_partial: bool = True
     enable_word_timestamps: bool = True
+    recognition_terms: List[str] = Field(default_factory=list, max_length=100)
     purpose: str = "candidate_answer_transcription"
     metadata: Dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("recognition_terms")
+    @classmethod
+    def validate_recognition_terms(cls, terms: List[str]) -> List[str]:
+        import re
+        if (len({term.casefold() for term in terms}) != len(terms)
+                or any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_+.#-]{1,63}", term) for term in terms)):
+            raise ValueError("Recognition terms must be unique bounded technical identifiers")
+        return terms
 
 
 class StreamingSTTEvent(BaseModel):
@@ -107,6 +118,7 @@ class StreamingSTTEvent(BaseModel):
         "stream.ready",
         "transcript.partial",
         "transcript.final",
+        "transcript.empty",
         "stream.error",
         "stream.closed",
     ]
@@ -117,6 +129,100 @@ class StreamingSTTEvent(BaseModel):
     is_final: bool = False
     error_code: Optional[str] = None
     provider: Optional[ProviderMeta] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_empty_completion(cls, value: Any) -> Any:
+        # This optional completion is deliberately narrower than the legacy
+        # event contract. It certifies completed recognition, never an answer.
+        if not isinstance(value, dict) or value.get("type") != "transcript.empty":
+            return value
+        if (set(value) - set(cls.model_fields) or value.get("is_final") is not True
+                or value.get("text", "") != "" or value.get("segments", []) != []
+                or value.get("error_code") is not None):
+            raise ValueError("Empty STT completion cannot contain transcript or error data.")
+        provider = value.get("provider")
+        if isinstance(provider, ProviderMeta):
+            provider = provider.model_dump(warnings=False)
+        if not isinstance(provider, dict) or set(provider) - set(ProviderMeta.model_fields):
+            raise ValueError("Empty STT completion requires provider provenance.")
+        meta = ProviderMeta.model_validate(provider, strict=True)
+        if (not meta.provider_id.strip() or not meta.model.strip() or not meta.request_id.strip()
+                or meta.latency_ms < 0):
+            raise ValueError("Empty STT completion requires valid provider provenance.")
+        return value
+
+
+class StableTranscriptPreview(BaseModel):
+    """Read-only, stable sentence prefix; deliberately not a final STT event."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, revalidate_instances="always")
+
+    stream_id: str = Field(min_length=1, max_length=512)
+    revision: int = Field(ge=1)
+    text: str = Field(min_length=1, max_length=100_000)
+    language: str = Field(min_length=1, max_length=128)
+    confidence: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    segments: List[TranscriptSegment] = Field(min_length=1, max_length=10_000)
+    provider: ProviderMeta
+    has_unstable_tail: bool
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_nested_contract(cls, value: Any) -> Any:
+        # The shared legacy segment/meta models are intentionally unchanged.
+        # Revalidate their values here, including objects made with model_copy
+        # or model_construct, so this stricter optional contract cannot bypass
+        # validation through already-instantiated, mutable nested models.
+        if isinstance(value, cls):
+            value = value.model_dump(warnings=False)
+        if not isinstance(value, dict):
+            return value
+        data = dict(value)
+        provider = data.get("provider")
+        if isinstance(provider, ProviderMeta):
+            provider = provider.model_dump(warnings=False)
+        if isinstance(provider, dict):
+            if set(provider) - set(ProviderMeta.model_fields):
+                raise ValueError("Unexpected stable preview provider field.")
+            data["provider"] = ProviderMeta.model_validate(provider, strict=True)
+        segments = data.get("segments")
+        if isinstance(segments, list):
+            checked = []
+            characters = 0
+            for segment in segments:
+                if isinstance(segment, TranscriptSegment):
+                    segment = segment.model_dump(warnings=False)
+                if isinstance(segment, dict) and set(segment) - set(TranscriptSegment.model_fields):
+                    raise ValueError("Unexpected stable preview segment field.")
+                item = TranscriptSegment.model_validate(segment, strict=True)
+                characters += len(item.text)
+                if characters > 100_000:
+                    raise ValueError("Stable preview exceeds the transcript limit.")
+                checked.append(item)
+            data["segments"] = checked
+        return data
+
+    @model_validator(mode="after")
+    def validate_stable_content(self) -> "StableTranscriptPreview":
+        if not self.stream_id.strip() or not self.language.strip() or not self.text.strip():
+            raise ValueError("Stable preview identifiers and content must be nonempty.")
+        if not self.provider.provider_id.strip() or not self.provider.model.strip() or self.provider.latency_ms < 0:
+            raise ValueError("Stable preview requires valid provider provenance.")
+        previous_end = 0
+        for segment in self.segments:
+            if (
+                not segment.text.strip()
+                or segment.start_ms < previous_end
+                or segment.end_ms < segment.start_ms
+                or not math.isfinite(segment.confidence)
+                or not 0 <= segment.confidence <= 1
+            ):
+                raise ValueError("Stable preview segments are invalid or out of order.")
+            previous_end = segment.end_ms
+        if self.text != "".join(segment.text for segment in self.segments):
+            raise ValueError("Stable preview text does not match its segments.")
+        return self
 
 
 class RealtimeSpeechDialogueRequest(BaseModel):

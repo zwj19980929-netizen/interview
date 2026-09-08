@@ -1,10 +1,77 @@
 # 已知问题与修复设计
 
+## EXPLICIT-FINISH-NO-ANSWER-023（in_progress）
+
+iv_3bdec492ad8f4247在10:23:58、10:24:34、10:25:28三次finish/0.95之后，完整理解因没有技术内容改为clarification_request/clarify，再被播报“没有完全听清”并重开同题；这是缺少明确未作答业务分支，区别于021确认上下文和022空识别/字幕问题。新增answer_declined并经原有证据事务保存实际响应、进入下一题；全未作答正常0分，混合证据保留既有技术回答。完整回归1530 passed/6 skipped；真实新合成7组完整理解正确，v2补充语义3/3正确，慢请求仍有超在线10秒预算。另修可取消采集清理泄漏，相关131项以RuntimeWarning为错误通过。当前等待活动面试结束或用户选择现在重启，详细文件/失败/结果见日志023；真实麦克风仍待实机验收，不标closed。
+
+## FOLLOWUP-LATENCY-AND-CAPTURE-022（仓库/合成真实链与本地加载验证，实机pending）
+
+iv_58da3095bac941c6中09:18:05/30已两次识别finish，但声音取消后同一无字音频段重复重开两分钟；最终组合模型12.497秒，TTS4.317秒。追问随后又在同一无字区间不断重放直至snapshot超时、缓冲耗尽。截图上一题305字final被前端recent无条件带入追问；追问本身新建流/start_byte=0，没有证据表明此处后端串题。修复将正常无文字完成与缺失结果区分、保留同证据纯准备并按题隔离字幕，增加finish预算及恢复缓冲一致性。最终后端1483 passed/6 skipped、前端185 passed；真实合成误触发恢复1次询问/1次准备/1次提交，全部录音保留。API49796及新bundle已加载，详情见022日志；真实麦克风长会话及生产仍pending，不标closed。
+
+## SUPPLEMENT-CONFIRMATION-LOOP-021（仓库/合成真实链验证，实机环境pending）
+
+iv_2449bbc1de8940b3同题7次补充询问，6句截图明确结束用语均与厂商sentence_final散列匹配；不是无转写。旧逻辑把结束确认后的任意新活动变回listening，随后重新冻结含否定答复的边界并重问；最终final未覆盖旧partial的输入水位还会产生错误撤销。现保留问答上下文，重复否定在同一问答处理，真实补充仍撤销提交；只有新完整final指纹一致才复用确认，无final不借用旧前缀。
+
+先运行新回归2项均失败，修复后重点39项、整链和陈旧表达30项通过。完整后端1422 passed/6 skipped；真实合成ASR+补充语义+慢准备中重复否定为1次询问/2次finish/1次提交、3个STT流，1,035,520字节录音完全一致。专用INFO诊断补全意图与撤销/播放来源。原会话最终另因TTS_ASSET_DOWNLOAD_FAILED暂停，历史数据未改写；旧TTS下载失败的具体下游原因无法由已保存的泛化错误还原，仍保留问题，不宣称所有外部故障消失。真实麦克风长会话仍待验，不标记closed。
+
+## SPEECH-ACTIVITY-AND-AUDIBLE-CONFIRMATION-020（仓库验证，实机听感pending）
+
+当前会话iv_acbc69fa54e24915中发现服务端0.001 RMS低于既有端点配置，新增转写通知错误挂到open事件。已统一门槛、修正实际收音事件通知、无有效回复时语音澄清和真实字幕活跃状态；修复前端语音未开始/卡顿/被阻止时缺少独立恢复的问题。补充询问私有WAV实际6.48秒、RMS−23.7dBFS，且存在播放结束回执；无法据此追认为用户扬声器已发声，也不能确认历史具体未听见原因。
+
+完整后端1416 passed/6 skipped，前端181 passed；低背景、持续语音、低声新增ASR经真实ingress、重复ASR、空回复语音澄清、播放受阻恢复/旧句隔离、诊断权限和严格Schema均已回归。新增播放开始/受阻的安全日志帮助后续定位。真实麦克风噪声、耳语识别率、浏览器及输出设备听感和生产仍environment/data pending，不标记closed。服务加载与合成厂商验证见工作项020。
+
+## ASR-REPLAY-AND-TRANSCRIPT-QUALITY-019（背压/语义门禁已验证，真实语音质量pending）
+
+iv_01b96d6b40314e2f 于06:00:49Z至06:00:57Z重复 PROVIDER_BACKPRESSURE_EXCEEDED。真实 Adapter + 慢 socket 已复现；旧测试下一拍清空所有缓存，遗漏真实网络排空时延。修复补送容量等待、恢复预算及继续补充后的无转写循环；新增术语提示和语义歧义门禁。红框字幕源于 ASR 投影路径，但旧逐句响应未保留，不能断言是模型虚构、回声或某个声源；新增散列/时间来源诊断。真实麦克风质量及生产仍 pending，不以合成测试标记 closed。
+
+## CONFIRMED-ANSWER-FINALIZATION-018（verified：仓库、真实合成音频链与本地加载）
+
+已确认新会话iv_bd12fa2e99b34f05进入supplement_reply.v1和确认后的decision.v2，仍无答案；端点用单帧RMS撤销确认，ContinuousSTT用更低RMS无限保留无转写后缀，确认final后还重开空识别。修复持有同一final、共享本地语音活动判断、待定起音守卫、新ASR假设撤销以及阶段准确的提示；另通过回归修复已覆盖半帧误阻塞、静音send在途导致重复理解。局部录音统计只能证明能量尖峰，不能断言声源。
+
+最终完整后端1392 passed/6 skipped、前端176 passed、build/compile/diff通过；真实合成TTS→STT→语义finish→收口仅2次识别开流，428160字节录音逐字节一致。API16195及index-Dtd5Burt.js加载，healthz/readyz正常；原会话仍in_progress/answers0，未补造答案。详细命令、两轮失败与对应修复见日志018。真实麦克风及生产仍为data_pending/environment_pending，兼容未移除，未closed。
+
+## SPOKEN-SUPPLEMENT-CONFIRMATION-016（verified：仓库、真实合成合同与本地加载）
+
+证据：iv_2c8b3c6b909d4d0c已转写但答案0，10:05:33Z起理解请求连续provider_bad_request。历史厂商错误正文不可追溯；本轮真实合成Schema均成功，不伪称唯一参数根因已复现。已增加原生400的单次受控JSON Object兼容、严格统一校验与安全诊断；正式5秒补充询问、服务端口头意图、明确完成后提交、续说撤销、回声隔离、播放超时、状态及题干投影已通过回归，另修动态表达错误复用题目音频。
+
+验收：完整后端1376 passed/6 skipped，后续影响面285 passed、最后确认/集成/合同/表达守卫39 passed，前端176 passed，build/compile/diff通过；真实Qwen合成肯定、否定、含糊答复与确认后完整答案理解通过。本地API8004及新bundle已加载，原会话保持paused/answers0。命令、失败及恢复留痕见操作日志016；真实麦克风质量和目标环境保持data_pending/environment_pending，兼容路径未删除，未标记closed。
+
 本文记录 2026-08-25 深度审查确认的实现问题、目标设计、迁移步骤和验收测试。它是修复工作的执行清单；目标领域不变量仍以 `docs/domain-model.md` 为准，接口语义以 `docs/api-design.md` 为准。
 
 状态约定：`open` 表示已确认、尚未修复；`in_progress` 表示实现或验收仍在进行；`verified` 表示仓库代码、迁移/配置保护和可执行自动化测试全部通过；`closed` 表示相关兼容路径也已删除。外部服务另用 `environment_pending`，真实业务金标或校准样本缺失另用 `data_pending`；两者都不能因 adapter 的离线合同测试通过而冒充完成。
 
 ## 修复顺序
+
+### NONCLOSING-STT-SNAPSHOT-015（verified：仓库与本地加载，真实麦克风/生产pending）
+
+- 已确认的设计问题：正常自动提案为拿转写先finish/reopen，决定提交后再finish；continue_listening也已切流。稳定句末事实在Adapter里被降为partial，增加不必要的连接生命周期与延迟；不追认为014历史错误的唯一原始原因。
+- 实现：独立非final预览、严格句段/来源/版本校验、原连接上可撤销预计算、真正提交前一次最终收口；尾句/置信度/上下文变化仍要重新准备，未稳定内容不形成答案。同内容继续听不反复模型调用，无稳定句等待、显式提前结束仍可单次final兜底，试音保留自动结束。不支持预览的Adapter保留原路径。
+- 回归补缺：预览异常必须标记故障后真实重建；final修订后理解暂时失败，重开仍能用已确认前缀重试，但新未识别有声后缀阻止旧前缀提交。所有PCM只录一次，owner/输入/题目/complete gates不减；预览轮询100ms且不反复读取完整会话，实际准备才持久封存前缀。新增安全无PII的识别开流/finish/预览准备/final修订计数。
+- 验收：完整后端1352 passed/6 skipped、前端173 passed、compile/diff通过；API96567加载新后端，healthz/readyz正常。完整命令与中途失败留痕见工作项015。真实麦克风中文多轮/丢包/轻声、时延p50/p95与生产仍pending，012实验TTS仍关闭，无预览Adapter兼容未删除。
+
+### CONTINUOUS-CAPTURE-RECOVERY-014（verified：仓库与本地加载，真实麦克风/生产 environment_pending）
+
+- 事故与根因：iv_4d9730f843ec4ca7正式开流/三次重开成功后，CONTINUOUS_CAPTURE_FAILED只保存ApiError并暂停。合成复现retryable snapshot失败先pause+abort，finally因capture已关闭从不resume。另证实补送积压会挤爆未获调度的sender，以及finish取消漏清理；后两项不能追认为这场事故已证原始错误。
+- 修复：独立安全错误分类、有界自动重建/未确认PCM有序补送/一次录音、30秒新积压、失败耗尽同题重答且不提交残缺答案。状态持久化与短UI投影拆开，critical状态失败必须撤销输入；主动暂停取消恢复，开流前后校验当前会话/题目/owner；过期owner只自撤销，不能暂停继任者。Provider正常finish/abort共享有界回收；提交后UI故障不漏调度下一步，批准表达不使用短UI期限。
+- 验收范围：最终后端1198 passed/6 skipped、前端173 passed，构建/compile/diff通过；合成故障全链集成、Endpoint、Provider、ContinuousSTT、重开fence和Memory/SQLite同题重试事务测试，以及前端恢复/重连/capture scope均通过。实际命令、本地health/readiness与新bundle加载证据见操作日志014。新retry开流已修服务端PCM格式、跨会话owner绑定和失败ACK解锁，保留中途失败记录。
+- 不变量与未完成：试音仍自动结束，正式仍智能可撤销接话，不强制按钮；不改历史paused会话、不发邀请、不外发历史回答、不启用实验TTS。真实中文停顿/长回答/网络抖动及生产验收仍pending，不宣称端到端稳定率或1–2秒达标，012剩余目标不因此关闭。
+
+### ROUTE-READINESS-REFRESH-013（verified：仓库与本地服务，生产 environment_pending）
+
+- 根因：五条必需路由的 healthy 记录超过 24 小时，邀请 admission 将“过期”和真实故障混为 configured_route_unhealthy；只有手动 route test 更新证据，管理页又缺四种用途。
+- 修复：统一分状态投影与命令触发的有界刷新、跨实例探针租约/配置指纹、失败冷却、探针取消清理；邀请/start 最终事务不放宽；补齐用途和安全反馈。真实探针另复现 STT 已握手但关闭等待误判超时，已改为共享独立 abort、强制底层回收及清理错误分类，正式 finish 不变；旧健康证据在配置修改前绑定旧配置，不能借兼容窗口绕过重测。
+- 验收：完整后端962 passed/6 skipped，前端158 passed，构建/compile/diff通过。`2026-09-07T07:47:56Z` 本机只刷新原预约，0.92秒后五路由 healthy/can_invite=true；重复刷新0.10秒且 invocation 85→85，预约仍 scheduled/version1，未签发邀请。已覆盖过期恢复、失败/超时、独立 SQLite 连接去重、配置/凭据变化、公网前置准入、最终复核与并发幂等；命令和证据见操作日志013。旧无指纹证据仍保留原TTL内兼容，未closed；探针成功不代表业务识别质量或生产验收。
+
+### INTERRUPTIBLE-AUTOMATIC-TURNS-012（自动轮次已启用，流式 TTS 默认关闭，目标验收 pending）
+
+- 根因与目标：011 将正式收口改成强制按钮仅规避抢话，不满足智能面试要求。原设计将语音句段 final、完整答案、语义处理和关闭 Evidence 耦合，续说容易排在慢推理后；修复必须拆开这些边界，不能靠扩大静音秒数。
+- 已实现并启用的自动轮次：持续收音＋可撤销音频 EOT 提案；识别轮换有序缓冲、缺 final 的有声段重放；后台合并理解/追问和有界重试；新输入/补传/最终置信度或上下文变化失效旧决策；锁内前置校验再提交唯一答案；暂停/换题/owner 变化后丢弃迟到播报；前端准备阶段保留输入，按钮仅可选兜底，试音仍自动结束。
+- 已实现但默认关闭的流式 TTS：统一 TTS PCM、DashScope SSE、独立最小权限 publisher、完整私有归档、ready/provider EOF/客户端 ACK 协议、前端精确绑定和断线新代重播已有代码与合同测试。`INTERVIEWER_STREAMING_TTS_ENABLED` 默认 false，当前默认仍使用预生成或完整合成后的私有音频；代码和合同完成不代表端到端验收通过。
+- 未完成的播放证据：Chrome 的 2 秒 PCM＋3 秒停供实测中，`currentTime` 仍增长到 5.122 秒且无 `waiting`，EOF 后立即报告 drained；该媒体时钟不能作为源样本排空或可靠口型的证据。源样本到实播位置映射／可计数的 PCM 消费时钟仍待完成并验证，不能用固定尾音等待或历史抖动均值冒充准确 ACK；此前不默认启用实验输出。
+- 当前环境修复证据：LiveKit `Cmd` 广播 `192.168.0.104`，但主机 `en0` 已为 `192.168.0.108`，两个无候选数据的浏览器探针 ICE 失败且响应数为 0。确认 `rooms=0/participants=0` 后运行 `local-media.sh up` 更新地址，Chrome 正常及 3 秒停供探针均完成并删除临时房间；不追认该问题为所有历史事故原因。新增 `local-media.sh doctor` 只读比对地址，漂移时非零且给人工操作指引，不自动中断运行中的房间。
+- 回归证据：本地 worker/概率协议、连续 STT、可撤销 endpoint、合并严格合同、Prepared 证据绑定、迟到表达/owner 围栏、阶段指标、流式输出生命周期/默认关闭门禁、候选端状态与只读 doctor 均有用例；最终本地全量后端 `858 passed, 6 skipped`、前端 `131 passed`，构建成功。原生离线合成 PCM smoke `31 passed`，冷/热运行开销不等同于中文轮次准确率。具体命令与服务状态见操作日志 012；这些是仓库与本地验证，不是生产验收。
+- 尚未关闭：真实中文思考停顿/填充词/轻声续说/长回答、并发模型 worker 负载、可靠 PCM 播放时钟、首音 p50/p95 与真实网络故障仍待样本校准和目标环境验收，保持 `data_pending/environment_pending`，不能宣称 1–2 秒端到端达标。批量补偿配置/生产 readiness 不绕过，旧 paused 会话不自动恢复。
+- 独立环境风险：本轮上线时证实 Docker/LiveKit 曾比签发主机慢约 15 分 24.5 秒，导致 probe JWT `not valid yet`；最新采样恢复到约 0.73 秒。不扩大 nbf 容差、不关鉴权、不改系统时间；真实运行需保证主机/VM 对时，初始 500 不据此强行追认根因。原生拒绝日志的 JWT 已在应用 logger 上脱敏。
 
 | 顺序 | ID | 优先级 | 问题 | 状态 |
 | --- | --- | --- | --- | --- |
@@ -228,6 +295,46 @@ Report module 在生成开始时先物化唯一的 `current_evaluations` 集合�
 - React `candidate` feature 已实现 `/#invite/{token}` 登记页和候选人 public API 调用，生产不再依赖后台 Bearer 身份。
 - `tests/test_realtime_media.py` 验证错误 token、跨会话媒体和标准答案投影均被拒绝，并完成 public 音频转写评分闭环。状态为 `closed`。
 
+### TURN-COMPLETION-UNDERSTANDING-011（verified（仓库与本地服务、真实模型合成合同），真实麦克风复验 pending）
+
+- 会话 `iv_f5c41141820c4b3c` 的追问转写已完整返回有效长文本；05:06:03.620Z stop 后 05:06:06.169Z 当前 capture 正常自动 seal，05:06:07.329Z 续说排队到 05:06:18.923Z。真正暂停在 05:06:18Z：真实 LLM 调用耗时 11,468ms，JSON schema 已过、领域内容被拒绝。旧日志未留具体规则，不追认到底是原文引用、能力分区还是 claim 声明错误；这次没有旧 capture 串流或 mock STT 成功证据。
+- 根因修复：正式静音与回答完成分开，显式完成前持续同一录音；处理期间投影真实状态、抑制 VAD/重复提交/旧快照重开；理解 v2 改为服务端原文/能力点编号，严格检验后精确还原；一次有界纠正与去敏拒绝分类；重大暂停不再被可恢复次生问题覆盖。百炼 wire 不接受 uniqueItems 的差异留在 Adapter，网关严格去重校验保留。
+- 完整后端 `525 passed, 5 skipped`、前端 `84 passed`，build/compile/diff 检查通过；本地 API 已重启 PID `21509`，新 bundle `index-jehEcGBW.js`。历史敏感转写外发复验被安全检查拒绝，未执行，待用户明确同意。仅无个人信息合成材料的真实模型已通过（5,268ms、两条精确证据），不代表事故原回答/真实浏览器或生产验收通过。历史 paused 会话不自动恢复，需刷新后在新测试场次核验明确完成、多轮和长停顿。
+
+### ENDPOINT-CAPTURE-SCOPE-010（verified（仓库与本地服务），真实麦克风停顿复验 pending）
+
+- 事故会话 `iv_618dd870f4a54270` 已完整提交第一题；没有 turn 的 speech.stopped 于追问 open 前进入 journal，旧端点在 2.5 秒后取当时新流的 turn，封存了仅 2.18 秒的低音量录音。补偿路由落到 mock，None 经字符串化被送给理解，最终 `UNDERSTANDING_RESULT_REJECTED` 安全暂停。
+- 修复为 ready/VAD 携带 capture ID/turn，端点另绑定每次停顿 ID，旧/无 scope/无匹配 start 的停止信号与迟到 seal 无副作用；正常 barge-in 和显式收口保留。Provider 无 final 时保留录音、原子标记转写失败并释放采集，提示继续说或重说；不虚构 utterance、不调用理解/评分。网关禁止无显式开发文本 fixture 的 mock batch，adapter 不再字符串化 None。
+- 全量后端 `514 passed, 5 skipped`，前端 `84 passed`，构建、编译与 diff 检查通过；覆盖跨题/同题采集作用域、已取消但排队的 seal、无 final 后重说及唯一答案、mock fixture、暖场与 owner 接管。接管测试改用可控数据库到期故障注入，不依赖在 200ms 内完成初始化，生产租约规则不变。本地 API PID `15757` 已加载修复，health/readiness 正常，首页提供新 bundle `index-C6hUuIMG.js`。
+- 原安全暂停会话不自动恢复；本地真实批量补偿路由尚未配置，缺少此能力时明确失败而非假成功。目标浏览器强制刷新后的实际停顿/续说、多轮识别、断流补偿和生产验收仍 pending，不标记 closed。
+
+### EVIDENCE-NONANSWER-RECAPTURE-009（verified（仓库与本地状态修复），真实麦克风复验 pending）
+
+- 会话 `iv_4b8a18d54e7e4747` 在 05:18:44Z 成功打开正式 STT，封存 1,025 帧、656,000 字节 PCM（20.5 秒）；05:19:16Z 理解结果 confidence=0.3、suggested_action=clarify，服务端要求重说。生命周期把题目恢复 asking，但 EvidenceMediaStream 仍 complete，造成后续 13 次 `EVIDENCE_MEDIA_ALREADY_COMPLETE`，界面卡在准备识别。这次不是流式模型未配置或麦克风全程没有传入。
+- 修复让非答案提交与采集 revision 归档/递增原子提交；流式、断线 batch、持久 repair 统一携带 revision。完整但未判定/已采纳的录音仍不能普通重置，迟到 writer、转写状态、语义结果和等长度跨 revision repair 失败关闭，旧录音/转写不被覆盖。
+- Memory/SQLite 定向 `27 passed`，后端全量 `495 passed, 5 skipped`。本机修复前备份数据库，校验目标完整 checkpoint、同一拒绝事件、无答案与 owner 过期后，通过短暂 maintenance owner 正常 claim/fence/release 将该会话 capture 1 推进到 2；保留 control generation、会话/题目状态和所有历史证据，写入 `evidence.nonanswer_capture.released` 审计。API PID `2644` 的 health/readiness 正常。浏览器刷新后真实重说复验仍为 pending，不声称 STT 准确率或生产验收通过。
+
+### FORMAL-EVIDENCE-DRAIN-SQLITE-008（verified（仓库与本地服务），目标新会话复验 pending）
+
+- 会话 `iv_581d8635efa8413b` 的暖场和正式回答均路由到 DashScope `qwen-audio-3.0-asr-flash-streaming`，因此不是“试音模型正确、正式模型不同”。正式 Evidence 从打开到暂停约 51 秒，但持久 segment 只有 125×20ms 帧、80,000 字节 PCM，即应用 sink 实际仅接收 2.5 秒；最终 `answers=0`，几个字只是中断前的 transient partial。
+- 同期浏览器产生 13 组 VAD start/stop。每条 durable Evidence command 和会话状态事务提交后，SQLite adapter 都调用 `_load_from_db()`，反序列化当前一万多条 documents/audit；这些同步工作与 LiveKit receive/sink/STT 共用事件循环，持续饿死有界 sink 并触发 `LIVEKIT_INGRESS_SINK_BACKPRESSURE`。此前扩大到五秒的队列只能容忍短抖动，不能修复这个确定性的 O(全库×命令数) 热点。
+- SQLite 现记录事务内 document/work item/secret/invocation delta，仅在 commit 后深拷贝实际变化到兼容缓存；rollback 不同步，事务读取/CAS、索引过滤和 reopen 仍以 SQLite 为权威。LiveKit ingress 同时维护 accepted/delivered 水位，warm-up/formal seal 必须等命令点之前的已接收前缀全部通过 Evidence sink，超时走原失败关闭/暖场 retry seam，不能截断 final。
+- 候选端默认连续静音 800ms 才发 stop，减少自然短停顿产生的命令风暴；`warmup.confirm` 立即清空暖场字幕，发送失败则恢复，snapshot 跨连接进入 completed 也会清理。定向后端 `44 passed`、前端 `35 passed`，完整后端 `475 passed, 5 skipped`、完整前端 `83 passed`，production build、compileall 与 diff check 均通过；修复后的本地 API/全部 readiness 检查已 ready。事故会话保持历史暂停，必须用全新邀请完成至少 60 秒正式长回答并核对 Evidence 帧、私有录音、唯一 final/CandidateAnswer 后才能移除环境 pending。
+
+### STT-FINAL-PARTIAL-TAIL-007（verified（仓库），目标新会话复验 pending）
+
+- 新会话 `iv_8120d4147ef14c67` 的暖场流从 `2026-09-04T06:18:32Z` 正常打开，约 46 秒后正常 seal；没有 Provider 背压、LiveKit 断流、面试暂停或 Evidence owner 失效，但最终确认字幕缺少尾部，因此与上一项背压事故不是同一故障。
+- DashScope reader 对实时 partial 使用 `committed + partial`，但旧 finish 在已有 committed 分句时只选择 committed，把厂商在 `task-finished` 前最后交付、尚未标记 `sentence_end` 的非空片段丢弃。前端收到 final 后会按权威结果收口并移除活动 partial，于是候选人看到“实时出现过、最终却少一截”。
+- adapter 现以单一 transcript projection 同时生成 partial 与 final：复制全部 committed segments，再追加有效 partial segment；最终 text 和 segments 来自同一集合。没有任何 Provider 文本时仍返回 `provider_final_transcript_missing`，多个 final、浏览器 final、跨 Provider 拼接和猜补未识别内容仍被禁止。试音面板展开态明确标为“完整服务端字幕”。
+- DashScope 合同新增 committed + uncommitted tail + task-finished 场景并验证唯一 final 和两个 segment；完整后端为 `471 passed, 5 skipped`，完整前端为 `81 passed`，production build、compileall、manifest JSON 与 diff check 均通过。仍须用新会话对真实 Provider 复验尾句，正式回答还要核对 CandidateAnswer 与录音，完成前保持目标环境 pending。
+
+### WARMUP-BACKPRESSURE-RECOVERY-006（verified（仓库），目标新会话复验 pending）
+
+- 会话 `iv_68419ac0bb784ee5` 的暖场 STT 已打开并形成大部分字幕，`2026-09-04T05:31:22Z` 因 `PROVIDER_BACKPRESSURE_EXCEEDED` 报 `LIVEKIT_EVIDENCE_AUDIO_STREAM_FAILED`；浏览器到 `05:33:39Z` 才断开，Evidence owner 续租全部成功，因此不是客户端先离线或租约失效。两秒 DashScope PCM 积压预算与实测约 1.76 秒调度尖峰距离过小，是直接稳定性风险。
+- 旧路径把任何 `audio_stream_failed` 都当正式 Evidence 致命错误暂停，但暖场是不录音、不评分、不能形成 CandidateAnswer 的临时校准。同时旧 endpoint seal 在断流后仍能等待 Provider final 并把 calibration 推进到 `awaiting_confirmation`，造成“服务器已暂停”和“试音请确认”相互矛盾。
+- 每个暖场 open 现分配本地单调 epoch；断流先同步失效 epoch，再由单一恢复 seam 取消端点、abort 临时流、清 partial 并持久进入显式 retry gate。seal 在调用 Provider 前后都检查 track failure/epoch；失败前已在等待的迟到成功结果也只能 rejected，不能发 final 或确认表达。正式流没有此可重试降级，仍走暂停、checkpoint repair 或人工接管。
+- LiveKit receive-only iterator 在候选人显式 `warmup.retry` 时可针对同一已发布 microphone track 重启，失败才重建 subscriber。LiveKit sink 和 DashScope sender 均改为默认五秒无损有界窗口、硬上限 30 秒；前者可由环境变量调整，后者由 STT 模型配置调整，任一超限仍明确断流而非丢帧。仓库专项回归通过；真实浏览器、真实 Provider、超过五秒的故障与多轮正式回答仍需新会话环境验收，事故会话保持暂停。
+
 ## REALTIME-AGENT-001：正式面试没有单一实时智能体运行时
 
 ### 修复前现状与影响
@@ -262,6 +369,24 @@ Report module 在生成开始时先物化唯一的 `current_evaluations` 集合�
 - 暖场 final/seal 失败对原流只执行一次 destructive finalize，保留首次真实错误并持久写入 `calibration_retry_required`。服务端 gate 未清时拒绝新 Evidence open；候选人只在显式点击“重新试音”后发送 `warmup.retry`。owner 执行 reset 后的 live transient ACK 或 snapshot `retrying + retry_required=false` 均允许当前 control 用新 causation 恢复；客户端忽略同 retry cause 的重复 ACK，服务端用 generation fence 与 existing-open 幂等 ACK 避免刷新、heartbeat、断线或多标签页重复创建付费 STT。
 - 本工作项不修改抽题、计划/题目冻结、权威证据形成、答案、评分、受控追问、S2S/cascade 或人工接管业务逻辑。全量仓库验证已通过，因此状态为 `verified（仓库）`；新会话 Chrome/Edge/Safari、LiveKit/STT、扬声器回声/真实打断和私有媒体 seek/Range 仍为目标环境待办，在这些证据齐备前不得标记 `closed` 或生产验收通过。
 
+### EVIDENCE-LEASE-TELEMETRY-004（verified（仓库），目标新会话复验 pending）
+
+- 会话 `iv_2dd0eecc8dd8491f` 的暖场 STT 已成功打开并完成识别，正式题目也已播放；但正式候选人 Evidence/STT 从未打开。事故时间线显示 owner 最后一次续租后超过 15 秒未续上，随后以 `EVIDENCE_OWNER_FENCED` 暂停。这不是正式 STT Provider “听不懂”，而是正式收音命令尚未执行前权威 ingress 已自围栏。
+- 根因是候选端逐 viseme 发送约 400 条 `telemetry.observe`。旧 AgentChannel 把每条遥测当作普通领域信号，依次执行幂等读取、`processed_signal_keys` 写入和 SQLite 整会话 reload；积压占用事件循环，使 owner 续租任务错过 15 秒 lease。暖场发生在积压前，所以“试音能识别、正式面试不能识别”的表象与该时间线一致。
+- `telemetry.observe` 现为 candidate-only、无 PII 的 process-only 旁路：合法固定词汇样本只更新进程指标并显式让出调度，不获取领域信号锁、不执行幂等读写、不修改 InterviewSession/事件/Evidence journal/takeover；非法、未知或越界样本静默丢弃，不能形成 problem 或暂停。其他非遥测信号的幂等和领域路径保持原样。
+- 候选端把 `avatar_viseme_drift_ms`、`avatar_freeze_ms` 按 metric 独立聚合为 1 秒最大值窗口，每窗至多发送一次；socket 未打开、窗口中断、播放停止或体验关闭时不排队、不重放，其他 latency 指标即时上报。Evidence owner 续租增加 `evidence_owner_renew_scheduler_lag_ms/evidence_owner_renew_db_latency_ms/evidence_owner_renew_success` 三项无标识符观测，用于区分调度延迟、数据库耗时和续租结果。
+- 续租安全没有放宽：过期 owner 仍 self-fence，有无 successor 都不能迟到复活；owner/lease/epoch fence、独立的 control-generation 命令 fence 和 CandidateAnswer commit fence 均保持严格。仓库回归覆盖 SQLite 下 512 条重复遥测不改变任何领域指纹、调度让步、非遥测幂等、多个 lease 周期续租以及过期 owner 自围栏，状态为 `verified（仓库）`。必须以全新预约/会话在目标浏览器和实际 LiveKit/STT 路由复验暖场后正式 Evidence open、字幕和持续多轮续租，完成前不得标记 `closed` 或 production accepted。
+- 本项不改变抽题、计划/题目冻结、权威证据、CandidateAnswer、评分、受控追问、S2S/cascade 或人工接管业务逻辑；事故会话保持暂停，不原地恢复。
+
+### FORMAL-STT-PARTIAL-BACKPRESSURE-005（verified（仓库与本地服务），目标新会话复验 pending）
+
+- 会话 `iv_31e593c1ef5b4098` 中候选人讲话持续到进入 LiveKit，Egress 记录 4,371 个 audio buffer 且 dropped 为 0，但应用的权威 Evidence 只保存 1,143 个 20ms 帧（22.86s）；其中前 19.195s 为静音，只剩约 3.66s 有效语音，对应页面上的短 partial。随后没有 formal final/CandidateAnswer，服务端以 `LIVEKIT_EVIDENCE_AUDIO_STREAM_FAILED` 严格暂停。这排除了候选人没说、麦克风先停、VAD 提前 seal、LiveKit 丢轨和 Evidence lease 失效。
+- 事故同时确认旧暖场播放的迟到 `avatar.performance.stopped` 在新正式题 performance 已建立后仍继续切换 floor，使正式 STT 在题目播放期间提前打开并摄入长静音。现在 stop 必须携带当前 ID 并在事务中 compare-and-clear 成功；缺失、迟到、重复或不匹配的 stop 不再产生事件、改 floor 或推进暖场/结束。
+- 失败版本把每个 `transcript.partial` 同步放在 `_receive_audio` 下游；即使是 transient，也会更新 SQLite 会话并做跨实例投影，可以耗尽两秒 LiveKit sink。现在 partial 由独立、有界、按 `(kind, turn_id)` latest-wins 的 projector 处理；501 帧高压测试在投影故意阻塞时仍全部进入 Evidence，final/reset/stop 屏障又阻止迟到 partial。非 partial 仍是同步无损路径。
+- DashScope adapter 现在把 16kHz/mono/PCM 默认合并为约 100ms/3,200B 后发送，finish 刷出尾包、abort 清空缓冲，并把所有未发字节纳入两秒背压预算。已安装的 `websockets>=15` 会默认发现环境代理；adapter 现严格落实已有 `use_environment_proxy=false` 配置为 `proxy=None`，仅显式开启才使用环境代理。
+- LiveKit track task 不再把所有原因压成单一 `RuntimeError`；adapter 只保留经校验的错误代码和异常类型，特权诊断在统一业务问题下记录 `cause_code/cause_type`。URL、token、凭据和转写均不落库，候选人投影也不包含诊断字段。
+- 这些修改仅改变播放回调的时序验证、可丢字幕投影、相同 PCM 的网络分包、连接路径和故障观测；没有改动抽题、冻结计划、权威 final/Evidence、CandidateAnswer、评分、追问、S2S/cascade 或人工接管规则。事故会话保持暂停，必须用新邀请复验长回答、final 和多轮。
+
 ### 真实状态与关闭条件
 
 - 状态保持 `in_progress（仓库实现已收口，目标环境/数据验收 pending）`。旧 `/api/v1/interviews/{id}/live`、`/stt-stream`、候选人/企业 `audio-answers`、`avatar/speak`、avatar close 及多通道前端 runtime 已物理删除，OpenAPI/静态资源合同阻止回归；仓库不会在故障时退回静态肖像或问卷式文本提交。
@@ -276,6 +401,8 @@ Report module 在生成开始时先物化唯一的 `current_evaluations` 集合�
 | `ASYNC-001` | P1 | `verified` | 题库构建/PDF/worker 缺少退避、dead-letter、监控和重放 | import/rebuild/build 与 PDF 均返回 job；Outbox 增加最大尝试、指数退避、dead-letter、指标和审计重放；故障矩阵通过 | 外部告警平台由部署环境接入 |
 | `DURABLE-MODEL-RETRY-001` | P1 | `verified（仓库）` | 模型调用首次可重试失败时，部分服务提前写领域 failed；TTS 因此推进 Question version，下一次成功响应被自身的 source-version guard 判成 superseded，出现 6/10 假终态 | 统一 `Outbox failed=重试等待 / dead_letter=领域终态`；SpeechBuild 把可领取失败计入 pending，TTS 保持 Question version，题库导入、Resume Review/经历题、评分和报告同步采用终态门禁；后端故障注入与 React 部分完成试听回归通过 | 真实供应商限流/超时率、目标 Celery/Redis/PostgreSQL 的长时间故障恢复仍为部署环境验收 |
 | `STREAM-001` | P1 | `verified（仓库）` | 没有 `stt.streaming/open_stream`、唯一 final 和断流修复 | 新增 streaming schema、网关开流、序号/大小/唯一 final 校验、WebSocket、私有录音和 batch repair；DashScope 提供低延迟 partial/final，`media_http` 保留通用 batch-final stream；端到端测试通过 | 阿里云真实凭据、目标网络、WER/延迟/费用 `environment_pending` |
+| `FORMAL-EVIDENCE-DRAIN-SQLITE-008` | P1 | `verified（仓库与本地服务）` | SQLite 每个 VAD/journal 事务后全库回载，饿死正式 LiveKit Evidence sink；seal 又缺少已接收帧排空屏障，事故 51 秒流只进入 2.5 秒 PCM | SQLite commit 按事务 delta 同步兼容缓存；LiveKit accepted/delivered 水位在 warm-up/formal seal 前排空；VAD stop 800ms、确认试音清字幕；定向与全量后端/前端、build、compileall、diff check、本地 readiness 通过 | 必须用新邀请复验 60 秒正式回答、唯一 final/CandidateAnswer 和私有录音，完成前保持目标环境 pending |
+| `STT-FINAL-PARTIAL-TAIL-007` | P1 | `verified（仓库）` | DashScope 已有 committed 分句时，finish 以二选一逻辑丢弃最后未 `sentence_end` 的有效 partial，导致 final 尾部截断 | partial/final 共用单一 transcript projection；final text/segments 合并 committed 与尾部 partial，空结果和唯一 final 规则不变；Provider/React 回归通过 | 用新会话复验真实 Provider 尾句，并在正式回答核对 CandidateAnswer 与录音 |
 | `MODEL-STREAM-PROBE-001` | P1 | `verified（仓库与本机）` | 流式 STT 模型测试用静音 WAV 强求 final，真实握手成功仍误报 `provider_final_transcript_missing`；实时语音对话没有统一测试 schema | 模型配置与 route 复用 stream handshake probe；STT/实时语音收到 ready 后主动关闭并返回 `probe_mode=handshake`；Qwen 3.5 session、输入转写模型、音色和受控指令更新顺序按当前协议校正；合同测试与本机百炼真实握手通过 | WER、final/首音延迟、打断、音质和费用仍为独立环境验收 |
 | `SECURITY-001` | P1 | `verified` | 联系人/凭证明文、无 RBAC/公开限流、敏感访问/失败请求无审计，URL token 可能进入日志 | 联系人 Fernet+租户 HMAC、ProviderSecretVault、生产 Bearer RBAC、Redis fail-closed 公开限流、未认证/成功请求审计、签名文件/媒体、媒体实际下载审计；Auth audit 与 Uvicorn access log 均遮蔽私有文件/媒体/邀请 path token 及 `grant/token/ticket/signature/access_token` 查询值，过滤器合同与启动安装路径有回归 | 外部 IdP/企业 SSO 尚未选择 |
 | `DATA-001` | P1 | `in_progress` | 只有 SQLite JSON，缺少生产租户 RLS 和数据库唯一约束 | 已提供显式 owner migration 与最小权限 runtime adapter；本机 PostgreSQL 16 真实验证事务/CAS、RLS、Outbox/预约约束、题库索引 EXPLAIN，离线 SQL 不变量继续通过 | 目标生产 PostgreSQL 的角色、并发负载、备份恢复与 EXPLAIN 仍为 `environment_pending`，完成前不改 verified |
@@ -293,6 +420,8 @@ Report module 在生成开始时先物化唯一的 `current_evaluations` 集合�
 | `REALTIME-001` | P2 | `verified（仓库）` | 多实例事件、断路器、心跳和厂商实时媒体曾缺失 | Redis bus/共享断路器/心跳已验证；新增浏览器 16k PCM → DashScope duplex ASR、腾讯数智人 create/stat/start/drive/close 与 TCPlayerLite WebRTC/SFU 播放 | 目标 Redis 集群、阿里/腾讯真实凭据、形象并发、WER/延迟/费用仍为 `environment_pending` |
 | `REALTIME-DIALOGUE-001` | P1 | `verified（仓库）` | 追问曾依赖“完整 STT → 完整 LLM → 完整 TTS”的串行链路，评分同步阻塞下一轮；追问预算、父子轮次、PCM 录音和断线恢复也没有形成同一运行时合同 | 新增 `speech.dialogue_realtime` 深模块及 OpenAI Realtime、DashScope Qwen Realtime、Volcengine Seeduplex adapter；预约可选 `cascade/s2s`。S2S 原始音频只在内存预生成，final transcript 与冻结 ApprovedConversationAct 逐字一致后才物化私有音频并下发；豆包使用 `speech_text_buffer.replacement` 提交同一批准文本。权威转写仍由 STT 形成 CandidateAnswer，完整评分由 Outbox 异步执行。追问为零权重子轮次并受深度、次数、时长、证据、能力点和安全门禁约束；浏览器恢复、batch repair、心跳和角色安全事件均有合同/端到端测试 | OpenAI/百炼/火山真实凭据、模型权限、Resource ID、区域、网络抖动、首音延迟/打断/音质/费用为 `environment_pending`；任一真实 route 未通过当前环境探针前不得标记 ready |
 | `REALTIME-AGENT-001` | P1 | `in_progress（本机 VRM 与 LiveKit/Egress 已验证，生产验收 pending）` | 正式面试曾由多个路由/WebSocket 和 React 直接编排，没有单一发言权、权威证据、语义理解、可中断 3D 表达、私有录制与人工接管合同 | 新增 AgentChannel/InterviewAgentRuntime、最小权限 LiveKit ticket/Egress、`database_fenced` receive-only Evidence ingress、数据库时钟 ownership/fence、持久 journal＋连接无关 owner executor/remote receipt、私有 segment/checkpoint＋owner-loss repair＋浏览器 gap backfill、warm-up、Floor/VAD/barge-in、角色安全回放、版本化理解、冻结证据两层追问、root evidence group、私有 AgentExpressionAudio、VRM AvatarPerformance、takeover lease 与 acceptance v2 release/org gate；旧实时 routes 和前端多通道实现已删除。本机 VRM preset/custom 合同、真实暂停回执和会话快照前 gate 已有定向回归；单参数本地 LiveKit/Egress/Redis 已生成含音视频的真实 Participant Egress MP4，媒体与权威音频 readiness 均通过 | 当前 VRM 许可只确认 `personalProfit`；生产目标 LiveKit/TURN/OSS/PostgreSQL/Redis、真实 STT/TTS/LLM、浏览器/网络/并发硬指标和分组织试点为 `environment_pending`；脱敏对话/评分金标为 `data_pending`，绑定当前 release 的签名报告形成前不得 production ready |
+| `EVIDENCE-LEASE-TELEMETRY-004` | P1 | `verified（仓库）` | 逐帧 avatar telemetry 走 SQLite 领域幂等/整会话写入，饿死 Evidence owner 续租，使暖场成功后正式 STT 尚未打开就自围栏暂停 | 遥测改为 candidate-only process-only 旁路并显式让出调度；高频 avatar 指标按 key 做 1 秒 max 聚合；续租增加无 PII scheduler/DB/success 观测且严格过期 self-fence 不变；SQLite、幂等、公平调度、连续续租和过期 fencing 回归通过 | 必须用目标浏览器、LiveKit/STT 和全新会话复验正式 Evidence/字幕及持续续租，完成前状态为目标新会话 pending，不能称 production accepted |
+| `WARMUP-BACKPRESSURE-RECOVERY-006` | P1 | `verified（仓库）` | 暖场大部分语音已识别后，两秒 Provider 背压触发整场暂停；旧 seal 又迟到完成，形成 pause 与 awaiting-confirmation 冲突 | 暖场 epoch 失效和单一 retry seam 阻止迟到 seal；显式 retry 先恢复 LiveKit iterator；LiveKit/DashScope 默认五秒无损有界窗口，正式 Evidence 断流仍失败关闭；竞态/背压/恢复合同测试通过 | 必须用新邀请在目标浏览器和真实 Provider 连续试音、重试并进入正式题；事故会话不恢复，完成前保持环境 pending |
 | `FAIRNESS-001` | P2 | `verified（仓库）` | 只有抽题分布，没有 AI/人工评分一致性与 cohort 差异校准 | 保留抽题公平性投影；新增只接受 current evaluation ID、人工分和 opaque cohort 的校准 API，输出 MAE/RMSE/偏差/分层/样本量告警且绝不自动改分 | 用户尚未提供真实脱敏金标；实际公平性结论为 `data_pending` |
 | `RETENTION-001` | P1 | `verified` | 敏感数据只有设计中的到期字段，没有可执行删除边界 | 新增默认 dry-run 的管理员留存服务；显式执行删除私有文件/录音并清空联系人、审阅、经历题、转写、评分/报告敏感内容，审计测试通过 | 企业实际留存天数与 legal hold 策略由部署配置决定 |
 | `COMPAT-001` | P2 | `closed` | 计划 `items`、管理员直建会话、文本答案和旧向量 QuestionService 曾同时存在 | 提供显式 v2 迁移命令；运行时旧表示、旧 schema、旧路由、旧 service/repository/worker 分支和前端 fallback 均已删除；OpenAPI/端到端测试通过 | 部署已有旧数据时必须先运行 v2 迁移；当前 SQLite 检查无计划数据 |

@@ -67,11 +67,16 @@ class InterviewEvidenceChain:
         self._warmup: Optional[WarmupCalibrationStream] = None
         self._server_audio_seen = False
         self._finishing = False
+        self._input_revoked = False
         self._lock = asyncio.Lock()
 
     @property
     def is_open(self) -> bool:
-        return self._stt is not None or self._warmup is not None
+        return not self._input_revoked and (self._stt is not None or self._warmup is not None)
+
+    def revoke_audio_input(self) -> None:
+        """Close the local input gate before any asynchronous provider cleanup."""
+        self._input_revoked = True
 
     @property
     def kind(self) -> Optional[str]:
@@ -99,13 +104,14 @@ class InterviewEvidenceChain:
                     "The previous Evidence stream is still finalizing.",
                     status_code=409,
                 )
-            if self.is_open:
+            if self._stt is not None or self._warmup is not None:
                 raise ApiError(
                     "AGENT_EVIDENCE_ALREADY_OPEN",
                     "Evidence stream is already open.",
                     status_code=409,
                 )
             self._server_audio_seen = False
+            self._input_revoked = False
             if calibration_status != "completed":
                 if calibration_status not in {"listening", "retrying"}:
                     raise ApiError(
@@ -132,7 +138,8 @@ class InterviewEvidenceChain:
                 commit_fence=self.commit_fence,
                 commit_guard=self.commit_guard,
             )
-            events = await stream.open({**payload, "turn_id": turn_id})
+            events = await stream.open({**payload, "turn_id": turn_id,
+                                        "_continuous_capture": self.commit_fence is not None})
             self._stt = stream
             return EvidenceOpenResult(
                 kind="formal", turn_id=stream.turn_id, events=events
@@ -174,8 +181,76 @@ class InterviewEvidenceChain:
                 first_server_audio=first,
             )
 
-    async def finish(self, payload: Dict[str, Any]) -> EvidenceFinishResult:
+    @property
+    def supports_stable_preview(self) -> bool:
+        return self._stt is not None and self._stt.supports_stable_preview
+
+    async def transcript_preview(self) -> Any:
+        stream = self._stt
+        if stream is None or self._input_revoked:
+            raise ApiError("AGENT_EVIDENCE_NOT_OPEN", "Evidence is not open.", status_code=409)
+        preview = await stream.transcript_preview()
+        if stream is not self._stt or self._input_revoked:
+            raise ApiError("TURN_DECISION_STALE", "Capture changed during preview.", status_code=409)
+        return preview
+
+    async def transcript_snapshot(self, *, resume: bool = True) -> Any:
+        stream = self._stt
+        if stream is None:
+            raise ApiError("AGENT_EVIDENCE_NOT_OPEN", "Evidence is not open.", status_code=409)
+        return await stream.transcript_snapshot(resume=resume)
+
+    async def resume_capture(self) -> None:
+        if self._stt is not None:
+            await self._stt.resume_capture()
+
+    @property
+    def recovery_required(self) -> bool:
+        return self._stt is not None and self._stt.recovery_required
+
+    @property
+    def recovery_error(self) -> Any:
+        return self._stt.recovery_error if self._stt is not None else None
+
+    async def recover_capture(self) -> None:
+        stream = self._stt
+        if stream is None:
+            raise ApiError("AGENT_EVIDENCE_NOT_OPEN", "Evidence is not open.", status_code=409)
+        await stream.recover_capture()
+        if stream is not self._stt:
+            raise ApiError("TURN_DECISION_STALE", "Capture changed during recovery.", status_code=409)
+
+    def checkpoint_incomplete(self) -> Any:
+        return self._stt.checkpoint_incomplete() if self._stt is not None else None
+
+    async def classify_supplement_reply(self, reply: str) -> Any:
+        if self._stt is None or self._input_revoked:
+            raise ApiError("AGENT_EVIDENCE_NOT_OPEN", "Evidence is not open.", status_code=409)
+        return await self._stt.interviews.conversation.classify_supplement_reply(reply, self.organization_id)
+
+    async def prepare_decision(self, final: Any, *, completion_confirmed: bool = False) -> Any:
+        if self._stt is None:
+            raise ApiError("AGENT_EVIDENCE_NOT_OPEN", "Evidence is not open.", status_code=409)
+        # Preview itself is cheap and read-only; seal a durable, incomplete
+        # prefix only when a new speculative decision is actually requested.
+        checkpoint = self._stt.checkpoint_for_preparation() or {}
+        if not checkpoint.get("last_sealed_frame_sequence"):
+            raise ApiError("EVIDENCE_MEDIA_INCOMPLETE", "Durable prefix required.", status_code=409)
+        snapshot_ref = "evidence-checkpoint://%s/%s/%s" % (
+            checkpoint["stream_id"], checkpoint["capture_revision"],
+            checkpoint["last_sealed_frame_sequence"],
+        )
+        return await self._stt.interviews.prepare_streaming_decision(
+            self.interview_id, self._stt.turn_id, final, self.organization_id,
+            snapshot_ref=snapshot_ref,
+            completion_confirmed=completion_confirmed,
+        )
+
+    async def finish(self, payload: Dict[str, Any], *, prepared_decision: Any = None,
+                     commit_guard: Any = None) -> EvidenceFinishResult:
         async with self._lock:
+            if commit_guard is not None:
+                commit_guard()
             if self._warmup is not None:
                 stream = self._warmup
                 # 端点一旦确认就先关闭证据门；Provider final 等待期间到达的
@@ -186,6 +261,8 @@ class InterviewEvidenceChain:
                 turn_id = None
             elif self._stt is not None:
                 stream = self._stt
+                if prepared_decision is not None:
+                    stream.assert_snapshot_current(prepared_decision)
                 turn_id = stream.turn_id
                 self._stt = None
                 self._finishing = True
@@ -222,7 +299,7 @@ class InterviewEvidenceChain:
                     interview_result=None,
                 )
             try:
-                events = await stream.finish(payload)
+                events = await stream.finish(payload, prepared_decision=prepared_decision)
             except BaseException:
                 try:
                     await stream.close(repair_disconnect=True)
@@ -256,7 +333,7 @@ class InterviewEvidenceChain:
 
     async def abort(self) -> None:
         """Drop process-local streams without repairing or committing an answer."""
-
+        self.revoke_audio_input()
         async with self._lock:
             warmup = self._warmup
             formal = self._stt

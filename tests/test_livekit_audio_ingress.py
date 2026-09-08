@@ -7,6 +7,8 @@ from livekit import rtc
 
 from app.adapters.livekit_audio_ingress import (
     LiveKitAudioIngressBinding,
+    LiveKitAudioIngressBackpressureError,
+    LiveKitAudioIngressFailure,
     LiveKitCandidateAudioIngress,
 )
 from app.adapters.livekit_media import LiveKitConfiguration, LiveKitMediaPlane
@@ -250,6 +252,57 @@ def test_livekit_ingress_yields_to_sink_when_audio_iterator_is_eager() -> None:
     asyncio.run(scenario())
 
 
+def test_livekit_ingress_drain_waits_for_the_accepted_frame_watermark() -> None:
+    async def scenario() -> None:
+        room = _FakeRoom()
+        sink_started = asyncio.Event()
+        release_sink = asyncio.Event()
+        received = []
+
+        async def delayed_sink(frame):
+            sink_started.set()
+            await release_sink.wait()
+            received.append(frame.sequence)
+
+        ingress = LiveKitCandidateAudioIngress(
+            _media_plane(),
+            LiveKitAudioIngressBinding(
+                room_name="interview-1",
+                candidate_identity="candidate:connection_1",
+                subscriber_identity="evidence:interview-1",
+            ),
+            on_audio_frame=delayed_sink,
+            room_factory=lambda: room,
+            audio_stream_factory=lambda _track: _FakeAudioStream(
+                [_FakeFrame(b"\x01\x00" * 320) for _ in range(5)]
+            ),
+            audio_track_validator=lambda _track: True,
+        )
+        await ingress.connect()
+        room.emit("track_subscribed", object(), _publication(), _participant())
+        await asyncio.wait_for(sink_started.wait(), timeout=1)
+        for _ in range(100):
+            state = ingress._sink_state
+            if state is not None and state.accepted_sequence == 5:
+                break
+            await asyncio.sleep(0)
+        assert ingress._sink_state is not None
+        assert ingress._sink_state.accepted_sequence == 5
+
+        draining = asyncio.create_task(ingress.drain(timeout_seconds=1))
+        await asyncio.sleep(0)
+        assert draining.done() is False
+        release_sink.set()
+
+        assert await draining == 5
+        assert ingress._track_task is not None
+        await ingress._track_task
+        assert received == [1, 2, 3, 4, 5]
+        await ingress.close()
+
+    asyncio.run(scenario())
+
+
 def test_livekit_ingress_track_replacement_and_candidate_disconnect_are_bounded() -> None:
     async def scenario() -> None:
         room = _FakeRoom()
@@ -454,16 +507,132 @@ def test_livekit_ingress_fails_closed_instead_of_silently_dropping_on_backpressu
                 [_FakeFrame(b"\x00\x00" * 320) for _ in range(102)]
             ),
             audio_track_validator=lambda _track: True,
+            sink_backpressure_seconds=2.0,
+        )
+        assert ingress._sink_queue_capacity_frames == 100
+        await ingress.connect()
+        room.emit("track_subscribed", object(), _publication(), _participant())
+        task = ingress._track_task
+        assert task is not None
+        with pytest.raises(
+            LiveKitAudioIngressBackpressureError, match="backpressure budget"
+        ):
+            await task
+        await asyncio.sleep(0)
+        assert "audio_stream_failed" in states
+        assert ingress.last_track_failure is not None
+        assert (
+            ingress.last_track_failure.code
+            == "LIVEKIT_INGRESS_SINK_BACKPRESSURE"
+        )
+        assert (
+            ingress.last_track_failure.cause_type
+            == "LiveKitAudioIngressBackpressureError"
+        )
+        never_release.set()
+        await ingress.close()
+
+    asyncio.run(scenario())
+
+
+def test_livekit_ingress_can_restart_same_published_track_after_warmup_failure() -> None:
+    async def scenario() -> None:
+        room = _FakeRoom()
+        received = []
+        created_streams = []
+
+        def stream_factory(_track):
+            stream = _FakeAudioStream([_FakeFrame(b"\x00\x00" * 320)])
+            created_streams.append(stream)
+            return stream
+
+        async def sink(frame):
+            received.append(frame.sequence)
+
+        ingress = LiveKitCandidateAudioIngress(
+            _media_plane(),
+            LiveKitAudioIngressBinding(
+                room_name="interview-1",
+                candidate_identity="candidate:connection_1",
+                subscriber_identity="evidence:interview-1",
+            ),
+            on_audio_frame=sink,
+            room_factory=lambda: room,
+            audio_stream_factory=stream_factory,
+            audio_track_validator=lambda _track: True,
+        )
+        await ingress.connect()
+        track = object()
+        publication = _publication(track=track)
+        room.emit("track_subscribed", track, publication, _participant())
+        first_task = ingress._track_task
+        assert first_task is not None
+        await first_task
+
+        assert ingress._sink_queue_capacity_frames == 250
+        assert await ingress.recover_audio_stream() is True
+        second_task = ingress._track_task
+        assert second_task is not None
+        assert second_task is not first_task
+        await second_task
+
+        assert received == [1, 2]
+        assert len(created_streams) == 2
+        assert all(stream.closed for stream in created_streams)
+        await ingress.close()
+
+    asyncio.run(scenario())
+
+
+def test_livekit_ingress_exposes_only_sanitized_downstream_failure_metadata() -> None:
+    class DownstreamFailure(RuntimeError):
+        code = "provider_stream_failed"
+
+    async def scenario() -> None:
+        room = _FakeRoom()
+        states = []
+
+        async def failed_sink(_frame):
+            raise DownstreamFailure("secret provider URL and candidate transcript")
+
+        ingress = LiveKitCandidateAudioIngress(
+            _media_plane(),
+            LiveKitAudioIngressBinding(
+                room_name="interview-1",
+                candidate_identity="candidate:connection_1",
+                subscriber_identity="evidence:interview-1",
+            ),
+            on_audio_frame=failed_sink,
+            on_state=lambda state: _append_async(states, state),
+            room_factory=lambda: room,
+            audio_stream_factory=lambda _track: _FakeAudioStream(
+                [_FakeFrame(b"\x00\x00" * 320) for _ in range(2)]
+            ),
+            audio_track_validator=lambda _track: True,
         )
         await ingress.connect()
         room.emit("track_subscribed", object(), _publication(), _participant())
         task = ingress._track_task
         assert task is not None
-        with pytest.raises(RuntimeError, match="backpressure budget"):
+        with pytest.raises(DownstreamFailure):
             await task
         await asyncio.sleep(0)
+
         assert "audio_stream_failed" in states
-        never_release.set()
+        assert ingress.last_track_failure is not None
+        assert ingress.last_track_failure.code == "PROVIDER_STREAM_FAILED"
+        assert ingress.last_track_failure.cause_type == "Exception"
+        assert "secret" not in repr(ingress.last_track_failure)
         await ingress.close()
 
     asyncio.run(scenario())
+
+
+def test_livekit_ingress_failure_metadata_uses_semantic_allow_lists() -> None:
+    value = LiveKitAudioIngressFailure(
+        code="CANDIDATE_ALICE_PRIVATE",
+        cause_type="AlicePrivateFailure",
+    )
+
+    assert value.code == "LIVEKIT_INGRESS_AUDIO_STREAM_FAILED"
+    assert value.cause_type == "Exception"

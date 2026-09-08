@@ -40,11 +40,11 @@ export async function createCandidateAudioCapture(mediaStream, {
   onSpeechStarted = () => {},
   onSpeechStopped = () => {},
   isAgentSpeaking = () => false,
-  speechThreshold = 0.018,
+  speechThreshold = 0.006,
   agentSpeechThreshold = 0.05,
-  speechStartMs = 80,
+  speechStartMs = 120,
   agentSpeechStartMs = 160,
-  speechStopMs = 480,
+  speechStopMs = 800,
   AudioContextClass = globalThis.AudioContext || globalThis.webkitAudioContext,
   AudioWorkletNodeClass = globalThis.AudioWorkletNode,
 } = {}) {
@@ -135,11 +135,11 @@ export async function createCandidateAudioCapture(mediaStream, {
  */
 export function createSpeechActivityDetector({
   isAgentSpeaking = () => false,
-  speechThreshold = 0.018,
+  speechThreshold = 0.006,
   agentSpeechThreshold = 0.05,
-  speechStartMs = 80,
+  speechStartMs = 120,
   agentSpeechStartMs = 160,
-  speechStopMs = 480,
+  speechStopMs = 800,
   onSpeechStarted = () => {},
   onSpeechStopped = () => {},
 } = {}) {

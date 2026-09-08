@@ -391,7 +391,19 @@ class OpenAICompatibleProvider:
         if response.status_code >= 500:
             raise ProviderError("provider_server_error", "Provider returned a server error.", retryable=True)
         if response.status_code >= 400:
-            raise ProviderError("provider_bad_request", "Provider rejected the request.", retryable=False)
+            # Fixed diagnostics only; provider error bodies may echo input.
+            category = "request_rejected"
+            try:
+                error = response.json().get("error", {})
+                message = str(error.get("message", ""))[:4096] if isinstance(error, dict) else ""
+                if "schema" in message.lower():
+                    category = "structured_schema_rejected"
+                elif "max_tokens" in message.lower() or "max_output_tokens" in message.lower():
+                    category = "output_limit_rejected"
+            except (ValueError, TypeError, AttributeError):
+                pass
+            raise ProviderError("provider_bad_request", "Provider rejected the request.", retryable=False,
+                                details={"http_status": response.status_code, "rejection_category": category})
         try:
             return response.json()
         except (json.JSONDecodeError, ValueError) as exc:

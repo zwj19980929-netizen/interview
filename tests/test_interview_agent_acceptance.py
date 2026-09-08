@@ -1,7 +1,13 @@
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
-from app.core.interview_agent_metrics import InterviewAgentMetrics
+from app.core.interview_agent_metrics import (
+    CANDIDATE_INTERVIEW_AGENT_METRICS,
+    INTERNAL_INTERVIEW_AGENT_METRICS,
+    INTERVIEW_AGENT_METRICS,
+    INTERVIEW_AGENT_STAGE_METRICS,
+    InterviewAgentMetrics,
+)
 from app.core.interview_agent_release import realtime_agent_release_status
 from app.operations.interview_agent_acceptance import (
     build_acceptance_report,
@@ -147,6 +153,26 @@ def test_process_metrics_accept_only_fixed_label_free_vocabulary() -> None:
         assert "unsupported" in str(exc)
     else:
         raise AssertionError("arbitrary PII-bearing metric names must be rejected")
+
+
+def test_candidate_and_internal_metric_vocabularies_are_disjoint() -> None:
+    assert INTERNAL_INTERVIEW_AGENT_METRICS == INTERVIEW_AGENT_STAGE_METRICS | {
+        "evidence_owner_renew_scheduler_lag_ms",
+        "evidence_owner_renew_db_latency_ms",
+        "evidence_owner_renew_success",
+        "turn_decision_cancelled",
+        "stt_recognition_opened",
+        "stt_recognition_finished",
+        "stt_preview_prepared",
+        "stt_preview_final_revised",
+    }
+    assert CANDIDATE_INTERVIEW_AGENT_METRICS.isdisjoint(
+        INTERNAL_INTERVIEW_AGENT_METRICS
+    )
+    assert INTERVIEW_AGENT_METRICS == (
+        CANDIDATE_INTERVIEW_AGENT_METRICS
+        | INTERNAL_INTERVIEW_AGENT_METRICS
+    )
 
 
 def test_production_release_gate_requires_matching_report_and_explicit_org(

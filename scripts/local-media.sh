@@ -40,8 +40,15 @@ case "${ACTION}" in
   logs)
     docker compose -f "${COMPOSE_FILE}" logs --tail=200 livekit egress
     ;;
+  doctor)
+    if ! command -v python3 >/dev/null 2>&1; then
+      echo "LOCAL_MEDIA_DOCTOR_UNAVAILABLE：只读诊断需要 Python 3；未修改任何服务。" >&2
+      exit 1
+    fi
+    python3 "${SCRIPT_DIR}/local-media-doctor.py" "${COMPOSE_FILE}"
+    ;;
   *)
-    echo "用法：$0 [up|down|status|logs]" >&2
+    echo "用法：$0 [up|down|status|logs|doctor]" >&2
     exit 2
     ;;
 esac

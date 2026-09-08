@@ -1,4 +1,5 @@
 from copy import deepcopy
+import asyncio
 import hashlib
 from io import BytesIO
 import wave
@@ -35,6 +36,8 @@ from app.persistence.errors import ConcurrencyConflict
 from app.persistence.interface import Persistence
 from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
+from app.domain.model_route_readiness import safe_probe_code
+from app.services.model_route_readiness import ModelRouteReadinessRefresher, route_facts, route_readiness
 
 
 UNIFIED_PARAMETER_FORMS: Dict[str, Dict[str, Any]] = {
@@ -60,6 +63,7 @@ class ModelAdminService:
     def __init__(self, store: InMemoryStore, *, persistence: Optional[Persistence] = None) -> None:
         self.persistence = persistence or persistence_for(store)
         self.gateway = ModelGateway(store, persistence=self.persistence)
+        self._route_readiness_refresher = ModelRouteReadinessRefresher(self.persistence, self._probe_route)
 
     def catalog(self) -> List[Dict[str, Any]]:
         return get_provider_catalog()
@@ -148,6 +152,10 @@ class ModelAdminService:
                     item[field] = payload[field]
             item["configuration_revision"] = int(item.get("configuration_revision", 1)) + 1
             item["updated_at"] = utc_now()
+            self._bind_legacy_route_health(transaction, {
+                model["id"] for model in transaction.model_configurations.list()
+                if model.get("provider_connection_id") == connection_id
+            })
             return transaction.provider_connections.update(item, expected_version=expected_version)
 
     def delete_provider_connection(
@@ -392,7 +400,28 @@ class ModelAdminService:
                     item[field] = payload[field]
             item["configuration_revision"] = int(item.get("configuration_revision", 1)) + 1
             item["updated_at"] = utc_now()
+            self._bind_legacy_route_health(transaction, {configuration_id})
             return transaction.model_configurations.update(item, expected_version=expected_version)
+
+    @staticmethod
+    def _bind_legacy_route_health(transaction: Any, model_configuration_ids: set[str]) -> None:
+        """Freeze legacy evidence against persisted configuration before a patch.
+
+        Ordinary health/version updates do not call this seam. The original
+        checked_at and TTL remain untouched, and new bound evidence is kept.
+        """
+        if not model_configuration_ids:
+            return
+        for candidate in transaction.model_routes.list():
+            targets = [candidate.get("primary") or {}, *(candidate.get("fallbacks") or [])]
+            if not any(target.get("model_configuration_id") in model_configuration_ids for target in targets):
+                continue
+            route = transaction.model_routes.get(candidate["id"])
+            health = (route or {}).get("last_health") or {}
+            if not health or health.get("configuration_fingerprint"):
+                continue
+            route["last_health"] = {**health, "configuration_fingerprint": route_facts(transaction, route)[3]}
+            transaction.model_routes.update(route, expected_version=route["version"])
 
     def delete_model_configuration(
         self,
@@ -503,27 +532,35 @@ class ModelAdminService:
 
     def list_routes(self, organization_id: str = "org_default") -> List[Dict[str, Any]]:
         with self.persistence.transaction(organization_id) as transaction:
-            return transaction.model_routes.list()
+            results = []
+            for route in transaction.model_routes.list():
+                readiness = route_readiness(transaction, route)
+                projected = deepcopy(route)
+                projected.pop("health_probe", None)
+                if projected.get("last_health"):
+                    health = projected["last_health"]
+                    projected["last_health"] = {
+                        "status": health.get("status"), "checked_at": readiness["checked_at"],
+                        "reason_code": safe_probe_code(health.get("reason_code")) if health.get("status") == "failed" else None,
+                    }
+                projected["readiness"] = readiness
+                results.append(projected)
+            return results
+
+    async def refresh_routes(self, route_ids: List[str], organization_id: str = "org_default") -> Dict[str, Any]:
+        return await self._route_readiness_refresher.refresh(route_ids, organization_id)
 
     async def test_route(self, route_id: str, organization_id: str = "org_default") -> Dict[str, Any]:
-        with self.persistence.transaction(organization_id) as transaction:
-            route = transaction.model_routes.get(route_id)
-        if not route:
-            raise ApiError("MODEL_ROUTE_NOT_FOUND", "Model route does not exist.", status_code=404)
+        return await self._route_readiness_refresher.test(route_id, organization_id)
+
+    async def _probe_route(self, route: Dict[str, Any], organization_id: str) -> Dict[str, Any]:
         request = self._probe_request(route["capability"], organization_id, route["purpose"])
-        try:
-            if route["capability"] in {cap.STT_STREAMING, cap.SPEECH_DIALOGUE_REALTIME}:
-                result = await self._probe_stream_handshake(
-                    route["capability"], request, route
-                )
-            else:
-                response = await self.gateway.invoke(route["capability"], request, route=route)
-                result = response.model_dump()
-                await self._close_avatar_probe(response, route, organization_id)
-        except Exception as exc:
-            self._record_route_health(route_id, organization_id, status="failed", error=str(exc))
-            raise
-        self._record_route_health(route_id, organization_id, status="healthy", error=None)
+        if route["capability"] in {cap.STT_STREAMING, cap.SPEECH_DIALOGUE_REALTIME}:
+            result = await self._probe_stream_handshake(route["capability"], request, route)
+        else:
+            response = await self.gateway.invoke(route["capability"], request, route=route)
+            result = response.model_dump()
+            await self._close_avatar_probe(response, route, organization_id)
         return result
 
     async def _probe_stream_handshake(
@@ -552,7 +589,24 @@ class ModelAdminService:
                 "message": "Provider endpoint, credentials, model access, and session setup succeeded.",
             }
         finally:
-            await stream.abort()
+            cleanup = asyncio.create_task(stream.abort())
+            try:
+                # A WebSocket closing handshake may legitimately exceed half a
+                # second. This cleanup budget remains inside the route probe's
+                # overall deadline; failed cleanup is not an STT open timeout.
+                done, _ = await asyncio.wait({cleanup}, timeout=2.0)
+                if not done:
+                    raise ProviderError("provider_probe_cleanup_failed", "Model probe resource cleanup was not confirmed.", retryable=True)
+                if cleanup.cancelled():
+                    raise ProviderError("provider_probe_cleanup_failed", "Model probe resource cleanup was cancelled.", retryable=True)
+                try:
+                    cleanup.result()
+                except Exception as exc:
+                    raise ProviderError("provider_probe_cleanup_failed", "Model probe resource cleanup failed.", retryable=True) from exc
+            finally:
+                if not cleanup.done():
+                    cleanup.cancel()
+                    cleanup.add_done_callback(lambda task: None if task.cancelled() else task.exception())
 
     async def _close_avatar_probe(
         self,
@@ -668,15 +722,6 @@ class ModelAdminService:
             }
             connection["updated_at"] = utc_now()
             transaction.provider_connections.update(connection, expected_version=connection["version"])
-
-    def _record_route_health(self, route_id: str, organization_id: str, *, status: str, error: Optional[str]) -> None:
-        with self.persistence.transaction(organization_id) as transaction:
-            route = transaction.model_routes.get(route_id)
-            if route is None:
-                return
-            route["last_health"] = {"status": status, "checked_at": utc_now(), "error": error[:500] if error else None}
-            route["updated_at"] = utc_now()
-            transaction.model_routes.update(route, expected_version=route["version"])
 
     def _probe_request(self, capability: str, organization_id: str, purpose: str) -> Any:
         if capability == cap.LLM_CHAT_JSON:

@@ -1,5 +1,8 @@
 import asyncio
+import json
 
+from app.core.time import utc_now
+from app.persistence.provider import persistence_for
 from app.repositories import provider as repository_provider
 from app.repositories.memory import InMemoryStore
 from app.repositories.sqlite import SQLiteStore
@@ -66,3 +69,71 @@ def test_reset_store_for_tests_never_resets_development_sqlite(tmp_path) -> None
     assert not isinstance(test_store, SQLiteStore)
     reopened = SQLiteStore(str(db_path))
     assert reopened.provider_connections[persisted["id"]]["display_name"] == "Must survive test reset"
+
+
+def test_sqlite_realtime_transaction_refreshes_only_its_committed_delta(
+    tmp_path, monkeypatch
+) -> None:
+    db_path = tmp_path / "realtime-delta.sqlite3"
+    store = SQLiteStore(str(db_path))
+    now = utc_now()
+    interview = {
+        "id": "iv_realtime_delta",
+        "organization_id": "org_default",
+        "status": "in_progress",
+        "agent_runtime": {"floor": "candidate"},
+        "created_at": now,
+        "updated_at": now,
+        "version": 1,
+    }
+    store.save_item("interviews", interview["id"], interview)
+    # Reproduce the local development shape that made every VAD command parse
+    # ten thousand unrelated rows after commit.
+    with store._connect() as connection:
+        connection.executemany(
+            "INSERT INTO documents(collection, id, data, updated_at) VALUES (?, ?, ?, ?)",
+            [
+                (
+                    "audit_events",
+                    "audit_history_%05d" % index,
+                    json.dumps(
+                        {
+                            "id": "audit_history_%05d" % index,
+                            "organization_id": "org_default",
+                            "event_type": "historical.event",
+                            "created_at": now,
+                            "updated_at": now,
+                            "version": 1,
+                        }
+                    ),
+                    now,
+                )
+                for index in range(2_000)
+            ],
+        )
+    store._load_from_db()
+
+    parsed_rows = 0
+    from app.persistence import sqlite as sqlite_persistence
+
+    real_loads = sqlite_persistence.json.loads
+
+    def counted_loads(value):
+        nonlocal parsed_rows
+        parsed_rows += 1
+        return real_loads(value)
+
+    monkeypatch.setattr(sqlite_persistence.json, "loads", counted_loads)
+    persistence = persistence_for(store)
+    with persistence.transaction("org_default") as transaction:
+        current = transaction.interview_sessions.get(interview["id"])
+        current["agent_runtime"]["last_sequence"] = 1
+        current["updated_at"] = utc_now()
+        updated = transaction.interview_sessions.update(
+            current, expected_version=current["version"]
+        )
+
+    assert parsed_rows == 2  # one CAS read plus the explicit repository get
+    assert updated["version"] == 2
+    assert store.interviews[interview["id"]]["agent_runtime"]["last_sequence"] == 1
+    assert len(store.audit_events) == 2_000

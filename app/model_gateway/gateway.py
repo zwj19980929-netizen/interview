@@ -37,6 +37,7 @@ from app.model_gateway.schemas import (
     RealtimeSpeechDialogueRequest,
 )
 from app.model_gateway.streaming import ValidatedSTTStream
+from app.model_gateway.tts_streaming import TTSStreamEvent, ValidatedTTSStream
 from app.persistence.interface import Persistence
 from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
@@ -47,6 +48,26 @@ def _nonnegative_int(value: Any) -> int:
         return max(0, int(value or 0))
     except (TypeError, ValueError):
         return 0
+
+
+async def _abort_unclaimed_stream(provider_stream: Any, timeout_s: float) -> None:
+    """Release an opened stream when validation/audit prevents handoff.
+
+    Shield a separately bounded cleanup so a second caller cancellation cannot
+    orphan the provider socket. Cleanup must never mask the original failure.
+    """
+    async def cleanup() -> None:
+        try:
+            await asyncio.wait_for(provider_stream.abort(), timeout=max(0.01, min(2.0, timeout_s)))
+        except (Exception, asyncio.CancelledError):
+            pass
+
+    task = asyncio.create_task(cleanup())
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        # The task continues only for its own bounded cleanup deadline.
+        pass
 
 
 @dataclass
@@ -232,6 +253,18 @@ class ModelGateway:
                     provider_id = model_configuration["provider_id"]
                     provider_connection_id = model_configuration["provider_connection_id"]
                     model = model_configuration["provider_model_id"]
+                    if capability == cap.STT_BATCH and provider_id == "mock":
+                        fixture = request.metadata.get("development_transcript")
+                        if (
+                            os.getenv("INTERVIEWER_RUNTIME_ENV", "development").lower() == "production"
+                            or not isinstance(fixture, str)
+                            or not fixture.strip()
+                        ):
+                            raise ProviderError(
+                                "provider_real_stt_required",
+                                "Real audio repair requires a non-mock STT route; mock STT only accepts explicit development fixtures.",
+                                retryable=False,
+                            )
                     if self.circuits.is_open(
                         circuit_key,
                         threshold=circuit_threshold,
@@ -303,6 +336,7 @@ class ModelGateway:
                         request_hash=request_hash,
                         response=response,
                         estimated_cost_usd=estimated_cost,
+                        prompt_version=request.metadata.get("prompt_version"),
                     )
                     self.circuits.record_success(circuit_key)
                     return response
@@ -325,6 +359,7 @@ class ModelGateway:
                         request_hash=request_hash,
                         error_code=exc.code,
                         error_details=exc.details,
+                        prompt_version=request.metadata.get("prompt_version"),
                     )
                     can_retry = exc.retryable and exc.code != "provider_circuit_open" and attempt <= retry_count
                     if can_retry:
@@ -349,6 +384,146 @@ class ModelGateway:
         )
         self._annotate_error(error, invocation_id, resolved_route, total_attempts)
         raise error
+
+    async def open_tts_stream(
+        self,
+        request: TTSSynthesizeRequest,
+        *,
+        route: Optional[Dict[str, Any]] = None,
+    ) -> ValidatedTTSStream:
+        """Stream approved TTS text through the existing synthesis route policy.
+
+        Retries/fallbacks may occur while opening, before any PCM is exposed.
+        After returning, the managed stream never replays an invocation.
+        """
+        capability = cap.TTS_SYNTHESIZE
+        self._validate_request(capability, request)
+        if not request.text.strip():
+            raise ProviderError("provider_bad_request", "TTS text cannot be blank.", retryable=False)
+        resolved_route = deepcopy(route) if route is not None else self._resolve_route(
+            request.organization_id, capability, request.purpose
+        )
+        if (
+            resolved_route.get("capability") != capability
+            or resolved_route.get("organization_id", request.organization_id) != request.organization_id
+            or not resolved_route.get("enabled", True)
+        ):
+            raise ProviderError("provider_route_invalid", "TTS stream route is disabled or outside the invocation scope.", retryable=False)
+        invocation_id = new_id("model_invocation")
+        request_hash = self._request_hash(request)
+        targets = [resolved_route.get("primary") or {}] + list(resolved_route.get("fallbacks") or [])
+        policy = resolved_route.get("policy") or {}
+        retry_count = min(3, max(0, int(policy.get("retry_count", 0))))
+        backoff_ms = min(1000, max(0, int(policy.get("retry_backoff_ms", 0))))
+        threshold = max(0, int(policy.get("circuit_failure_threshold", 3)))
+        recovery = max(0.0, float(policy.get("circuit_recovery_seconds", 30)))
+        total_attempts = 0
+        last_error = None
+        for fallback_index, target in enumerate(targets):
+            model_configuration_id = str(target.get("model_configuration_id") or "")
+            timeout_s = max(0.01, float(target.get("timeout_s", 20)))
+            provider_id = provider_connection_id = model = "unknown"
+            circuit_key = "%s:%s:%s" % (request.organization_id, model_configuration_id, capability)
+            for attempt in range(1, retry_count + 2):
+                total_attempts += 1
+                started_at = perf_counter()
+                provider_stream = None
+                log_fields = dict(
+                    invocation_id=invocation_id, organization_id=request.organization_id,
+                    capability=capability, purpose=request.purpose, route=resolved_route,
+                    model_configuration_id=model_configuration_id, attempt=attempt,
+                    fallback_index=fallback_index, request_hash=request_hash,
+                )
+                try:
+                    configuration, connection, credentials = self._model_connection(
+                        request.organization_id, model_configuration_id, capability,
+                        allow_unready=resolved_route.get("id") == "model_configuration_test",
+                    )
+                    provider_id = configuration["provider_id"]
+                    provider_connection_id = configuration["provider_connection_id"]
+                    model = configuration["provider_model_id"]
+                    if self.circuits.is_open(circuit_key, threshold=threshold, recovery_seconds=recovery):
+                        raise ProviderError("provider_circuit_open", "Provider circuit is open for this capability.", retryable=True)
+                    adapter = self.providers.adapter(provider_id, capability)
+                    open_stream = getattr(adapter, "open_tts_stream", None)
+                    if not callable(open_stream):
+                        raise ProviderError("provider_streaming_not_supported", "Provider adapter does not implement TTS PCM streaming.", retryable=False)
+                    context = ProviderContext(
+                        organization_id=request.organization_id, invocation_id=invocation_id,
+                        route_id=str(resolved_route.get("id") or "route_inline"),
+                        provider_connection_id=provider_connection_id,
+                        model_configuration_id=model_configuration_id,
+                        model_type=configuration["model_type"], capability=capability,
+                        purpose=request.purpose, model=model, timeout_s=timeout_s,
+                        attempt=attempt, fallback_index=fallback_index,
+                        connection_config=connection.get("connection_config") or {},
+                        model_settings=configuration.get("settings") or {},
+                        default_parameters=configuration.get("default_parameters") or {},
+                        credentials=credentials, metadata=request.metadata,
+                    )
+                    try:
+                        provider_stream = await asyncio.wait_for(
+                            open_stream(self._apply_model_defaults(request, context.default_parameters), context),
+                            timeout=timeout_s,
+                        )
+                    except asyncio.TimeoutError as exc:
+                        raise ProviderError("provider_timeout", "TTS stream open timed out.", retryable=True) from exc
+                    log_fields.update(provider_connection_id=provider_connection_id, provider_id=provider_id, model=model)
+
+                    def terminal(status: str, event: Optional[TTSStreamEvent], error: Optional[ProviderError]):
+                        cost = self._estimated_cost(event, configuration, target) if event else 0.0
+                        maximum = policy.get("max_cost_usd_per_call")
+                        if event is not None and maximum is not None and cost > float(maximum):
+                            raise ProviderError("provider_cost_limit_exceeded", "TTS response exceeded the configured per-call cost limit.", retryable=False)
+                        if error:
+                            self._annotate_error(error, invocation_id, resolved_route, total_attempts)
+                        self._log_invocation(
+                            **log_fields, status="stream_%s" % status,
+                            latency_ms=int((perf_counter() - started_at) * 1000),
+                            response=event, estimated_cost_usd=cost,
+                            error_code=error.code if error else "",
+                            error_details=error.details if error else None,
+                        )
+                        if status == "success":
+                            self.circuits.record_success(circuit_key)
+                        elif error and error.retryable and error.code != "provider_circuit_open":
+                            self.circuits.record_failure(circuit_key, threshold=threshold)
+
+                    stream = ValidatedTTSStream(
+                        provider_stream, provider_id=provider_id, model=model,
+                        read_timeout_s=timeout_s, on_terminal=terminal,
+                    )
+                    self._log_invocation(
+                        **log_fields,
+                        status="stream_fallback_opened" if fallback_index else "stream_opened",
+                        latency_ms=int((perf_counter() - started_at) * 1000),
+                    )
+                    return stream
+                except ProviderError as exc:
+                    if provider_stream is not None:
+                        try:
+                            await asyncio.wait_for(provider_stream.abort(), timeout=min(5.0, timeout_s))
+                        except Exception:
+                            pass
+                    exc.details = {**exc.details, "audio_started": False, "fallback_allowed": True}
+                    last_error = exc
+                    log_fields.update(provider_connection_id=provider_connection_id, provider_id=provider_id, model=model)
+                    self._log_invocation(
+                        **log_fields, status="failed",
+                        latency_ms=int((perf_counter() - started_at) * 1000),
+                        error_code=exc.code, error_details=exc.details,
+                    )
+                    if exc.retryable and exc.code != "provider_circuit_open" and attempt <= retry_count:
+                        if backoff_ms:
+                            await asyncio.sleep(backoff_ms * attempt / 1000.0)
+                        continue
+                    if exc.retryable and exc.code != "provider_circuit_open":
+                        self.circuits.record_failure(circuit_key, threshold=threshold)
+                    break
+            if fallback_index + 1 >= len(targets) or not self._allows_fallback(last_error, policy):
+                self._annotate_error(last_error, invocation_id, resolved_route, total_attempts)
+                raise last_error
+        raise ProviderError("provider_route_invalid", "TTS route contains no invokable target.", retryable=False)
 
     async def open_stream(
         self,
@@ -415,23 +590,27 @@ class ModelGateway:
                     provider_stream = await asyncio.wait_for(open_stream(request, context), timeout=timeout_s)
                 except asyncio.TimeoutError as exc:
                     raise ProviderError("provider_timeout", "Provider stream open timed out.", retryable=True) from exc
-                stream = ValidatedSTTStream(provider_stream, request)
-                self._log_invocation(
-                    invocation_id=invocation_id,
-                    organization_id=request.organization_id,
-                    capability=capability,
-                    purpose=request.purpose,
-                    route=resolved_route,
-                    provider_connection_id=provider_connection_id,
-                    model_configuration_id=model_configuration_id,
-                    provider_id=provider_id,
-                    model=model,
-                    status="stream_opened" if not fallback_index else "stream_fallback_opened",
-                    latency_ms=int((perf_counter() - started_at) * 1000),
-                    attempt=1,
-                    fallback_index=fallback_index,
-                    request_hash=request_hash,
-                )
+                try:
+                    stream = ValidatedSTTStream(provider_stream, request)
+                    self._log_invocation(
+                        invocation_id=invocation_id,
+                        organization_id=request.organization_id,
+                        capability=capability,
+                        purpose=request.purpose,
+                        route=resolved_route,
+                        provider_connection_id=provider_connection_id,
+                        model_configuration_id=model_configuration_id,
+                        provider_id=provider_id,
+                        model=model,
+                        status="stream_opened" if not fallback_index else "stream_fallback_opened",
+                        latency_ms=int((perf_counter() - started_at) * 1000),
+                        attempt=1,
+                        fallback_index=fallback_index,
+                        request_hash=request_hash,
+                    )
+                except BaseException:
+                    await _abort_unclaimed_stream(provider_stream, timeout_s)
+                    raise
                 return stream
             except ProviderError as exc:
                 last_error = exc
@@ -539,23 +718,27 @@ class ModelGateway:
                         "Realtime speech dialogue open timed out.",
                         retryable=True,
                     ) from exc
-                stream = ValidatedSpeechDialogueStream(provider_stream, request)
-                self._log_invocation(
-                    invocation_id=invocation_id,
-                    organization_id=request.organization_id,
-                    capability=capability,
-                    purpose=request.purpose,
-                    route=resolved_route,
-                    provider_connection_id=provider_connection_id,
-                    model_configuration_id=model_configuration_id,
-                    provider_id=provider_id,
-                    model=model,
-                    status="stream_opened" if not fallback_index else "stream_fallback_opened",
-                    latency_ms=int((perf_counter() - started_at) * 1000),
-                    attempt=1,
-                    fallback_index=fallback_index,
-                    request_hash=request_hash,
-                )
+                try:
+                    stream = ValidatedSpeechDialogueStream(provider_stream, request)
+                    self._log_invocation(
+                        invocation_id=invocation_id,
+                        organization_id=request.organization_id,
+                        capability=capability,
+                        purpose=request.purpose,
+                        route=resolved_route,
+                        provider_connection_id=provider_connection_id,
+                        model_configuration_id=model_configuration_id,
+                        provider_id=provider_id,
+                        model=model,
+                        status="stream_opened" if not fallback_index else "stream_fallback_opened",
+                        latency_ms=int((perf_counter() - started_at) * 1000),
+                        attempt=1,
+                        fallback_index=fallback_index,
+                        request_hash=request_hash,
+                    )
+                except BaseException:
+                    await _abort_unclaimed_stream(provider_stream, timeout_s)
+                    raise
                 return stream
             except ProviderError as exc:
                 last_error = exc
@@ -803,6 +986,7 @@ class ModelGateway:
         estimated_cost_usd: float = 0.0,
         error_code: str = "",
         error_details: Optional[Dict[str, Any]] = None,
+        prompt_version: Optional[str] = None,
     ) -> None:
         usage = getattr(response, "usage", None)
         diagnostics = error_details or {}
@@ -836,6 +1020,18 @@ class ModelGateway:
             "audio_seconds": None,
             "estimated_cost_usd": estimated_cost_usd,
             "error_code": error_code,
+            "prompt_version": prompt_version if prompt_version in {
+                "interview_turn_understanding.v1", "interview_turn_understanding.v2", "interview_turn_understanding.v3",
+                "interview_turn_understanding.v4", "interview_turn_understanding.v5",
+                "interview_turn_understanding.v6", "interview_turn_understanding.v7",
+                "interview_turn_decision.v3", "interview_turn_decision.v4", "answer_evaluation.v2",
+                "interview_turn_decision.v5", "interview_turn_decision.v6",
+                "interview_turn_decision.v1", "interview_turn_decision.v2", "supplement_reply.v1", "supplement_reply.v2",
+            } else None,
+            "http_status": diagnostics.get("http_status") if diagnostics.get("http_status") in {400, 404, 409, 413, 422} else None,
+            "rejection_category": diagnostics.get("rejection_category") if diagnostics.get("rejection_category") in {
+                "request_rejected", "structured_schema_rejected", "output_limit_rejected",
+            } else None,
             "finish_reason": diagnostics.get("finish_reason"),
             "requested_max_output_tokens": diagnostics.get(
                 "requested_max_output_tokens"

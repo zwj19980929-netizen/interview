@@ -1,5 +1,31 @@
 # 检索与评分设计
 
+## 明确不作答与评分（023）
+
+理解v6/v7、组合决策v5/v6增加answer_declined/next：候选人已经明确结束本题、完整原文没有实质回答时，保留客观摘要和原文证据，claims/covered为空、missing完整，不因知识缺失将理解置信度降为“没听清”。候选人仍在思考或提出未解决的转写争议时不能据此结束；技术回答后附带结束语仍为answer，不能丢弃已经表达的知识。
+
+评分使用declined_answer.v1规则，从持久化会话重新核验服务端答案、understanding_id、utterance_id、原始文本、音频和理解合同；传入的intent标签不能授权0分。全组均为明确未作答时，正常生成0分评分revision，列出全部缺失关键点，技术证据/错误主张为空，记录规则及理解来源，不让LLM补造技术表现。主回答有内容、追问未作答时，保留主回答的评分输入；若其他轮有技术响应，则只评分这些实际内容。证据组原始答案/发言引用仍保留审计，全部未作答的正式题继续参与既有权重汇总，不以skip移除分母。公平性复核和人类最终决策维持原有流程。
+
+## 技术术语与转写争议（019）
+
+理解 v4/v5、组合决策 v3/v4 和评分 answer_evaluation.v2 明确区分可由上下文唯一理解的误拼（例如 redios/Redis 缓存）、真实不同术语（RADIUS 认证）与未解决的转写争议。保留原文及 E 编号引用；明确撤回或纠正的旧话语不能作为当前主张，不用标准答案补造候选人知识。服务端对理解结果 ambiguities 执行澄清门禁，即使模型同时提议 next/followup 也不得推进；评分存在未解决歧义时要求 transcription_ambiguity 复核标记。模型成功不等于字词准确，本场事故 answers=0，没有产生评分。
+
+## 018：确认与评分之间的边界
+
+补充意图与完整答案的版本化Prompt/严格Schema保持016版本；已确认回复final直接用于原有理解与受控后续动作，减少重复切流。音频活动检测只保护准备/提交时序，不参与专业能力评分、不生成文本、不决定录用。新ASR假设即使低于声学检测阈值也须保留并撤销旧提案；转写缺失不能通过沿用旧评分证据绕过。
+
+## 口头完成确认与评分证据（016）
+
+5秒静音只触发询问是否补充。独立supplement_reply.v1将本次服务端final答复分类为continue/finish/supplement/pause/unclear；网关校验类型、枚举、数量/长度边界、禁止额外字段及非空内容，业务再校验逐字证据和置信度。ASR回复置信度不足0.65或意图置信度不足0.75只澄清；“嗯/好的/可以”不能单独判为finish。只有当前capture明确完成后，完整转写进入v3/v2理解合同，先前“尚未说完”的控制表态不使累积回答永久阻塞，控制对话不能充当能力主张。评分、rubric、抽题、报告和原文引用门禁不变，暖场保留原2.5秒自动收口。
+
+## 015：非关闭预计算
+
+正式自动轮次可使用已校验稳定句段预览作可撤销准备，不为准备而结束识别；它不是权威Utterance或评分输入。仍复用既有版本化Prompt、严格响应校验与全部追问门禁，不新增词库/关键词评分；提交前真实final及冻结上下文必须匹配，否则重新准备或继续听。最终评分/检索/rubric/权重/答案唯一性均不变。
+
+## 自动轮次准备（INTERRUPTIBLE-AUTOMATIC-TURNS-012）
+
+本地音频 EOT 只提议何时准备理解，不做能力评分或判断录用。正式累计服务端 final 进入 `interview_turn_decision.v1`，一次返回 understanding 与 followup，先由网关校验完整嵌套 schema，再精确还原 E/P 引用并执行原文证据、能力分区、敏感性、泄题、难度和追问次数/深度/时长预算检查；不通过不形成领域答案。无追问预算/低 STT 置信度等分支仍用单次既有 understanding，确定控制意图可零调用。准备可撤销，只有重新核验 final 与冻结上下文后才落库；评分仍为答案提交后的 Outbox 异步任务，rubric/权重/抽题与报告规则未改变。
+
 本文描述岗位题库候选池、简历审阅与经历问题、计划装配、面试中随机选择、服务端转写、逐题 AI 评分和最终岗位匹配报告的算法边界。MVP 的抽题与评分都不依赖向量数据库。
 
 当前实现说明：岗位题库路径和公开 `/questions/search` 已共用结构化 Question Catalog，Memory/SQLite/PostgreSQL backend 均有租户、岗位、题库、状态/readiness 和结构化条件查询实现，不依赖 embedding。`QuestionSelection` 采用 `HMAC-SHA256(session_seed, slot + question + version)` 排序选出稳定结果，而不是数据库 `ORDER BY random()`。服务端已实现 `stt.streaming` 的 open/chunk/partial/唯一 final 协议、权威 final 提交及断流 `stt.batch` 修复；本地 mock 需要显式开发输入，生产 readiness 只接受非 mock 且近期健康的 route。单题评分传入冻结 rubric、标准答案、关键点、岗位要求和服务端 final，并区分岗位题与经历题 profile；报告和 JSON/CSV 导出的分数、证据、风险与 `manual_review` 只读取各答案当前评分 revision。验证证据见 [已知问题与修复设计](known-issues-and-remediation.md)。
@@ -189,7 +215,7 @@ candidate LiveKit microphone track -> receive-only server subscriber
 - 每个 PCM 帧同时写入有界 `EvidenceMediaSegment`，只有已 seal、序号连续且 checksum 通过的 checkpoint 能由新 ownership epoch 重建为 batch repair 录音。内存中未 seal suffix 不得标记持久。
 - 浏览器的 30 秒 AES-GCM 环形缓冲只用于服务端授权的精确 gap。ticket 冻结 source connection/audio epoch/2 MiB/32 KiB 上限；JSON `evidence.recovery.begin/chunk/complete` 中每帧先写私有 FileObject，journal 只引用 file ID/hash/epoch/sequence，由当前 owner 以 `ack_through` 去重后注入原 Evidence chain。它不是常态 WebSocket PCM 备用通道。
 
-回答结束优先由服务端语义/静音端点触发 2.5 秒可取消倒计时，也可由最长时限、候选人明确结束或面试官结束触发。服务端必须在音频 flush 与私有录音持久化完成后等待 final；不能在客户端 `speech.stopped/evidence.finish` 到达时直接拿浏览器文本评分。
+正式回答结束由候选人点击“回答完毕”明确确认；静音仅提示继续补充，不关闭 Evidence。暖场保留 2.5 秒可取消端点，资源最大时限和人工结束边界保持不变。服务端必须在音频 flush 与私有录音持久化完成后等待 final；不能在客户端 `speech.stopped/evidence.finish` 到达时直接拿浏览器文本评分。
 
 ## 受控澄清追问与低延迟双轨
 
@@ -199,7 +225,7 @@ candidate LiveKit microphone track -> receive-only server subscriber
 
 CandidateAnswer、`answer.evaluate` DurableWorkItem 和生命周期事件在同一事务提交。HTTP/WebSocket 随即返回 `evaluation.status=pending` / `evaluation.queued`；完整 LLM 评分由 worker 执行，完成后才写 append-only AnswerEvaluation 并广播安全摘要。因此评分吞吐或模型抖动不会延长追问首包语音延迟，也不会丢失证据链。
 
-REALTIME-AGENT-001 将追问提升为两步结构化合同。`interview_turn_understanding.v1` 先对服务端 final 生成意图、摘要、主张、逐字证据、冻结能力点覆盖/缺失、歧义、矛盾、置信度和建议动作；确定性中英文元意图优先识别重读、未说完、暂停和澄清，这些话语不进入 CandidateAnswer。低置信度不得自动提交或追问，只能澄清或重说。Provider 不可用时形成 `UNDERSTANDING_PROVIDER_UNAVAILABLE`，schema/证据/冻结能力点校验失败形成 `UNDERSTANDING_RESULT_REJECTED`；两者只投影去敏 `UnderstandingProblem` 并限定为澄清或暂停，不持久原始模型输出。
+REALTIME-AGENT-001 将追问提升为两步结构化合同。当前 `interview_turn_understanding.v2` 从服务端 final 的冻结原文片段 ID 和能力点 ID 生成意图、摘要、主张、证据引用、覆盖/缺失、歧义、矛盾、置信度和建议动作；统一 wire 检验、精确引用还原和完整分区/证据/claim 检查通过后才进入原有领域对象。历史 v1 保持可读。确定性中英文元意图优先识别重读、未说完、暂停和澄清，这些话语不进入 CandidateAnswer。低置信度不得自动提交或追问，只能澄清或重说。合同不合法最多重新生成一次（每次 20 秒），不使用非法响应做证据。Provider 不可用时形成 `UNDERSTANDING_PROVIDER_UNAVAILABLE`，两次合同失败形成 `UNDERSTANDING_RESULT_REJECTED`；只投影去敏 `UnderstandingProblem`，仍不持久原始模型输出、不让无效结果进入评分。
 
 只有理解通过 Schema、原文证据和冻结能力点校验后，`controlled_followup.v1` 才能建议并持久化追问。gate 固定最多深度 2、每个 root 最多 2 次、全场最多 `min(4, 主问题数)`、剩余不足 90 秒停止新增，并校验难度、180 字长度、敏感属性、标准答案泄漏、暗示性正误评价和已追问能力点。Expression 必须精确复用带 root/depth/非空证据/能力点的冻结 act，找不到时失败关闭，不能临时补建。安全模型失败时只允许证据绑定的确定性 probe；无安全 probe 直接下一题，绝不自由聊天。
 

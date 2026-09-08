@@ -2,7 +2,7 @@
   "schema_version": "2",
   "provider_id": "dashscope",
   "display_name": "阿里云百炼（千问 / Qwen）",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "capabilities": ["llm.chat_json", "llm.chat_text", "embedding.text", "speech.dialogue_realtime", "stt.streaming", "stt.batch", "tts.synthesize"],
   "model_selection": "customizable",
   "defaults": {
@@ -35,6 +35,8 @@
       {"name": "asr_websocket_url", "label": "实时 ASR WebSocket", "control": "text", "required": false},
       {"name": "asr_batch_endpoint", "label": "批量 ASR Endpoint", "control": "text", "required": false},
       {"name": "max_sentence_silence_ms", "label": "断句静音阈值（毫秒）", "control": "number", "required": false, "default": 800, "min": 200, "max": 6000},
+      {"name": "stream_audio_packet_ms", "label": "实时音频包（毫秒）", "control": "number", "required": false, "default": 100, "min": 20, "max": 200, "help": "将 LiveKit PCM 小帧合并后再发送给百炼；建议保持 100ms。"},
+      {"name": "stream_send_backpressure_seconds", "label": "实时发送背压窗口（秒）", "control": "number", "required": false, "default": 5, "min": 0.25, "max": 30, "help": "无损、有界地容忍事件循环或网络短抖动；超限仍失败关闭，不会丢弃音频。"},
       {"name": "vocabulary_id", "label": "面试术语热词表 ID", "control": "text", "required": false},
       {"name": "batch_max_bytes", "label": "批量音频最大字节", "control": "number", "required": false, "default": 10485760, "min": 1024, "max": 10485760}
     ]}},
@@ -69,6 +71,8 @@
       "asr_websocket_url": {"type": "string"},
       "asr_batch_endpoint": {"type": "string"},
       "max_sentence_silence_ms": {"type": "integer"},
+      "stream_audio_packet_ms": {"type": "integer", "minimum": 20, "maximum": 200},
+      "stream_send_backpressure_seconds": {"type": "number", "minimum": 0.25, "maximum": 30},
       "vocabulary_id": {"type": "string"},
       "batch_max_bytes": {"type": "integer"},
       "realtime_websocket_url": {"type": "string"},

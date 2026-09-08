@@ -19,6 +19,7 @@ dependencies = [
     "pytest>=8.0.0",
     "uvicorn>=0.39.0",
     "websockets>=14.0",
+    "webrtcvad-wheels==2.0.14",
 ]
 
 [project.scripts]

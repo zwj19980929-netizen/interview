@@ -7,14 +7,20 @@ takeover. WebSocket handlers and React are intentionally thin adapters.
 from __future__ import annotations
 
 import asyncio
+import os
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from app.core.auth import Principal
 from app.core.errors import ApiError
+from app.services.capture_recovery import candidate_capture_recovery
 from app.core.ids import new_id
-from app.core.interview_agent_metrics import interview_agent_metrics
+from app.core.interview_agent_metrics import (
+    CANDIDATE_INTERVIEW_AGENT_METRICS,
+    interview_agent_metrics,
+    measure_interview_agent_stage,
+)
 from app.core.time import utc_now
 from app.domain.interview_agent import (
     ApprovedConversationAct,
@@ -28,12 +34,15 @@ from app.domain.interview_agent import (
 )
 from app.model_gateway import capabilities as cap
 from app.model_gateway.gateway import ModelGateway
+from app.model_gateway.errors import ProviderError
 from app.model_gateway.schemas import TTSSynthesizeRequest
 from app.persistence.provider import persistence_for
 from app.realtime_bus import realtime_event_bus
 from app.services.avatar import AvatarService
 from app.services.avatar_performance import AvatarPerformanceComposer
 from app.services.agent_expression_audio import AgentExpressionAudioService
+from app.services.approved_speech_output import ApprovedSpeechOutput
+from app.adapters.livekit_audio_output import LiveKitApprovedAudioPublisher
 from app.adapters.livekit_media import LiveKitMediaPlane
 from app.services.interviews import InterviewService
 from app.services.interview_evidence import EvidenceFinishResult
@@ -242,6 +251,8 @@ class AgentChannel:
         self._evidence_session: Optional[ManagedLiveKitEvidenceSession] = None
         self._server_audio_seen = False
         self._takeover_watchdog_task: Optional[asyncio.Task[None]] = None
+        self._speech_output: Optional[ApprovedSpeechOutput] = None
+        self._speech_output_task: Optional[asyncio.Task[None]] = None
 
     async def initialize(self) -> None:
         session = self.runtime.interviews.get_interview(
@@ -323,6 +334,9 @@ class AgentChannel:
     async def send(self, signal: ClientSignal) -> None:
         if self._closed or self._terminating:
             raise ApiError("AGENT_CHANNEL_CLOSED", "Agent channel is closed.", status_code=409)
+        if signal.type == "telemetry.observe":
+            await self._observe_process_telemetry(signal)
+            return
         async with self._lock:
             durable_evidence = bool(
                 self._evidence_session is not None
@@ -364,6 +378,32 @@ class AgentChannel:
                     self.organization_id,
                 )
 
+    async def _observe_process_telemetry(self, signal: ClientSignal) -> None:
+        """Sample best-effort process telemetry without touching domain state."""
+
+        try:
+            self.runtime._require_candidate(self.principal)
+            metric = signal.payload.get("metric")
+            value = signal.payload.get("value")
+            if (
+                not isinstance(metric, str)
+                or metric not in CANDIDATE_INTERVIEW_AGENT_METRICS
+                or isinstance(value, bool)
+                or value is None
+            ):
+                return
+            interview_agent_metrics().observe(metric, float(value))
+        except ApiError:
+            raise
+        except (TypeError, ValueError, OverflowError):
+            # Browser telemetry is untrusted and non-authoritative. Invalid
+            # samples must neither become a domain problem nor pause a session.
+            return
+        finally:
+            # A buffered client can deliver hundreds of viseme samples at once.
+            # Yield explicitly so ownership renewal and media tasks stay fair.
+            await asyncio.sleep(0)
+
     async def events(self) -> AsyncIterator[AgentEvent]:
         while True:
             item = await self._queue.get()
@@ -377,6 +417,20 @@ class AgentChannel:
         self._closed = True
         self._terminating = True
         failure: Optional[BaseException] = None
+        if self._speech_output is not None:
+            try:
+                self.runtime._mark_streamed_expression_for_replay(
+                    self.interview_id, self.organization_id,
+                    performance_id=self._speech_output.performance_id,
+                    output_id=self._speech_output.output_id,
+                )
+            except BaseException as exc:
+                failure = exc
+        try:
+            await self._cancel_speech_output()
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
         endpoint_task = self._endpoint_task
         self._endpoint_task = None
         if endpoint_task:
@@ -537,6 +591,20 @@ class AgentChannel:
             )
             await self._emit_snapshot(signal.causation_id)
             if "candidate" in self.principal.roles:
+                if self._evidence_session is not None:
+                    self._evidence_session.assert_controller(self)
+                if self._speech_output is None:
+                    replay = self.runtime._recover_streamed_expression(
+                        self.interview_id, self.organization_id,
+                    )
+                    if replay is not None:
+                        await self._select_act(
+                            act_type=replay["payload"]["act_type"],
+                            text=replay["payload"]["text"], turn_id=replay.get("turn_id"),
+                            causation_id=signal.causation_id, evidence_refs=[],
+                            gesture="look_at_candidate",
+                        )
+                        return
                 session = self.runtime.interviews.get_interview(
                     self.interview_id, self.organization_id
                 )
@@ -620,6 +688,10 @@ class AgentChannel:
                 reason="candidate_requested_pause",
                 organization_id=self.organization_id,
             )
+            if self._evidence_session is not None:
+                await self._evidence_session.pause_capture()
+            await self._cancel_speech_output()
+            self.runtime._clear_active_performance(self.interview_id, None, self.organization_id)
             await self._set_floor(FloorOwner.NONE, "candidate_pause", signal.causation_id)
             await self._emit_snapshot(signal.causation_id)
             return
@@ -686,6 +758,31 @@ class AgentChannel:
         if kind in {"evidence.finish", "finish_answer"}:
             await self._finish_evidence(signal)
             return
+        if kind == "avatar.performance.playback":
+            self.runtime._require_candidate(self.principal)
+            if self._evidence_session is not None:
+                self._evidence_session.assert_controller(self)
+            session = self.runtime.interviews.get_interview(self.interview_id, self.organization_id)
+            state = session.get("agent_runtime") or {}
+            if (session.get("current_turn_id") == signal.turn_id
+                    and state.get("active_performance_id") == signal.payload["performance_id"]):
+                from app.core.speech_diagnostics import record_turn_control
+                record_turn_control("audio_playback", interview_id=self.interview_id,
+                                    turn_id=signal.turn_id, **signal.payload)
+                await self._emit("avatar.performance.playback", dict(signal.payload),
+                    turn_id=signal.turn_id, causation_id=signal.causation_id,
+                    replayability=Replayability.TRANSIENT)
+            return
+        if kind == "avatar.performance.ready":
+            self.runtime._require_candidate(self.principal)
+            if self._evidence_session is not None:
+                self._evidence_session.assert_controller(self)
+            if self._speech_output is not None:
+                self._speech_output.acknowledge_ready(
+                    str(signal.payload.get("performance_id") or ""),
+                    str(signal.payload.get("output_id") or ""),
+                )
+            return
         if kind == "avatar.performance.stopped":
             self.runtime._require_candidate(self.principal)
             session = self.runtime.interviews.get_interview(
@@ -698,11 +795,26 @@ class AgentChannel:
             )
             if runtime_state.get("completion_emitted_at"):
                 return
-            self.runtime._clear_active_performance(
+            if not stopped_performance_id:
+                return
+            if runtime_state.get("active_output_id"):
+                if self._evidence_session is not None:
+                    self._evidence_session.assert_controller(self)
+                if self._speech_output is None or not self._speech_output.acknowledge_drained(
+                    stopped_performance_id, str(signal.payload.get("output_id") or ""),
+                    str(signal.payload.get("reason") or ""),
+                ):
+                    # A legacy or early stop cannot finish a streamed utterance.
+                    return
+            if not self.runtime._clear_active_performance(
                 self.interview_id,
-                stopped_performance_id or None,
+                stopped_performance_id,
                 self.organization_id,
-            )
+            ):
+                # Browser media callbacks may arrive after a replacement
+                # performance has started.  A stale stop must have no effect on
+                # the current floor, calibration, or completion state.
+                return
             await self._emit(
                 "avatar.performance.stopped",
                 {"performance_id": signal.payload.get("performance_id"), "reason": "completed"},
@@ -762,13 +874,6 @@ class AgentChannel:
             )
             await self._emit_snapshot(signal.causation_id)
             return
-        if kind == "telemetry.observe":
-            self.runtime._require_candidate(self.principal)
-            interview_agent_metrics().observe(
-                str(signal.payload.get("metric") or ""),
-                float(signal.payload.get("value") or 0),
-            )
-            return
         raise ApiError(
             "AGENT_SIGNAL_UNSUPPORTED",
             "Client signal is not supported by InterviewAgentRuntime.",
@@ -782,6 +887,7 @@ class AgentChannel:
         if self._evidence_session is not None:
             await self._evidence_session.dispatch(self, signal)
             return
+        await self._cancel_speech_output()
         if self._endpoint_task:
             self._endpoint_task.cancel()
             self._endpoint_task = None
@@ -825,11 +931,12 @@ class AgentChannel:
         if self._evidence_session is not None:
             await self._evidence_session.dispatch(self, signal)
             return
+        automatic = self._warmup is not None
         await self._emit(
             "speech.stopped",
             {
                 "speaker": "candidate",
-                "endpoint_countdown_ms": 2500,
+                "endpoint_countdown_ms": 2500 if automatic else 0,
                 "cancellable": True,
             },
             turn_id=signal.turn_id or (self._stt.turn_id if self._stt else None),
@@ -838,6 +945,9 @@ class AgentChannel:
         )
         if self._endpoint_task:
             self._endpoint_task.cancel()
+            self._endpoint_task = None
+        if not automatic:
+            return
         self._endpoint_task = asyncio.create_task(
             self._endpoint_after_delay(signal.turn_id, signal.causation_id)
         )
@@ -1018,6 +1128,7 @@ class AgentChannel:
         stt = self._stt
         self._stt = None
         finished_turn_id = stt.turn_id
+        await self._set_floor(FloorOwner.NONE, "answer_processing", signal.causation_id)
         events = await stt.finish(signal.payload)
         for raw in events:
             raw.setdefault("turn_id", finished_turn_id)
@@ -1078,6 +1189,40 @@ class AgentChannel:
         if session.get("status") in {"completed", "report_generating", "report_ready"} or session.get(
             "candidate_input_completed_at"
         ):
+            from app.services.evidence_coordination import assert_current_evidence_fence
+
+            closing_evidence_session = self._evidence_session
+            closing_fence = (
+                closing_evidence_session.ownership.commit_fence()
+                if closing_evidence_session is not None and closing_evidence_session.ownership is not None
+                else None
+            )
+            closing_turn_id = session.get("current_turn_id")
+
+            def closing_is_current() -> bool:
+                if self._closed or self._terminating:
+                    return False
+                if closing_evidence_session is not None and (
+                    self._evidence_session is not closing_evidence_session
+                    or closing_evidence_session._stopped or closing_fence is None
+                ):
+                    return False
+                try:
+                    with self.runtime.persistence.transaction(self.organization_id) as transaction:
+                        if closing_fence is not None:
+                            assert_current_evidence_fence(transaction, closing_fence)
+                        current = transaction.interview_sessions.get(self.interview_id)
+                        if not current or current.get("current_turn_id") != closing_turn_id:
+                            return False
+                        state = current.get("agent_runtime") or {}
+                        if state.get("floor") == "human" or (state.get("takeover") or {}).get("status") == "active":
+                            return False
+                        return current.get("status") in {"completed", "report_generating", "report_ready"} or (
+                            current.get("status") == "in_progress" and bool(current.get("candidate_input_completed_at"))
+                        )
+                except ApiError:
+                    return False
+
             runtime_state = session.get("agent_runtime") or {}
             if runtime_state.get("completion_emitted_at"):
                 return
@@ -1100,6 +1245,8 @@ class AgentChannel:
             if stop_evidence_session and self._evidence_session is not None:
                 await self._evidence_session.stop("interview_completed")
                 self._evidence_session = None
+            if not closing_is_current():
+                return
             performance = await self._select_act(
                 act_type="closing",
                 text=(
@@ -1111,6 +1258,11 @@ class AgentChannel:
                 evidence_refs=[],
                 gesture="farewell",
             )
+            # None can mean lost authority, not merely unavailable TTS. A
+            # paused/replaced owner must not mint a completion receipt or arm
+            # a timer after its delayed farewell result returns.
+            if not closing_is_current():
+                return
             if performance is None:
                 await self._finalize_completion(
                     causation_id=causation_id,
@@ -1399,7 +1551,9 @@ class AgentChannel:
                     problem.get("code") or "UNDERSTANDING_RESULT_REJECTED"
                 )
                 user_message = (
-                    "系统暂时无法确认这段回答，请重新回答一次。"
+                    "这段录音未得到有效转写，请继续说话或重新说一次。"
+                    if code == "STT_TRANSCRIPT_UNAVAILABLE"
+                    else "系统暂时无法确认这段回答，请重新回答一次。"
                     if action == "clarify"
                     else "系统无法安全理解这段回答，面试已暂停并等待人工处理。"
                 )
@@ -1434,6 +1588,10 @@ class AgentChannel:
                     await self._select_turn(current, causation_id, act_type="repeat")
             elif action == "continue_listening":
                 await self._set_floor(FloorOwner.CANDIDATE, "candidate_not_finished", causation_id)
+                if problem and problem.get("code") == "STT_TRANSCRIPT_UNAVAILABLE":
+                    # Same-owner floor deduplication must not leave the client
+                    # waiting for a final from the now-consumed old stream.
+                    await self._emit_snapshot(causation_id)
             elif action == "pause":
                 session = self.runtime.interviews.get_interview(
                     self.interview_id, self.organization_id
@@ -1514,9 +1672,83 @@ class AgentChannel:
         evidence_refs: List[str],
         gesture: str,
         expression: Optional[Dict[str, Any]] = None,
+        approval_guard: Any = None,
     ) -> Optional[AvatarPerformance]:
         if not text.strip():
             raise ApiError("CONVERSATION_ACT_EMPTY", "Approved conversation act is empty.", status_code=409)
+        if approval_guard is not None:
+            approval_guard()
+        # Expression I/O can outlive a pause, another act, or this Evidence
+        # owner. Bind completion to the original authority, not whichever
+        # owner/turn happens to be current when the provider finally returns.
+        from app.services.evidence_coordination import assert_current_evidence_fence
+
+        evidence_session = self._evidence_session
+        if (self._closed or self._terminating
+                or (evidence_session is not None and evidence_session._stopped)):
+            return None
+        owner_fence = None
+        if evidence_session is not None:
+            try:
+                grant = evidence_session.ownership or evidence_session._require_attached(self)
+                owner_fence = grant.commit_fence()
+            except ApiError:
+                return None
+        try:
+            with self.runtime.persistence.transaction(self.organization_id) as transaction:
+                if owner_fence is not None:
+                    assert_current_evidence_fence(transaction, owner_fence)
+                initial_session = transaction.interview_sessions.get(self.interview_id)
+        except ApiError:
+            return None
+        if not initial_session:
+            return None
+        expected_turn_id = initial_session.get("current_turn_id")
+        allowed_statuses = {"in_progress"}
+        if act_type == "closing":
+            # The existing completion protocol deliberately speaks its one
+            # farewell after answers are sealed but before issuing a receipt.
+            allowed_statuses.update({"completed", "report_generating", "report_ready"})
+        if (initial_session.get("status") not in allowed_statuses
+                or (turn_id is not None and turn_id != expected_turn_id)):
+            return None
+        await self._cancel_speech_output()
+        expected_performance_id = None
+        if approval_guard is not None:
+            approval_guard()
+
+        def expression_is_current() -> bool:
+            if (self._closed or self._terminating
+                    or self._evidence_session is not evidence_session
+                    or (evidence_session is not None and evidence_session._stopped)):
+                return False
+            try:
+                if approval_guard is not None:
+                    approval_guard()
+                with self.runtime.persistence.transaction(self.organization_id) as transaction:
+                    if owner_fence is not None:
+                        assert_current_evidence_fence(transaction, owner_fence)
+                    session = transaction.interview_sessions.get(self.interview_id)
+                    if not session or session.get("status") not in allowed_statuses:
+                        return False
+                    state = session.get("agent_runtime") or {}
+                    if act_type == "closing" and state.get("completion_emitted_at"):
+                        return False
+                    if (session.get("current_turn_id") != expected_turn_id
+                            or state.get("floor") != FloorOwner.AGENT.value):
+                        return False
+                    if (expected_performance_id is not None
+                            and state.get("active_performance_id") != expected_performance_id):
+                        return False
+                    selected = next((item for item in reversed(session.get("agent_events", []))
+                                     if item.get("type") == "conversation.act.selected"), None)
+                    return bool(selected
+                                and selected.get("event_id") == selected_event.event_id
+                                and selected.get("payload", {}).get("act_id") == act.act_id
+                                and selected.get("payload", {}).get("approved") is True)
+            except ApiError:
+                return False
+
         act = self.runtime._approve_conversation_act(
             self.interview_id,
             act_type=act_type,
@@ -1527,7 +1759,7 @@ class AgentChannel:
             organization_id=self.organization_id,
         )
         await self._set_floor(FloorOwner.AGENT, "approved_conversation_act", causation_id)
-        await self._emit(
+        selected_event = await self._emit(
             "conversation.act.selected",
             {
                 "act_id": act.act_id,
@@ -1543,8 +1775,59 @@ class AgentChannel:
             replayability=Replayability.REPLAYABLE,
         )
         try:
+            if not expression_is_current():
+                return None
             selected_expression = expression
             if selected_expression is None:
+                # Existing question assets remain the fastest path. Dynamic
+                # approved acts can use the same TTS route's PCM transport.
+                stream_performance_id = new_id("performance")
+
+                def assert_stream_current() -> None:
+                    if not expression_is_current():
+                        raise ApiError("AGENT_SPEECH_OUTPUT_STALE", "Approved speech is no longer current.", status_code=409)
+
+                output = None
+                if (isinstance(self._evidence_session, ManagedLiveKitEvidenceSession)
+                        and act_type != "closing"):
+                    output = await self.runtime._open_streamed_expression(
+                        self.interview_id, turn_id, text, self.organization_id,
+                        performance_id=stream_performance_id,
+                        assert_current=assert_stream_current,
+                    )
+                if output is not None:
+                    try:
+                        binding = await output.open()
+                        assert_stream_current()
+                        stream_performance = self.runtime.performance.compose(
+                            text, turn_id=turn_id, gesture=gesture,
+                        )
+                        performance = AvatarPerformance.model_validate({
+                            **stream_performance.model_dump(),
+                            "performance_id": stream_performance_id,
+                            "delivery": "streaming_tts", "live_audio": binding,
+                        })
+                        self._speech_output = output
+                        self.runtime._set_active_performance(
+                            self.interview_id, performance.performance_id, self.organization_id,
+                            output_id=output.output_id, act_event_id=selected_event.event_id,
+                        )
+                        expected_performance_id = performance.performance_id
+                        await self._emit(
+                            "avatar.performance.started", performance.model_dump(mode="json"),
+                            turn_id=turn_id, causation_id=causation_id,
+                            replayability=Replayability.TRANSIENT,
+                        )
+                        assert_stream_current()
+                        self._speech_output_task = asyncio.create_task(
+                            self._run_speech_output(output, expression_is_current, turn_id, causation_id)
+                        )
+                        return performance
+                    except BaseException:
+                        await output.abort()
+                        if self._speech_output is output:
+                            self._speech_output = None
+                        raise
                 selected_expression = await self.runtime._expression_audio(
                     self.interview_id,
                     turn_id,
@@ -1552,6 +1835,8 @@ class AgentChannel:
                     self.principal.actor_id,
                     self.organization_id,
                 )
+            if not expression_is_current():
+                return None
             audio_uri = str(selected_expression.get("audio_uri") or "")
             if not audio_uri:
                 raise ApiError(
@@ -1576,7 +1861,13 @@ class AgentChannel:
                 delivery=delivery,
             )
         except Exception as exc:
+            if not expression_is_current():
+                return None
             await self._problem(exc, turn_id=turn_id, causation_id=causation_id)
+            # Publishing the problem can yield to a new act or a takeover.
+            # An old synthesis failure must never pause that newer state.
+            if not expression_is_current():
+                return None
             self.runtime._clear_active_performance(
                 self.interview_id, None, self.organization_id
             )
@@ -1584,6 +1875,8 @@ class AgentChannel:
                 self.interview_id, self.organization_id
             )
             await self._set_floor(FloorOwner.NONE, "expression_failure", causation_id)
+            return None
+        if not expression_is_current():
             return None
         self.runtime._set_active_performance(
             self.interview_id, performance.performance_id, self.organization_id
@@ -1596,6 +1889,45 @@ class AgentChannel:
             replayability=Replayability.REPLAYABLE,
         )
         return performance
+
+    async def _run_speech_output(self, output, is_current, turn_id, causation_id) -> None:
+        async def finished(payload):
+            await self._emit(
+                "avatar.performance.producer_finished", payload,
+                turn_id=turn_id, causation_id=causation_id,
+                replayability=Replayability.TRANSIENT,
+            )
+
+        try:
+            await output.run(finished)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if is_current():
+                await self._problem(exc, turn_id=turn_id, causation_id=causation_id)
+                if is_current():
+                    self.runtime._clear_active_performance(
+                        self.interview_id, output.performance_id, self.organization_id,
+                    )
+                    self.runtime._pause_for_fatal_expression(self.interview_id, self.organization_id)
+                    await self._set_floor(FloorOwner.NONE, "expression_failure", causation_id)
+                    await self._emit_snapshot(causation_id)
+        finally:
+            if self._speech_output is output:
+                self._speech_output = None
+                self._speech_output_task = None
+
+    async def _cancel_speech_output(self) -> None:
+        output, task = self._speech_output, self._speech_output_task
+        self._speech_output = self._speech_output_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+        try:
+            if output is not None:
+                await output.abort()
+        finally:
+            if task is not None and task is not asyncio.current_task():
+                await asyncio.gather(task, return_exceptions=True)
 
     async def _acquire_takeover(self, signal: ClientSignal) -> None:
         self.runtime._require_human(self.principal)
@@ -1615,6 +1947,7 @@ class AgentChannel:
             reason=reason,
             organization_id=self.organization_id,
         )
+        await self._cancel_speech_output()
         if replaced:
             await self.runtime._disconnect_takeover_media(
                 self.interview_id, replaced, self.organization_id
@@ -1808,6 +2141,8 @@ class AgentChannel:
                 causation_id=causation_id,
                 replayability=Replayability.REPLAYABLE,
             )
+        if owner == FloorOwner.CANDIDATE and hasattr(self._evidence_session, "confirmation_floor_returned"):
+            await self._evidence_session.confirmation_floor_returned(reason)
 
     async def _emit_snapshot(self, causation_id: Optional[str]) -> None:
         await self._emit(
@@ -2061,6 +2396,9 @@ class InterviewAgentRuntime:
             "phase": session.get("phase"),
             "current_turn_id": session.get("current_turn_id"),
             "floor": (session.get("agent_runtime") or {}).get("floor", FloorOwner.NONE.value),
+            "active_performance_id": (session.get("agent_runtime") or {}).get("active_performance_id"),
+            "capture_recovery": candidate_capture_recovery(session),
+            "supplement_confirmation": self._supplement_projection(session),
             "takeover": self._takeover_projection(
                 (session.get("agent_runtime") or {}).get("takeover"),
                 privileged=False,
@@ -2088,7 +2426,9 @@ class InterviewAgentRuntime:
                 if current
                 else None
             ),
-            "completed_answers": len(session.get("answers", [])),
+            "completed_answers": len({answer.get("turn_id") for answer in session.get("answers", [])}
+                                     & {turn["id"] for turn in session.get("turns", [])
+                                        if not turn.get("is_followup")}),
             "total_primary_questions": len([item for item in session.get("turns", []) if not item.get("is_followup")]),
         }
         if "candidate" in principal.roles:
@@ -2180,7 +2520,7 @@ class InterviewAgentRuntime:
 
         allowed_by_type = {
             "session.snapshot": set(),
-            "floor.changed": {"owner", "reason"},
+            "floor.changed": {"owner", "reason", "capture_id"},
             "speech.started": {
                 "speaker",
                 "continued",
@@ -2231,6 +2571,10 @@ class InterviewAgentRuntime:
                 "alignment_source",
                 "delivery",
                 "interruptible",
+                "live_audio",
+            },
+            "avatar.performance.producer_finished": {
+                "performance_id", "output_id", "total_samples", "sample_rate_hz",
             },
             "avatar.performance.cue": {
                 "performance_id",
@@ -2247,13 +2591,14 @@ class InterviewAgentRuntime:
                 "deadline_ms",
             },
             "avatar.performance.stopped": {"performance_id", "reason"},
+            "avatar.performance.playback": {"performance_id", "status"},
             "takeover.changed": {
                 "status",
                 "expires_at",
                 "version",
                 "ai_resumed",
             },
-            "problem": {"code", "message", "recoverable", "action", "calibration"},
+            "problem": {"code", "message", "recoverable", "action", "calibration", "capture_id"},
             "completed": {
                 "interview_id",
                 "status",
@@ -2388,11 +2733,15 @@ class InterviewAgentRuntime:
             return True
 
     def _set_active_performance(
-        self, interview_id: str, performance_id: Optional[str], organization_id: str
+        self, interview_id: str, performance_id: Optional[str], organization_id: str,
+        *, output_id: Optional[str] = None, act_event_id: Optional[str] = None,
     ) -> None:
         with self.persistence.transaction(organization_id) as transaction:
             session = self._required(transaction.interview_sessions.get(interview_id))
             session.setdefault("agent_runtime", {})["active_performance_id"] = performance_id
+            session["agent_runtime"]["active_output_id"] = output_id
+            session["agent_runtime"]["active_expression_act_event_id"] = act_event_id
+            session["agent_runtime"]["expression_replay_act_event_id"] = None
             session["updated_at"] = utc_now()
             transaction.interview_sessions.update(session, expected_version=session["version"])
 
@@ -2401,7 +2750,7 @@ class InterviewAgentRuntime:
         interview_id: str,
         expected_performance_id: Optional[str],
         organization_id: str,
-    ) -> None:
+    ) -> bool:
         with self.persistence.transaction(organization_id) as transaction:
             session = self._required(
                 transaction.interview_sessions.get(interview_id)
@@ -2409,15 +2758,77 @@ class InterviewAgentRuntime:
             state = session.setdefault("agent_runtime", {})
             active = state.get("active_performance_id")
             if expected_performance_id and active != expected_performance_id:
-                return
+                return False
             if active is None:
-                return
+                return False
             state["active_performance_id"] = None
+            state["active_output_id"] = None
+            state["active_expression_act_event_id"] = None
+            state["expression_replay_act_event_id"] = None
             state["performance_cleared_at"] = utc_now()
             session["updated_at"] = utc_now()
             transaction.interview_sessions.update(
                 session, expected_version=session["version"]
             )
+            return True
+
+    def _mark_streamed_expression_for_replay(
+        self, interview_id: str, organization_id: str, *, performance_id: str, output_id: str,
+    ) -> None:
+        with self.persistence.transaction(organization_id) as transaction:
+            session = self._required(transaction.interview_sessions.get(interview_id))
+            state = session.setdefault("agent_runtime", {})
+            if (state.get("active_performance_id") != performance_id
+                    or state.get("active_output_id") != output_id):
+                return
+            state["expression_replay_act_event_id"] = (
+                state.get("active_expression_act_event_id")
+                if session.get("status") == "in_progress" and state.get("floor") == FloorOwner.AGENT.value
+                else None
+            )
+            state["active_performance_id"] = None
+            state["active_output_id"] = None
+            state["active_expression_act_event_id"] = None
+            if state.get("floor") == FloorOwner.AGENT.value:
+                state["floor"] = FloorOwner.NONE.value
+            session["updated_at"] = utc_now()
+            transaction.interview_sessions.update(session, expected_version=session["version"])
+
+    def _recover_streamed_expression(self, interview_id: str, organization_id: str) -> Optional[dict]:
+        """A current controller may restart an interrupted act with a NEW track.
+
+        A worker crash has no close callback, so it can also leave orphan active
+        IDs. The approved event reference, current turn/status and controller
+        fence (checked by the caller) bind this recovery, never raw client text.
+        """
+        with self.persistence.transaction(organization_id) as transaction:
+            session = self._required(transaction.interview_sessions.get(interview_id))
+            state = session.setdefault("agent_runtime", {})
+            reference = state.get("expression_replay_act_event_id")
+            if not reference and state.get("active_output_id"):
+                reference = state.get("active_expression_act_event_id")
+            if not reference:
+                return None
+            latest = next((item for item in reversed(session.get("agent_events", []))
+                           if item.get("type") == "conversation.act.selected"), None)
+            replay = (
+                deepcopy(latest) if latest and latest.get("event_id") == reference
+                and latest.get("payload", {}).get("approved") is True
+                and (latest.get("turn_id") == session.get("current_turn_id")
+                     or (latest.get("turn_id") is None and latest.get("payload", {}).get("act_type") == "opening"))
+                and session.get("status") == "in_progress"
+                and state.get("floor") in {FloorOwner.AGENT.value, FloorOwner.NONE.value}
+                else None
+            )
+            state["expression_replay_act_event_id"] = None
+            state["active_expression_act_event_id"] = None
+            state["active_performance_id"] = None
+            state["active_output_id"] = None
+            if state.get("floor") == FloorOwner.AGENT.value:
+                state["floor"] = FloorOwner.NONE.value
+            session["updated_at"] = utc_now()
+            transaction.interview_sessions.update(session, expected_version=session["version"])
+            return replay
 
     def _mark_completion_closing(
         self,
@@ -2605,6 +3016,7 @@ class InterviewAgentRuntime:
                 prompt_version=(
                     "controlled_followup.v1"
                     if act_type == "followup"
+                    else "supplement_confirmation.v1" if act_type.startswith("supplement_")
                     else None
                 ),
                 created_at=utc_now(),
@@ -2958,6 +3370,55 @@ class InterviewAgentRuntime:
                 }
             )
 
+    async def _open_streamed_expression(
+        self, interview_id: str, turn_id: Optional[str], text: str,
+        organization_id: str, *, performance_id: str, assert_current,
+    ) -> Optional[ApprovedSpeechOutput]:
+        # Chrome MediaStream.currentTime includes sender underflow silence. The
+        # real browser probe disproved sample-clock equivalence; keep this
+        # transport opt-in until a content/sample playout mapping is validated.
+        if os.getenv("INTERVIEWER_STREAMING_TTS_ENABLED", "false").lower() != "true":
+            return None
+        session = self.interviews.get_interview(interview_id, organization_id)
+        current = self._current_turn(session)
+        if (turn_id and current and current["id"] == turn_id and not current.get("is_followup")
+                and text.strip() == str(current.get("question_spoken_text") or "").strip()):
+            return None
+        assert_current()
+        try:
+            with measure_interview_agent_stage("tts_stream_open_ms"):
+                stream = await self.gateway.open_tts_stream(TTSSynthesizeRequest(
+                    organization_id=organization_id, purpose="interview_agent_expression",
+                    text=text, language=session.get("settings", {}).get("language", "zh-CN"),
+                    voice_profile_id=session.get("settings", {}).get("voice_profile_id") or "voice_default_cn",
+                    format="audio/wav",
+                    metadata={"interview_id": interview_id, "turn_id": turn_id, "approved": True},
+                ))
+        except ProviderError as exc:
+            assert_current()
+            if exc.code in {"provider_streaming_not_supported", "provider_bad_request"}:
+                # Transport-only unsupported cases use the existing managed
+                # asset path before any PCM escapes. Never replay spoken bytes.
+                return None
+            raise
+        try:
+            assert_current()
+            publisher = LiveKitApprovedAudioPublisher(
+                self.media_plane, room_name=interview_room_name(organization_id, interview_id),
+                performance_id=performance_id, assert_current=assert_current,
+            )
+            return ApprovedSpeechOutput(
+                performance_id=performance_id, stream=stream, publisher=publisher,
+                assert_current=assert_current,
+                archive=lambda **audio: self.expression_audio.store_pcm(
+                    organization_id=organization_id, interview_id=interview_id,
+                    turn_id=turn_id, source_type="approved_streaming_tts", **audio,
+                ),
+            )
+        except BaseException:
+            await stream.abort()
+            raise
+
     async def _expression_audio(
         self,
         interview_id: str,
@@ -2968,7 +3429,8 @@ class InterviewAgentRuntime:
     ) -> Dict[str, Any]:
         session = self.interviews.get_interview(interview_id, organization_id)
         current = self._current_turn(session)
-        if turn_id and current and current["id"] == turn_id and not current.get("is_followup"):
+        if (turn_id and current and current["id"] == turn_id and not current.get("is_followup")
+                and text.strip() == str(current.get("question_spoken_text") or "").strip()):
             response = await self.avatar.speak(
                 interview_id,
                 {
@@ -2987,27 +3449,29 @@ class InterviewAgentRuntime:
                 }
             # 题目预生成阶段可能仍返回开发占位结果。正式面试不能让浏览器
             # 自行朗读，但也不能因此直接暂停；统一回落到服务端受管 TTS。
-        response = await self.gateway.invoke(
-            cap.TTS_SYNTHESIZE,
-            TTSSynthesizeRequest(
+        with measure_interview_agent_stage("tts_synthesis_ms"):
+            response = await self.gateway.invoke(
+                cap.TTS_SYNTHESIZE,
+                TTSSynthesizeRequest(
+                    organization_id=organization_id,
+                    purpose="interview_agent_expression",
+                    text=text,
+                    language=session.get("settings", {}).get("language", "zh-CN"),
+                    voice_profile_id=session.get("settings", {}).get("voice_profile_id") or "voice_default_cn",
+                    format="audio/wav",
+                    metadata={"interview_id": interview_id, "turn_id": turn_id, "approved": True},
+                ),
+            )
+        with measure_interview_agent_stage("tts_asset_import_ms"):
+            materialized = await self.expression_audio.import_tts(
                 organization_id=organization_id,
-                purpose="interview_agent_expression",
-                text=text,
-                language=session.get("settings", {}).get("language", "zh-CN"),
-                voice_profile_id=session.get("settings", {}).get("voice_profile_id") or "voice_default_cn",
-                format="audio/wav",
-                metadata={"interview_id": interview_id, "turn_id": turn_id, "approved": True},
-            ),
-        )
-        materialized = await self.expression_audio.import_tts(
-            organization_id=organization_id,
-            interview_id=interview_id,
-            turn_id=turn_id,
-            audio_uri=str(response.audio_uri),
-            content_type=response.content_type,
-            duration_ms=response.duration_ms,
-            provider_id=response.provider.provider_id,
-        )
+                interview_id=interview_id,
+                turn_id=turn_id,
+                audio_uri=str(response.audio_uri),
+                content_type=response.content_type,
+                duration_ms=response.duration_ms,
+                provider_id=response.provider.provider_id,
+            )
         return {
             "audio_uri": str(materialized["audio_uri"]),
             "duration_ms": materialized.get("duration_ms"),
@@ -3100,13 +3564,23 @@ class InterviewAgentRuntime:
         return "candidate" if "candidate" in principal.roles else "human"
 
     @staticmethod
+    def _supplement_projection(session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        value = (session.get("agent_runtime") or {}).get("supplement_confirmation") or {}
+        if (session.get("status") != "in_progress" or value.get("turn_id") != session.get("current_turn_id")
+                or value.get("status") not in {"listening", "awaiting_reply"}):
+            return None
+        return {key: value.get(key) for key in ("status", "turn_id", "capture_id")}
+
+    @staticmethod
     def _public_problem_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         recoverable = bool(payload.get("recoverable"))
         calibration = bool(payload.get("calibration"))
         result = {
             "code": str(payload.get("code") or "AGENT_RUNTIME_PROBLEM")[:128],
             "message": (
-                "试音暂时不可用，请重试或等待面试官接管。"
+                "这段录音未得到有效转写，请继续说话或重新说一次。"
+                if payload.get("code") == "STT_TRANSCRIPT_UNAVAILABLE" and recoverable
+                else "试音暂时不可用，请重试或等待面试官接管。"
                 if calibration
                 else (
                     "实时面试暂时遇到问题，请重试当前操作。"
@@ -3124,6 +3598,26 @@ class InterviewAgentRuntime:
                 )
             )[:128],
         }
+        messages = {
+            "UNDERSTANDING_UNAVAILABLE": "语音已收到，暂时无法完成回答理解；正在重试，你也可以继续补充。",
+            "UNDERSTANDING_RETRY_EXHAUSTED": "语音已保留，但回答理解暂时不可用。恢复后请说话或点击提前结束回答重试。",
+            "TRANSCRIPT_UNAVAILABLE": "已收到音频，仍在等待本段最终转写；已有字幕和回答会保留。",
+            "DETECTOR_UNAVAILABLE": "自动接话检测暂时不可用，仍在收音。",
+            "ENDPOINT_UNCERTAIN": "我还在听，你可以继续补充。",
+        }
+        if recoverable and payload.get("code") in messages:
+            result["message"] = messages[payload["code"]]
+            if isinstance(payload.get("capture_id"), str):
+                result["capture_id"] = payload["capture_id"][:128]
+        if payload.get("code") in {"CAPTURE_RECOVERING", "CAPTURE_RETRY_REQUIRED"}:
+            result["message"] = (
+                "正在恢复语音识别，音频仍在保留。"
+                if payload["code"] == "CAPTURE_RECOVERING" else
+                "本题收音未能恢复，请重试本题；不会提交不完整回答。"
+            )
+            capture_id = payload.get("capture_id")
+            if isinstance(capture_id, str) and 0 < len(capture_id) <= 128:
+                result["capture_id"] = capture_id
         if calibration:
             result["calibration"] = True
         if payload.get("occurred_at"):

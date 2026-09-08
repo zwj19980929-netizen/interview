@@ -1,12 +1,15 @@
 import hashlib
+import json
 import math
 import re
 import base64
+import os
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from app.core.ids import new_id
 from app.model_gateway import capabilities as cap
 from app.model_gateway.errors import ProviderError
+from app.model_gateway.tts_streaming import TTSStreamEvent
 from app.model_gateway.schemas import (
     AvatarSpeakRequest,
     AvatarSpeakResponse,
@@ -18,6 +21,7 @@ from app.model_gateway.schemas import (
     BatchSTTResponse,
     ProviderContext,
     ProviderMeta,
+    StableTranscriptPreview,
     TextEmbeddingRequest,
     TextEmbeddingResponse,
     TranscriptSegment,
@@ -30,6 +34,11 @@ from app.model_gateway.schemas import (
     TTSSynthesizeResponse,
     Usage,
 )
+
+
+def _development_transcript(metadata: Dict[str, Any]) -> str:
+    value = metadata.get("development_transcript")
+    return value.strip() if isinstance(value, str) else ""
 
 
 class MockProvider:
@@ -50,7 +59,13 @@ class MockProvider:
         if capability == cap.LLM_CHAT_JSON and isinstance(request, ChatJSONRequest):
             if request.purpose == "answer_evaluation":
                 data = evaluate_answer(request.metadata)
+            elif request.purpose == "interview_turn_understanding" and request.metadata.get("prompt_version") in {"supplement_reply.v1", "supplement_reply.v2"}:
+                reply = json.loads(request.messages[-1].content)["reply"]
+                # Offline mock never fabricates permission to finish.
+                data = {"intent": "unclear", "confidence": 0.0, "evidence_quote": reply[:300]}
             elif request.purpose == "interview_turn_understanding":
+                from app.core.prompt.understanding_references import understanding_references
+
                 transcript = str(request.metadata.get("transcript") or "").strip()
                 points = [str(item) for item in request.metadata.get("capability_points") or []]
                 covered = [item for item in points if item.casefold() in transcript.casefold()]
@@ -72,6 +87,39 @@ class MockProvider:
                     "confidence": 0.9,
                     "suggested_action": "followup" if missing else "next",
                 }
+                if request.metadata.get("prompt_version") in {
+                    "interview_turn_understanding.v2", "interview_turn_decision.v1",
+                    "interview_turn_understanding.v3", "interview_turn_decision.v2",
+                    "interview_turn_understanding.v4", "interview_turn_understanding.v5",
+                    "interview_turn_understanding.v6", "interview_turn_understanding.v7",
+                    "interview_turn_decision.v3", "interview_turn_decision.v4",
+                    "interview_turn_decision.v5", "interview_turn_decision.v6",
+                }:
+                    references = understanding_references(transcript, points)
+                    point_ids = {text: key for key, text in references["capabilities"].items()}
+                    evidence_ids = list(references["evidence"])[:1]
+                    data.pop("evidence_quotes")
+                    data["evidence_ids"] = evidence_ids
+                    data["claims"] = [{"claim": transcript[:600], "evidence_id": evidence_ids[0]}] if evidence_ids else []
+                    data["covered_point_ids"] = [point_ids[point] for point in data.pop("covered_capability_points")]
+                    data["missing_point_ids"] = [point_ids[point] for point in data.pop("missing_capability_points")]
+                    if request.metadata.get("prompt_version") in {"interview_turn_decision.v1", "interview_turn_decision.v2", "interview_turn_decision.v3", "interview_turn_decision.v4", "interview_turn_decision.v5", "interview_turn_decision.v6"}:
+                        probed = set(request.metadata.get("previously_probed_ids") or [])
+                        targets = [key for key in data["missing_point_ids"] if key not in probed][:1]
+                        selected = bool(targets and evidence_ids)
+                        data = {
+                            "understanding": data,
+                            "followup": {
+                                "selected": selected,
+                                "question_text": "请结合刚才的做法，具体说明你如何验证方案的效果？" if selected else "",
+                                "evidence_id": evidence_ids[0] if selected else "",
+                                "target_point_ids": targets if selected else [],
+                                "rationale": "核验冻结能力点的证据" if selected else "",
+                                "difficulty": str(request.metadata.get("difficulty") or "mid"),
+                                "sensitive_attribute_inference": False,
+                                "leaks_answer": False,
+                            },
+                        }
             elif request.purpose == "controlled_followup":
                 evidence = [str(item) for item in request.metadata.get("evidence_quotes") or []]
                 targets = [str(item) for item in request.metadata.get("target_capability_points") or []]
@@ -142,7 +190,7 @@ class MockProvider:
                 provider=provider,
             )
         if capability == cap.STT_BATCH and isinstance(request, BatchSTTRequest):
-            text = str(request.metadata.get("development_transcript", "")).strip()
+            text = _development_transcript(request.metadata)
             if not text:
                 raise ProviderError(
                     "provider_final_transcript_missing",
@@ -165,6 +213,13 @@ class MockProvider:
             retryable=False,
         )
 
+    async def open_tts_stream(self, request: TTSSynthesizeRequest, context: ProviderContext) -> Any:
+        if context.capability != cap.TTS_SYNTHESIZE:
+            raise ProviderError("provider_capability_missing", "Mock TTS stream capability is invalid.", retryable=False)
+        if os.getenv("INTERVIEWER_RUNTIME_ENV", "development").lower() == "production" or request.metadata.get("development_tts_fixture") is not True:
+            raise ProviderError("provider_streaming_not_supported", "Mock PCM streaming requires an explicit non-production fixture.", retryable=False)
+        return MockTTSStream(context)
+
     async def open_stream(self, request: StreamingSTTRequest, context: ProviderContext) -> Any:
         if context.capability != cap.STT_STREAMING:
             raise ProviderError(
@@ -184,6 +239,27 @@ class MockProvider:
                 retryable=False,
             )
         return MockSpeechDialogueStream(request, context)
+
+
+class MockTTSStream:
+    """Clearly tagged synthetic PCM; never a substitute for formal spoken text."""
+
+    def __init__(self, context: ProviderContext):
+        self.stream_id = new_id("mock_tts_stream")
+        self._closed = False
+        self._provider = ProviderMeta(provider_id="mock", model=context.model, request_id=new_id("mock_tts_request"), latency_ms=0)
+        self.ready_event = TTSStreamEvent(stream_id=self.stream_id, sequence=1, type="stream.ready", sample_rate_hz=24000, provider=self._provider)
+
+    async def events(self):
+        if self._closed:
+            raise ProviderError("provider_stream_closed", "Mock TTS stream is closed.", retryable=False)
+        pcm = b"\x00\x00" * 480  # Explicit 20 ms silence fixture, not synthetic speech.
+        yield TTSStreamEvent(stream_id=self.stream_id, sequence=2, type="audio.chunk", sample_rate_hz=24000, provider=self._provider, pcm_s16le=pcm)
+        if not self._closed:
+            yield TTSStreamEvent(stream_id=self.stream_id, sequence=3, type="audio.final", sample_rate_hz=24000, provider=self._provider, total_audio_bytes=len(pcm), usage=Usage())
+
+    async def abort(self):
+        self._closed = True
 
 
 class MockSpeechDialogueStream:
@@ -285,7 +361,7 @@ class MockSTTStream:
         if self.closed:
             raise ProviderError("provider_stream_closed", "Mock STT stream is closed.", retryable=False)
         self.byte_count += len(chunk)
-        text = str(self.request.metadata.get("development_transcript", "")).strip()
+        text = _development_transcript(self.request.metadata)
         if not self.request.enable_partial or not text or self.partial_sent:
             return []
         self.partial_sent = True
@@ -307,7 +383,7 @@ class MockSTTStream:
         if self.closed:
             return []
         self.closed = True
-        text = str(self.request.metadata.get("development_transcript", "")).strip()
+        text = _development_transcript(self.request.metadata)
         if not text:
             raise ProviderError(
                 "provider_final_transcript_missing",
@@ -337,6 +413,21 @@ class MockSTTStream:
             provider=self.provider,
         )
         return [final, closed]
+
+    async def preview(self) -> Optional[StableTranscriptPreview]:
+        if self.closed:
+            raise ProviderError("provider_stream_closed", "Mock STT stream is closed.", retryable=False)
+        text = _development_transcript(self.request.metadata)
+        if not self.byte_count or not text:
+            return None
+        confidence = float(self.request.metadata.get("confidence", 0.9))
+        duration_ms = int(self.request.metadata.get("duration_ms", 0))
+        return StableTranscriptPreview(
+            stream_id=self.stream_id, revision=1, text=text,
+            language=self.request.language, confidence=confidence,
+            segments=[TranscriptSegment(text=text, start_ms=0, end_ms=duration_ms, confidence=confidence)],
+            provider=self.provider.model_copy(deep=True), has_unstable_tail=False,
+        )
 
     async def abort(self) -> None:
         self.closed = True

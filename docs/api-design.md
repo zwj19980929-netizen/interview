@@ -1,6 +1,123 @@
 # 接口设计
 
+## 明确结束且无技术回答（023）
+
+TurnUnderstanding新增 `intent=answer_declined`，仅表示从完整服务端原文明确理解候选人本题不再作答（例如不会、请求下一题，或独立确认结束且无实质回答）；使用 `suggested_action=next`，非空原文证据、空claims/covered、全部能力点missing，无未解决歧义，不生成技术追问。理解置信度至少0.75，描述对这项意图的把握，不能因知识点缺失而降低为没听清。低语音置信度仍需澄清。理解Prompt为v6/v7、组合决策为v5/v6，历史版本继续可读。
+
+supplement_reply.v2保持continue/finish/supplement/pause/unclear三字段返回结构；未解决的字幕投诉优先unclear，不算技术补充。已完成的术语纠正、技术方案中的假设或引用须按实际语义处理，不能用关键词否决。
+
+此完整发言沿用受所有权、题目、STT/上下文指纹及完整录音保护的答案事务，保存原始转写与独立understanding，按实际未提供技术回答进入评分与下一题；不造技术主张、不调用无Evidence fence的管理员skip。未结束的思考、含糊应答、空转写、真实字幕争议仍不能据此推进。历史事件和答案不改写。
+
+## 2026-09-08 实时识别完成语义补充（022）
+
+供应商流式 STT 增加内部 `transcript.empty` 完成事件：仅在完整发送并收到供应商正常结束确认、整段没有非空文字或未决文字假设时产生。事件必须 `is_final=true`、空 text/segments、包含 provider 和当前 stream_id，单流只允许一个完成结果。它表示本段识别完成但没有文字，不表示候选人回答了“没有”，也不能单独形成答案。超时、断线、先前出现非空 partial 后丢失结果仍是错误，必须保留和恢复证据。
+
+连续采集可在已验证的空完成后推进音频水位，避免同一无文字片段无限重放；已有完整答案和结束语义仍须通过当前输入、所有权和提交校验。候选人字幕面板按当前 turn_id 隔离，切入追问/下一题清空当前题字幕，旧题迟到事件不改变当前题字幕和收音状态。
+
+确认后的纯准备可在同一capture和完整STT指纹一致时复用；新完整快照仍是恢复提交资格的前提，变化的证据和上下文会废弃准备。单份准备总预算45秒不因重新等待续期；单次STT finish最多10秒，PCM接收缓冲统一60秒以覆盖收尾和有界恢复，不能在进入恢复时缩小容量。
+
+## 补充确认的上下文保留（021）
+
+不新增REST或客户端答案输入。结束确认后的新活动只撤销PreparedTurnDecision，继续保留原补充问答，阶段退到awaiting_reply而非listening；新回复继续按既有supplement_reply语义合同处理。确认final划定后续回复边界，重复明确否定不再触发新supplement_check，真实继续/实质补充才返回listening。完整final覆盖其已有partial，延迟到达的同前缀字幕不产生新输入revision；超出前缀的新文字仍撤销。
+
+复用结束语义必须重新取得完整服务端final且文本、分段、置信度及Provider指纹均与已确认快照一致；缺final、未识别尾部、所有权/题目失效仍禁止提交。turn_control安全日志接入已有独立INFO通道，记录确认意图、撤销来源、阶段与音频播放状态，文字只记散列和字数；不记录完整答复、模型响应或凭据。
+
+## 播放事实与语音活动（020）
+
+候选人可发送 `avatar.performance.playback`，payload严格为 `{performance_id: string(1..128), status: "playing"|"blocked"|"failed"|"buffering"}`。仅当前候选控制器、当前题目和active_performance_id匹配时接收，回投同名transient事件用于诊断；不授予答案提交、结束播放或转换floor的权限。`avatar.performance.started`仍表示服务端已交付可播放音频，实际浏览器`playing`回执才表示媒体开始推进，不能证明操作系统或标签页扬声器未静音。旧客户端没有该回执时仍兼容。
+
+级联播放受阻保留本题与已批准音频，在界面提供“播放这句话”；加载/卡顿8秒后提示恢复，暂停、替换、离场清理旧音频及计时器，补充播报仍受服务端30秒回执预算约束。声音活动与音频帧接收分开；共享服务端VAD要求近120毫秒内至少100毫秒具有语音特征且RMS达到配置门槛（默认0.006，约−44.4dBFS）。所有PCM仍送识别；实际当前capture新增服务端文字可独立重置静音与撤销提案，重复文字不重置。连续无声5秒才询问，沉默及无有效文字均不能充当肯定/否定。
+
+## 识别术语及补送内部扩展（019）
+
+未新增 REST 或候选人文字输入接口。StreamingSTTRequest.recognition_terms 是服务端从冻结题干、skills、key_points 提取的技术标识符列表：至多100项，单项2–64字符、ASCII字母开头，只允许字母数字及 _+.#-，大小写去重；不接受句子或标准答案全文。ValidatedSTTStream.send_audio(chunk, wait_for_capacity=True) 仅供独立补送路径使用；可选 Provider.wait_audio_capacity(byte_count) 等待真实发送容量，未实现的插件保持兼容。等待取消不累计 byte_count、不重录。
+
+## 已确认答复的收口反馈（018）
+
+未新增REST/候选控制字段；内部AnswerEndpoint可接受本轮尚未恢复识别的权威final_snapshot，必须通过现有capture提交守卫。TRANSCRIPT_UNAVAILABLE表示本段最终转写尚未取得，提示“已收到音频，仍在等待本段最终转写；已有字幕和回答会保留”，不再宣称整题未识别或强迫重说。候选提示采用自然语义表达，不呈现固定口令集合。服务端partial仅可撤销旧提案，不能变成候选答案或完成许可。
+
+确认完成后的候选准备状态明确显示“已收到结束确认，正在整理回答”，说明无需重复确认且仍可开口补充。
+
+## 正式回答的补充确认（016）
+
+沿用Agent事件与控制接口，不新增REST路由。新增批准act_type：supplement_check、supplement_continue、supplement_clarify，不能覆盖候选页面的当前题干；它们必须合成批准文本，只有文本与冻结题干完全一致时才能复用题目音频。floor.changed(reason=supplement_awaiting_reply,owner=candidate)携带当前turn_id/capture_id，收音保持ready。session.snapshot增加可空supplement_confirmation，仅允许status(listening/awaiting_reply)、turn_id、capture_id；不含转写边界或意图模型输入。确认来源必须为当前capture新增的服务端final，客户端仍不能提交文字答案。finish_answer/continue_speaking保持可选按钮；口头答复完成正常轮转。UNDERSTANDING_UNAVAILABLE与UNDERSTANDING_RETRY_EXHAUSTED区分重试中/耗尽，保留安全消息和scope，错误后退出answer_preparing，新准备清除旧告警。
+
+## 正式转写的内部只读预览（015，仓库verified）
+
+`ValidatedSTTStream.supports_stable_preview/preview()` 是服务端内部可选能力，返回独立 `StableTranscriptPreview` 或暂无稳定结果；不新增候选人提交接口，不改变 WebSocket `transcript.final` 唯一性。预览含流身份、revision、稳定text/segments、language/confidence/provider及has_unstable_tail，无is_final字段。它不关闭识别、不等待厂商完成，不声明已处理全部PCM。Evidence仅将无未定尾句的已校验预览用于可撤销准备；实际finish与持久提交仍要求完整server final和现有所有权/输入/决策指纹。未支持该能力的Adapter保持原路径，客户端无需更新协议。
+
+自动等待不强行收口；沿用现有候选人显式提前结束命令时，即使暂无可用稳定句也允许一次真正final，仍通过语义/输入/fence后才提交。内部指标新增stt_recognition_opened、stt_recognition_finished、stt_preview_prepared、stt_preview_final_revised，均只接受数值、不包含会话/候选人标签。预览以100ms有界轮询，当前owner仍校验，完整会话读取与持久前缀封存只在真正准备时执行。
+
+## 正式采集恢复（CONTINUOUS-CAPTURE-RECOVERY-014）
+
+正式 STT 的短时故障进入有界自动恢复，不直接把 InterviewSession 置为 paused。沿用 `floor.changed`，当前 turn/capture 下 `answer_recovering` 保持 owner=candidate 与音频采集，恢复成功 `answer_listening`；重试耗尽 `answer_retry_required` 为 owner=none 并停止本次采集，不提交残缺回答。对应可恢复 problem 为 `CAPTURE_RECOVERING/continue_listening`、`CAPTURE_RETRY_REQUIRED/retry_answer`，这两类必须携带 capture_id 与事件 turn_id，旧 scope 不影响当前采集。
+
+候选 snapshot 新增可选 `capture_recovery=null|{status,turn_id,capture_id,attempt,max_attempts}`，status 为 recovering/retry_required，attempt为0..3、max_attempts为3。只投影当前未完成题且会话in_progress的恢复状态，不包含原异常、Provider响应或内部stage。重连时从该事实恢复界面。
+
+候选人点击“重试本题”复用 `continue_speaking` 并携带当前turn_id/capture_id；服务端须验证持久retry_required、当前题未作答、当前owner及同一采集证据，归档不完整前缀后开启新代收音。新open-ready使用本次signal.causation_id，晚到/重复重试不得再次清空新采集。普通open不能绕过retry_required；完整录音/已提交答案不可借此重置。
+
+识别重连每轮至多3次、单次4秒，短退避；等待期间保留有界音频。只对白名单暂时故障恢复，owner/授权/证据完整性或未知提交结果仍禁止自动提交。原始安全错误码、阶段和次数在特权记录持久保存，不能只写通用ApiError。试音原有自动完成不变，无新增公开HTTP接口。
+
+重试信号不接收客户端音频格式或文本：正式LiveKit重开使用服务端16kHz/mono/PCM格式，保留原signal.causation_id。恢复新积压上限30秒；上限导致缺口时直接重试本题而非静默遗漏或整场暂停。持久状态/采集门变更先于至多1秒的UI投影；真正存储/完整性故障仍安全停止。候选主动pause撤销当前采集和后台恢复，不能靠浏览器静音来保证停止。
+
+## 路由就绪自动刷新（ROUTE-READINESS-REFRESH-013）
+
+`POST /api/v1/interview-appointments/{id}/invite` 在签发事务之前，对本次预约需要的已配置模型路由按需执行有界合成探针；健康且未过期则复用，不在数据库事务内等待外部网络。最终邀请事务仍重新校验全部门禁，探测成功不等于已发邀请。GET 不触发付费模型调用。
+
+新增 `POST /api/v1/interview-appointments/{id}/readiness/refresh`：仅刷新路由证据并返回当前预约 readiness，不修改预约状态或签发令牌，使用企业预约权限和审计。候选人设备 readiness/start 的自动刷新须先验证有效邀请与当前阶段，不能让无效公开令牌触发模型费用。
+
+后台 route 列表增加服务端计算的 `readiness`：`status` 区分 healthy/expired/untested/checking/failed/configuration_invalid，提供安全的 reason_code、checked_at/expires_at/retry_at 等时间；不输出原始 Provider 异常或凭据。预约 checks 保留既有 ready/production_ready/mode，并增加 route_readiness；过期、未检测、检测中使用不同 mode。自动探针有总时限、并发上限、同租户/路由去重和失败冷却，配置或凭据发生变化后旧探针不得覆盖当前证据。超时/失败仍关闭准入，不能回落 mock 冒充恢复。
+
+自动网络预算为每条 15 秒/整批 30 秒，取消处理另有至多 0.1 秒等待宽限；前端邀请与候选 readiness/start 局部请求上限 40 秒、手动路由测试 35 秒，均保持操作中状态并防重复。显式手动重测允许重试冷却中的失败，自动刷新遵守冷却。连接清理失败独立分类 `provider_probe_cleanup_failed`，不与开流超时混同。显式停用路由属于 configuration_invalid，不能降为开发 mock。
+
+候选返回的 `can_start` 使用当前登记、同意、时间窗、设备 TTL、计划批准和模型证据共同计算；网络等待后再次核对，不把 device.ready 旧布尔值当作当前准入。等待期间另一请求已消费邀请时，start 仍返回原已创建会话；归档计划或取消预约不得凭较早探测结果发邀请。创建预约成功后的界面重试保留同一预约，已取得邀请但列表刷新失败也不再次签发。
+
+## 批准语音的流式播放（工作项 012）
+
+**实验合同，默认关闭**（`INTERVIEWER_STREAMING_TTS_ENABLED=false`）。2026-09-06 Chrome 实测2秒PCM中间停供3秒，
+媒体 currentTime 在 EOF 已为5.122秒且未触发 waiting，不能证明内容样本的真实排空；以下流式播放/ACK只供显式测试，
+未通过 source sample→播放位置校验前不得作为默认正式表达。默认仍用完整私有资产和原生 ended，自动轮次与合并推理不受此开关影响。
+
+`avatar.performance.started` 新增 `delivery=streaming_tts`：`audio_uri=null`，
+`live_audio={output_id,publisher_identity,track_sid,track_name,sample_rate_hz,channels}`。
+绑定来自本场已批准 act 的独立 LiveKit 音轨；客户端只播放精确匹配的绑定，不播放未知 participant。
+客户端在绑定音轨并请求播放后发送 `avatar.performance.ready {performance_id,output_id}`；
+服务端等待当前候选人控制连接确认后才发布首个 PCM，防止首段先于订阅丢失。
+`avatar.performance.producer_finished {performance_id,output_id,total_samples,sample_rate_hz}`
+仅表示 Provider 唯一 final 与本机发送队列排空，不表示候选人听完；浏览器按本地媒体时钟实际排空后发送
+`avatar.performance.stopped {performance_id,output_id,reason:drained}`，服务端校验当前输出与 EOF 后才移交话轮。
+新流式 started/producer_finished 均为 transient，不重放过期轨道；候选快照新增可选 `active_performance_id`，
+用于暂停、完成、换代时撤销播放。断开/owner 丢失/打断须取消 Provider、清空发送队列和撤销 track。
+等待 ready、Provider 空闲、总时长和等待播放确认均有界；PCM 不通过 AgentEvent/Redis 传输。
+流式 G2P 口型为估计，首音由客户端 `playing` 观测；未通过真实浏览器验证前不承诺精确同步或首音目标。
+
+控制连接中断时，当前 live 输出撤轨并清空 active 标识，保存原批准 act 的事件引用为待重播标记，Floor 暂为 none。
+新控制连接 `client.ready` 仅在原题/原批准仍匹配时用新 performance/output 重播该批准表达；不恢复过期轨道或从任意字节续播。
+这是断线后的明确重播，不是已发 PCM 后对 Provider 失败的自动重试；暂停/接管/换题必须丢弃旧待重播标记。
+
+## 可撤销自动轮次（INTERRUPTIBLE-AUTOMATIC-TURNS-012）
+
+正式收音保持开放，停顿只产生可撤销 AnswerEndpointProposal。服务端本地音频轮次检测可自动提出收口，`finish_answer` 仍为可选的显式建议；两者不能把浏览器文本变成答案。准备阶段允许当前 capture 的 `speech.started`/`continue_speaking`，新输入使旧提议失效。准备与提交分离：媒体 checkpoint 不提前 complete，后台理解不会占住控制执行器；只有当前 owner/capture/输入版本、权威 final 与决策上下文一致才完成一次答案提交。未知模型判断保持收音，不按超时默认完成。暖场现有自动完成合同不变。本节替代 011 强制按钮语义。
+
+新增 transient `floor.changed(owner=candidate, reason=answer_preparing|answer_listening|answer_detector_ready, capture_id)`；候选端只接受当前 turn/capture，准备中继续 PCM/VAD。真正提交成功后才投影 `owner=none, reason=answer_processing`（同样携带刚提交的 turn/capture）并关闭前端输入门，旧 scope 的 processing/准备事件均不得影响新采集。显式按钮文案为“提前结束回答”，不承担必经流程。模型不可用和不确定以 `problem(recoverable=true, action=continue_listening)` 提示；同轮最终转写/processing 仅清准备类可恢复提示，检测器恢复事件仅清其不可用提示，不清严重故障；不发送内部响应或证据指纹。
+
+内部 journal `evidence.seal(endpoint=prepared_turn)` 只保存有界 `capture_id/proposal_id`，不保存转写或模型提案。执行器还必须找到当前进程内对应 PreparedTurnDecision 并执行 guard，客户端伪造引用不能触发提交；丢失 owner 后没有提案的旧命令不产生新答案，历史已落库答案仍是唯一效果事实。显式 hint 与最终 prepared seal 是两条命令，但只能产生一个 CandidateAnswer。没有新增公开 HTTP API。
+
+## 正式回答完成确认（TURN-COMPLETION-UNDERSTANDING-011）
+
+历史 011 的“按钮后立即停止 VAD/进入不可撤销处理中”已由 012 替代，不是当前候选端合同。turn/capture scope、服务端 final、合同校验和 ownership fence 继续有效；试音自动端点不变。
+
+`UnderstandingProblem` 仅在特权领域记录中新增固定枚举 `reason_code` 和 `attempts`（1–2），共享事件和候选人投影不包含这些内部诊断。严重暂停 problem 不能被随后 `INTERVIEW_NOT_IN_PROGRESS` 等可重试提示覆盖。
+
 本文定义目标业务流程的第一版 API 语义。实际实现可生成 OpenAPI，但不能改变这里的资源边界、候选人隐私和事件语义，除非同步更新本文档。
+
+## 正式 Evidence 采集代次合同
+
+`floor.changed` 的 open-ready 事件新增服务端生成的 `capture_id`（仅 transient）。候选端 `speech.started/stopped`、`continue_speaking` 与自动 seal 必须绑定 ready 的 capture ID 和 turn；旧/缺少 scope 的停止信号不调度端点。服务端计时器在创建、到期和执行命令时验证同一 scope，不在到期时改用新流的 turn。未开流的同题 barge-in 只打断播放，不充当新流已开始收音的事实。无有效转写的正式采集返回可恢复 `STT_TRANSCRIPT_UNAVAILABLE`/`continue_listening`，不产生虚构 utterance 或答案；新 open-ready 清除此提示。
+
+自动 `evidence.seal` 的 `endpoint=semantic_timeout` 同时携带服务端创建的 `endpoint_id`。`speech.started`/continue 失效上一端点，后续 stop 获得新 ID，已排队的旧 seal 也只确认 no-op。journal 对 scope ID 使用长度和字符 allow-list；旧/缺 scope 自动命令不得按当前题目猜补。人工 explicit seal 的原始恢复 receipt 合同保持不变。后端、前端 bundle 应一起发布，旧浏览器需刷新以取得新 ready/scope 协议。
+
+内部 `media_evidence`（`mode=sealed_segments`）统一携带 `capture_revision`，流式 final、断线 batch 与持久 checkpoint repair 使用同一合同。`transcription.started/failed` 和最终答案事务校验它与当前完整 stream/revision/segment/frame checkpoint 一致；不一致返回 `EVIDENCE_MEDIA_CHECKPOINT_CHANGED`，不得修改下一次采集的转写状态或提交答案。`utterance.not_accepted` 的既有事件 schema 不变，但其服务端事务同时归档未采纳采集并推进 revision，使随后同题 `evidence.open` 可重新收音。`EVIDENCE_MEDIA_ALREADY_COMPLETE` 对没有明确非答案结果的完整录音仍有效；不开放客户端重置完整录音的接口，也不接受客户端指定权威 capture revision。
 
 ## 通用约定
 
@@ -635,23 +752,35 @@ WebSocket 第一条消息必须是 `session.open`，只包含 `recovery_cursor` 
 
 候选人控制信号包括 `client.ready`、`media.published`、`speech.started/stopped`、`evidence.stream.open`、`evidence.finish`、`evidence.recovery.begin/chunk/complete`、`request_repeat`、`continue_speaking`、`warmup.confirm/retry`、`pause`、`avatar.performance.stopped` 和无 PII 的 `telemetry.observe`。票据的 `media.evidence_transport` 在候选人角色必须为 `livekit_server_subscriber`；`media.recovery.server_checkpoint` 声明服务端持久 checkpoint，`browser_backfill` 冻结 source connection、audio epoch、30 秒/2 MiB/32 KiB 限额。backfill chunk 是有界 JSON base64，每帧先写私有 FileObject，不会放宽 WebSocket 二进制禁令。人工控制包括 `takeover.acquire/renew/release` 与 `human.speech`；acquire 必须含原因，renew/release 必须含 lease ID 和 expected version，人工话语永远是 `unscored_intervention`。
 
+`telemetry.observe` 的包络形式与其他 JSON 信号一致，但其 `idempotency_key` 不形成领域幂等承诺：服务端完成 candidate role 校验后，只把合法、有限且属于固定词汇的数值送入当前进程指标，并显式让出调度。它不进入 AgentChannel 领域锁、`processed_signal_keys`、InterviewSession/SQLite/PostgreSQL 事务、事件 replay、Evidence command journal 或 takeover 到期处理；非法、未知、NaN/Infinity、负数或越界样本静默丢弃，不能转成 `problem` 或生命周期 pause。候选端把 `avatar_viseme_drift_ms`、`avatar_freeze_ms` 分别收敛为 1 秒最大值窗口，每个窗口至多发送一次；socket 未打开或窗口结束前关闭时不排队、不跨重连补发。其余低频 latency 指标保持即时发送。
+
 `evidence.stream.open` 是两阶段 causation handshake：客户端发送后只能标记 `requested=true/ready=false`；单一 fenced owner 在 Provider stream 已实际打开、且 command receipt 尚未完成时，必须经 Hub 投影同 causation 的 transient `floor.changed(reason=warmup_stream_open|evidence_stream_open)`，发起命令的客户端匹配后才标记 ready。同一候选人的其他 controller 也可能收到这条广播，但只能推进 cursor 和安全共享状态，不能据此打开本地 gate。即使 floor 已经是 candidate，或者幂等重提命中已打开的同一 stream，也必须重新投影这条 ready ACK；ACK 不进入 replay history。控制连接在 ACK 前断开时，新连接可对同一未确认 open 有界重提一次并等待新 causation，旧 ACK 不得打开新连接的 gate。ready 前普通 VAD 不发送 `speech.started/stopped`，页面显示“准备识别”；ready 时若本地 capture 仍持续 speaking，再承接 start。唯一例外是 agent 播放期间已经过更高幅度和持续时间确认的 barge-in，它仍须在 200ms 目标内先静音并立即通知服务端。
 
 `avatar.performance.started` 在候选人 facade 中建立与 `performance_id` 绑定的单一当前播放代次。`avatar.performance.interrupted` 携带 ID 时只能中断同一代次；旧 ID 的迟到事件以及已因 barge-in/replaced/close 失效播放器的 `error`、`ended` 或 `play()` 拒绝全部忽略。当前代次自然结束只发送一次 `avatar.performance.stopped`；当前代次真实加载/解码/播放错误仍提交 `CANDIDATE_RUNTIME_FAILED` 并等待服务端持久暂停回执。
 
+服务端对 `avatar.performance.stopped` 同样执行强校验：`performance_id` 缺失、当前已无活动播放或 ID 不匹配时，该信号除自身幂等记录外不得产生 `avatar.performance.stopped` 事件、改变 floor/暖场/结束状态或打开 Evidence。只有在同一租户事务中成功 compare-and-clear 当前 ID 后才可继续状态迁移。
+
+`transcript.partial` 仍为 `TRANSIENT` 界面信号，不是答案或评分输入。Authoritative Evidence owner 不在 LiveKit 收帧回调中等待 partial 投影，而是按 `(warmup|formal, turn_id)` 只保留一个正在投影值与一个最新待投影值；不同 key 的待处理总数也有硬上限。`transcript.final`、错误、对话动作与结束边界仍同步有序；final/reset/stop 必须等待当前 partial 投影边界并丢弃已合并的旧值，不得在 final 后迟到。正式权威收音断流仍暂停且面向候选人输出统一 `LIVEKIT_EVIDENCE_AUDIO_STREAM_FAILED`；若同一错误发生在非评分暖场，事件为 `recoverable=true/action=retry_warmup/calibration=true`，runtime 进入 durable retry gate 而不暂停 InterviewSession。特权会话诊断可额外包含经固定语义白名单校验的 `cause_code/cause_type`，不得包含 URL、token、凭据或转写。
+
+`evidence.finish`/内部 `evidence.seal` 不能直接越过 LiveKit sink：ingress 在命令执行点捕获已无损入队的 `accepted_sequence`，等待 `delivered_sequence` 至少达到该水位后，才调用 Evidence chain finish。水位之后的房间环境音由随后关闭的 Evidence gate 过滤，不属于已接受的本轮前缀。排空失败或超时统一映射为 `LIVEKIT_EVIDENCE_AUDIO_STREAM_FAILED`，特权根因为 `LIVEKIT_INGRESS_SINK_BACKPRESSURE`；正式轮次暂停并等待修复/人工接管，暖场则复用显式 `warmup.retry`，两者都不得生成截断 final。候选端默认连续静音 800ms 才发 `speech.stopped`，自然的短停顿保持在同一发言内；暖场保留服务端 2.5 秒 endpoint timer，正式回答改为本页 011 的显式 finish。
+
 权威 Evidence 命令受 `EvidenceControlGeneration` 保护：新 control attach 后旧连接命令返回 `409 EVIDENCE_CONTROL_STALE`，迟到 detach 不能启动新 grace。正式 STT/final 另受 `EvidenceOwnershipEpoch` 保护；旧 owner 提交返回 `409 EVIDENCE_OWNER_FENCED`。`EvidenceCommandJournal` 在返回 receipt 前持久化安全命令，同 idempotency key 返回同一 terminal outcome；当前数据库 fenced owner executor 通过 DB polling 和 Redis wake hint 执行，非 owner 控制连接作为 remote receipt proxy，不创建第二证据链。claim 过期/崩溃时由新 epoch 重领，effect receipt 与 CandidateAnswer commit fence 阻止重复效果；Redis 永远不是命令或所有权真相。
+
+owner 的周期续租保持数据库 fence 为唯一正确性判断，同时上报不含 interview、candidate、lease 或 connection 标识符的 `evidence_owner_renew_scheduler_lag_ms`、`evidence_owner_renew_db_latency_ms`、`evidence_owner_renew_success` 进程指标。指标异常或采集失败不得影响续租；反过来，指标也不能延长租约、放宽数据库时钟或吞掉续租异常。租约已过期或 epoch/lease/owner fence 不再匹配时仍执行原 self-fence、关闭 ingress 并暂停/等待人工处理，旧 owner 不得以迟到续租恢复；control generation 继续独立保护候选控制命令。
 
 `GET /api/v1/public/interviews/{interview_id}/avatar-config` 只在许可清单的实际使用范围、VRM 1.0 与 SHA-256 一致时返回 ready 配置；标准元音 `aa/ih/oh/ou` 可位于 VRM preset，其余必需口型可位于 custom，检查两者并集。模型用候选人/面试绑定的短期 grant 通过 `GET /api/v1/public/interviews/{interview_id}/avatar-model` 交付，响应 `private, no-store`。LiveKit Egress webhook 为 `POST /api/v1/public/livekit/egress-webhook`，必须校验 JWT 签名、issuer、时间、body hash，再从 provider 绑定解析组织；不得相信请求体 tenant/room，随后才可幂等推进 `InterviewMediaCapture`。
 
 `CandidateConsentCreate` 的正式字段只有 `audio_recording` 与 `video_recording`，旧的合并录制字段已从 schema 删除。`CandidateReadinessCreate` 包含 camera、microphone、speaker、WebRTC、AudioWorklet、WebGL、MediaRecorder、网络 RTT/jitter 和 avatar FPS。VRM 持续帧率 gate 与候选人可见值使用同一整数判定 `Math.round(fps) >= minimum_fps`，避免页面显示 30 FPS、底层却因 29.5 左右的原始浮点值失败；29.5/29.4 边界由前端合同固定。录像场次缺少 video consent/camera/LiveKit Egress 时 start 失败关闭；未授权视频的 participant grant 不含 camera。
 
-`media.published` 只建立 Evidence subscriber，暖场试音不录制且不进入评分。暖场 final/seal 是 destructive-once：Provider final 失败后原 stream 已消费，journal 保留第一次真实错误，不能二次进入同一流并用通用 turn 错误覆盖。此时 runtime 原子写入 `calibration_status=retrying + calibration_retry_required=true`；服务端在 durable gate 未清时拒绝 `evidence.stream.open`。候选人页面只展示显式“重新试音”；owner 执行 `warmup.retry` 并清 gate 后投影 transient 同 causation `floor.changed(reason=warmup_retry)`。任一当前 control 收到这条 live reset 事实，或从 snapshot 读到 `retrying + calibration_retry_required=false`，都可用新 causation open/reassert；相同 retry causation 的重复 ACK 不得清掉已请求/ready 的新流。旧 control 由 generation fence 拒绝，existing-open 只重新 ACK，不重复创建 Provider 流，因此刷新、heartbeat 或断线恢复不会绕过显式 retry 反复调用付费 STT。`warmup.confirm` 删除暖场音频/转写并启动必需 Egress；启动失败进入暂停/接管。最后回答接受后 runtime 先停 Evidence/Egress，再播放 `closing` act；收到 `avatar.performance.stopped` 或有界超时后才发唯一 `completed` 回执，包含提交确认、录制留存和人工审核声明。
+`media.published` 只建立 Evidence subscriber，暖场试音不录制且不进入评分。暖场 final/seal 是 destructive-once：Provider final 或暖场音频流失败后原 stream 被消费/abort，journal 保留第一次真实错误，不能二次进入同一流并用通用 turn 错误覆盖。每个打开的暖场流有本地 epoch；音频流失败会先失效 epoch，因而已提交或正在等待 final 的旧 seal 即使随后成功返回，也只能得到同一 rejected receipt，不能发出 `transcript.final` 或 `warmup_confirmation`。此时 runtime 原子写入 `calibration_status=retrying + calibration_retry_required=true`；服务端在 durable gate 未清时拒绝 `evidence.stream.open`。候选人页面只展示显式“重新试音”；owner 执行 `warmup.retry` 时先恢复同一 LiveKit microphone 的服务端 iterator，必要时重建 subscriber，成功后才清 gate 并投影 transient 同 causation `floor.changed(reason=warmup_retry)`。任一当前 control 收到这条 live reset 事实，或从 snapshot 读到 `retrying + calibration_retry_required=false`，都可用新 causation open/reassert；相同 retry causation 的重复 ACK 不得清掉已请求/ready 的新流。旧 control 由 generation fence 拒绝，existing-open 只重新 ACK，不重复创建 Provider 流，因此刷新、heartbeat 或断线恢复不会绕过显式 retry 反复调用付费 STT。`warmup.confirm` 删除暖场音频/转写、清空候选端暖场字幕投影并启动必需 Egress；若命令发送失败，页面恢复原确认状态和字幕。启动失败进入暂停/接管。最后回答接受后 runtime 先停 Evidence/Egress，再播放 `closing` act；收到 `avatar.performance.stopped` 或有界超时后才发唯一 `completed` 回执，包含提交确认、录制留存和人工审核声明。
 
 人工接管 lease 为 60 秒 CAS 事实。普通企业 Agent ticket 只能订阅；获得 lease 的 admin/interviewer 调用 `POST /api/v1/interviews/{interview_id}/takeover/media-permit`，以 `lease_id + expected_version` 一次换取最长 15 秒、限房间/限 microphone/禁止订阅的 LiveKit permit。获取、续租、发言复核、释放、过期与 permit 均使用数据库时钟；lease 释放、过期或会话终止立即移除 participant，并保持 AI 暂停。
 
 旧 `/live`、`/stt-stream`、候选人/企业 `audio-answers`、`avatar/speak` 和 avatar close 路由已删除；旧候选人 runtime/PCM 发送器也已删除。安全的历史记录修复仍可在内部 `InterviewEvidenceChain -> stt.batch` seam 执行，但不是另一个候选人入口。当前仓库合同不等于生产验收；目标 LiveKit/TURN/Egress/OSS、商用 VRM、真实 Provider、金标与试点仍需生成鲜活、合格、绑定当前 release 的 HMAC 签名 `realtime-interview-agent.acceptance.v2` 报告。
 
 `REALTIME-WARMUP-VAD-RANGE-003` 已达到“verified（仓库），目标环境复验 pending”，以上合同不得表述为目标浏览器和真实 Provider 已验收。该项不修改题目抽取、冻结证据、答案/评分、追问、S2S/cascade 或人工接管 API 与领域语义。
+
+`EVIDENCE-LEASE-TELEMETRY-004` 已达到“verified（仓库），目标新会话复验 pending”。它只修正遥测传输成本、调度公平性和 owner 续租可观测性；抽题、计划/题目冻结、权威证据、CandidateAnswer、评分、受控追问、S2S/cascade 与人工接管 API/领域语义均未改变，也不代表生产环境已验收。
 
 ## 模型网关和后台配置 API
 

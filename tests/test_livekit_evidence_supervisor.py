@@ -1,12 +1,20 @@
 import asyncio
 import base64
+from types import SimpleNamespace
 
 import pytest
+from livekit import rtc
 
-from app.adapters.livekit_audio_ingress import LiveKitIngressAudioFrame
+from app.adapters.livekit_audio_ingress import (
+    LiveKitAudioIngressBackpressureError,
+    LiveKitAudioIngressFailure,
+    LiveKitCandidateAudioIngress,
+    LiveKitIngressAudioFrame,
+)
 from app.adapters.livekit_media import LiveKitConfiguration, LiveKitMediaPlane
 from app.core.auth import Principal
 from app.core.errors import ApiError
+from app.core.interview_agent_metrics import InterviewAgentMetrics
 from app.core.time import utc_now
 from app.domain.evidence_coordination import EvidenceCommandSubmission
 from app.domain.interview_agent import (
@@ -168,6 +176,9 @@ class _FakeIngress:
         self.on_state = on_state
         self.connected = False
         self.closed = False
+        self.last_track_failure = None
+        self.recovery_count = 0
+        self.drain_count = 0
         self.instances.append(self)
 
     async def connect(self) -> None:
@@ -177,6 +188,15 @@ class _FakeIngress:
     async def close(self) -> None:
         self.connected = False
         self.closed = True
+
+    async def recover_audio_stream(self) -> bool:
+        self.recovery_count += 1
+        self.last_track_failure = None
+        return self.connected
+
+    async def drain(self) -> int:
+        self.drain_count += 1
+        return 0
 
     async def push(
         self, sequence: int = 1, pcm_s16le: bytes = b"\x01\x00" * 320
@@ -244,6 +264,70 @@ class _FakeEvidenceChain:
     async def close_for_disconnect(self):
         self.is_open = False
         return None
+
+
+@pytest.mark.parametrize("replacement_turn", ["turn_1", "followup_turn"])
+def test_endpoint_scope_cannot_cross_capture_or_rearm_after_new_speech(replacement_turn) -> None:
+    async def scenario():
+        store = InMemoryStore()
+        saved = _session(store)
+        supervisor = LiveKitEvidenceIngressSupervisor(
+            store, media_plane=LiveKitMediaPlane(_configuration()), ingress_factory=_FakeIngress,
+            endpoint_delay_seconds=0.1, command_poll_seconds=0.001,
+        )
+        runtime = InterviewAgentRuntime(store)
+        runtime.evidence_ingress = supervisor
+        channel = await runtime.open(_opened("connection_original"))
+        managed = channel._evidence_session
+        chain = _FakeEvidenceChain()
+        managed.chain = chain
+        with persistence_for(store).transaction("org_default") as transaction:
+            session = transaction.interview_sessions.get(saved["id"])
+            session["agent_runtime"]["calibration_status"] = "completed"
+            transaction.interview_sessions.update(session, expected_version=session["version"])
+
+        async def send(kind, key, turn_id, payload=None):
+            await channel.send(ClientSignal(type=kind, idempotency_key=key, turn_id=turn_id, payload=payload or {}))
+
+        await send("evidence.stream.open", "first_open", "turn_1")
+        first_capture = managed._capture_id
+        await send("speech.started", "first_start", "turn_1", {"capture_id": first_capture})
+        await send("speech.stopped", "first_stop", "turn_1", {"capture_id": first_capture})
+        timer_id = "endpoint_scope_old"
+        assert managed._endpoint_id is None and managed._endpoint_task is None
+        # Mimic the incident: a consumed root stream and delayed VAD stop arrive
+        # before the follow-up opens. Neither may attach to the next capture.
+        chain.is_open = False
+        await send("speech.stopped", "late_unscoped_stop", None)
+        await send("evidence.stream.open", "replacement_open", replacement_turn)
+        new_capture = managed._capture_id
+        assert new_capture != first_capture
+        assert managed._endpoint_task is None
+        await send("speech.started", "late_old_start", "turn_1", {"capture_id": first_capture})
+        await send("speech.stopped", "late_old_stop", "turn_1", {"capture_id": first_capture})
+        await send("evidence.finish", "queued_old_timer", "turn_1", {
+            "endpoint": "semantic_timeout", "capture_id": first_capture, "endpoint_id": timer_id,
+        })
+        assert chain.finish_count == 0
+        assert managed._endpoint_task is None
+        # A stop without a start in this new capture must not arm a countdown.
+        await send("speech.stopped", "stop_without_start", replacement_turn, {"capture_id": new_capture})
+        assert managed._endpoint_task is None
+        await send("speech.started", "new_start", replacement_turn, {"capture_id": new_capture})
+        await send("speech.stopped", "new_stop", replacement_turn, {"capture_id": new_capture})
+        stopped_timer = "endpoint_scope_cancelled"
+        await send("speech.started", "resumed_start", replacement_turn, {"capture_id": new_capture})
+        await send("speech.stopped", "resumed_stop", replacement_turn, {"capture_id": new_capture})
+        assert managed._endpoint_id is None
+        await send("evidence.finish", "queued_cancelled_timer", replacement_turn, {
+            "endpoint": "semantic_timeout", "capture_id": new_capture, "endpoint_id": stopped_timer,
+        })
+        assert chain.finish_count == 0
+        await managed.cancel_endpoint()
+        await channel.close("test_complete")
+        await supervisor.shutdown()
+
+    asyncio.run(scenario())
 
 
 def test_open_ready_ack_covers_same_floor_duplicate_existing_and_reconnect() -> None:
@@ -808,7 +892,955 @@ def test_authoritative_ingress_survives_control_reconnect_and_rejects_ws_pcm() -
     asyncio.run(scenario())
 
 
-def test_authoritative_endpoint_finishes_after_control_disconnect() -> None:
+def test_partial_projection_backpressure_does_not_block_authoritative_audio() -> None:
+    async def scenario() -> None:
+        _FakeIngress.instances.clear()
+        store = InMemoryStore()
+        saved = _session(store)
+        with persistence_for(store).transaction("org_default") as transaction:
+            current = transaction.interview_sessions.get(saved["id"])
+            current["agent_runtime"]["calibration_status"] = "completed"
+            current["updated_at"] = utc_now()
+            transaction.interview_sessions.update(
+                current, expected_version=current["version"]
+            )
+        supervisor = LiveKitEvidenceIngressSupervisor(
+            store,
+            media_plane=LiveKitMediaPlane(_configuration()),
+            ingress_factory=_FakeIngress,
+            command_poll_seconds=0.001,
+        )
+        runtime = InterviewAgentRuntime(store)
+        runtime.evidence_ingress = supervisor
+        channel = await runtime.open(_opened("connection_original"))
+        managed = channel._evidence_session
+        assert managed is not None
+        chain = _FakeEvidenceChain()
+        managed.chain = chain
+
+        projection_started = asyncio.Event()
+        release_projection = asyncio.Event()
+        projected_partials = []
+
+        async def slow_projection(raw, _causation_id):
+            if raw.get("type") != "transcript.partial":
+                return
+            projected_partials.append(raw.get("text"))
+            if len(projected_partials) == 1:
+                projection_started.set()
+                await release_projection.wait()
+
+        channel._project_evidence_event = slow_projection
+        await channel.send(
+            ClientSignal(
+                type="evidence.stream.open",
+                idempotency_key="partial_pressure_open",
+                turn_id="turn_1",
+                payload={
+                    "content_type": "audio/pcm",
+                    "sample_rate_hz": 16_000,
+                    "channels": 1,
+                },
+            )
+        )
+        ingress = _FakeIngress.instances[0]
+        await ingress.push(sequence=1)
+        await asyncio.wait_for(projection_started.wait(), timeout=1)
+
+        async def push_burst() -> None:
+            for sequence in range(2, 502):
+                await ingress.push(sequence=sequence)
+
+        # A blocked browser/session projection must not consume the LiveKit
+        # sink's two-second PCM budget. All 501 frames reach the Evidence chain.
+        await asyncio.wait_for(push_burst(), timeout=1)
+        assert chain.audio_count == 501
+        assert len(managed._partial_projection_pending) == 1
+        pending = next(iter(managed._partial_projection_pending.values()))
+        assert pending.kind == "formal"
+        assert pending.turn_id == "turn_1"
+        assert pending.raw["text"] == "服务端实时字幕 501"
+
+        release_projection.set()
+        for _ in range(200):
+            if (
+                not managed._partial_projection_pending
+                and len(projected_partials) >= 2
+            ):
+                break
+            await asyncio.sleep(0.001)
+        assert projected_partials == [
+            "服务端实时字幕 1",
+            "服务端实时字幕 501",
+        ]
+
+        await channel.close("test_complete")
+        await managed.stop("test_complete")
+        await supervisor.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_formal_seal_waits_for_livekit_ingress_drain_barrier() -> None:
+    async def scenario() -> None:
+        drain_started = asyncio.Event()
+        release_drain = asyncio.Event()
+
+        class BarrierIngress(_FakeIngress):
+            async def drain(self) -> int:
+                self.drain_count += 1
+                drain_started.set()
+                await release_drain.wait()
+                return 17
+
+        _FakeIngress.instances.clear()
+        store = InMemoryStore()
+        saved = _session(store)
+        with persistence_for(store).transaction("org_default") as transaction:
+            current = transaction.interview_sessions.get(saved["id"])
+            current["agent_runtime"]["calibration_status"] = "completed"
+            current["updated_at"] = utc_now()
+            transaction.interview_sessions.update(
+                current, expected_version=current["version"]
+            )
+        supervisor = LiveKitEvidenceIngressSupervisor(
+            store,
+            media_plane=LiveKitMediaPlane(_configuration()),
+            ingress_factory=BarrierIngress,
+            command_poll_seconds=0.001,
+        )
+        runtime = InterviewAgentRuntime(store)
+        runtime.evidence_ingress = supervisor
+        channel = await runtime.open(_opened("connection_original"))
+        managed = channel._evidence_session
+        assert managed is not None
+        chain = _FakeEvidenceChain()
+        managed.chain = chain
+        await channel.send(
+            ClientSignal(
+                type="evidence.stream.open",
+                idempotency_key="drain_barrier_open",
+                turn_id="turn_1",
+                payload={
+                    "content_type": "audio/pcm",
+                    "sample_rate_hz": 16_000,
+                    "channels": 1,
+                },
+            )
+        )
+
+        sealing = asyncio.create_task(
+            channel.send(
+                ClientSignal(
+                    type="evidence.finish",
+                    idempotency_key="drain_barrier_seal",
+                    turn_id="turn_1",
+                    payload={"endpoint": "explicit"},
+                )
+            )
+        )
+        await asyncio.wait_for(drain_started.wait(), timeout=1)
+        assert chain.finish_count == 0
+        release_drain.set()
+        await asyncio.wait_for(sealing, timeout=1)
+
+        assert chain.finish_count == 1
+        assert _FakeIngress.instances[0].drain_count == 1
+        await channel.close("test_complete")
+        await supervisor.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_formal_seal_drain_failure_pauses_without_creating_an_answer() -> None:
+    async def scenario() -> None:
+        class FailingDrainIngress(_FakeIngress):
+            async def drain(self) -> int:
+                self.drain_count += 1
+                raise LiveKitAudioIngressBackpressureError("blocked sink")
+
+        _FakeIngress.instances.clear()
+        store = InMemoryStore()
+        saved = _session(store)
+        with persistence_for(store).transaction("org_default") as transaction:
+            current = transaction.interview_sessions.get(saved["id"])
+            current["agent_runtime"]["calibration_status"] = "completed"
+            current["updated_at"] = utc_now()
+            transaction.interview_sessions.update(
+                current, expected_version=current["version"]
+            )
+        supervisor = LiveKitEvidenceIngressSupervisor(
+            store,
+            media_plane=LiveKitMediaPlane(_configuration()),
+            ingress_factory=FailingDrainIngress,
+            command_poll_seconds=0.001,
+        )
+        runtime = InterviewAgentRuntime(store)
+        runtime.evidence_ingress = supervisor
+        channel = await runtime.open(_opened("connection_original"))
+        managed = channel._evidence_session
+        assert managed is not None
+        chain = _FakeEvidenceChain()
+        managed.chain = chain
+        await channel.send(
+            ClientSignal(
+                type="evidence.stream.open",
+                idempotency_key="drain_failure_open",
+                turn_id="turn_1",
+                payload={
+                    "content_type": "audio/pcm",
+                    "sample_rate_hz": 16_000,
+                    "channels": 1,
+                },
+            )
+        )
+
+        await channel.send(
+            ClientSignal(
+                type="evidence.finish",
+                idempotency_key="drain_failure_seal",
+                turn_id="turn_1",
+                payload={"endpoint": "explicit"},
+            )
+        )
+
+        paused = runtime.interviews.get_interview(saved["id"])
+        assert paused["status"] == "paused"
+        assert paused["answers"] == []
+        assert chain.finish_count == 0
+        assert _FakeIngress.instances[0].drain_count == 1
+        assert paused["agent_runtime"]["problems"][-1]["code"] == (
+            "LIVEKIT_EVIDENCE_AUDIO_STREAM_FAILED"
+        )
+        assert paused["agent_runtime"]["problems"][-1]["cause_code"] == (
+            "LIVEKIT_INGRESS_SINK_BACKPRESSURE"
+        )
+        with persistence_for(store).transaction("org_default") as transaction:
+            seal = next(
+                item
+                for item in transaction.evidence_commands.list()
+                if item["command_type"] == "evidence.seal"
+            )
+        assert seal["status"] == "rejected"
+        assert seal["last_error_code"] == "LIVEKIT_EVIDENCE_AUDIO_STREAM_FAILED"
+
+        await channel.close("test_complete")
+        await supervisor.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_real_livekit_sink_survives_more_than_two_seconds_of_blocked_partial_projection() -> None:
+    async def scenario() -> None:
+        store = InMemoryStore()
+        saved = _session(store)
+        with persistence_for(store).transaction("org_default") as transaction:
+            current = transaction.interview_sessions.get(saved["id"])
+            current["agent_runtime"]["calibration_status"] = "completed"
+            current["updated_at"] = utc_now()
+            transaction.interview_sessions.update(
+                current, expected_version=current["version"]
+            )
+
+        class EagerAudioStream:
+            def __init__(self, count: int) -> None:
+                self.remaining = count
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self.remaining <= 0:
+                    raise StopAsyncIteration
+                self.remaining -= 1
+                return SimpleNamespace(
+                    frame=SimpleNamespace(
+                        data=b"\x01\x00" * 320,
+                        sample_rate=16_000,
+                        num_channels=1,
+                        samples_per_channel=320,
+                    )
+                )
+
+            async def aclose(self) -> None:
+                return None
+
+        class Room:
+            def __init__(self) -> None:
+                self.handlers = {}
+                self.remote_participants = {}
+
+            def on(self, name, callback):
+                self.handlers[name] = callback
+
+            async def connect(self, _url, _token, _options):
+                return None
+
+            async def disconnect(self):
+                return None
+
+        created = {}
+
+        def ingress_factory(media_plane, binding, *, on_audio_frame, on_state):
+            room = Room()
+            ingress = LiveKitCandidateAudioIngress(
+                media_plane,
+                binding,
+                on_audio_frame=on_audio_frame,
+                on_state=on_state,
+                room_factory=lambda: room,
+                audio_stream_factory=lambda _track: EagerAudioStream(600),
+                audio_track_validator=lambda _track: True,
+            )
+            created.update(room=room, ingress=ingress)
+            return ingress
+
+        supervisor = LiveKitEvidenceIngressSupervisor(
+            store,
+            media_plane=LiveKitMediaPlane(_configuration()),
+            ingress_factory=ingress_factory,
+            command_poll_seconds=0.001,
+        )
+        runtime = InterviewAgentRuntime(store)
+        runtime.evidence_ingress = supervisor
+        channel = await runtime.open(_opened("connection_original"))
+        managed = channel._evidence_session
+        assert managed is not None
+        chain = _FakeEvidenceChain()
+        managed.chain = chain
+
+        projection_started = asyncio.Event()
+        release_projection = asyncio.Event()
+
+        async def blocked_projection(raw, _causation_id):
+            if raw.get("type") == "transcript.partial":
+                projection_started.set()
+                await release_projection.wait()
+
+        channel._project_evidence_event = blocked_projection
+        await channel.send(
+            ClientSignal(
+                type="evidence.stream.open",
+                idempotency_key="real_sink_partial_pressure_open",
+                turn_id="turn_1",
+                payload={
+                    "content_type": "audio/pcm",
+                    "sample_rate_hz": 16_000,
+                    "channels": 1,
+                },
+            )
+        )
+
+        room = created["room"]
+        publication = SimpleNamespace(
+            sid="mic_1",
+            source=rtc.TrackSource.SOURCE_MICROPHONE,
+            kind=rtc.TrackKind.KIND_AUDIO,
+            track=None,
+        )
+        publication.set_subscribed = lambda _enabled: None
+        participant = SimpleNamespace(identity="candidate:connection_original")
+        room.handlers["track_subscribed"](
+            object(), publication, participant
+        )
+        ingress = created["ingress"]
+        track_task = ingress._track_task
+        assert track_task is not None
+        await asyncio.wait_for(projection_started.wait(), timeout=1)
+        # 600 x 20 ms represents 12 seconds of audio, six times the explicit
+        # sink budget. It must drain while one partial projection is blocked.
+        await asyncio.wait_for(track_task, timeout=1)
+
+        assert chain.audio_count == 600
+        assert ingress.last_track_failure is None
+        assert len(managed._partial_projection_pending) == 1
+
+        release_projection.set()
+        await asyncio.sleep(0)
+        await channel.close("test_complete")
+        await supervisor.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_audio_stream_failure_persists_sanitized_root_cause_only_for_diagnostics() -> None:
+    async def scenario() -> None:
+        _FakeIngress.instances.clear()
+        store = InMemoryStore()
+        saved = _session(store)
+        supervisor = LiveKitEvidenceIngressSupervisor(
+            store,
+            media_plane=LiveKitMediaPlane(_configuration()),
+            ingress_factory=_FakeIngress,
+            command_poll_seconds=0.001,
+        )
+        runtime = InterviewAgentRuntime(store)
+        runtime.evidence_ingress = supervisor
+        channel = await runtime.open(_opened("connection_original"))
+        ingress = _FakeIngress.instances[0]
+        ingress.last_track_failure = LiveKitAudioIngressFailure(
+            code="PROVIDER_STREAM_FAILED",
+            cause_type="ProviderError",
+        )
+
+        await ingress.on_state("audio_stream_failed")
+
+        paused = runtime.interviews.get_interview(saved["id"])
+        assert paused["status"] == "paused"
+        diagnostic = paused["agent_runtime"]["problems"][-1]
+        assert diagnostic["code"] == "LIVEKIT_EVIDENCE_AUDIO_STREAM_FAILED"
+        assert diagnostic["message"] == "RuntimeError"
+        assert diagnostic["cause_code"] == "PROVIDER_STREAM_FAILED"
+        assert diagnostic["cause_type"] == "ProviderError"
+        candidate_problem = next(
+            event
+            for event in list(channel._queue._queue)
+            if event.type == "problem"
+            and event.payload.get("code")
+            == "LIVEKIT_EVIDENCE_AUDIO_STREAM_FAILED"
+        )
+        assert "cause_code" not in candidate_problem.payload
+        assert "cause_type" not in candidate_problem.payload
+
+        await channel.close("test_complete")
+        await supervisor.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_warmup_audio_stream_backpressure_requires_retry_without_pausing_interview() -> None:
+    async def scenario() -> None:
+        _FakeIngress.instances.clear()
+        store = InMemoryStore()
+        saved = _session(store)
+        supervisor = LiveKitEvidenceIngressSupervisor(
+            store,
+            media_plane=LiveKitMediaPlane(_configuration()),
+            ingress_factory=_FakeIngress,
+            command_poll_seconds=0.001,
+        )
+        runtime = InterviewAgentRuntime(store)
+        runtime.evidence_ingress = supervisor
+        channel = await runtime.open(_opened("connection_original"))
+        managed = channel._evidence_session
+        assert managed is not None
+        chain = _FakeEvidenceChain()
+        managed.chain = chain
+        await channel.send(
+            ClientSignal(
+                type="evidence.stream.open",
+                idempotency_key="warmup_backpressure_open",
+                payload={
+                    "content_type": "audio/pcm",
+                    "sample_rate_hz": 16_000,
+                    "channels": 1,
+                },
+            )
+        )
+        ingress = _FakeIngress.instances[0]
+        ingress.last_track_failure = LiveKitAudioIngressFailure(
+            code="PROVIDER_BACKPRESSURE_EXCEEDED",
+            cause_type="ProviderError",
+        )
+
+        await ingress.on_state("audio_stream_failed")
+
+        retrying = runtime.interviews.get_interview(saved["id"])
+        assert retrying["status"] == "in_progress"
+        assert retrying["agent_runtime"]["calibration_status"] == "retrying"
+        assert retrying["agent_runtime"]["calibration_retry_required"] is True
+        assert retrying["answers"] == []
+        assert retrying["turns"][0]["status"] == "asking"
+        assert chain.is_open is False
+        diagnostic = retrying["agent_runtime"]["problems"][-1]
+        assert diagnostic["code"] == "LIVEKIT_EVIDENCE_AUDIO_STREAM_FAILED"
+        assert diagnostic["recoverable"] is True
+        assert diagnostic["action"] == "retry_warmup"
+        assert diagnostic["cause_code"] == "PROVIDER_BACKPRESSURE_EXCEEDED"
+        assert diagnostic["cause_type"] == "ProviderError"
+        candidate_problems = [
+            event
+            for event in list(channel._queue._queue)
+            if event.type == "problem"
+            and event.payload.get("code")
+            == "LIVEKIT_EVIDENCE_AUDIO_STREAM_FAILED"
+        ]
+        assert len(candidate_problems) == 1
+        assert candidate_problems[0].payload == {
+            "code": "LIVEKIT_EVIDENCE_AUDIO_STREAM_FAILED",
+            "message": "试音暂时不可用，请重试或等待面试官接管。",
+            "recoverable": True,
+            "action": "retry_warmup",
+            "calibration": True,
+        }
+
+        # Reproduce the incident ordering: the track has already failed and
+        # recovered to the retry gate, then an old endpoint seal arrives. It
+        # must reuse the first terminal receipt instead of completing warm-up
+        # or adding EVIDENCE_TURN_REQUIRED as a contradictory second problem.
+        await channel.send(
+            ClientSignal(
+                type="evidence.finish",
+                idempotency_key="late_warmup_seal_after_backpressure",
+                payload={"endpoint": "explicit"},
+            )
+        )
+        still_retrying = runtime.interviews.get_interview(saved["id"])
+        assert still_retrying["agent_runtime"]["calibration_status"] == "retrying"
+        assert len(still_retrying["agent_runtime"]["problems"]) == 1
+        with persistence_for(store).transaction("org_default") as transaction:
+            late_seal = next(
+                item
+                for item in transaction.evidence_commands.list()
+                if item["command_type"] == "evidence.seal"
+            )
+        assert late_seal["status"] == "rejected"
+        assert late_seal["last_error_code"] == (
+            "LIVEKIT_EVIDENCE_AUDIO_STREAM_FAILED"
+        )
+
+        await channel.send(
+            ClientSignal(
+                type="warmup.retry",
+                idempotency_key="warmup_backpressure_retry",
+            )
+        )
+        reset = runtime.interviews.get_interview(saved["id"])
+        assert reset["status"] == "in_progress"
+        assert reset["agent_runtime"]["calibration_status"] == "retrying"
+        assert reset["agent_runtime"]["calibration_retry_required"] is False
+        assert ingress.recovery_count == 1
+        assert ingress.last_track_failure is None
+
+        await channel.close("test_complete")
+        await supervisor.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_failed_warmup_epoch_discards_late_successful_seal() -> None:
+    async def scenario() -> None:
+        _FakeIngress.instances.clear()
+        store = InMemoryStore()
+        saved = _session(store)
+        supervisor = LiveKitEvidenceIngressSupervisor(
+            store,
+            media_plane=LiveKitMediaPlane(_configuration()),
+            ingress_factory=_FakeIngress,
+            command_poll_seconds=0.001,
+        )
+        runtime = InterviewAgentRuntime(store)
+        runtime.evidence_ingress = supervisor
+        channel = await runtime.open(_opened("connection_original"))
+        managed = channel._evidence_session
+        assert managed is not None
+        finish_started = asyncio.Event()
+        release_finish = asyncio.Event()
+
+        class LateSuccessfulWarmupChain(_FakeEvidenceChain):
+            async def finish(self, _payload):
+                self.finish_count += 1
+                self.is_open = False
+                finish_started.set()
+                await release_finish.wait()
+                return EvidenceFinishResult(
+                    kind="warmup",
+                    turn_id=None,
+                    events=[],
+                    final={
+                        "type": "transcript.final",
+                        "text": "这条迟到结果不得采用。",
+                        "confidence": 0.99,
+                    },
+                    interview_result=None,
+                )
+
+        chain = LateSuccessfulWarmupChain()
+        managed.chain = chain
+        await channel.send(
+            ClientSignal(
+                type="evidence.stream.open",
+                idempotency_key="warmup_race_open",
+                payload={
+                    "content_type": "audio/pcm",
+                    "sample_rate_hz": 16_000,
+                    "channels": 1,
+                },
+            )
+        )
+        sealing = asyncio.create_task(
+            channel.send(
+                ClientSignal(
+                    type="evidence.finish",
+                    idempotency_key="warmup_race_seal",
+                    payload={"endpoint": "explicit"},
+                )
+            )
+        )
+        await asyncio.wait_for(finish_started.wait(), timeout=1)
+        ingress = _FakeIngress.instances[0]
+        ingress.last_track_failure = LiveKitAudioIngressFailure(
+            code="PROVIDER_BACKPRESSURE_EXCEEDED",
+            cause_type="ProviderError",
+        )
+        await ingress.on_state("audio_stream_failed")
+        release_finish.set()
+        await asyncio.wait_for(sealing, timeout=1)
+
+        current = runtime.interviews.get_interview(saved["id"])
+        assert current["status"] == "in_progress"
+        assert current["agent_runtime"]["calibration_status"] == "retrying"
+        assert current["agent_runtime"]["calibration_retry_required"] is True
+        assert current["answers"] == []
+        assert chain.finish_count == 1
+        assert not any(
+            event.type == "transcript.final"
+            and event.payload.get("text") == "这条迟到结果不得采用。"
+            for event in list(channel._queue._queue)
+        )
+        assert not any(
+            event.type == "conversation.act.selected"
+            and event.payload.get("act_type") == "warmup_confirmation"
+            for event in list(channel._queue._queue)
+        )
+        with persistence_for(store).transaction("org_default") as transaction:
+            seal = next(
+                item
+                for item in transaction.evidence_commands.list()
+                if item["command_type"] == "evidence.seal"
+            )
+        assert seal["status"] == "rejected"
+        assert seal["last_error_code"] == "LIVEKIT_EVIDENCE_AUDIO_STREAM_FAILED"
+
+        await channel.close("test_complete")
+        await supervisor.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_partial_coalescing_never_drops_non_partial_stream_events() -> None:
+    async def scenario() -> None:
+        _FakeIngress.instances.clear()
+        store = InMemoryStore()
+        saved = _session(store)
+        with persistence_for(store).transaction("org_default") as transaction:
+            current = transaction.interview_sessions.get(saved["id"])
+            current["agent_runtime"]["calibration_status"] = "completed"
+            current["updated_at"] = utc_now()
+            transaction.interview_sessions.update(
+                current, expected_version=current["version"]
+            )
+        supervisor = LiveKitEvidenceIngressSupervisor(
+            store,
+            media_plane=LiveKitMediaPlane(_configuration()),
+            ingress_factory=_FakeIngress,
+            command_poll_seconds=0.001,
+        )
+        runtime = InterviewAgentRuntime(store)
+        runtime.evidence_ingress = supervisor
+        channel = await runtime.open(_opened("connection_original"))
+        managed = channel._evidence_session
+        assert managed is not None
+
+        class MixedEventChain(_FakeEvidenceChain):
+            async def send_audio(self, _audio):
+                if not self.is_open:
+                    return None
+                self.audio_count += 1
+                return EvidenceAudioResult(
+                    kind=self.kind,
+                    turn_id=self.turn_id,
+                    first_server_audio=False,
+                    events=[
+                        {
+                            "type": "transcript.partial",
+                            "text": "partial %s" % self.audio_count,
+                            "confidence": 0.9,
+                        },
+                        {
+                            "type": "stream.error",
+                            "error_code": "TRANSIENT_%s" % self.audio_count,
+                        },
+                    ],
+                )
+
+        chain = MixedEventChain()
+        managed.chain = chain
+        projected = []
+
+        async def capture_projection(raw, _causation_id):
+            projected.append(dict(raw))
+
+        channel._project_evidence_event = capture_projection
+        await channel.send(
+            ClientSignal(
+                type="evidence.stream.open",
+                idempotency_key="mixed_projection_open",
+                turn_id="turn_1",
+                payload={
+                    "content_type": "audio/pcm",
+                    "sample_rate_hz": 16_000,
+                    "channels": 1,
+                },
+            )
+        )
+        ingress = _FakeIngress.instances[0]
+        for sequence in range(1, 101):
+            await ingress.push(sequence=sequence)
+
+        errors = [
+            item for item in projected if item.get("type") == "stream.error"
+        ]
+        assert len(errors) == 100
+        assert [item["error_code"] for item in errors] == [
+            "TRANSIENT_%s" % sequence for sequence in range(1, 101)
+        ]
+        assert len(managed._partial_projection_pending) <= 1
+
+        await asyncio.sleep(0)
+        partials = [
+            item for item in projected if item.get("type") == "transcript.partial"
+        ]
+        assert len(partials) <= 1
+        if partials:
+            assert partials[-1]["text"] == "partial 100"
+
+        await channel.close("test_complete")
+        await managed.stop("test_complete")
+        await supervisor.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_final_waits_for_inflight_partial_and_rejects_late_audio_partial() -> None:
+    async def scenario() -> None:
+        _FakeIngress.instances.clear()
+        store = InMemoryStore()
+        saved = _session(store)
+        with persistence_for(store).transaction("org_default") as transaction:
+            current = transaction.interview_sessions.get(saved["id"])
+            current["agent_runtime"]["calibration_status"] = "completed"
+            current["updated_at"] = utc_now()
+            transaction.interview_sessions.update(
+                current, expected_version=current["version"]
+            )
+        supervisor = LiveKitEvidenceIngressSupervisor(
+            store,
+            media_plane=LiveKitMediaPlane(_configuration()),
+            ingress_factory=_FakeIngress,
+            command_poll_seconds=0.001,
+        )
+        runtime = InterviewAgentRuntime(store)
+        runtime.evidence_ingress = supervisor
+        channel = await runtime.open(_opened("connection_original"))
+        managed = channel._evidence_session
+        assert managed is not None
+
+        late_audio_started = asyncio.Event()
+        release_late_audio = asyncio.Event()
+
+        class FinishRaceChain(_FakeEvidenceChain):
+            async def send_audio(self, _audio):
+                if not self.is_open:
+                    return None
+                self.audio_count += 1
+                if self.audio_count == 2:
+                    late_audio_started.set()
+                    await release_late_audio.wait()
+                return EvidenceAudioResult(
+                    kind="formal",
+                    turn_id="turn_1",
+                    first_server_audio=False,
+                    events=[
+                        {
+                            "type": "transcript.partial",
+                            "text": "partial %s" % self.audio_count,
+                            "confidence": 0.9,
+                        }
+                    ],
+                )
+
+            async def finish(self, _payload):
+                self.finish_count += 1
+                self.is_open = False
+                return EvidenceFinishResult(
+                    kind="formal",
+                    turn_id="turn_1",
+                    events=[
+                        {
+                            "type": "transcript.final",
+                            "text": "authoritative final",
+                            "confidence": 0.98,
+                        },
+                        {
+                            "type": "stream.error",
+                            "error_code": "BATCH_REPAIRED",
+                        },
+                    ],
+                    final={
+                        "type": "transcript.final",
+                        "text": "authoritative final",
+                        "confidence": 0.98,
+                    },
+                    interview_result={"accepted": True},
+                )
+
+        chain = FinishRaceChain()
+        managed.chain = chain
+        partial_started = asyncio.Event()
+        release_partial = asyncio.Event()
+        projected = []
+
+        async def capture_projection(raw, _causation_id):
+            projected.append((raw.get("type"), raw.get("text")))
+            if raw.get("type") == "transcript.partial":
+                partial_started.set()
+                await release_partial.wait()
+
+        async def ignore_after_finish(
+            _turn_id,
+            _signal,
+            *,
+            conversation_action_selected,
+            stop_evidence_session,
+        ):
+            assert conversation_action_selected is False
+            assert stop_evidence_session is False
+
+        channel._project_evidence_event = capture_projection
+        channel._after_formal_evidence_finished = ignore_after_finish
+        await channel.send(
+            ClientSignal(
+                type="evidence.stream.open",
+                idempotency_key="final_barrier_open",
+                turn_id="turn_1",
+                payload={
+                    "content_type": "audio/pcm",
+                    "sample_rate_hz": 16_000,
+                    "channels": 1,
+                },
+            )
+        )
+        ingress = _FakeIngress.instances[0]
+        await ingress.push(sequence=1)
+        await asyncio.wait_for(partial_started.wait(), timeout=1)
+        late_audio = asyncio.create_task(ingress.push(sequence=2))
+        await asyncio.wait_for(late_audio_started.wait(), timeout=1)
+
+        finish = asyncio.create_task(
+            managed._finish_with_channel(
+                channel,
+                ClientSignal(
+                    type="evidence.finish",
+                    idempotency_key="final_barrier_finish",
+                    turn_id="turn_1",
+                    payload={"duration_seconds": 10},
+                ),
+            )
+        )
+        await asyncio.sleep(0)
+        assert finish.done() is False
+
+        # This result belongs to audio accepted before finish, but it resumes
+        # after the stream key was fenced. It must not appear behind final.
+        release_late_audio.set()
+        await asyncio.wait_for(late_audio, timeout=1)
+        assert finish.done() is False
+        release_partial.set()
+        await asyncio.wait_for(finish, timeout=1)
+        await asyncio.sleep(0)
+
+        assert projected == [
+            ("transcript.partial", "partial 1"),
+            ("transcript.final", "authoritative final"),
+            ("stream.error", None),
+        ]
+        assert managed._partial_projection_pending == {}
+        assert ("formal", "turn_1") not in (
+            managed._partial_projection_active_keys
+        )
+
+        await channel.close("test_complete")
+        await managed.stop("test_complete")
+        await supervisor.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_stop_joins_inflight_partial_and_drops_latest_pending_partial() -> None:
+    async def scenario() -> None:
+        _FakeIngress.instances.clear()
+        store = InMemoryStore()
+        saved = _session(store)
+        with persistence_for(store).transaction("org_default") as transaction:
+            current = transaction.interview_sessions.get(saved["id"])
+            current["agent_runtime"]["calibration_status"] = "completed"
+            current["updated_at"] = utc_now()
+            transaction.interview_sessions.update(
+                current, expected_version=current["version"]
+            )
+        supervisor = LiveKitEvidenceIngressSupervisor(
+            store,
+            media_plane=LiveKitMediaPlane(_configuration()),
+            ingress_factory=_FakeIngress,
+            command_poll_seconds=0.001,
+        )
+        runtime = InterviewAgentRuntime(store)
+        runtime.evidence_ingress = supervisor
+        channel = await runtime.open(_opened("connection_original"))
+        managed = channel._evidence_session
+        assert managed is not None
+        chain = _FakeEvidenceChain()
+        managed.chain = chain
+        partial_started = asyncio.Event()
+        release_partial = asyncio.Event()
+        projected = []
+
+        async def slow_projection(raw, _causation_id):
+            if raw.get("type") == "transcript.partial":
+                projected.append(raw.get("text"))
+                partial_started.set()
+                await release_partial.wait()
+
+        channel._project_evidence_event = slow_projection
+        await channel.send(
+            ClientSignal(
+                type="evidence.stream.open",
+                idempotency_key="stop_barrier_open",
+                turn_id="turn_1",
+                payload={
+                    "content_type": "audio/pcm",
+                    "sample_rate_hz": 16_000,
+                    "channels": 1,
+                },
+            )
+        )
+        ingress = _FakeIngress.instances[0]
+        await ingress.push(sequence=1)
+        await asyncio.wait_for(partial_started.wait(), timeout=1)
+        await ingress.push(sequence=2)
+        assert len(managed._partial_projection_pending) == 1
+
+        stopping = asyncio.create_task(managed.stop("test_complete"))
+        await asyncio.sleep(0)
+        assert stopping.done() is False
+        release_partial.set()
+        await asyncio.wait_for(stopping, timeout=1)
+        await asyncio.sleep(0)
+
+        assert projected == ["服务端实时字幕 1"]
+        assert managed._partial_projection_pending == {}
+        assert managed._partial_projection_active_keys == set()
+        assert managed._partial_projection_task is None
+        assert supervisor._sessions == {}
+
+        await channel.close("test_complete")
+        await supervisor.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_formal_pause_and_control_disconnect_keep_audio_until_explicit_finish() -> None:
     async def scenario() -> None:
         _FakeIngress.instances.clear()
         store = InMemoryStore()
@@ -871,15 +1903,26 @@ def test_authoritative_endpoint_finishes_after_control_disconnect() -> None:
             and event.replayability == Replayability.TRANSIENT
             for event in list(channel._queue._queue)
         )
+        await channel.send(ClientSignal(type="speech.started", idempotency_key="endpoint_speech_started", turn_id="turn_1", payload={"capture_id": managed._capture_id}))
         await channel.send(
             ClientSignal(
                 type="speech.stopped",
                 idempotency_key="endpoint_speech_stopped",
                 turn_id="turn_1",
+                payload={"capture_id": managed._capture_id},
             )
         )
         await channel.close("control_lost_before_endpoint")
         await asyncio.sleep(0.02)
+        assert chain.finish_count == 0
+        assert chain.is_open
+        await _FakeIngress.instances[0].push()
+        assert chain.audio_count == 1
+        channel = await runtime.open(_opened("connection_replacement"))
+        # A stale explicit completion also cannot close the current capture.
+        await channel.send(ClientSignal(type="finish_answer", idempotency_key="stale_finish", turn_id="turn_1", payload={"capture_id": "capture_old", "endpoint": "explicit"}))
+        assert chain.finish_count == 0
+        await channel.send(ClientSignal(type="finish_answer", idempotency_key="explicit_finish", turn_id="turn_1", payload={"capture_id": managed._capture_id, "endpoint": "explicit"}))
         assert chain.finish_count == 1
         current = runtime.interviews.get_interview(saved["id"])
         assert (current.get("agent_runtime") or {}).get("floor") == "candidate"
@@ -931,10 +1974,12 @@ def test_warmup_endpoint_finishes_without_a_formal_turn_id() -> None:
                 },
             )
         )
+        await channel.send(ClientSignal(type="speech.started", idempotency_key="warmup_endpoint_speech_started", payload={"capture_id": managed._capture_id}))
         await channel.send(
             ClientSignal(
                 type="speech.stopped",
                 idempotency_key="warmup_endpoint_speech_stopped",
+                payload={"capture_id": managed._capture_id},
             )
         )
         for _ in range(100):
@@ -1001,7 +2046,7 @@ def test_failed_warmup_finalize_is_not_retried_or_overwritten() -> None:
             ClientSignal(
                 type="evidence.finish",
                 idempotency_key="failed_warmup_finish",
-                payload={"endpoint": "semantic_timeout"},
+                payload={"endpoint": "explicit"},
             )
         )
 
@@ -1192,7 +2237,7 @@ def test_partially_projected_warmup_finalize_returns_to_retrying_once() -> None:
                 ClientSignal(
                     type="evidence.finish",
                     idempotency_key="partial_warmup_finish",
-                    payload={"endpoint": "semantic_timeout"},
+                    payload={"endpoint": "explicit"},
                 )
             )
         finally:
@@ -1483,6 +2528,7 @@ def test_remote_controller_dispatches_to_database_fenced_owner() -> None:
                 type="speech.started",
                 idempotency_key="remote_speech_started",
                 turn_id="turn_1",
+                payload={"capture_id": owner_session._capture_id},
             )
         )
         await controller.send(
@@ -1490,14 +2536,16 @@ def test_remote_controller_dispatches_to_database_fenced_owner() -> None:
                 type="speech.stopped",
                 idempotency_key="remote_speech_stopped",
                 turn_id="turn_1",
+                payload={"capture_id": owner_session._capture_id},
             )
         )
-        assert owner_session._endpoint_task is not None
+        assert owner_session._endpoint_task is None
         await controller.send(
             ClientSignal(
                 type="continue_speaking",
                 idempotency_key="remote_continue",
                 turn_id="turn_1",
+                payload={"capture_id": owner_session._capture_id},
             )
         )
         assert owner_session._endpoint_task is None
@@ -1741,6 +2789,218 @@ def test_remote_attach_cancels_owner_control_expiry_via_database_truth() -> None
         await controller.close("test_complete")
         await controller_supervisor.shutdown()
         await owner_supervisor.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_owner_renews_across_multiple_lease_cycles_with_process_metrics(
+    monkeypatch,
+) -> None:
+    async def scenario() -> None:
+        _FakeIngress.instances.clear()
+        metrics = InterviewAgentMetrics()
+        monkeypatch.setattr(
+            "app.services.livekit_evidence_ingress.interview_agent_metrics",
+            lambda: metrics,
+        )
+        store = InMemoryStore()
+        _session(store)
+        supervisor = LiveKitEvidenceIngressSupervisor(
+            store,
+            media_plane=LiveKitMediaPlane(
+                _configuration(lease_seconds=0.3, renew_seconds=0.05)
+            ),
+            ingress_factory=_FakeIngress,
+            instance_id="renewing_owner",
+            command_poll_seconds=0.005,
+        )
+        runtime = InterviewAgentRuntime(store)
+        runtime.evidence_ingress = supervisor
+
+        renewal_count = 0
+        multiple_renewals = asyncio.Event()
+        original_renew = supervisor.coordinator.renew
+
+        def counted_renew(grant):
+            nonlocal renewal_count
+            renewed = original_renew(grant)
+            renewal_count += 1
+            if renewal_count >= 3:
+                multiple_renewals.set()
+            return renewed
+
+        monkeypatch.setattr(supervisor.coordinator, "renew", counted_renew)
+        channel = await runtime.open(_opened("connection_original"))
+        managed = channel._evidence_session
+        assert managed is not None
+
+        await asyncio.wait_for(multiple_renewals.wait(), timeout=1)
+
+        assert managed._stopped is False
+        assert managed.ingress_connected is True
+        assert renewal_count >= 3
+        snapshot = metrics.snapshot()
+        assert snapshot["evidence_owner_renew_scheduler_lag_ms"]["count"] >= 3
+        assert snapshot["evidence_owner_renew_scheduler_lag_ms"]["max"] >= 0
+        assert snapshot["evidence_owner_renew_db_latency_ms"]["count"] >= 3
+        assert snapshot["evidence_owner_renew_db_latency_ms"]["max"] >= 0
+        assert snapshot["evidence_owner_renew_success"] == {
+            "count": renewal_count,
+            "p50": 1.0,
+            "p95": 1.0,
+            "max": 1.0,
+        }
+
+        await channel.close("test_complete")
+        await supervisor.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_metrics_backend_failure_never_interrupts_owner_renewal(monkeypatch) -> None:
+    class FailingMetrics:
+        def observe(self, _name, _value) -> None:
+            raise RuntimeError("metrics backend unavailable")
+
+    async def scenario() -> None:
+        _FakeIngress.instances.clear()
+        monkeypatch.setattr(
+            "app.services.livekit_evidence_ingress.interview_agent_metrics",
+            lambda: FailingMetrics(),
+        )
+        store = InMemoryStore()
+        _session(store)
+        supervisor = LiveKitEvidenceIngressSupervisor(
+            store,
+            media_plane=LiveKitMediaPlane(
+                _configuration(lease_seconds=0.3, renew_seconds=0.05)
+            ),
+            ingress_factory=_FakeIngress,
+            instance_id="owner_with_unavailable_metrics",
+            command_poll_seconds=0.005,
+        )
+        runtime = InterviewAgentRuntime(store)
+        runtime.evidence_ingress = supervisor
+
+        renewed = asyncio.Event()
+        original_renew = supervisor.coordinator.renew
+
+        def observed_renew(grant):
+            result = original_renew(grant)
+            renewed.set()
+            return result
+
+        monkeypatch.setattr(supervisor.coordinator, "renew", observed_renew)
+        channel = await runtime.open(_opened("connection_original"))
+        managed = channel._evidence_session
+        assert managed is not None
+
+        await asyncio.wait_for(renewed.wait(), timeout=1)
+
+        assert managed._stopped is False
+        assert managed.ingress_connected is True
+        current = runtime.interviews.get_interview(managed.interview_id)
+        assert current["status"] == "in_progress"
+        assert not current["agent_runtime"].get("problems")
+
+        await channel.close("test_complete")
+        await supervisor.shutdown()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("replacement_claimed", [False, True])
+def test_expired_owner_still_self_fences_with_or_without_successor(
+    monkeypatch, replacement_claimed
+) -> None:
+    class RecordingMetrics:
+        def __init__(self) -> None:
+            self.values = {}
+
+        def observe(self, name, value) -> None:
+            self.values.setdefault(name, []).append(value)
+
+    async def scenario() -> None:
+        _FakeIngress.instances.clear()
+        metrics = RecordingMetrics()
+        monkeypatch.setattr(
+            "app.services.livekit_evidence_ingress.interview_agent_metrics",
+            lambda: metrics,
+        )
+        store = InMemoryStore()
+        saved = _session(store)
+        supervisor = LiveKitEvidenceIngressSupervisor(
+            store,
+            media_plane=LiveKitMediaPlane(
+                _configuration(lease_seconds=0.3, renew_seconds=0.1)
+            ),
+            ingress_factory=_FakeIngress,
+            instance_id="stale_owner",
+            # Keep the command poller parked so this regression exercises the
+            # renewal task's strict expiry fence and its failure metric.
+            command_poll_seconds=0.5,
+        )
+        runtime = InterviewAgentRuntime(store)
+        runtime.evidence_ingress = supervisor
+        channel = await runtime.open(_opened("connection_original"))
+        managed = channel._evidence_session
+        assert managed is not None
+        old_grant = managed.ownership
+        assert old_grant is not None
+        # Let the command executor enter its long idle wait before expiring the
+        # row, so the renewal task is the component that observes the fence.
+        await asyncio.sleep(0.01)
+
+        with persistence_for(store).transaction("org_default") as transaction:
+            current = transaction.evidence_ownerships.get(old_grant.ownership_id)
+            current["lease_expires_at"] = "2000-01-01T00:00:00Z"
+            current["updated_at"] = utc_now()
+            transaction.evidence_ownerships.update(
+                current, expected_version=current["version"]
+            )
+
+        if replacement_claimed:
+            successor = supervisor.coordinator.claim_owner(
+                interview_id=saved["id"],
+                organization_id="org_default",
+                local_instance_id="successor_owner",
+            )
+            assert successor.ownership_epoch == old_grant.ownership_epoch + 1
+            assert successor.lease_id != old_grant.lease_id
+
+        async def wait_until_fenced() -> None:
+            while True:
+                current = runtime.interviews.get_interview(saved["id"])
+                if (
+                    managed._stopped
+                    and metrics.values.get("evidence_owner_renew_success")
+                ):
+                    return
+                await asyncio.sleep(0.005)
+
+        await asyncio.wait_for(wait_until_fenced(), timeout=1)
+
+        assert _FakeIngress.instances[0].closed is True
+        assert metrics.values["evidence_owner_renew_success"][-1] == 0.0
+        assert metrics.values["evidence_owner_renew_db_latency_ms"][-1] >= 0
+        assert metrics.values["evidence_owner_renew_scheduler_lag_ms"][-1] >= 0
+        current = runtime.interviews.get_interview(saved["id"])
+        # A stale owner must revoke local side effects, not pause a session
+        # now controlled by its successor (or write after its lease expired).
+        assert current["status"] == "in_progress"
+        assert not any(p.get("code") == "EVIDENCE_OWNER_FENCED"
+                       for p in current["agent_runtime"].get("problems", []))
+        with persistence_for(store).transaction("org_default") as transaction:
+            ownership = transaction.evidence_ownerships.get(
+                old_grant.ownership_id
+            )
+        if replacement_claimed:
+            assert ownership["owner_instance_id"] == "successor_owner"
+            assert ownership["ownership_epoch"] == old_grant.ownership_epoch + 1
+        else:
+            assert ownership["lease_expires_at"] == "2000-01-01T00:00:00Z"
+
+        await supervisor.shutdown()
 
     asyncio.run(scenario())
 

@@ -38,6 +38,7 @@ const EMPTY_EXPERIENCE = {
   microphone: { enabled: true, localDetected: false, level: 0 },
   serverAudio: { received: false, receivedAt: null },
   evidence: { requested: false, ready: false },
+  captureRecovery: null,
   captions: { forming: false, recent: [], full: [] },
   endpoint: { active: false, deadlineAt: null },
   calibration: { status: "pending", transcript: "", confidence: null, retryRequired: false },
@@ -69,6 +70,8 @@ function InvitationPage() {
   const invitation = data.invitation;
   const [busy, setBusy] = useState(false);
   const [entering, setEntering] = useState(false);
+  const enteringRef = useRef(false);
+  const [entryStage, setEntryStage] = useState(null);
   const [confirmed, setConfirmed] = useState(invitation?.status === "registered");
   const [now, setNow] = useState(Date.now());
   const [preflight, setPreflight] = useState(null);
@@ -130,6 +133,8 @@ function InvitationPage() {
   };
 
   const beginPreflight = async () => {
+    if (enteringRef.current) return;
+    enteringRef.current = true;
     setEntering(true);
     try {
       const result = await runCandidatePreflight({ probeUrl: "/healthz" });
@@ -137,6 +142,7 @@ function InvitationPage() {
     } catch (error) {
       toast("设备预检未通过", error.message, "error");
     } finally {
+      enteringRef.current = false;
       setEntering(false);
     }
   };
@@ -151,27 +157,32 @@ function InvitationPage() {
   };
 
   const finishPreflightAndEnter = async () => {
-    if (!preflight?.stream || !speakerPlayed) return;
+    if (!preflight?.stream || !speakerPlayed || enteringRef.current) return;
+    enteringRef.current = true;
     setEntering(true);
+    setEntryStage("model_services");
     try {
       const report = { ...preflight.report, speaker_verified: true };
       prepareCandidateMedia(preflight.stream, report);
       rememberPreflightReport(report);
       const readiness = await request(
         `${API}/public/interview-invitations/${encodeURIComponent(token)}/readiness`,
-        { method: "POST", body: report },
+        { method: "POST", body: report, timeoutMs: 40000 },
       );
       if (!readiness.can_start) {
         throw new Error("摄像头、扬声器、网络、WebRTC、AudioWorklet、WebGL 或模型服务尚未达到正式面试门槛");
       }
+      setEntryStage("starting");
       const result = await request(
         `${API}/public/interview-invitations/${encodeURIComponent(token)}/start`,
-        { method: "POST" },
+        { method: "POST", timeoutMs: 40000 },
       );
       location.href = result.candidate_join_url;
     } catch (error) {
       toast("暂时无法进入面试", error.message, "error");
+      enteringRef.current = false;
       setEntering(false);
+      setEntryStage(null);
     }
   };
 
@@ -210,8 +221,11 @@ function InvitationPage() {
               {speakerPlayed ? "重新播放测试音" : "播放扬声器测试音"}
             </button>
             <button className="button button-primary" type="button" disabled={!speakerPlayed || entering} onClick={finishPreflightAndEnter}>
-              {entering ? "正在建立安全会话…" : "我听到了测试音，进入面试"}
+              {entering ? entryStage === "model_services" ? "正在检查模型服务…" : "正在建立安全会话…" : "我听到了测试音，进入面试"}
             </button>
+            {entering && <p className="form-hint" role="status">{entryStage === "model_services"
+              ? "正在检查模型服务与入场条件，可能需要约 30 秒，请勿重复点击。"
+              : "正在建立安全会话，请稍候。"}</p>}
           </div>
         </section>}
       </div> : <>
@@ -361,7 +375,7 @@ function CandidateRoom() {
   const act = useCallback((type, payload = {}) => {
     const run = runRef.current;
     if (!run) return;
-    run.act({
+    return run.act({
       type,
       payload,
       idempotencyKey: uniqueActionKey(type),
@@ -438,25 +452,7 @@ function CandidateRoom() {
             </div>}
             <span className="camera-label">本机自拍预览</span>
           </div>
-          <div className="candidate-signal-list">
-            <SignalState
-              label="本机检测到声音"
-              active={experience.microphone.localDetected}
-              detail={experience.microphone.localDetected ? "麦克风正在拾音" : "等待你开口"}
-            >
-              <span className="microphone-level" aria-hidden="true"><i style={{ width: `${Math.round(experience.microphone.level * 100)}%` }} /></span>
-            </SignalState>
-            <SignalState
-              label="服务器收到音频"
-              active={experience.serverAudio.received}
-              detail={experience.serverAudio.received ? "服务器已确认当前音频帧" : "尚未收到正式音频"}
-            />
-            <SignalState
-              label="正在形成实时字幕"
-              active={experience.captions.forming}
-              detail={experience.captions.forming ? "服务端正在转写" : "等待有效语音"}
-            />
-          </div>
+          <CandidateSignalList experience={experience} blocked={problem?.recoverable === false} />
           <p className="privacy-note">
             摄像头与麦克风不用于情绪、眼神、人格、诚信或能力推断。人工接管会被审计并明确显示。
           </p>
@@ -478,6 +474,7 @@ function CandidateRoom() {
             : "请停止作答并联系企业面试官确认会话状态。"}</small>}
         </div>}
 
+        <SpeechPlaybackState playback={experience.speechPlayback} act={act} />
         {!experience.session ? <CandidateSessionGate problem={problem} /> : calibration.status !== "completed" ? <WarmupPanel calibration={calibration} experience={experience} act={act} /> : <>
           <div className="candidate-question-head">
             <div>
@@ -488,21 +485,27 @@ function CandidateRoom() {
               {answered}/{totalQuestions || "—"}
             </div>
           </div>
-          <ConversationState phase={experience.phase} endpoint={experience.endpoint} />
+          <ConversationState phase={experience.phase} endpoint={experience.endpoint} formal
+            speechDetected={experience.microphone.localDetected || experience.captions.forming} />
           <CaptionPanel
             captions={experience.captions}
             expanded={expandedTranscript}
             onToggle={() => setExpandedTranscript((value) => !value)}
           />
           <div className="candidate-answer-actions">
-            <div className="recording-actions">
-              <button className="button button-secondary" type="button" onClick={() => act("request_repeat")}>
+            {experience.captureRecovery?.status === "retry_required" && experience.phase !== "paused"
+              ? <AnswerRecoveryAction recovery={experience.captureRecovery} act={act} disabled={problem?.recoverable === false} />
+              : <div className="recording-actions">
+              <button className="button button-secondary" type="button" onClick={() => act("finish_answer")} disabled={!experience.evidence?.ready || !["listening", "answer_preparing", "awaiting_supplement"].includes(experience.phase)}>
+                提前结束回答
+              </button>
+              <button className="button button-secondary" type="button" onClick={() => act("request_repeat")} disabled={experience.phase === "understanding" || experience.phase === "paused" || Boolean(experience.captureRecovery)}>
                 请再说一遍
               </button>
-              <button className="button button-secondary" type="button" onClick={() => act("continue_speaking")} disabled={!experience.endpoint.active}>
+              <button className="button button-secondary" type="button" onClick={() => act("continue_speaking")} disabled={(!experience.endpoint.active && !["answer_preparing", "awaiting_supplement"].includes(experience.phase)) || !experience.evidence?.ready}>
                 继续补充
               </button>
-            </div>
+            </div>}
             <button className="button button-danger" type="button" onClick={() => act("pause")}>暂停面试</button>
           </div>
         </>}
@@ -548,7 +551,9 @@ function CaptionPanel({ captions, expanded, onToggle }) {
   const rows = expanded ? captions.full : captions.recent;
   return <div className="candidate-transcript-wrap" aria-live="polite">
     <div className="transcript-toolbar">
-      <span>{captions.forming ? "服务端实时字幕形成中" : "最近两行服务端字幕"}</span>
+      <span>{captions.forming
+        ? "服务端实时字幕形成中"
+        : expanded ? "完整服务端字幕" : "最近两行服务端字幕"}</span>
       {onToggle && <button className="button button-ghost button-small" type="button" onClick={onToggle}>
         {expanded ? "收起完整转写" : "展开完整转写"}
       </button>}
@@ -559,13 +564,59 @@ function CaptionPanel({ captions, expanded, onToggle }) {
   </div>;
 }
 
-function ConversationState({ phase, endpoint }) {
+export function SpeechPlaybackState({ playback, act }) {
+  if (!playback) return null;
+  return <div className="candidate-waiting-row" role="status" aria-live="polite">
+    <span><strong>{playback.message}</strong></span>
+    {playback.status === "blocked" && <button type="button" className="button button-primary"
+      onClick={() => act("retry_speech")}>播放这句话</button>}
+  </div>;
+}
+
+export function ConversationState({ phase, endpoint, formal = false, speechDetected }) {
   return <div className="candidate-waiting-row" role="status" aria-live="polite">
     <span>
-      <strong>{phaseText(phase)}</strong>
-      <small>{endpoint.active ? "检测到连续静音；若 2.5 秒内没有继续说话，服务端将收口当前回答并判断是否追问。继续说话会取消本次收口，不会直接跳到下一题。" : phaseDetail(phase)}</small>
+      <strong>{phase === "listening" && speechDetected === false ? "正在聆听，等待你开口" : phaseText(phase)}</strong>
+      <small>{["listening", "preparing"].includes(phase) && endpoint.active ? endpoint.deadlineAt == null
+        ? "停顿5秒后，面试官会询问是否补充。直接口头回答即可，无需提交。"
+        : "试音静音后将自动收口；继续说话会取消本次收口。"
+        : phaseDetail(phase, formal)}</small>
     </span>
     <span className={`conversation-phase is-${phase}`} aria-hidden="true" />
+  </div>;
+}
+
+export function AnswerRecoveryAction({ recovery, act, disabled = false }) {
+  const pending = useRef(false);
+  const [sending, setSending] = useState(false);
+  const retry = async () => {
+    if (disabled || pending.current || recovery.retryPending) return;
+    pending.current = true;
+    setSending(true);
+    try { await act("continue_speaking"); }
+    finally { pending.current = false; setSending(false); }
+  };
+  return <div className="recording-actions">
+    <button className="button button-primary" type="button" disabled={disabled || sending || recovery.retryPending} onClick={retry}>
+      {sending || recovery.retryPending ? "正在重新开启本题收音…" : "重试本题"}
+    </button>
+  </div>;
+}
+
+export function CandidateSignalList({ experience, blocked = false }) {
+  const stopped = blocked || ["paused", "completed", "answer_retry_required", "understanding"].includes(experience.phase);
+  const recovering = experience.captureRecovery?.status === "recovering" && !stopped;
+  const local = !stopped && experience.microphone.localDetected;
+  const received = !stopped && experience.serverAudio.received;
+  const forming = !stopped && !recovering && experience.captions.forming;
+  const stoppedDetail = experience.phase === "answer_retry_required" ? "本题收音已停止，请重试本题" : "当前未在收音或转写";
+  return <div className="candidate-signal-list">
+    <SignalState label="本机声音活动" active={local} detail={stopped ? stoppedDetail : local ? "音量持续达到检测门槛" : "低于起音门槛，等待你开口"}>
+      <span className="microphone-level" aria-hidden="true"><i style={{ width: `${stopped ? 0 : Math.round(experience.microphone.level * 100)}%` }} /></span>
+    </SignalState>
+    <SignalState label="音频传输通道" active={received} detail={stopped ? stoppedDetail : received ? "服务器已收到音频；静音时也会传输" : "尚未收到正式音频"} />
+    <SignalState label={recovering ? "正在恢复语音识别" : forming ? "实时字幕正在更新" : "当前没有新增字幕"}
+      active={forming} detail={stopped ? stoppedDetail : recovering ? "音频仍在保留，请等待服务端恢复" : forming ? "最近识别到了新文字" : "等待有效语音，已有字幕会保留"} />
   </div>;
 }
 
@@ -603,19 +654,27 @@ function phaseText(phase) {
     connecting: "正在建立实时安全会话",
     preparing: "正在准备语音识别",
     listening: "正在听你说",
-    understanding: "回答已识别，正在判断下一步",
+    awaiting_supplement: "还有什么需要补充的吗？",
+    answer_preparing: "已收到结束确认，正在整理回答",
+    answer_recovering: "正在恢复语音识别，音频仍在保留",
+    answer_retry_required: "本题收音未能恢复，请重试本题",
+    understanding: "正在处理已提交的回答",
     responding: "面试官正在回应，可随时开口打断",
     paused: "面试已暂停",
     completed: "面试已完成",
   }[phase] || "正在同步面试状态");
 }
 
-function phaseDetail(phase) {
+function phaseDetail(phase, formal) {
   return ({
     connecting: "正在核对 WebRTC、控制通道、录制轨和 3D 表达能力。",
     preparing: "服务端正在打开权威语音识别流；就绪前不会误报正在听或提交本地 VAD 信号。",
-    listening: "无需点击开始；系统会自动识别你的发言。",
-    understanding: "可能生成追问，也可能进入下一道主问题；结果以服务端状态为准。",
+    listening: formal ? "停顿5秒后会询问是否补充。自然表达即可，系统会理解你想继续还是结束。" : "正在识别试音，停止说话后将自动形成试音字幕。",
+    awaiting_supplement: "还有想说的可以直接补充，已经讲完也请告诉我；没听清可以让我再问一遍。",
+    answer_preparing: "不需要重复确认。若想补充，仍可直接开口，面试官会重新整理后再回应。",
+    answer_recovering: "收音与音频保留仍在继续；恢复完成前不会提交这段回答。",
+    answer_retry_required: "不会提交不完整回答。点击“重试本题”重新开启收音。",
+    understanding: "本段已停止收音，请等待处理完成后再说；可能生成追问或进入下一题。",
     responding: "检测到你开口后，数字人会在 200ms 目标内停止发言。",
     paused: "系统不会退回静态图片和问卷，请等待人工处理。",
   }[phase] || "所有状态均来自统一 InterviewAgentRuntime。");

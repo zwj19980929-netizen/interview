@@ -3,6 +3,7 @@ import base64
 import hashlib
 import hmac
 import json
+from copy import deepcopy
 import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
@@ -14,7 +15,12 @@ from pydantic import ValidationError
 from app.adapters.livekit_media import LiveKitConfiguration, LiveKitMediaPlane
 from app.core.auth import Principal
 from app.core.errors import ApiError
+from app.core.interview_agent_metrics import (
+    INTERNAL_INTERVIEW_AGENT_METRICS,
+    InterviewAgentMetrics,
+)
 from app.core.time import utc_now
+from app.core.prompt.understanding_references import understanding_references
 from app.file_storage.local import LocalPrivateFileAdapter
 from app.domain.interview_agent import (
     AgentEvent,
@@ -38,9 +44,11 @@ from app.model_gateway.schemas import (
 )
 from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
+from app.repositories.sqlite import SQLiteStore
 from app.services.agent_ticket import InterviewAgentTicketService
 from app.services.conversation_understanding import ConversationUnderstandingService
 from app.services.interview_agent import (
+    AgentChannel,
     InterviewAgentRuntime,
     _AGENT_CHANNEL_HUB,
     _AGENT_QUEUE_CAPACITY,
@@ -409,13 +417,29 @@ class _Gateway:
         self.responses = list(responses or [])
         self.error = error
         self.requests = []
+        self.last_response = None
 
     async def invoke(self, capability, request):
         self.requests.append((capability, request))
         if self.error is not None:
             raise self.error
+        if self.responses:
+            self.last_response = self.responses.pop(0)
+        data = deepcopy(self.last_response)
+        if request.purpose == "interview_turn_understanding" and "evidence_quotes" in data:
+            # This fixture's domain-style expectations are encoded into the
+            # wire protocol; unknown references remain invalid, never repaired.
+            references = understanding_references(request.metadata["transcript"], request.metadata["capability_points"])
+            evidence_ids = {text: key for key, text in references["evidence"].items()}
+            point_ids = {text: key for key, text in references["capabilities"].items()}
+            data["evidence_ids"] = [evidence_ids.get(text, text) for text in data.pop("evidence_quotes")]
+            for claim in data["claims"]:
+                text = claim.pop("evidence_quote")
+                claim["evidence_id"] = evidence_ids.get(text, text)
+            for state in ("covered", "missing"):
+                data[state + "_point_ids"] = [point_ids.get(text, text) for text in data.pop(state + "_capability_points")]
         return ChatJSONResponse(
-            data=self.responses.pop(0),
+            data=data,
             usage=Usage(),
             provider=ProviderMeta(
                 provider_id="test",
@@ -484,6 +508,175 @@ def test_agent_contracts_reject_invalid_binary_and_non_authoritative_evidence() 
             source="server_streaming",
             created_at=utc_now(),
         )
+
+
+def test_candidate_telemetry_is_ephemeral_non_idempotent_and_fair_on_sqlite(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = SQLiteStore(str(tmp_path / "telemetry.sqlite3"))
+    session = _runtime_session(store)
+    runtime = InterviewAgentRuntime(store)
+    metrics = InterviewAgentMetrics()
+    monkeypatch.setattr(
+        "app.services.interview_agent.interview_agent_metrics", lambda: metrics
+    )
+
+    def opened(*, roles: frozenset[str], actor_id: str) -> OpenAgentSession:
+        return OpenAgentSession(
+            interview_id=session["id"],
+            principal=Principal(
+                actor_id=actor_id,
+                organization_id="org_default",
+                roles=roles,
+                authenticated=True,
+            ),
+            connection_id="connection_telemetry_%s" % actor_id,
+            capabilities=ClientCapabilities(
+                webrtc=True,
+                audio_worklet=True,
+                webgl=True,
+                camera=True,
+                microphone=True,
+                speaker=True,
+                avatar_fps=60,
+                media_recorder=True,
+                browser="Chrome test",
+            ),
+        )
+
+    def domain_fingerprint() -> dict:
+        current = runtime.interviews.get_interview(session["id"], "org_default")
+        state = current.get("agent_runtime") or {}
+        return {
+            "version": current["version"],
+            "updated_at": current["updated_at"],
+            "processed_signal_keys": list(state.get("processed_signal_keys", [])),
+            "last_sequence": state.get("last_sequence"),
+            "events": list(current.get("agent_events", [])),
+            "problems": list(state.get("problems", [])),
+        }
+
+    async def scenario() -> None:
+        channel = AgentChannel(
+            runtime,
+            opened(
+                roles=frozenset({"candidate"}),
+                actor_id="candidate:candidate_1",
+            ),
+        )
+        shared_sample = ClientSignal(
+            type="telemetry.observe",
+            idempotency_key="same_process_sample_key",
+            payload={"metric": "avatar_viseme_drift_ms", "value": 12.5},
+        )
+        before = domain_fingerprint()
+
+        marker_ran = False
+
+        async def mark_scheduler_progress() -> None:
+            nonlocal marker_ran
+            marker_ran = True
+
+        await channel._lock.acquire()
+        marker = asyncio.create_task(mark_scheduler_progress())
+        try:
+            # Process telemetry must not queue behind a domain signal, while
+            # its explicit yield lets ownership/media tasks make progress.
+            await asyncio.wait_for(channel.send(shared_sample), timeout=1)
+            assert marker_ran is True
+        finally:
+            channel._lock.release()
+        await marker
+
+        for _ in range(511):
+            await channel.send(shared_sample)
+        assert metrics.snapshot()["avatar_viseme_drift_ms"]["count"] == 512
+
+        invalid_samples = [
+            {},
+            {"metric": "not_registered", "value": 1},
+            {"metric": "evidence_owner_renew_success", "value": 1},
+            {"metric": "avatar_viseme_drift_ms"},
+            {"metric": "avatar_viseme_drift_ms", "value": True},
+            {"metric": "avatar_viseme_drift_ms", "value": -1},
+            {"metric": "avatar_viseme_drift_ms", "value": 300_001},
+            {"metric": "avatar_viseme_drift_ms", "value": float("inf")},
+            {"metric": "avatar_viseme_drift_ms", "value": "not-a-number"},
+        ]
+        for index, payload in enumerate(invalid_samples):
+            await channel.send(
+                ClientSignal(
+                    type="telemetry.observe",
+                    idempotency_key="invalid_process_sample_%s" % index,
+                    payload=payload,
+                )
+            )
+        assert metrics.snapshot()["avatar_viseme_drift_ms"]["count"] == 512
+        assert all(
+            metrics.snapshot()[name]["count"] == 0
+            for name in INTERNAL_INTERVIEW_AGENT_METRICS
+        )
+
+        reviewer = AgentChannel(
+            runtime,
+            opened(roles=frozenset({"interviewer"}), actor_id="interviewer_1"),
+        )
+        with pytest.raises(ApiError) as forbidden:
+            await reviewer.send(shared_sample)
+        assert forbidden.value.code == "CANDIDATE_SIGNAL_FORBIDDEN"
+
+        # Even hundreds of duplicate samples, invalid input, and a forbidden
+        # role leave the SQLite document byte-for-byte stable at domain level.
+        assert domain_fingerprint() == before
+
+    asyncio.run(scenario())
+
+
+def test_non_telemetry_signal_idempotency_is_unchanged() -> None:
+    store = InMemoryStore()
+    session = _runtime_session(store)
+    runtime = InterviewAgentRuntime(store)
+
+    async def scenario() -> None:
+        channel = AgentChannel(
+            runtime,
+            OpenAgentSession(
+                interview_id=session["id"],
+                principal=Principal(
+                    actor_id="candidate:candidate_1",
+                    organization_id="org_default",
+                    roles=frozenset({"candidate"}),
+                    authenticated=True,
+                ),
+                connection_id="connection_ping_idempotency",
+                capabilities=ClientCapabilities(
+                    webrtc=True,
+                    audio_worklet=True,
+                    webgl=True,
+                    camera=True,
+                    microphone=True,
+                    speaker=True,
+                    avatar_fps=60,
+                    media_recorder=True,
+                    browser="Chrome test",
+                ),
+            ),
+        )
+        signal = ClientSignal(type="ping", idempotency_key="ping_once")
+        await channel.send(signal)
+        after_first = runtime.interviews.get_interview(session["id"])
+        await channel.send(signal)
+        after_duplicate = runtime.interviews.get_interview(session["id"])
+
+        assert after_duplicate == after_first
+        assert (
+            after_duplicate["agent_runtime"]["processed_signal_keys"].count(
+                "ping_once"
+            )
+            == 1
+        )
+
+    asyncio.run(scenario())
 
 
 def test_avatar_performance_requires_ordered_visemes_and_stable_event_types() -> None:
@@ -1376,6 +1569,92 @@ def test_candidate_barge_in_revokes_agent_floor_and_active_performance() -> None
     asyncio.run(scenario())
 
 
+def test_stale_performance_stop_cannot_end_replacement_performance() -> None:
+    store = InMemoryStore()
+    session = _runtime_session(store)
+    with persistence_for(store).transaction("org_default") as transaction:
+        current = transaction.interview_sessions.get(session["id"])
+        current["agent_runtime"].update(
+            {
+                "calibration_status": "completed",
+                "floor": "agent",
+                "floor_reason": "question_playback",
+                "active_performance_id": "performance_current",
+            }
+        )
+        transaction.interview_sessions.update(
+            current, expected_version=current["version"]
+        )
+    runtime = InterviewAgentRuntime(store)
+
+    async def scenario() -> None:
+        channel = await runtime.open(
+            OpenAgentSession(
+                interview_id=session["id"],
+                principal=Principal(
+                    actor_id="candidate:candidate_1",
+                    organization_id="org_default",
+                    roles=frozenset({"candidate"}),
+                    authenticated=True,
+                ),
+                connection_id="connection_stale_performance_stop",
+                capabilities=ClientCapabilities(
+                    webrtc=True,
+                    audio_worklet=True,
+                    webgl=True,
+                    camera=True,
+                    microphone=True,
+                    speaker=True,
+                    avatar_fps=60,
+                    media_recorder=True,
+                    browser="Chrome test",
+                ),
+            )
+        )
+        before = runtime.interviews.get_interview(session["id"])
+        stopped_count = len(
+            [
+                event
+                for event in before["agent_events"]
+                if event["type"] == "avatar.performance.stopped"
+            ]
+        )
+
+        await channel.send(
+            ClientSignal(
+                type="avatar.performance.stopped",
+                idempotency_key="stale_performance_stopped",
+                payload={"performance_id": "performance_replaced"},
+            )
+        )
+        stale = runtime.interviews.get_interview(session["id"])
+        assert stale["agent_runtime"]["active_performance_id"] == "performance_current"
+        assert stale["agent_runtime"]["floor"] == "agent"
+        assert stale["agent_runtime"]["floor_reason"] == "question_playback"
+        assert len(
+            [
+                event
+                for event in stale["agent_events"]
+                if event["type"] == "avatar.performance.stopped"
+            ]
+        ) == stopped_count
+
+        await channel.send(
+            ClientSignal(
+                type="avatar.performance.stopped",
+                idempotency_key="current_performance_stopped",
+                payload={"performance_id": "performance_current"},
+            )
+        )
+        matched = runtime.interviews.get_interview(session["id"])
+        assert matched["agent_runtime"]["active_performance_id"] is None
+        assert matched["agent_runtime"]["floor"] == "candidate"
+        assert matched["agent_runtime"]["floor_reason"] == "agent_finished"
+        await channel.close("test_complete")
+
+    asyncio.run(scenario())
+
+
 def test_completed_interview_plays_farewell_before_single_receipt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1921,8 +2200,9 @@ def test_agent_hub_fans_out_takeover_with_role_safe_replay_and_snapshot() -> Non
                 ][-1]
                 assert snapshot.payload["interview_id"] == session["id"]
                 assert set(snapshot.payload).isdisjoint(
-                    {"candidate", "media_capture", "problems", "active_performance_id"}
+                    {"candidate", "media_capture", "problems", "active_output_id"}
                 )
+                assert snapshot.payload["active_performance_id"] is None
                 assert set(snapshot.payload["takeover"]).isdisjoint(
                     {"actor_id", "reason", "lease_id"}
                 )
@@ -2852,6 +3132,62 @@ def test_understanding_rejects_non_verbatim_evidence_without_creating_semantics(
     assert result.claims == []
     assert result.problem is not None
     assert result.problem.code == "UNDERSTANDING_RESULT_REJECTED"
+
+
+def test_understanding_reference_contract_retries_partition_without_rewriting_evidence(caplog) -> None:
+    transcript = "嗯，Fast API 检查 Redis 依赖，readiness 返回 200。然后等待 10 秒，再退出旧 Pod。"
+    first = {
+        "intent": "answer", "answer_summary": "说明了就绪检查和滚动更新",
+        "claims": [{"claim": "先检查依赖", "evidence_id": "E1"}],
+        "evidence_ids": ["E1"], "covered_point_ids": ["P1"],
+        "missing_point_ids": ["P2"], "ambiguities": [], "contradictions": [],
+        "confidence": 0.9, "suggested_action": "accept",
+    }
+    second = {**first, "missing_point_ids": ["P2", "P3"]}
+    gateway = _Gateway([first, second])
+    result = asyncio.run(ConversationUnderstandingService(InMemoryStore(), gateway=gateway).understand(
+        _utterance(transcript), _turn(), _interview(_turn()),
+    ))
+    assert result.problem is None
+    assert result.prompt_version == "interview_turn_understanding.v6"
+    assert result.evidence_quotes == ["嗯，Fast API 检查 Redis 依赖，readiness 返回 200。"]
+    assert result.claims[0].evidence_quote == result.evidence_quotes[0]
+    assert len(gateway.requests) == 2
+    assert "point_partition_invalid" in gateway.requests[1][1].messages[-1].content
+    assert "point_partition_invalid" in caplog.text
+    assert transcript not in caplog.text and "Redis" not in caplog.text
+
+
+@pytest.mark.parametrize("overrides,reason", [
+    ({"evidence_ids": ["E999"]}, "wire_schema_invalid"),
+    ({"evidence_ids": ["E1", "E1"]}, "wire_schema_invalid"),
+    ({"covered_point_ids": ["P999"]}, "wire_schema_invalid"),
+    ({"missing_point_ids": ["P1", "P2", "P3"]}, "point_partition_invalid"),
+    ({"evidence_ids": ["E2"]}, "claim_evidence_undeclared"),
+    ({"claims": []}, "answer_evidence_empty"),
+    ({"answer_summary": ""}, "answer_evidence_empty"),
+    ({"unexpected": "private_response_marker"}, "wire_schema_invalid"),
+])
+def test_reference_contract_invalid_twice_never_creates_semantics(overrides, reason, caplog) -> None:
+    transcript = "我检查依赖。然后验证就绪。"
+    data = {
+        "intent": "answer", "answer_summary": "说明检查流程",
+        "claims": [{"claim": "检查依赖", "evidence_id": "E1"}],
+        "evidence_ids": ["E1"], "covered_point_ids": ["P1"],
+        "missing_point_ids": ["P2", "P3"], "ambiguities": [], "contradictions": [],
+        "confidence": 0.9, "suggested_action": "accept", **overrides,
+    }
+    gateway = _Gateway([data, data])
+    result = asyncio.run(ConversationUnderstandingService(InMemoryStore(), gateway=gateway).understand(
+        _utterance(transcript), _turn(), _interview(_turn()),
+    ))
+    assert result.suggested_action == "pause"
+    assert result.problem.reason_code == reason
+    assert result.problem.attempts == 2
+    assert len(gateway.requests) == 2
+    assert result.claims == [] and result.evidence_quotes == []
+    assert "private_response_marker" not in caplog.text
+    assert transcript not in caplog.text
 
 
 def test_agent_projects_understanding_failure_as_problem_and_pauses() -> None:

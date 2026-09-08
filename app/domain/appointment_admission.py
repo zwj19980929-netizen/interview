@@ -8,7 +8,7 @@ from app.core.interview_agent_release import realtime_agent_release_status
 from app.domain.avatar_asset import inspect_licensed_vrm
 from app.domain.speech_profile import speech_asset_matches_profile
 from app.model_gateway import capabilities as cap
-from app.model_gateway.registry import get_provider_manifest
+from app.services.model_route_readiness import purpose_readiness
 
 
 def ensure_utc(value: datetime) -> datetime:
@@ -386,6 +386,24 @@ class AppointmentAdmission:
                 ),
             }
         )
+        route_checks = {
+            "answer_evaluation": (cap.LLM_CHAT_JSON, "answer_evaluation"),
+            "stt_batch": (cap.STT_BATCH, "candidate_answer_repair"),
+            "stt_streaming": (cap.STT_STREAMING, "candidate_answer_transcription"),
+            "warmup_stt_streaming": (cap.STT_STREAMING, "warmup_calibration"),
+            "turn_understanding": (cap.LLM_CHAT_JSON, "interview_turn_understanding"),
+            "controlled_followup": (cap.LLM_CHAT_JSON, "controlled_followup"),
+            "agent_expression_tts": (cap.TTS_SYNTHESIZE, "interview_agent_expression"),
+            "agent_realtime_speech": (cap.SPEECH_DIALOGUE_REALTIME, "candidate_followup_dialogue"),
+        }
+        for check in checks:
+            if check["name"] not in route_checks:
+                continue
+            capability, purpose = route_checks[check["name"]]
+            state = purpose_readiness(transaction, capability, purpose, now)
+            check["route_readiness"] = state
+            if state["route_id"] is not None and not state["ready"]:
+                check["mode"] = "configured_route_" + ("unhealthy" if state["status"] == "failed" else state["status"])
         local_ready = all(item["ready"] for item in checks)
         production_ready = all(item.get("production_ready", item["ready"]) for item in checks)
         invite_ready = all(
@@ -434,51 +452,14 @@ class AppointmentAdmission:
         purpose: str,
         now: datetime,
     ) -> bool:
-        routes = [
-            item
-            for item in transaction.model_routes.list()
-            if item.get("enabled", True)
-            and item.get("capability") == capability
-            and item.get("purpose") == purpose
-        ]
-        route = next((item for item in routes if item.get("purpose") == purpose), None)
-        if route is None:
-            return False
-        model_configuration = transaction.model_configurations.get(
-            (route.get("primary") or {}).get("model_configuration_id")
-        )
-        if (
-            model_configuration is None
-            or not model_configuration.get("enabled", True)
-            or model_configuration.get("status") != "ready"
-            or capability not in model_configuration.get("supported_capabilities", [])
-        ):
-            return False
-        provider_connection = transaction.provider_connections.get(
-            model_configuration.get("provider_connection_id")
-        )
-        if provider_connection is None or not provider_connection.get("enabled", True):
-            return False
-        manifest = get_provider_manifest(model_configuration.get("provider_id", ""))
-        if (
-            model_configuration.get("provider_id") == "mock"
-            or not manifest.get("implemented", False)
-            or capability not in manifest.get("capabilities", [])
-        ):
-            return False
-        health = route.get("last_health") or {}
-        if health.get("status") != "healthy" or not health.get("checked_at"):
-            return False
-        ttl = max(1, int((route.get("policy") or {}).get("readiness_ttl_seconds", 60)))
-        return parse_utc(health["checked_at"]) + timedelta(seconds=ttl) >= ensure_utc(now)
+        return bool(purpose_readiness(transaction, capability, purpose, now)["ready"])
 
     @staticmethod
     def _route_configured(transaction: Any, capability: str, purpose: str) -> bool:
         """判断管理员是否显式选择了某条运行时路由，不把未配置等同于故障。"""
 
         return any(
-            item.get("enabled", True)
-            and item.get("capability") == capability
+            item.get("capability") == capability
             and item.get("purpose") == purpose
             for item in transaction.model_routes.list()
         )

@@ -6,6 +6,7 @@ from app.model_gateway import capabilities as cap
 from app.model_gateway.errors import ProviderError
 from app.model_gateway.gateway import CircuitBreaker, ModelGateway
 from app.model_gateway.schemas import (
+    BatchSTTRequest,
     ChatJSONRequest,
     ChatJSONResponse,
     ChatMessage,
@@ -13,6 +14,46 @@ from app.model_gateway.schemas import (
     Usage,
 )
 from app.repositories.memory import InMemoryStore
+from app.providers.mock.provider import MockProvider
+from types import SimpleNamespace
+
+
+@pytest.mark.parametrize("fixture", [None, "", "   ", False, 12, {"text": "fake"}])
+def test_real_batch_audio_never_uses_mock_without_explicit_text_fixture(fixture):
+    async def scenario():
+        store = InMemoryStore()
+        gateway = ModelGateway(store)
+        with pytest.raises(ProviderError) as error:
+            await gateway.invoke(cap.STT_BATCH, BatchSTTRequest(
+                audio_uri="private-file://test", audio_bytes=b"real audio",
+                metadata={"development_transcript": fixture},
+            ))
+        assert error.value.code == "provider_real_stt_required"
+        assert not any(item["status"] == "success" for item in store.model_invocations)
+
+    asyncio.run(scenario())
+
+
+def test_batch_mock_remains_available_for_explicit_development_fixture():
+    async def scenario():
+        result = await ModelGateway(InMemoryStore()).invoke(cap.STT_BATCH, BatchSTTRequest(
+            audio_uri="private-test://fixture", metadata={"development_transcript": "  明确的测试转写  "},
+        ))
+        assert result.text == "明确的测试转写"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("fixture", [None, "", "   ", False, 12, {"text": "fake"}])
+def test_mock_adapter_rejects_invalid_fixture_instead_of_stringifying_it(fixture):
+    async def scenario():
+        with pytest.raises(ProviderError) as error:
+            await MockProvider().invoke(cap.STT_BATCH, BatchSTTRequest(
+                audio_uri="private-test://fixture", metadata={"development_transcript": fixture},
+            ), SimpleNamespace(model="mock-stt"))
+        assert error.value.code == "provider_final_transcript_missing"
+
+    asyncio.run(scenario())
 
 
 def response(data=None, *, input_tokens=0, output_tokens=0) -> ChatJSONResponse:

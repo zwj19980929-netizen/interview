@@ -1,8 +1,62 @@
 # Interviewer Domain
 
+## 明确不再作答（023）
+
+**AnswerDeclined**：完整服务端发言明确表示本题不再作答，且没有技术回答的语义事实；包含不会回答或已经明确结束的情形，不等同于没有听清。保留真实原文和音频，空技术主张、全部能力点缺失，沿用受保护的答案提交进入下一题。结束意图的理解置信度与知识覆盖分开；仍在思考、空识别或未解决的字幕争议不能据此推进。
+
+## 识别空完成与当前题字幕（022）
+
+RecognitionEmptyCompletion表示本段供应商已经完整结束但没有文字，区别于识别失败、缺失final、静音和候选否定。它不能成为答案；任何已观察的文字不能在重建后被空结果覆盖。声音撤销提交资格时，可以保留同证据的有界纯准备；只有新完整快照一致才能复用，新内容必须重算。候选字幕的默认范围是当前turn，不能将上一题答案无标记地显示为追问的新话语。
+
+## 补充问答上下文（021）
+
+新音频或文字可以撤销提交准备，不能自动清掉已经进行的“是否补充”问答。重复明确否定继续处理同一确认，只有语义判断为继续或实质补充才回到作答阶段；不要再按5秒静音重新询问同一个确认。服务端完整final覆盖的旧partial不是新输入。复用确认必须有新的完整快照和一致证据指纹，不能用旧答案越过未识别音频。
+
+## 声音与播报边界（020）
+
+收到音频帧不等同正在说话；服务端按语音特征、默认RMS0.006和100/120ms持续门槛判断，新增服务端文字独立保护轻声续说。所有已接受候选PCM仍保留，5秒静音仅询问；无文字回复要语音澄清，不能判肯定/否定。数字人表达交付与浏览器实际开始播放是不同事实；播放状态回执不授权答案，播放失败保留本题并恢复当前已批准语音。
+
+## 识别边界（019）
+
+Recognition terms 是冻结题材的词级提示，不是候选事实。Transcript ambiguity 是尚未解决、影响含义的语义疑点；拼写异常不自动等于歧义，明确自我纠正以最终表达为准。补充确认只确认回答是否结束；对话边界不能替代完整 final。补送容量等待与实时录音分离，诊断中的句子散列只用于比对厂商文字来源，不能证明录音中一定说过。
+
+## ConfirmedAnswerFinalization
+
+**ConfirmedAnswerFinalization**：候选人明确完成后，使用本次服务端final继续理解与受保护提交的阶段；识别可暂时关闭，录音与输入撤销仍继续。单个音量尖峰不等同于重新开始回答；新增服务端字幕或持续语音会撤销旧决定，未识别有声后缀不能丢弃。
+_Avoid_: EmptyStreamReconfirmation、EnergyEqualsSpeech、VadEqualsTranscript
+
+## SpokenSupplementConfirmation
+
+**SpokenSupplementConfirmation**：候选人回答后静音5秒触发的补充确认。肯定或实质补充继续同题收听，明确否定才授权准备完整答案，未知/无答复不会自动跳题。它是当前owner/turn/capture内的会话控制状态，不是评分或答案事实。
+_Avoid_: SilenceEqualsAnswer、ButtonRequired、BrowserTranscript
+
 本领域描述从岗位题库与候选人简历形成计划和预约，执行语音面试并形成可复核岗位评价的核心概念。
 
 ## Language
+
+**AnswerCaptureRecovery**:
+当前题回答采集遇到暂时识别故障后的恢复过程；保留已收到的音频，未确认片段重新识别，恢复成功不代表回答已提交。
+_Avoid_: InterviewPaused、HumanTakeover、BatchSubmitOnDisconnect
+
+**AnswerRetryRequired**:
+本次回答无法可靠续接而需要候选人重答同一题的状态；原片段不进入评分，新一次采集与旧片段分开保留，不要求企业人员先行处理。
+_Avoid_: CandidateAnswer、ManualRecovery、PartialAnswerAccepted
+
+**ModelRouteReadiness**:
+某项业务用途在当前模型配置下的近期连通性证据；未检测或证据过期代表需要重新确认，不等同于服务已故障，也不替代正式语音与业务质量验收。
+_Avoid_: PermanentHealthy、ExpiredMeansFailed、ModelTestIsRouteTest
+
+**PreparedTurnDecision**:
+绑定已校验的稳定转写预览或服务端final前缀和当前题目/预算的只读预计算理解与追问；续说或上下文变化时失效，最终提交前重新验证，不能自行创建答案。
+_Avoid_: CachedAnswer、BrowserFinal、IrrevocableDecision
+
+**StableTranscriptPreview**:
+识别连接尚未结束时，供应商已确认不再修订的句段所形成的只读预览；只用于可撤销准备，不代表音频已全部处理或回答已结束，也不是权威发言证据。
+_Avoid_: TranscriptFinal、AuthoritativeUtterance、ProviderAudioAck、CandidateAnswer
+
+**ApprovedSpeechOutput**:
+已批准 ConversationAct 的可撤销输出，独立轨道绑定、连续 PCM 校验、私有完整归档和客户端排空确认属于同一生命周期；供应商 EOF 不等于候选人已听完。
+_Avoid_: RawProviderAudioUrl、SpeculativeSpeech、SourceDrainIsPlaybackDone
 
 **JobPosition**:
 企业可复用的岗位，是 KnowledgeBase、RoleRequirement、ResumeReview、InterviewPlan 和 InterviewAppointment 的共同上层边界。
@@ -43,6 +97,14 @@ _Avoid_: AudioChunk、BrowserTranscript、CandidateAnswer
 **TurnUnderstanding**:
 针对一个 ConversationUtterance 形成的版本化结构化理解，记录原文证据、能力点覆盖、歧义、矛盾、置信度与建议动作；它服务于对话决策，不等同于 AnswerEvaluation。
 _Avoid_: Score、LLMThought、FollowUpText
+
+**AnswerEndpointProposal**:
+对候选人可能已结束当前回答的可撤销判断；它不是回答提交事实，候选人的续说使旧判断失效。
+_Avoid_: SilenceEqualsAnswer、STTFinal、CandidateAnswer
+
+**EvidenceTranscriptSnapshot**:
+与当前采集的一个已识别音频前缀对应的服务端转写快照；可用于准备对话决策，但不代表整个回答已经结束。
+_Avoid_: BrowserFinal、SubmittedAnswer、CompletedCapture
 
 **ApprovedConversationAct**:
 实时面试策略在预算、安全与证据校验后批准的唯一下一动作及其可播报文本；追问必须绑定冻结根轮次、非空原文证据、能力点和正深度，表达层不得临时补建追问；所有 AI 动作恒为非评价性，数字人和语音 Provider 只能表达它，不能自行决定追问或评价。

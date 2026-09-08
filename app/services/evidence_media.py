@@ -23,9 +23,9 @@ from app.domain.evidence_media import (
 )
 from app.file_storage.interface import PrivateFileStorage
 from app.file_storage.provider import private_file_storage
-from app.persistence.interface import Persistence
+from app.persistence.interface import Persistence, PersistenceTransaction
 from app.persistence.provider import persistence_for
-from app.services.evidence_coordination import assert_current_evidence_fence
+from app.services.evidence_coordination import EvidenceOwnershipCoordinator, assert_current_evidence_fence
 
 
 def _stream_id(interview_id: str, turn_id: str) -> str:
@@ -113,7 +113,7 @@ class DurableEvidenceMediaWriter:
             self._seal_buffer(complete=complete)
         elif complete:
             self._checkpoint = self._module._mark_complete(
-                self._spec, self._fence
+                self._spec, self._fence, self._checkpoint.capture_revision
             )
         self._closed = complete
         return self._checkpoint
@@ -134,6 +134,7 @@ class DurableEvidenceMediaWriter:
         self._checkpoint = self._module._seal_segment(
             self._spec,
             self._fence,
+            capture_revision=self._checkpoint.capture_revision,
             content=content,
             first_frame_sequence=self._first_buffered_sequence,
             last_frame_sequence=last_sequence,
@@ -372,7 +373,10 @@ class DurableEvidenceMedia:
                         status_code=409,
                     )
                 if (
-                    int(current.get("last_sealed_ordinal", 0)) != expected_count
+                    int(current.get("capture_revision", 1))
+                    != int(stream.get("capture_revision", 1))
+                    or not current.get("complete")
+                    or int(current.get("last_sealed_ordinal", 0)) != expected_count
                     or int(current.get("last_sealed_frame_sequence", 0))
                     != expected_last_frame
                     or int(current.get("sealed_byte_count", 0))
@@ -451,43 +455,206 @@ class DurableEvidenceMedia:
                     "Completed Evidence media cannot be reset.",
                     status_code=409,
                 )
-            now = transaction.database_now().isoformat()
-            expected_version = int(stream["version"])
-            stream.setdefault("abandoned_captures", []).append(
-                {
-                    "capture_revision": int(stream.get("capture_revision", 1)),
-                    "sealed_segment_count": int(
-                        stream.get("last_sealed_ordinal", 0)
-                    ),
-                    "last_sealed_frame_sequence": int(
-                        stream.get("last_sealed_frame_sequence", 0)
-                    ),
-                    "sealed_byte_count": int(stream.get("sealed_byte_count", 0)),
-                    "abandoned_by_epoch": fence.ownership_epoch,
-                    "reason": str(reason or "owner_loss")[:128],
-                    "abandoned_at": now,
-                }
+            return self._advance_capture(
+                transaction, stream, fence,
+                reason=str(reason or "owner_loss")[:128],
             )
-            stream["capture_revision"] = int(
-                stream.get("capture_revision", 1)
-            ) + 1
-            stream["last_sealed_ordinal"] = 0
-            stream["last_sealed_frame_sequence"] = 0
-            stream["sealed_byte_count"] = 0
-            stream["ownership_epoch"] = fence.ownership_epoch
-            stream["complete"] = False
-            stream["status"] = "open"
-            stream["updated_at"] = now
-            stream = transaction.evidence_media_streams.update(
-                stream, expected_version=expected_version
+
+    def prepare_candidate_retry(
+        self, *, interview_id: str, turn_id: str, capture_id: str,
+        fence: EvidenceCommitFence,
+    ) -> bool:
+        """Advance only the durable failed, unanswered capture, at most once.
+
+        A failed open may be retried without archiving another empty revision.
+        The candidate cannot name a recording or request a general reset.
+        """
+        if fence.ownership_id != EvidenceOwnershipCoordinator.ownership_id(interview_id):
+            raise ApiError("EVIDENCE_OWNER_FENCED", "Capture retry belongs to another interview.", status_code=409)
+        with self.persistence.transaction(self.organization_id) as transaction:
+            assert_current_evidence_fence(transaction, fence)
+            session = transaction.interview_sessions.get(interview_id)
+            state = (session or {}).get("agent_runtime") or {}
+            recovery = state.get("capture_recovery") or {}
+            if (not session or session.get("status") != "in_progress"
+                    or session.get("current_turn_id") != turn_id
+                    or any(answer.get("turn_id") == turn_id for answer in session.get("answers", []))
+                    or (state.get("takeover") or {}).get("status") == "active"
+                    or recovery.get("status") != "retry_required"
+                    or recovery.get("turn_id") != turn_id
+                    or recovery.get("capture_id") != capture_id):
+                return False
+            stream = transaction.evidence_media_streams.get(_stream_id(interview_id, turn_id))
+            if (not stream or stream.get("complete") or stream.get("recovered_audio_uri")):
+                raise ApiError("EVIDENCE_MEDIA_ALREADY_COMPLETE", "Incomplete capture required for retry.", status_code=409)
+            revision = int(stream.get("capture_revision", 1))
+            if recovery.get("retry_capture_revision") == revision:
+                return True
+            if recovery.get("capture_revision") != revision:
+                raise ApiError("EVIDENCE_MEDIA_CHECKPOINT_CHANGED", "Failed capture changed.", status_code=409)
+            checkpoint = self._advance_capture(transaction, stream, fence, reason="candidate_capture_retry")
+            recovery["retry_capture_revision"] = checkpoint.capture_revision
+            state["capture_recovery"] = recovery
+            session["agent_runtime"] = state
+            transaction.interview_sessions.update(session, expected_version=session["version"])
+            return True
+
+    @staticmethod
+    def assert_complete_capture(
+        transaction: PersistenceTransaction,
+        *,
+        interview_id: str,
+        turn_id: str,
+        media_evidence: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Fence a semantic result to the exact sealed capture, not just its owner."""
+
+        stream_id = _stream_id(interview_id, turn_id)
+        stream = transaction.evidence_media_streams.get(stream_id)
+        if (
+            stream is None
+            or not stream.get("complete")
+            or media_evidence.get("mode") != "sealed_segments"
+            or media_evidence.get("complete") is not True
+            or media_evidence.get("stream_id") != stream_id
+            or media_evidence.get("capture_revision") != stream.get("capture_revision", 1)
+            or media_evidence.get("sealed_segment_count") != stream.get("last_sealed_ordinal")
+            or media_evidence.get("last_sealed_frame_sequence") != stream.get("last_sealed_frame_sequence")
+        ):
+            raise ApiError(
+                "EVIDENCE_MEDIA_CHECKPOINT_CHANGED",
+                "The transcript no longer matches the complete Evidence capture.",
+                status_code=409,
             )
-            return self._checkpoint(stream)
+        return stream
+
+    @classmethod
+    def release_rejected_capture(
+        cls,
+        transaction: PersistenceTransaction,
+        *,
+        interview_id: str,
+        turn_id: str,
+        media_evidence: dict[str, Any],
+        utterance_id: str,
+        fence: EvidenceCommitFence,
+    ) -> EvidenceMediaCheckpoint:
+        """Advance capture in the same transaction that rejects an utterance.
+
+        This is not a general reset: the authoritative lifecycle must have
+        committed its non-answer decision in this transaction. Old sealed
+        segments and the rejected utterance remain immutable evidence.
+        """
+
+        assert_current_evidence_fence(transaction, fence)
+        stream = cls.assert_complete_capture(
+            transaction, interview_id=interview_id, turn_id=turn_id,
+            media_evidence=media_evidence,
+        )
+        session = transaction.interview_sessions.get(interview_id) or {}
+        turn = next((item for item in session.get("turns", []) if item["id"] == turn_id), {})
+        rejected = any(
+            event.get("type") == "utterance.not_accepted"
+            and event.get("payload", {}).get("turn_id") == turn_id
+            and event.get("payload", {}).get("utterance_id") == utterance_id
+            for event in session.get("lifecycle_events", [])
+        )
+        if (
+            turn.get("status") != "asking"
+            or (turn.get("current_understanding") or {}).get("utterance_id") != utterance_id
+            or not rejected
+            or any(answer.get("turn_id") == turn_id for answer in session.get("answers", []))
+        ):
+            raise ApiError(
+                "EVIDENCE_MEDIA_REJECTION_REQUIRED",
+                "Only a committed non-answer may release a complete Evidence capture.",
+                status_code=409,
+            )
+        return cls._advance_capture(
+            transaction, stream, fence,
+            reason="utterance_not_accepted", rejected_utterance_id=utterance_id,
+        )
+
+    @classmethod
+    def release_untranscribed_capture(
+        cls, transaction: PersistenceTransaction, *, interview_id: str, turn_id: str,
+        media_evidence: dict[str, Any], audio_uri: str, fence: EvidenceCommitFence,
+    ) -> EvidenceMediaCheckpoint:
+        """Release only the exact recording marked transcription-unavailable in this transaction."""
+        assert_current_evidence_fence(transaction, fence)
+        stream = cls.assert_complete_capture(
+            transaction, interview_id=interview_id, turn_id=turn_id, media_evidence=media_evidence,
+        )
+        session = transaction.interview_sessions.get(interview_id) or {}
+        turn = next((item for item in session.get("turns", []) if item["id"] == turn_id), {})
+        if (
+            turn.get("status") != "asking"
+            or turn.get("transcription_error") != "STT_TRANSCRIPT_UNAVAILABLE"
+            or (turn.get("recording") or {}).get("audio_uri") != audio_uri
+            or any(item.get("turn_id") == turn_id for item in session.get("answers", []))
+        ):
+            raise ApiError("EVIDENCE_MEDIA_REJECTION_REQUIRED", "The recording has not been marked untranscribed.", status_code=409)
+        return cls._advance_capture(
+            transaction, stream, fence, reason="transcript_unavailable",
+            untranscribed_audio_uri=audio_uri,
+        )
+
+    @classmethod
+    def _advance_capture(
+        cls, transaction: PersistenceTransaction, stream: dict[str, Any],
+        fence: EvidenceCommitFence, *, reason: str,
+        rejected_utterance_id: Optional[str] = None,
+        untranscribed_audio_uri: Optional[str] = None,
+    ) -> EvidenceMediaCheckpoint:
+        now = transaction.database_now().isoformat()
+        expected_version = int(stream["version"])
+        archived = {
+            "capture_revision": int(stream.get("capture_revision", 1)),
+            "sealed_segment_count": int(stream.get("last_sealed_ordinal", 0)),
+            "last_sealed_frame_sequence": int(stream.get("last_sealed_frame_sequence", 0)),
+            "sealed_byte_count": int(stream.get("sealed_byte_count", 0)),
+            "abandoned_by_epoch": fence.ownership_epoch,
+            "reason": reason,
+            "abandoned_at": now,
+        }
+        if rejected_utterance_id is not None:
+            archived["rejected_utterance_id"] = rejected_utterance_id
+            archived["recovered_audio_uri"] = stream.get("recovered_audio_uri")
+        if untranscribed_audio_uri is not None:
+            archived["untranscribed_audio_uri"] = untranscribed_audio_uri
+        stream.setdefault("abandoned_captures", []).append(archived)
+        stream.update(
+            capture_revision=int(stream.get("capture_revision", 1)) + 1,
+            last_sealed_ordinal=0, last_sealed_frame_sequence=0, sealed_byte_count=0,
+            ownership_epoch=fence.ownership_epoch, complete=False, status="open",
+            updated_at=now, recovered_audio_uri=None,
+        )
+        for key in ("recovered_byte_count", "recovered_source_pcm_byte_count", "recovered_at", "recovered_by_epoch"):
+            stream.pop(key, None)
+        stream = transaction.evidence_media_streams.update(stream, expected_version=expected_version)
+        return cls._checkpoint(stream)
+
+    @staticmethod
+    def _assert_writable_capture(stream: dict[str, Any], capture_revision: int) -> None:
+        if int(stream.get("capture_revision", 1)) != capture_revision:
+            raise ApiError(
+                "EVIDENCE_MEDIA_CHECKPOINT_CHANGED",
+                "This writer belongs to an earlier Evidence capture.",
+                status_code=409,
+            )
+        if stream.get("complete") or stream.get("recovered_audio_uri"):
+            raise ApiError(
+                "EVIDENCE_MEDIA_ALREADY_COMPLETE",
+                "Completed Evidence media cannot receive more audio.",
+                status_code=409,
+            )
 
     def _seal_segment(
         self,
         spec: _MediaSpec,
         fence: EvidenceCommitFence,
         *,
+        capture_revision: int,
         content: bytes,
         first_frame_sequence: int,
         last_frame_sequence: int,
@@ -514,6 +681,7 @@ class DurableEvidenceMedia:
                         status_code=409,
                     )
                 self._require_matching_spec(stream, spec)
+                self._assert_writable_capture(stream, capture_revision)
                 ordinal = int(stream.get("last_sealed_ordinal", 0)) + 1
                 if first_frame_sequence != int(
                     stream.get("last_sealed_frame_sequence", 0)
@@ -589,7 +757,7 @@ class DurableEvidenceMedia:
             raise
 
     def _mark_complete(
-        self, spec: _MediaSpec, fence: EvidenceCommitFence
+        self, spec: _MediaSpec, fence: EvidenceCommitFence, capture_revision: int
     ) -> EvidenceMediaCheckpoint:
         stream_id = _stream_id(spec.interview_id, spec.turn_id)
         with self.persistence.transaction(self.organization_id) as transaction:
@@ -601,6 +769,7 @@ class DurableEvidenceMedia:
                     "Evidence media stream is not open.",
                     status_code=409,
                 )
+            self._assert_writable_capture(stream, capture_revision)
             if int(stream.get("last_sealed_ordinal", 0)) <= 0:
                 raise ApiError(
                     "EVIDENCE_MEDIA_NOT_RECOVERABLE",

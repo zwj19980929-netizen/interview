@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>本机流式音频时钟探针</title>
+  <style>
+    body { font: 16px system-ui, sans-serif; max-width: 1060px; margin: 32px auto; padding: 0 20px; color: #162a24; background: #f5f8f6; }
+    h1 { font-size: 26px; } p { line-height: 1.6; } button { font: inherit; padding: 12px 16px; border: 1px solid #206b53; border-radius: 7px; background: white; color: #16553f; cursor: pointer; margin: 5px; }
+    button:disabled { opacity: .5; cursor: default; } #status { margin: 16px 0; font-weight: 650; }
+    pre { background: #132922; color: #d6eee3; padding: 18px; border-radius: 9px; min-height: 260px; max-height: 60vh; overflow: auto; font-size: 13px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>本机流式音频时钟探针</h1>
+  <p>每次播放两秒低音量合成音（前半低、后半高）。不请求麦克风或摄像头、不读取历史数据、不调用外部语音服务、不录制。
+    请先降低扬声器音量。断供用例用于观察 MediaStream 时钟是否仍在补偿静音时推进；“完成”仅是当前模块回执，不代表准确同步已通过验收。</p>
+  <div>
+    <button data-mode="normal">开始：正常合成流</button>
+    <button data-mode="gap600">开始：中途停供 600ms</button>
+    <button data-mode="gap3000">开始：中途停供 3 秒</button>
+    <button id="stop" disabled>停止并清理</button>
+  </div>
+  <div id="status" role="status">就绪：仅连接本机探针</div>
+  <pre id="events" aria-label="合成音频播放事件"></pre>
+  <script type="module">
+    import { Room, RoomEvent, LogLevel, setLogLevel } from "livekit-client";
+    import { LiveSpeechPlayback } from "/web/src/features/candidate/live-speech-playback.js";
+
+    setLogLevel(LogLevel.silent);
+    const log = document.querySelector("#events");
+    const status = document.querySelector("#status");
+    const buttons = [...document.querySelectorAll("[data-mode]")];
+    const stop = document.querySelector("#stop");
+    let active = null;
+    // Only numeric diagnostics and fixed event names are exposed for inspection.
+    window.syntheticAudioProbeEvents = [];
+
+    function record(state, event, values = {}) {
+      if (active !== state) return;
+      const item = { event, elapsed_ms: Math.round((performance.now() - state.started) * 10) / 10 };
+      if (Number.isFinite(state.audio?.currentTime)) item.current_time = Math.round(state.audio.currentTime * 1000) / 1000;
+      for (const [name, value] of Object.entries(values)) {
+        if (["samples", "gap_ms", "server_ms", "concealed_samples", "silent_concealed_samples", "received_samples"].includes(name)
+          && typeof value === "number" && Number.isFinite(value)) item[name] = value;
+      }
+      window.syntheticAudioProbeEvents.push(item);
+      if (window.syntheticAudioProbeEvents.length > 500) window.syntheticAudioProbeEvents.shift();
+      log.textContent = window.syntheticAudioProbeEvents.map((value) => JSON.stringify(value)).join("\n");
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function send(state, message) {
+      if (active === state && state.ws?.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify(message));
+    }
+
+    function observation(state, event) {
+      send(state, { type: "observation", event, elapsed_ms: performance.now() - state.started,
+        current_time: Number.isFinite(state.audio?.currentTime) ? state.audio.currentTime : 0 });
+    }
+
+    async function cleanup(state, result) {
+      if (active !== state || state.cleaning) return;
+      state.cleaning = true;
+      record(state, "cleanup");
+      state.player.close();
+      clearInterval(state.timer);
+      try { await state.room?.disconnect(); } catch { /* no credential-bearing error messages */ }
+      try { state.ws?.close(); } catch { /* best effort */ }
+      if (active !== state) return;
+      active = null;
+      status.textContent = result;
+      buttons.forEach((button) => { button.disabled = false; });
+      stop.disabled = true;
+    }
+
+    async function start(mode) {
+      if (active) return;
+      if (location.origin !== "http://127.0.0.1:5178") {
+        status.textContent = "必须从指定的本机 Vite 地址打开此页面";
+        return;
+      }
+      buttons.forEach((button) => { button.disabled = true; });
+      stop.disabled = false;
+      window.syntheticAudioProbeEvents = [];
+      const state = { started: performance.now(), ws: null, room: null, player: null,
+        audio: null, track: null, binding: null, timer: null, statsBusy: false, cleaning: false };
+      active = state;
+      status.textContent = "运行中：仅播放本机合成音频";
+      state.player = new LiveSpeechPlayback({ audioFactory: () => {
+        const audio = new Audio();
+        state.audio = audio;
+        for (const event of ["play", "playing", "timeupdate", "waiting", "stalled", "pause", "ended", "error"]) {
+          audio.addEventListener(event, () => record(state, "audio_" + event));
+        }
+        return audio;
+      } });
+      record(state, "begin");
+      const ws = new WebSocket("ws://127.0.0.1:5179/probe");
+      state.ws = ws;
+      ws.onopen = () => send(state, { type: "start", mode });
+      ws.onerror = () => { record(state, "control_error"); cleanup(state, "探针连接失败，已清理"); };
+      ws.onclose = () => cleanup(state, "探针连接已关闭，已清理");
+      ws.onmessage = async ({ data }) => {
+        if (active !== state || state.cleaning) return;
+        try {
+          const event = JSON.parse(data);
+          if (event.type === "room") {
+            const room = new Room({ adaptiveStream: true, dynacast: true });
+            state.room = room;
+            room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
+              if (active !== state || state.cleaning) return;
+              record(state, "track_subscribed");
+              state.track = track;
+              state.player.trackSubscribed(track, publication, participant);
+            });
+            room.on(RoomEvent.TrackUnsubscribed, (track) => {
+              record(state, "track_unsubscribed");
+              state.player.trackUnsubscribed(track);
+            });
+            await room.connect(event.url, event.participant_token, { autoSubscribe: true });
+            if (active !== state || state.cleaning) { await room.disconnect(); return; }
+            record(state, "room_connected");
+            send(state, { type: "connected" });
+          } else if (event.type === "started") {
+            record(state, "started");
+            state.binding = event.performance;
+            const identity = { performance_id: event.performance.performance_id,
+              output_id: event.performance.live_audio.output_id };
+            state.player.begin(event.performance, {
+              onReady: () => { record(state, "ready"); send(state, { type: "ready", ...identity }); },
+              onPlaying: () => { record(state, "playing"); observation(state, "playing"); },
+              onFinished: () => { record(state, "drained"); observation(state, "drained"); send(state, { type: "drained", ...identity }); },
+              onError: (error) => {
+                const message = String(error?.message || "");
+                const kind = message.includes("等待音频时仍推进") ? "clock_advanced_while_waiting"
+                  : message.includes("时钟无效或倒退") ? "invalid_clock"
+                  : message.includes("未形成可靠播放进度") ? "clock_timeout" : "playback_error";
+                record(state, kind); observation(state, "failed");
+                cleanup(state, "播放未能安全确认，已停止；查看事件记录");
+              },
+            });
+          } else if (event.type === "producer_finished") {
+            record(state, "producer_finished", event);
+            observation(state, "eof");
+            state.player.producerFinished(event.payload);
+          } else if (event.type === "gap_started" || event.type === "gap_finished") {
+            record(state, event.type, event);
+          } else if (event.type === "complete") {
+            record(state, "complete", event);
+            cleanup(state, "本轮完成并清理；请比较时钟与停供区间，不代表同步验收通过");
+          } else if (event.type === "probe_failed") {
+            record(state, "server_failed"); cleanup(state, "服务器探针结束，已清理");
+          }
+        } catch {
+          record(state, "probe_protocol_or_media_error");
+          cleanup(state, "探针协议或媒体失败，已清理");
+        }
+      };
+      state.timer = setInterval(async () => {
+        if (active !== state || state.cleaning) return;
+        record(state, "clock_sample");
+        if (!state.track?.getRTCStatsReport || state.statsBusy) return;
+        state.statsBusy = true;
+        try {
+          const report = await state.track.getRTCStatsReport();
+          for (const item of report?.values() || []) {
+            if (item.type === "inbound-rtp" && (item.kind === "audio" || item.mediaType === "audio")) {
+              record(state, "rtc_samples", { concealed_samples: item.concealedSamples,
+                silent_concealed_samples: item.silentConcealedSamples, received_samples: item.totalSamplesReceived });
+            }
+          }
+        } catch { record(state, "rtc_stats_unavailable"); }
+        finally { state.statsBusy = false; }
+      }, 200);
+    }
+    buttons.forEach((button) => button.addEventListener("click", () => start(button.dataset.mode)));
+    stop.addEventListener("click", () => { if (active) cleanup(active, "已手动停止并清理"); });
+    window.addEventListener("pagehide", () => { if (active) cleanup(active, "页面关闭"); });
+  </script>
+</body>
+</html>

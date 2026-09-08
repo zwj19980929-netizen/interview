@@ -5,10 +5,12 @@ from __future__ import annotations
 import math
 import threading
 from collections import defaultdict, deque
-from typing import Deque, Dict
+from contextlib import contextmanager
+from time import perf_counter
+from typing import Callable, Deque, Dict, Iterator
 
 
-INTERVIEW_AGENT_METRICS = frozenset(
+CANDIDATE_INTERVIEW_AGENT_METRICS = frozenset(
     {
         "local_microphone_feedback_ms",
         "server_audio_confirmation_ms",
@@ -21,6 +23,39 @@ INTERVIEW_AGENT_METRICS = frozenset(
         "avatar_viseme_drift_ms",
         "avatar_freeze_ms",
     }
+)
+
+INTERVIEW_AGENT_STAGE_METRICS = frozenset(
+    {
+        "stt_snapshot_ms",
+        "stt_final_ms",
+        "understanding_prepare_ms",
+        "decision_commit_ms",
+        "turn_detector_ms",
+        "tts_synthesis_ms",
+        "tts_asset_import_ms",
+        "tts_stream_open_ms",
+        "tts_first_pcm_ms",
+        "tts_playback_ready_ms",
+        "tts_remote_drain_ms",
+    }
+)
+
+INTERNAL_INTERVIEW_AGENT_METRICS = INTERVIEW_AGENT_STAGE_METRICS | frozenset(
+    {
+        "evidence_owner_renew_scheduler_lag_ms",
+        "evidence_owner_renew_db_latency_ms",
+        "evidence_owner_renew_success",
+        "turn_decision_cancelled",
+        "stt_recognition_opened",
+        "stt_recognition_finished",
+        "stt_preview_prepared",
+        "stt_preview_final_revised",
+    }
+)
+
+INTERVIEW_AGENT_METRICS = (
+    CANDIDATE_INTERVIEW_AGENT_METRICS | INTERNAL_INTERVIEW_AGENT_METRICS
 )
 
 
@@ -74,3 +109,45 @@ _METRICS = InterviewAgentMetrics()
 
 def interview_agent_metrics() -> InterviewAgentMetrics:
     return _METRICS
+
+
+def observe_interview_agent_metric(name: str, value: float) -> None:
+    """Best-effort internal observations can never change interview outcomes."""
+
+    try:
+        interview_agent_metrics().observe(name, value)
+    except Exception:
+        # No dynamic labels, exception messages, provider text or identifiers.
+        # Telemetry failure must not mask the original failure or cancellation.
+        pass
+
+
+@contextmanager
+def measure_interview_agent_stage(
+    name: str,
+    *,
+    time_source: Callable[[], float] = perf_counter,
+) -> Iterator[None]:
+    """Measure one awaited stage, including failed/cancelled attempts.
+
+    This synchronous context manager intentionally spans ``await`` without
+    scheduling another task. It only records a bounded, fixed-vocabulary
+    duration; it cannot prolong a critical path or turn an error into success.
+    Counter names and client-supplied names are not valid stage durations.
+    """
+
+    started = None
+    if name in INTERVIEW_AGENT_STAGE_METRICS:
+        try:
+            started = time_source()
+        except Exception:
+            pass
+    try:
+        yield
+    finally:
+        if started is not None:
+            try:
+                elapsed_ms = max(0.0, (time_source() - started) * 1000)
+                observe_interview_agent_metric(name, elapsed_ms)
+            except Exception:
+                pass

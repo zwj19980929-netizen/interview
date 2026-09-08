@@ -70,42 +70,67 @@ function InterviewList() {
 }
 
 function AppointmentForm({ data, request, API, onDone }) {
+  const submitting = useRef(false);
+  const savedAppointment = useRef(null);
+  const completedResult = useRef(null);
+  const [phase, setPhase] = useState(null);
   const approved = data.plans.filter(
     (item) => item.status === "approved" && item.candidate_profile_id && item.job_position_id,
   );
   return <ModalForm
     submitLabel="创建预约并生成邀请"
     onSubmit={async (form) => {
+      if (submitting.current) return;
       const plan = approved.find((item) => item.id === form.get("plan_id"));
       const start = new Date(form.get("scheduled_start_at"));
       const end = new Date(form.get("scheduled_end_at"));
       if (!plan || start >= end) throw new Error("请选择计划并确保结束时间晚于开始时间");
-      const result = await createAppointmentAndInvite({
-        createAppointment: () => request(`${API}/interview-appointments`, {
-          method: "POST",
-          body: {
-            plan_id: plan.id,
-            candidate_profile_id: plan.candidate_profile_id,
-            job_position_id: plan.job_position_id,
-            scheduled_start_at: start.toISOString(),
-            scheduled_end_at: end.toISOString(),
-            settings: {
-              record_audio: true,
-              record_video: form.get("record_video") === "on",
-              avatar_mode: form.get("avatar_mode"),
-              speech_dialogue_mode: form.get("speech_dialogue_mode"),
-              avatar_id: "avatar_default_cn",
-            },
+      submitting.current = true;
+      try {
+        const result = completedResult.current || await createAppointmentAndInvite({
+          createAppointment: async () => {
+            if (savedAppointment.current) return savedAppointment.current;
+            setPhase("saving");
+            const appointment = await request(`${API}/interview-appointments`, {
+              method: "POST",
+              body: {
+                plan_id: plan.id,
+                candidate_profile_id: plan.candidate_profile_id,
+                job_position_id: plan.job_position_id,
+                scheduled_start_at: start.toISOString(),
+                scheduled_end_at: end.toISOString(),
+                settings: {
+                  record_audio: true,
+                  record_video: form.get("record_video") === "on",
+                  avatar_mode: form.get("avatar_mode"),
+                  speech_dialogue_mode: form.get("speech_dialogue_mode"),
+                  avatar_id: "avatar_default_cn",
+                },
+              },
+            });
+            savedAppointment.current = appointment;
+            return appointment;
           },
-        }),
-        issueInvitation: (appointment) => request(
-          `${API}/interview-appointments/${appointment.id}/invite`,
-          { method: "POST", body: { expires_at: end.toISOString() } },
-        ),
-      });
-      await onDone(result);
+          issueInvitation: (appointment) => {
+            setPhase("checking");
+            return request(
+              `${API}/interview-appointments/${appointment.id}/invite`,
+              { method: "POST", body: { expires_at: appointment.scheduled_end_at || end.toISOString() }, timeoutMs: 40000 },
+            );
+          },
+        });
+        if (result.invitation) completedResult.current = result;
+        await onDone(result);
+      } finally {
+        submitting.current = false;
+        setPhase(null);
+      }
     }}
   >
+    {phase && <p className="form-hint field-full" role="status">{phase === "checking"
+      ? "预约已保存，正在检查模型服务并生成邀请，可能需要约 30 秒，请勿重复提交。"
+      : "正在保存预约…"}</p>}
+    {savedAppointment.current && !phase && <p className="form-hint field-full">预约已保存，重试不会重复创建预约。</p>}
     <Field label="可用计划" full>
       <select className="form-select" name="plan_id">
         {approved.map((plan) => <option key={plan.id} value={plan.id}>
@@ -148,20 +173,29 @@ function AppointmentForm({ data, request, API, onDone }) {
 
 function RetryInvite({ appointment }) {
   const { API, request, openModal, toast } = useWorkbench();
+  const pending = useRef(false);
+  const [busy, setBusy] = useState(false);
   const retry = async () => {
+    if (pending.current) return;
+    pending.current = true;
+    setBusy(true);
     try {
       const invitation = await request(
         `${API}/interview-appointments/${appointment.id}/invite`,
-        { method: "POST", body: { expires_at: appointment.scheduled_end_at } },
+        { method: "POST", body: { expires_at: appointment.scheduled_end_at }, timeoutMs: 40000 },
       );
       openModal({ title: "候选人邀请", body: <InvitationLink invitation={invitation} /> });
     } catch (error) {
       toast("邀请仍未就绪", error.message, "error");
+    } finally {
+      pending.current = false;
+      setBusy(false);
     }
   };
   return <div>
     <p>预约已经安全保存，不会重复创建。readiness 就绪后可重试。</p>
-    <button className="button button-primary" onClick={retry}>重试签发邀请</button>
+    {busy && <p role="status">正在检查模型服务并签发邀请，可能需要约 30 秒，请勿重复点击。</p>}
+    <button className="button button-primary" disabled={busy} onClick={retry}>{busy ? "正在检查模型服务…" : "重试签发邀请"}</button>
   </div>;
 }
 

@@ -3,6 +3,36 @@ import { describe, expect, it, vi } from "vitest";
 import { createSpeechActivityDetector } from "./audio-worklet-capture.js";
 
 describe("candidate AudioWorklet speech activity detector", () => {
+  it("requires sustained amplitude and rejects low background and brief peaks", () => {
+    const onSpeechStarted = vi.fn();
+    const detector = createSpeechActivityDetector({ onSpeechStarted });
+    for (let i = 0; i < 1000; i++) detector.observe({ rms: 0.003, durationMs: 10 });
+    for (let i = 0; i < 10; i++) {
+      detector.observe({ rms: 0.08, durationMs: 20 });
+      detector.observe({ rms: 0.001, durationMs: 20 });
+    }
+    expect(onSpeechStarted).not.toHaveBeenCalled();
+    for (let i = 0; i < 12; i++) detector.observe({ rms: 0.008, durationMs: 10 });
+    expect(onSpeechStarted).toHaveBeenCalledOnce();
+  });
+  it("keeps natural sub-second pauses inside one utterance by default", () => {
+    const onSpeechStarted = vi.fn();
+    const onSpeechStopped = vi.fn();
+    const detector = createSpeechActivityDetector({ onSpeechStarted, onSpeechStopped });
+
+    for (let index = 0; index < 12; index += 1) {
+      detector.observe({ rms: 0.03, durationMs: 10 });
+    }
+    for (let index = 0; index < 79; index += 1) {
+      detector.observe({ rms: 0, durationMs: 10 });
+    }
+    expect(onSpeechStarted).toHaveBeenCalledOnce();
+    expect(onSpeechStopped).not.toHaveBeenCalled();
+
+    detector.observe({ rms: 0, durationMs: 10 });
+    expect(onSpeechStopped).toHaveBeenCalledOnce();
+  });
+
   it("uses sustained audio time instead of render-frame counts", () => {
     const onSpeechStarted = vi.fn();
     const onSpeechStopped = vi.fn();

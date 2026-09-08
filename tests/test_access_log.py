@@ -1,9 +1,29 @@
 import logging
 
 from app.core.access_log import (
+    SensitiveMediaLogFilter,
     SensitiveQueryAccessLogFilter,
+    install_sensitive_access_log_filter,
     redact_sensitive_query,
 )
+
+
+def test_native_media_error_retains_failure_category_but_not_jwt():
+    synthetic = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzeW50aGV0aWMifQ.synthetic_signature"
+    record = logging.LogRecord("livekit", logging.ERROR, __file__, 1,
+                              "%s: invalid token: %s, token is not valid yet", ("room", synthetic), None)
+    assert SensitiveMediaLogFilter().filter(record)
+    assert synthetic not in record.getMessage()
+    assert "[REDACTED_JWT]" in record.getMessage()
+    assert "token is not valid yet" in record.getMessage()
+    assert not record.args
+
+
+def test_media_log_redaction_install_is_idempotent():
+    install_sensitive_access_log_filter()
+    install_sensitive_access_log_filter()
+    assert sum(isinstance(item, SensitiveMediaLogFilter)
+               for item in logging.getLogger("livekit").filters) == 1
 
 
 def test_sensitive_query_values_are_redacted_without_losing_route_context() -> None:

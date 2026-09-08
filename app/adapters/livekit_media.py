@@ -12,6 +12,7 @@ import hmac
 import importlib.util
 import json
 import os
+import re
 import time
 from copy import deepcopy
 from dataclasses import dataclass
@@ -71,6 +72,7 @@ class LiveKitConfiguration:
     authoritative_ingress_grace_seconds: int = 30
     authoritative_ingress_lease_seconds: int = 15
     authoritative_ingress_renew_seconds: int = 5
+    authoritative_ingress_backpressure_seconds: int = 5
     runtime_environment: str = "development"
     local_media_enabled: bool = False
     recording_storage_backend: str = "aliyun_oss"
@@ -139,6 +141,12 @@ class LiveKitConfiguration:
                 default=5,
                 minimum=1,
                 maximum=40,
+            ),
+            authoritative_ingress_backpressure_seconds=_bounded_env_int(
+                "INTERVIEWER_LIVEKIT_INGRESS_BACKPRESSURE_SECONDS",
+                default=5,
+                minimum=2,
+                maximum=30,
             ),
             runtime_environment=runtime_environment,
             local_media_enabled=local_media_enabled,
@@ -351,6 +359,43 @@ class LiveKitMediaPlane:
             },
         }
         return self._jwt(payload)
+
+    def issue_audio_publisher_token(
+        self,
+        *,
+        room_name: str,
+        performance_id: str,
+        ttl_seconds: int = 90,
+    ) -> str:
+        """One approved expression's audio-only, non-subscribing room grant.
+
+        The identity is derived here, never supplied by a browser. Approval
+        and ownership remain the caller's domain responsibility; this grant
+        deliberately cannot publish camera/data or subscribe to candidates.
+        """
+        self.require_ready(recording=False)
+        if not isinstance(room_name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,254}", room_name):
+            raise ValueError("Publisher room name must be an exact server-issued room identifier")
+        if not isinstance(performance_id, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", performance_id):
+            raise ValueError("Publisher performance ID must be a server-issued identifier")
+        identity = "expression:%s" % performance_id
+        now = int(time.time())
+        return self._jwt({
+            "iss": self.configuration.api_key,
+            "sub": identity,
+            "name": identity,
+            "nbf": now - 5,
+            "exp": now + max(30, min(int(ttl_seconds), 300)),
+            "metadata": json.dumps({"role": "approved_expression"}, separators=(",", ":")),
+            "video": {
+                "roomJoin": True,
+                "room": room_name,
+                "canPublish": True,
+                "canSubscribe": False,
+                "canPublishData": False,
+                "canPublishSources": ["microphone"],
+            },
+        })
 
     async def start_participant_egress(
         self,

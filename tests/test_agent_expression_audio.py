@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from app.core.errors import ApiError
@@ -120,3 +122,53 @@ def test_production_expression_store_deletes_object_if_encryption_is_unverified(
     assert len(storage.deleted) == 1
     with persistence_for(store).transaction("org_default") as transaction:
         assert transaction.file_objects.list() == []
+
+
+@pytest.mark.anyio
+async def test_cancelled_tts_import_does_not_create_private_audio_or_ready_file() -> None:
+    """A superseded decision must cancel its download before materialization."""
+
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    class SlowImporter:
+        max_bytes = 20 * 1024 * 1024
+
+        async def audio(self, uri, content_type):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+    store = InMemoryStore()
+    _interview(store, "iv_expression_cancelled")
+    storage = _Storage()
+    service = AgentExpressionAudioService(
+        persistence_for(store), storage=storage, importer=SlowImporter()
+    )
+    task = asyncio.create_task(
+        service.import_tts(
+            organization_id="org_default",
+            interview_id="iv_expression_cancelled",
+            turn_id="turn_1",
+            audio_uri="https://unused.example.test/approved.wav",
+            content_type="audio/wav",
+            duration_ms=1000,
+            provider_id="test_provider",
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert cancelled.is_set()
+    assert storage.values == {}
+    assert storage.deleted == []
+    with persistence_for(store).transaction("org_default") as transaction:
+        assert transaction.file_objects.list() == []
+        session = transaction.interview_sessions.get("iv_expression_cancelled")
+        assert session["status"] == "in_progress"
+        assert session["agent_events"] == []
+        assert session["agent_runtime"] == {}

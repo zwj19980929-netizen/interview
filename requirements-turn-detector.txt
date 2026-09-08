@@ -1,0 +1,4 @@
+# Install in a separate Python 3.12 venv; never upgrade the API runtime.
+# Wheel code: Apache-2.0; bundled model: LicenseRef-LiveKit-Model.
+livekit-local-inference==0.2.7
+numpy==2.2.6

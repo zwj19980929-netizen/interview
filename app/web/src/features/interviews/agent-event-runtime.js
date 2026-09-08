@@ -18,6 +18,8 @@ export const STABLE_AGENT_EVENT_TYPES = Object.freeze([
   "transcript.final",
   "conversation.act.selected",
   "avatar.performance.started",
+  "avatar.performance.playback",
+  "avatar.performance.producer_finished",
   "avatar.performance.cue",
   "avatar.performance.interrupted",
   "avatar.performance.stopped",
@@ -39,10 +41,11 @@ const GESTURES = new Set([
   "listen", "think", "interrupt", "farewell",
 ]);
 const ALIGNMENT_SOURCES = new Set(["provider_timestamp", "g2p_estimate"]);
-const EXPRESSION_DELIVERIES = new Set(["pre_generated", "cascade", "s2s"]);
+const EXPRESSION_DELIVERIES = new Set(["pre_generated", "cascade", "s2s", "streaming_tts"]);
 
 const BASE_PAYLOAD_KEYS = Object.freeze({
-  "floor.changed": ["owner", "reason"],
+  "avatar.performance.playback": ["performance_id", "status"],
+  "floor.changed": ["owner", "reason", "capture_id"],
   "speech.started": [
     "speaker", "continued", "local_detected", "server_audio_received",
     "server_received_at", "acknowledged_audio_sequence", "audio_epoch",
@@ -57,15 +60,16 @@ const BASE_PAYLOAD_KEYS = Object.freeze({
   "conversation.act.selected": ["act_id", "act_type", "text", "evaluative", "approved"],
   "avatar.performance.started": [
     "performance_id", "turn_id", "audio_uri", "audio_clock_origin_ms",
-    "text", "visemes", "gestures", "alignment_source", "delivery", "interruptible",
+    "text", "visemes", "gestures", "alignment_source", "delivery", "interruptible", "live_audio",
   ],
+  "avatar.performance.producer_finished": ["performance_id", "output_id", "total_samples", "sample_rate_hz"],
   "avatar.performance.cue": [
     "performance_id", "at_ms", "duration_ms", "shape", "weight", "gesture", "intensity",
   ],
   "avatar.performance.interrupted": ["performance_id", "reason", "deadline_ms"],
-  "avatar.performance.stopped": ["performance_id", "reason"],
+  "avatar.performance.stopped": ["performance_id", "output_id", "reason"],
   "takeover.changed": ["status", "expires_at", "version", "ai_resumed"],
-  problem: ["code", "message", "recoverable", "action", "calibration"],
+  problem: ["code", "message", "recoverable", "action", "calibration", "capture_id"],
   completed: [
     "interview_id", "status", "submitted_at", "recording_retention_notice", "human_review_required",
   ],
@@ -83,7 +87,9 @@ const ENTERPRISE_PAYLOAD_EXTENSIONS = Object.freeze({
 const CANDIDATE_SNAPSHOT_KEYS = Object.freeze([
   "interview_id", "status", "phase", "current_turn_id", "floor", "takeover",
   "calibration_status", "calibration_retry_required", "recording",
-  "current_question", "completed_answers", "total_primary_questions",
+  "current_question", "completed_answers", "total_primary_questions", "active_performance_id",
+  "capture_recovery",
+  "supplement_confirmation",
 ]);
 
 const ENTERPRISE_SNAPSHOT_KEYS = Object.freeze([
@@ -138,6 +144,10 @@ export function validateAgentEvent(value, { audience = "candidate" } = {}) {
   }
   const payloadResult = validatePayload(value.type, value.payload, audience);
   if (!payloadResult.ok) return payloadResult;
+  if ((value.type === "floor.changed" && ["answer_recovering", "answer_retry_required"].includes(value.payload.reason))
+    || (value.type === "problem" && ["CAPTURE_RECOVERING", "CAPTURE_RETRY_REQUIRED"].includes(value.payload.code))) {
+    if (!scopeId(value.turn_id) || !scopeId(value.payload.capture_id)) return invalidPayload(value.type);
+  }
   return { ok: true, event: value };
 }
 
@@ -225,6 +235,9 @@ function validatePayload(type, payload, audience) {
   switch (type) {
     case "floor.changed":
       return FLOOR_OWNERS.has(payload.owner) && optionalString(payload.reason, 256)
+        && optionalString(payload.capture_id, 128)
+        && (payload.reason !== "answer_recovering" || payload.owner === "candidate")
+        && (payload.reason !== "answer_retry_required" || payload.owner === "none")
         ? valid() : invalidPayload(type);
     case "speech.started":
       return SPEAKERS.has(payload.speaker)
@@ -259,6 +272,16 @@ function validatePayload(type, payload, audience) {
         ? valid() : invalidPayload(type);
     case "avatar.performance.started":
       return validatePerformance(payload) ? valid() : invalidPayload(type);
+    case "avatar.performance.playback":
+      return boundedString(payload.performance_id, 1, 128)
+        && ["playing", "blocked", "failed", "buffering"].includes(payload.status)
+        ? valid() : invalidPayload(type);
+    case "avatar.performance.producer_finished":
+      return boundedString(payload.performance_id, 1, 128)
+        && boundedString(payload.output_id, 1, 128)
+        && payload.sample_rate_hz === 24_000
+        && positiveInteger(payload.total_samples, 24_000 * 600)
+        ? valid() : invalidPayload(type);
     case "avatar.performance.cue":
       return boundedString(payload.performance_id, 1, 128)
         && nonNegativeInteger(payload.at_ms)
@@ -275,6 +298,7 @@ function validatePayload(type, payload, audience) {
         ? valid() : invalidPayload(type);
     case "avatar.performance.stopped":
       return optionalString(payload.performance_id, 128)
+        && optionalString(payload.output_id, 128)
         && optionalString(payload.reason, 256)
         ? valid() : invalidPayload(type);
     case "takeover.changed":
@@ -295,6 +319,9 @@ function validatePayload(type, payload, audience) {
         && boundedString(payload.message, 1, 1_000)
         && typeof payload.recoverable === "boolean"
         && optionalString(payload.action, 128)
+        && optionalString(payload.capture_id, 128)
+        && (payload.code !== "CAPTURE_RECOVERING" || (payload.recoverable === true && payload.action === "continue_listening"))
+        && (payload.code !== "CAPTURE_RETRY_REQUIRED" || (payload.recoverable === true && payload.action === "retry_answer"))
         && optionalBooleanFields(payload, ["calibration"])
         ? valid() : invalidPayload(type);
     case "completed":
@@ -316,6 +343,7 @@ function validateSnapshot(payload, audience) {
     || !boundedString(payload.status, 1, 64)
     || !optionalString(payload.phase, 64)
     || !optionalString(payload.current_turn_id, 128)
+    || !optionalString(payload.active_performance_id, 128)
     || !FLOOR_OWNERS.has(payload.floor)
     || !boundedString(payload.calibration_status, 1, 64)
     || !optionalBooleanFields(payload, ["calibration_retry_required"])
@@ -325,7 +353,9 @@ function validateSnapshot(payload, audience) {
   }
   if (!validateRecording(payload.recording)
     || !validateCurrentQuestion(payload.current_question)
-    || !validateTakeover(payload.takeover, audience)) {
+    || !validateTakeover(payload.takeover, audience)
+    || !validateCaptureRecovery(payload.capture_recovery, payload)
+    || !validateSupplementConfirmation(payload.supplement_confirmation, payload)) {
     return invalidPayload("session.snapshot");
   }
   if (audience === "enterprise") {
@@ -339,11 +369,39 @@ function validateSnapshot(payload, audience) {
   return valid();
 }
 
+function scopeId(value) {
+  return boundedString(value, 1, 128) && /^[A-Za-z0-9_-]+$/.test(value);
+}
+
+function validateSupplementConfirmation(value, snapshot) {
+  if (value == null) return true;
+  return isPlainObject(value) && hasExactKeys(value, ["status", "turn_id", "capture_id"])
+    && ["listening", "awaiting_reply"].includes(value.status)
+    && scopeId(value.turn_id) && scopeId(value.capture_id)
+    && value.turn_id === snapshot.current_turn_id;
+}
+
+function validateCaptureRecovery(value, snapshot) {
+  if (value == null) return true;
+  return isPlainObject(value)
+    && hasExactKeys(value, ["status", "turn_id", "capture_id", "attempt", "max_attempts"])
+    && ["recovering", "retry_required"].includes(value.status)
+    && scopeId(value.turn_id) && scopeId(value.capture_id)
+    && value.turn_id === snapshot.current_turn_id
+    && value.turn_id === snapshot.current_question?.turn_id
+    && Number.isSafeInteger(value.attempt) && value.attempt >= 0
+    && value.max_attempts === 3 && value.attempt <= value.max_attempts;
+}
+
 function validatePerformance(payload) {
+  const live = payload.delivery === "streaming_tts";
+  const validAudio = live
+    ? payload.audio_uri === null && validateLiveAudio(payload.live_audio)
+    : boundedString(payload.audio_uri, 1, 2_048) && safeAudioUri(payload.audio_uri)
+      && (payload.live_audio === undefined || payload.live_audio === null);
   if (!boundedString(payload.performance_id, 1, 128)
     || !optionalString(payload.turn_id, 128)
-    || !boundedString(payload.audio_uri, 1, 2_048)
-    || !safeAudioUri(payload.audio_uri)
+    || !validAudio
     || !nonNegativeInteger(payload.audio_clock_origin_ms)
     || !boundedString(payload.text, 1, 1_200)
     || !ALIGNMENT_SOURCES.has(payload.alignment_source)
@@ -370,6 +428,16 @@ function validatePerformance(payload) {
     previousAt = cue.at_ms;
   }
   return true;
+}
+
+function validateLiveAudio(value) {
+  return isPlainObject(value)
+    && hasExactKeys(value, ["output_id", "publisher_identity", "track_sid", "track_name", "sample_rate_hz", "channels"])
+    && boundedString(value.output_id, 1, 128)
+    && boundedString(value.publisher_identity, 1, 160)
+    && boundedString(value.track_sid, 1, 128)
+    && boundedString(value.track_name, 1, 128)
+    && value.sample_rate_hz === 24_000 && value.channels === 1;
 }
 
 function validateRecording(value) {

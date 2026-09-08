@@ -1,5 +1,53 @@
 # 数据库与向量存储设计
 
+## 未作答响应的数据影响（023）
+
+无DDL、表或旧数据迁移。answer_declined保存在现有TurnUnderstanding；非空权威原文、录音、utterance_id和understanding_id仍由CandidateAnswer引用。正常答案事务及Outbox产生评分revision，model_info记录declined_answer.v1及对应理解引用；混合证据保留全部审计ID而不把未作答发言当技术证据。历史会话和评分不回写、不补造提交。
+
+## 本次识别修复的数据影响（019）
+
+无 DDL、持久表、向量策略、候选答案或旧评分迁移。补送重放使用同一已录 PCM，保存顺序与字节数不变；新到音频仍只录一次。来源诊断写入服务日志且仅含文本散列、长度、时间和会话/流身份，不增加原始敏感转写日志。iv_01b96d6b40314e2f 的旧录音/事故状态保留，不用诊断或合成测试补写答案。
+
+## 018：持有final时继续保留PCM
+
+无DDL及历史数据修订。确认回复的server final、声学活动水位及待定起音仅属于当前owner进程；已确认识别主动暂停期间仍按序接收PCM，并沿用原私有分段持久化与唯一录音。准备窗口临时PCM最多60秒，异常恢复仍30秒；超限继续失败关闭而非丢帧。新有声后缀或缺失ASR final仍阻止封存complete；仅受确认规则判作非语音的后缀可随已有final封存，波形本身完整保留。
+
+## 016：确认投影与请求诊断
+
+沿用JSON文档，无新表/索引/DDL。agent_runtime.supplement_confirmation仅持久安全状态和turn/capture绑定，原文边界保留在当前owner进程；新采集清除旧确认，不迁移或自动恢复历史paused会话。补充询问不complete录音、不产生答案/评分；整个回答及口头控制交谈保存在同一私有录音/累计权威final。ModelInvocationLog增加可空http_status、固定rejection_category和白名单实时prompt_version；不保存HTTP错误正文。历史空字段保持兼容。
+
+## 稳定预览不等于完整证据（015，仓库verified）
+
+StableTranscriptPreview/PreparedTurnDecision仅进程内保存，预计算前沿用当前capture的 `seal(complete=false)` 封存录音前缀，不创建权威Utterance、CandidateAnswer或评分任务。PCM仍只记录一次，音频接受/本地发送水位不当作厂商处理ACK；最终final/输入fence/上下文及完整证据事务保持原约束。无DDL、数据迁移或历史证据修改。
+
+## 采集恢复与同题重答（CONTINUOUS-CAPTURE-RECOVERY-014）
+
+沿用InterviewSession.agent_runtime的JSON保存capture_recovery（status/turn_id/capture_id/attempt/max_attempts、内部安全cause_code/stage/capture_revision）；候选投影仅前五字段。识别恢复不推进媒体capture_revision，不重复写PCM；耗尽seal complete=false，保留现有私有片段，不创建答案/评分。
+
+`prepare_candidate_retry` 在同一租户短事务内验证owner且ownership_id属于目标interview、in_progress/当前未回答题/无active接管，以及持久retry_required与capture_id/媒体revision。旧prefix元数据进入abandoned_captures，原segments仍保留；advance与session.retry_capture_revision原子写入。失败open再试复用已准备的新revision，不重复归档；新代已有完整证据/答案不得重置。同题重答不混合旧片段。Memory和SQLite包含并发/CAS回滚验收，无DDL，不删除或恢复历史会话。
+
+## 路由探针所有权（ROUTE-READINESS-REFRESH-013）
+
+复用 ModelRoute 的 versioned JSON 文档保存健康证据、配置指纹和短期探针租约，不新增表/DDL。领取与完成各使用短事务/CAS，外部模型调用期间不持有事务。不同实例只在租约可取得时发探针，晚回包必须验证租约标识和当前配置。租约到期允许安全接管，失败冷却限制请求风暴；不把进程内锁当作跨实例保证。
+
+配置指纹不包含明文凭据；模型/连接配置 revision 与路由目标/策略用于绑定。健康探测不增加 configuration_revision。管理员列表只返回安全 readiness 投影，不返回租约秘密或原始 Provider 异常；历史候选人、预约状态和评分数据不由本刷新修改。
+
+## INTERRUPTIBLE-AUTOMATIC-TURNS-012 持久化约束
+
+流式表达复用私有 FileObject：只归档唯一有效 final 的完整 PCM/WAV，source_type=approved_streaming_tts，
+不保存 PCM 到 AgentEvent/Redis、不保存 Provider URL。`agent_runtime.active_output_id/active_expression_act_event_id`
+绑定当前输出和批准事实，清除 active 时同步清除；控制断线把批准事件引用置入 `expression_replay_act_event_id`，
+新控制连接校验当前题/最后批准/status 后以新输出重播或丢弃标记。所有变更沿用短 JSON 聚合事务/CAS，无 DDL。
+客户端只看到 opaque active_performance_id，不获得内部重播引用、owner、凭据或存储 key。
+
+正式语音句段 final/理解准备只能 seal `complete=false` 的私有 Evidence 前缀，收音期间仍使用同一 stream/capture_revision；按字节水位拼接分段时间，轮换缓冲/缺 final 重放不能重复写录音。仅通过当前 final、决策上下文与输入 fence 后才 seal complete 并提交唯一答案。journal 增加内部 prepared_turn 的 proposal_id/capture_id 白名单，禁止持久化模型输出或音频；该进程提案丢失不能按引用猜造答案。无 DDL，沿用原 JSON 聚合、事务/CAS、owner/media fence 与留存规则。011 的强制 explicit 才 seal 语义由此替代。
+
+## TURN-COMPLETION-UNDERSTANDING-011 持久化约束
+
+正式静音不再 enqueue 自动 seal；候选人显式 finish 仍通过 EvidenceCommandJournal、drain、封存 checkpoint 与当前 fence。正在开放新采集时拒绝旧 capture 的显式完成；owner 丢失后无开放流的未知 receipt 仍允许按既有完整 checkpoint 恢复，不能因旧 process-local capture ID 不在内存而静默丢弃修复。处理阶段持久 Floor=none、reason=answer_processing，客户端不得据旧 candidate 快照提前重开。
+
+TurnUnderstanding 新写入 prompt_version=v2，历史 v1 可读；内部 UnderstandingProblem 的 reason_code/attempts 随原 JSON 领域记录持久化，无新表/DDL。E/P 编号只属于单次冻结模型请求，还原的原文证据保持 canonical 存储，不保存非法模型输出。模型返回 JSON schema 成功并不证明领域内容已合格；内容失败另记录固定类别日志，不能包含转写/Prompt/凭据。原事故的录音、utterance、答案和 paused 状态不由本修复修改。
+
 本文记录当前本地存储实现，以及岗位题库、简历库、预约、题目语音、服务端 STT 和企业复核迁移到 PostgreSQL 的目标边界。向量存储是可选优化，不是正式面试主链路依赖。
 
 ## 当前决策
@@ -102,6 +150,8 @@ migrations/001_postgresql_persistence.sql
 PostgreSQL 首版迁移采用受约束 JSONB documents，以保持现有聚合事务语义，并增加 `(organization_id, idempotency_key)` Outbox 唯一约束、预约单会话唯一索引、选择槽位唯一检查、Provider 凭证复合主键和全部表的强制 RLS。显式迁移入口使用事务级 advisory lock；本机隔离 PostgreSQL 16 已验证非 owner runtime role 的跨租户读写、事务回滚、CAS、Outbox/预约约束和题库索引 `EXPLAIN`。它是可运行 adapter，不等同于下文完全规范化关系表的最终形态；目标生产集群仍必须重复迁移、并发和查询计划验收。
 
 SQLite 当前用通用 JSON documents 表保存业务对象。`InterviewSession` 以单一聚合文档保存候选人、计划/题目快照、轮次、回答、评分/报告 revision、中断上下文和生命周期事件。生命周期命令产生的聚合、领域事件和 Outbox 工作项原子提交；这属于带事件日志的状态持久化，不是完整 event sourcing。
+
+SQLite 事务中的 get/list/CAS 始终直接读取当前连接，数据库是提交与并发真相。提交成功后 adapter 只把本事务实际更新/删除的 document、Outbox、Provider secret 和 model invocation 深拷贝到同进程兼容缓存；回滚不应用任何 delta。启动或显式新建 `SQLiteStore` 才执行全库装载。这样一条 VAD/Evidence journal 命令不再反序列化无关的万级历史 audit/documents；Memory 与 PostgreSQL 的事务合同、数据库版本检查和 reopen 持久性不变。SQLite 仍不承担生产多实例一致性，生产使用 PostgreSQL/RLS。
 
 候选人个人题库不新增 repository 或复制题目文档：`CandidateQuestionBank` 由 `ExperienceQuestionRepository` 按 `candidate_profile_id` 投影。人工题仍必须引用同一候选人的 `ResumeReview`，从该审阅继承岗位范围；`source_type` 区分 `ai_generated/manual`，逻辑删除写入 `status=archived` 和操作者/时间。新计划忽略 archived，历史计划与面试只读其已冻结快照，因此本次字段扩展不需要新增物理集合或破坏性迁移。
 
@@ -453,5 +503,9 @@ finish/token 诊断；活动进度、后续 merge 和停止/恢复只处理替�
 `interview_media_captures` 独立记录 requested/consented scopes、LiveKit room/participant/Egress、私有 object key/URI、SHA-256、字节数、`storage_protection`、可选 `encryption`、保留期、状态与失败原因，并以 `(organization_id, interview_id)` 唯一。开发环境可记录 `local_private_development` 且不声称静态加密；生产只能在对象级 AES256/KMS 元数据复核通过后完成。对象存储路径只含清洗后的 tenant/interview/capture ID；候选人和普通 AgentEvent 不得到 object key 或私有 URI。Egress webhook 在签名和 body hash 验证后通过 idempotent provider result 推进 capture，完整 hash 未读取成功时保持 `hash_pending`。
 
 `evidence_media_streams` 以 interview/turn 的确定性 ID 保存当前 capture revision、连续 segment/frame checkpoint、完整标记与 repair 音频引用；`evidence_media_segments` 以 stream/revision/ordinal 唯一保存 frame 范围、checksum、byte count 与 `candidate_evidence_segment` FileObject 引用。reset 只单调推进 stream revision，旧 revision 由周期 GC 删除；候选人 purge 删除全部 revision，并把 stream/capture 清成最小 `retention_purged` tombstone，避免被放弃片段或直写 Egress object 脱离 FileObject 留存链路。
+
+权威非答案提交与采集释放使用同一个 Persistence transaction：ConversationUtterance/current_understanding、`UTTERANCE_REJECTED` 事件与当前 stream revision CAS 任一失败均整体回滚。`abandoned_captures` 为未采纳采集增加 `rejected_utterance_id` 和原 repair URI，随后清空当前 repair 字段；不修改旧 segments/完整录音。writer 固定创建时 revision，repair 落盘前后复核 revision/complete/checkpoint，防止同 owner 下等长度新录音被旧异步结果覆盖。新增字段通过现有 JSON documents 存储，无 DDL 迁移；历史答案不强制补写 capture revision。
+
+明确无 final 的采集使用现有 `transcription.started/failed` 生命周期事实与同事务 stream CAS；归档元数据增加 `reason=transcript_unavailable`、`untranscribed_audio_uri`，录音继续受既有留存/访问控制约束，不增加虚构 utterance。Evidence command payload 允许经长度/字符校验的 `capture_id` 和（仅自动 seal）`endpoint_id`，作为迟到计时命令的作用域证据；它们不能代替数据库 owner fence 或媒体 checkpoint。无需 DDL 迁移。
 
 Memory、SQLite 与 PostgreSQL 通用 documents/RLS adapter 已实现上述 collection 合同。数据库时钟 ownership lease、单调 epoch、control generation、CandidateAnswer 事务 commit fence 与持久 command submit/claim/result journal 已由连接无关 owner executor 执行：数据库 polling 是正确性路径，Redis 只作 wake hint，remote controller 只等待 terminal receipt。LiveKit subscriber、StreamingSTTSession 与端点 timer 是当前 owner 的进程态，但新 owner 可从已 seal 的私有 segment/checkpoint 重建并执行 batch repair；未 seal 的内存后缀不冒充已持久化证据，必要时只接受服务端授权 sequence gap 内的浏览器私有 backfill。目标 PostgreSQL/RLS 并发、Redis/LiveKit 故障注入和真实 Egress 对象一致性仍必须由绑定当前 release 的外部验收报告证明，因此实时 Agent 状态继续为 `in_progress`。

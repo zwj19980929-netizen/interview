@@ -2,6 +2,7 @@ import { createCandidateAudioCapture } from "./audio-worklet-capture.js";
 import { EncryptedAudioRingBuffer } from "./encrypted-audio-ring.js";
 import { claimPreparedCandidateMedia, runCandidatePreflight } from "./preflight.js";
 import { OrderedAgentEventStream } from "../interviews/agent-event-runtime.js";
+import { LiveSpeechPlayback } from "./live-speech-playback.js";
 
 const EMPTY_AVATAR = {
   status: "idle",
@@ -10,6 +11,21 @@ const EMPTY_AVATAR = {
   visemeWeight: 0,
   gesture: "idle",
   gestureIntensity: 0,
+};
+
+const WINDOWED_AVATAR_METRICS = new Set([
+  "avatar_viseme_drift_ms",
+  "avatar_freeze_ms",
+]);
+const AVATAR_METRIC_WINDOW_MS = 1_000;
+const ANSWER_PREPARATION_WARNING_CODES = new Set([
+  "UNDERSTANDING_UNAVAILABLE", "UNDERSTANDING_RETRY_EXHAUSTED", "TRANSCRIPT_UNAVAILABLE", "ENDPOINT_UNCERTAIN",
+]);
+const DETECTOR_WARNING_CODES = new Set(["DETECTOR_UNAVAILABLE"]);
+const CAPTURE_RECOVERY_CODES = new Set(["CAPTURE_RECOVERING", "CAPTURE_RETRY_REQUIRED"]);
+const CAPTURE_RECOVERY_MESSAGES = {
+  recovering: "正在恢复语音识别，音频仍在保留。",
+  retry_required: "本题收音未能恢复，请重试本题；不会提交不完整回答。",
 };
 
 /**
@@ -27,6 +43,7 @@ const EMPTY_AVATAR = {
  * @property {{enabled:boolean, localDetected:boolean, level:number}} microphone
  * @property {{received:boolean, receivedAt:string|null}} serverAudio
  * @property {{requested:boolean, ready:boolean}} evidence
+ * @property {Object|null} captureRecovery
  * @property {{forming:boolean, recent:Array, full:Array}} captions
  * @property {{active:boolean, deadlineAt:number|null}} endpoint
  * @property {{status:string, transcript:string, confidence:number|null}} calibration
@@ -71,6 +88,7 @@ export function createCandidateInterviewExperience({
     (module) => module.verifyLicensedVrmAsset(context),
   ),
   audioFactory = (url) => new Audio(url),
+  liveAudioFactory = () => new Audio(),
   clock = () => Date.now(),
 } = {}) {
   if (typeof request !== "function") throw new TypeError("CandidateInterviewExperience requires a request adapter");
@@ -87,6 +105,7 @@ export function createCandidateInterviewExperience({
         ringFactory,
         verifyAvatar,
         audioFactory,
+        liveAudioFactory,
         clock,
       });
       await run.open();
@@ -112,6 +131,49 @@ export function reportCandidateRuntimeProblem({
   });
 }
 
+export function createCandidateMetricReporter({
+  emit,
+  isOpen = () => true,
+  setTimer = (callback, delay) => window.setTimeout(callback, delay),
+  clearTimer = (timer) => window.clearTimeout(timer),
+  windowMs = AVATAR_METRIC_WINDOW_MS,
+} = {}) {
+  if (typeof emit !== "function") throw new TypeError("Candidate metric reporter requires an emit adapter");
+  const windows = new Map();
+
+  const send = (metric, value) => {
+    if (!isOpen()) return;
+    try { emit(metric, value); } catch { /* best-effort telemetry must never affect the interview */ }
+  };
+
+  return Object.freeze({
+    observe(metric, value) {
+      const numeric = Number(value);
+      if (!Number.isFinite(numeric) || numeric < 0 || numeric > 300_000 || !isOpen()) return;
+      if (!WINDOWED_AVATAR_METRICS.has(metric)) {
+        send(metric, numeric);
+        return;
+      }
+      const current = windows.get(metric);
+      if (current) {
+        current.maximum = Math.max(current.maximum, numeric);
+        return;
+      }
+      const pending = { maximum: numeric, timer: 0 };
+      pending.timer = setTimer(() => {
+        if (windows.get(metric) !== pending) return;
+        windows.delete(metric);
+        send(metric, pending.maximum);
+      }, windowMs);
+      windows.set(metric, pending);
+    },
+    clear() {
+      for (const pending of windows.values()) clearTimer(pending.timer);
+      windows.clear();
+    },
+  });
+}
+
 class CandidateExperienceRun {
   constructor(options) {
     Object.assign(this, options);
@@ -123,6 +185,7 @@ class CandidateExperienceRun {
     this.ring = null;
     this.audio = null;
     this.activePlayback = null;
+    this.liveSpeech = new LiveSpeechPlayback({ audioFactory: this.liveAudioFactory });
     this.performanceFrame = 0;
     this.performance = null;
     this.currentAct = null;
@@ -142,6 +205,10 @@ class CandidateExperienceRun {
     this.lastSentSequence = 0;
     this.evidenceTurnId = null;
     this.endpointTimer = 0;
+    this.answerFinishRequested = false;
+    this.answerSubmissionPending = false;
+    this.captureRetryCausationId = null;
+    this.endpointProblemScope = null;
     this.heartbeatTimer = 0;
     this.reconnectTimer = 0;
     this.eventResyncTimer = 0;
@@ -160,6 +227,13 @@ class CandidateExperienceRun {
     this.finalReceivedAt = null;
     this.ticketResponse = null;
     this.capabilityReport = null;
+    this.metricReporter = createCandidateMetricReporter({
+      emit: (metric, value) => this.sendSignal("telemetry.observe", { metric, value }),
+      isOpen: () => (
+        !this.closed
+        && this.socket?.readyState === WebSocket.OPEN
+      ),
+    });
     this.state = {
       phase: "connecting",
       floor: "none",
@@ -171,6 +245,7 @@ class CandidateExperienceRun {
       microphone: { enabled: true, localDetected: false, level: 0 },
       serverAudio: { received: false, receivedAt: null },
       evidence: { requested: false, ready: false },
+      captureRecovery: null,
       captions: { forming: false, recent: [], full: [] },
       endpoint: { active: false, deadlineAt: null },
       calibration: { status: "pending", transcript: "", confidence: null, retryRequired: false },
@@ -245,7 +320,7 @@ class CandidateExperienceRun {
         onLevel: (rms) => this.onLevel(rms),
         onSpeechStarted: (details) => this.onLocalSpeechStarted(details),
         onSpeechStopped: () => this.onLocalSpeechStopped(),
-        isAgentSpeaking: () => this.state.avatar.status === "speaking",
+        isAgentSpeaking: () => this.state.floor === "agent" || Boolean(this.activePlayback),
       });
       this.heartbeatTimer = window.setInterval(() => {
         if (this.socket?.readyState === WebSocket.OPEN) this.sendSignal("ping", {});
@@ -266,32 +341,64 @@ class CandidateExperienceRun {
 
   async act({ type, idempotencyKey, turnId, payload = {} } = {}) {
     if (!type) throw new Error("候选人动作缺少 type");
+    if (type === "retry_speech") return this.retrySpeech();
     let causationId = null;
+    let warmupConfirmRollback = null;
+    let finishRollback = null;
     if (type === "continue_speaking") {
-      window.clearTimeout(this.endpointTimer);
-      this.endpointTimer = 0;
-      this.patch({ endpoint: { active: false, deadlineAt: null }, phase: "listening" });
+      const recovery = this.state.captureRecovery;
+      if (recovery?.status === "retry_required") {
+        if (this.captureRetryCausationId || this.isSafetyStopped()
+          || recovery.turnId !== this.state.currentQuestion?.turn_id
+          || (turnId && turnId !== recovery.turnId)
+          || (payload.capture_id && payload.capture_id !== recovery.captureId)) return false;
+        turnId = recovery.turnId;
+        payload = { ...payload, capture_id: recovery.captureId };
+        causationId = uniqueId("candidate");
+        this.captureRetryCausationId = causationId;
+        this.patch({ captureRecovery: { ...recovery, retryPending: true } });
+      } else {
+        if (!this.evidenceReady || this.answerSubmissionPending || this.isSafetyStopped()) return false;
+        payload = { ...payload, capture_id: this.evidenceCaptureId };
+        this.answerFinishRequested = false;
+        window.clearTimeout(this.endpointTimer);
+        this.endpointTimer = 0;
+        this.patch({ endpoint: { active: false, deadlineAt: null }, phase: recovery?.status === "recovering" ? "answer_recovering" : "listening" });
+      }
     }
     if (type === "finish_answer") {
+      if (
+        !this.evidenceReady || this.answerSubmissionPending || this.answerFinishRequested
+        || !["listening", "answer_preparing", "awaiting_supplement"].includes(this.state.phase)
+      ) return false;
+      payload = { ...payload, endpoint: "explicit", capture_id: this.evidenceCaptureId };
+      turnId = this.evidenceTurnId;
+      finishRollback = {
+        phase: this.state.phase,
+        endpoint: { ...this.state.endpoint },
+      };
+      // This is an optional completion hint, not permission to drop audio.
+      // The server alone closes the gate with answer_processing; new speech
+      // can withdraw this hint while speculative preparation is in flight.
+      this.answerFinishRequested = true;
       window.clearTimeout(this.endpointTimer);
       this.endpointTimer = 0;
-      this.evidenceOpen = false;
-      this.evidenceReady = false;
-      this.evidenceOpenCausationId = null;
-      this.acknowledgedWarmupRetryCausationIds.clear();
-      this.speechStartSignaled = false;
-      this.pendingSpeechStop = false;
-      this.evidenceReassertPending = false;
-      this.patch({
-        endpoint: { active: false, deadlineAt: null },
-        evidence: { requested: false, ready: false },
-        phase: "understanding",
-      });
+      this.patch({ endpoint: { active: false, deadlineAt: null } });
     }
     if (type === "pause") this.stopPerformance("candidate_pause");
     if (type === "warmup.confirm") {
+      warmupConfirmRollback = {
+        calibration: { ...this.state.calibration },
+        captions: {
+          forming: this.state.captions.forming,
+          recent: [...this.state.captions.recent],
+          full: [...this.state.captions.full],
+        },
+        phase: this.state.phase,
+      };
       this.patch({
         calibration: { ...this.state.calibration, status: "confirming" },
+        captions: { forming: false, recent: [], full: [] },
         phase: "understanding",
       });
     }
@@ -323,6 +430,17 @@ class CandidateExperienceRun {
         causationId,
       });
     } catch (error) {
+      if (type === "continue_speaking" && causationId === this.captureRetryCausationId) {
+        this.captureRetryCausationId = null;
+        if (this.state.captureRecovery) this.patch({ captureRecovery: { ...this.state.captureRecovery, retryPending: false } });
+      }
+      if (finishRollback) {
+        this.answerFinishRequested = false;
+        this.patch(finishRollback);
+      }
+      if (type === "warmup.confirm" && warmupConfirmRollback) {
+        this.patch(warmupConfirmRollback);
+      }
       if (type === "warmup.retry") {
         this.warmupRetryRequested = false;
         this.warmupRetryCausationId = null;
@@ -350,6 +468,8 @@ class CandidateExperienceRun {
         media,
         stream: this.stream,
         onState: (value) => this.onMediaState(value),
+        onRemoteAudioTrack: (track, publication, participant) => this.liveSpeech.trackSubscribed(track, publication, participant),
+        onRemoteAudioTrackRemoved: (track) => this.liveSpeech.trackUnsubscribed(track),
       });
       this.mediaConnectionState = "connected";
       this.patch({ connection: { ...this.state.connection, media: "connected" } });
@@ -363,6 +483,8 @@ class CandidateExperienceRun {
     this.patch({ connection: { ...this.state.connection, media: value } });
     if (this.closed || this.intentionalClose || this.state.completion) return;
     if (["reconnecting", "disconnected"].includes(value)) {
+      if (this.performance?.delivery === "streaming_tts") this.stopPerformance("media_reconnecting", false);
+      this.liveSpeech.reset();
       this.media?.setRecoveryMute?.(true);
       if (!this.mediaGap && this.evidenceOpen) {
         const capability = this.ticketResponse?.media?.recovery?.browser_backfill;
@@ -571,6 +693,9 @@ class CandidateExperienceRun {
       socket.addEventListener("close", () => {
         window.clearTimeout(timeout);
         if (this.socket === socket) {
+          if (this.performance?.delivery === "streaming_tts") this.stopPerformance("control_reconnecting", false);
+          this.liveSpeech.reset();
+          this.metricReporter.clear();
           this.socket = null;
           // A reset command written to a WebSocket is not durable until the
           // server reflects it in a snapshot/ack. On disconnect, drop the
@@ -578,6 +703,8 @@ class CandidateExperienceRun {
           // explicit retry button instead of leaving the UI in limbo.
           this.warmupRetryRequested = false;
           this.warmupRetryCausationId = null;
+          this.captureRetryCausationId = null;
+          if (this.state.captureRecovery) this.patch({ captureRecovery: { ...this.state.captureRecovery, retryPending: false } });
           if (
             !this.intentionalClose
             && !this.closed
@@ -617,7 +744,89 @@ class CandidateExperienceRun {
       this.applySnapshot(payload);
       return;
     }
+    if (this.isSafetyStopped() && ["floor.changed", "speech.started", "speech.stopped", "transcript.partial", "transcript.final"].includes(event.type)) return;
     if (event.type === "floor.changed") {
+      if (["answer_recovering", "answer_retry_required"].includes(payload.reason)) {
+        if (this.matchesCapture(event)) this.applyCaptureRecovery({
+          status: payload.reason === "answer_recovering" ? "recovering" : "retry_required",
+          turnId: event.turn_id, captureId: payload.capture_id,
+        });
+        return;
+      }
+      const recovery = this.state.captureRecovery;
+      if (recovery?.status === "retry_required") {
+        const ready = payload.reason === "evidence_stream_open" && payload.owner === "candidate"
+          && this.captureRetryCausationId && event.causation_id === this.captureRetryCausationId
+          && event.turn_id === recovery.turnId && event.turn_id === this.state.currentQuestion?.turn_id
+          && payload.capture_id && payload.capture_id !== recovery.captureId;
+        if (!ready) return;
+        this.evidenceCaptureId = payload.capture_id;
+        this.evidenceTurnId = event.turn_id;
+        this.evidenceOpen = true;
+        this.evidenceReady = true;
+        this.evidenceReassertPending = false;
+        this.evidenceOpenCausationId = null;
+        this.answerSubmissionPending = false;
+        this.answerFinishRequested = false;
+        this.speechStartSignaled = false;
+        this.pendingSpeechStop = false;
+        this.ring?.clear();
+        this.clearCaptureRecovery();
+        this.patch({ floor: "candidate", phase: "listening", evidence: { requested: true, ready: true },
+          serverAudio: { received: false, receivedAt: null }, captions: { forming: false, recent: [], full: [] } });
+        this.flushPendingSpeechState();
+        return;
+      }
+      if (payload.reason === "answer_processing") {
+        if (recovery) return;
+        if (payload.capture_id && (
+          payload.capture_id !== this.evidenceCaptureId || event.turn_id !== this.evidenceTurnId
+        )) return;
+        this.clearEndpointWarning(event, ANSWER_PREPARATION_WARNING_CODES);
+        this.answerFinishRequested = false;
+        this.answerSubmissionPending = true;
+        this.evidenceOpen = false;
+        this.evidenceReady = false;
+        this.evidenceOpenCausationId = null;
+        this.speechStartSignaled = false;
+        this.pendingSpeechStop = false;
+        this.patch({ floor: "none", phase: "understanding", evidence: { requested: false, ready: false }, endpoint: { active: false, deadlineAt: null } });
+        return;
+      }
+      if (["answer_preparing", "answer_listening", "answer_detector_ready", "supplement_awaiting_reply"].includes(payload.reason)) {
+        // Preparation never acknowledges a new capture. A late result from
+        // another turn/capture must not reopen or relabel the active stream.
+        if (
+          payload.owner !== "candidate" || !this.evidenceReady || this.answerSubmissionPending
+          || this.state.calibration.status !== "completed"
+          || !this.evidenceCaptureId || payload.capture_id !== this.evidenceCaptureId
+          || event.turn_id !== this.evidenceTurnId
+          || ["paused", "completed"].includes(this.state.phase)
+        ) return;
+        if (payload.reason === "answer_detector_ready") {
+          // A detector recovery is not an acknowledgement of a new capture
+          // and must not alter an in-flight preparation or the media gate.
+          this.clearEndpointWarning(event, DETECTOR_WARNING_CODES);
+          return;
+        }
+        if (payload.reason === "answer_listening") {
+          this.answerFinishRequested = false;
+          this.clearCaptureRecovery();
+        } else if (recovery) return;
+        if (["answer_preparing", "supplement_awaiting_reply"].includes(payload.reason)) {
+          this.clearEndpointWarning(event, ANSWER_PREPARATION_WARNING_CODES);
+        }
+        this.patch({
+          floor: "candidate",
+          phase: payload.reason === "answer_preparing" ? "answer_preparing"
+            : payload.reason === "supplement_awaiting_reply" ? "awaiting_supplement" : "listening",
+          endpoint: { active: false, deadlineAt: null },
+          evidence: { requested: this.evidenceOpen, ready: this.evidenceReady },
+        });
+        return;
+      }
+      if (payload.owner === "agent" || payload.owner === "candidate") this.answerSubmissionPending = false;
+      if (payload.owner === "agent") this.answerFinishRequested = false;
       const acknowledgesEvidenceReady = payload.owner === "candidate"
         && ["warmup_stream_open", "evidence_stream_open"].includes(payload.reason);
       const invalidatesEvidenceReady = payload.reason === "warmup_retry";
@@ -656,12 +865,18 @@ class CandidateExperienceRun {
         this.evidenceReassertPending = false;
         this.evidenceTurnId = null;
       } else if (acknowledgesCurrentOpen) {
+        if (this.evidenceCaptureId !== payload.capture_id) {
+          this.answerFinishRequested = false;
+          this.speechStartSignaled = false;
+          this.pendingSpeechStop = false;
+        }
+        this.evidenceCaptureId = payload.capture_id;
         this.evidenceReady = true;
         this.evidenceReassertPending = false;
       }
       this.patch({
         floor: payload.owner,
-        phase: payload.owner === "candidate"
+        phase: recovery?.status === "recovering" ? "answer_recovering" : payload.owner === "candidate"
           ? this.evidenceReady ? "listening" : "preparing"
           : phaseForFloor(payload.owner, this.state.phase),
         calibration: {
@@ -677,6 +892,8 @@ class CandidateExperienceRun {
           requested: this.evidenceOpen,
           ready: this.evidenceReady,
         },
+        ...(acknowledgesCurrentOpen && this.state.problem?.code === "STT_TRANSCRIPT_UNAVAILABLE"
+          ? { problem: null } : {}),
         ...(invalidatesEvidenceReady ? {
           microphone: { ...this.state.microphone, localDetected: false },
           endpoint: { active: false, deadlineAt: null },
@@ -714,6 +931,7 @@ class CandidateExperienceRun {
           this.patch({ recovery: this.ring?.snapshot?.() || this.state.recovery });
         }
       }
+      if (this.state.captureRecovery?.status === "retry_required") return;
       if (payload.speaker === "candidate" && payload.server_audio_received) {
         if (this.localSpeechStartedAt != null) {
           this.observeMetric("server_audio_confirmation_ms", this.clock() - this.localSpeechStartedAt);
@@ -724,12 +942,16 @@ class CandidateExperienceRun {
       return;
     }
     if (event.type === "speech.stopped" && payload.speaker === "candidate") {
+      if (this.answerSubmissionPending || this.state.captureRecovery || ["paused", "completed"].includes(this.state.phase)) return;
+      const countdownMs = Number(payload.endpoint_countdown_ms ?? 2500);
       this.patch({
-        endpoint: { active: true, deadlineAt: this.clock() + Number(payload.endpoint_countdown_ms || 2500) },
+        endpoint: { active: true, deadlineAt: countdownMs > 0 ? this.clock() + countdownMs : null },
       });
       return;
     }
     if (event.type === "transcript.partial") {
+      if (!this.matchesTranscriptTurn(event)) return;
+      if (this.state.captureRecovery?.status === "retry_required" || (this.state.captureRecovery && event.turn_id !== this.state.captureRecovery.turnId)) return;
       if (!this.partialObserved && this.evidenceOpenedAt != null) {
         this.partialObserved = true;
         this.observeMetric("partial_first_token_ms", this.clock() - this.evidenceOpenedAt);
@@ -738,6 +960,13 @@ class CandidateExperienceRun {
       return;
     }
     if (event.type === "transcript.final") {
+      if (!this.matchesTranscriptTurn(event)) return;
+      // During repair this may be a late provider prefix, not an answer commit.
+      // Recovery can only be cleared by its scoped ready/listening or snapshot.
+      if (this.state.captureRecovery) return;
+      if (!payload.calibration) this.clearEndpointWarning(event, ANSWER_PREPARATION_WARNING_CODES);
+      this.answerFinishRequested = false;
+      this.answerSubmissionPending = false;
       if (this.localSpeechStoppedAt != null) {
         this.observeMetric("stop_to_final_ms", this.clock() - this.localSpeechStoppedAt);
         this.localSpeechStoppedAt = null;
@@ -779,8 +1008,11 @@ class CandidateExperienceRun {
     }
     if (event.type === "conversation.act.selected") {
       this.currentAct = { ...payload, turnId: event.turn_id };
-      if (event.turn_id && payload.act_type !== "opening") {
+      if (event.turn_id && ["question", "repeat", "followup"].includes(payload.act_type)) {
+        const turnChanged = event.turn_id !== this.currentTranscriptTurnId();
+        if (turnChanged) window.clearTimeout(this.captionFreshnessTimer);
         this.patch({
+          ...(turnChanged ? { captions: { forming: false, recent: [], full: [] } } : {}),
           currentQuestion: {
             ...(this.state.currentQuestion || {}),
             turn_id: event.turn_id,
@@ -792,7 +1024,15 @@ class CandidateExperienceRun {
       return;
     }
     if (event.type === "avatar.performance.started") {
+      if (payload.delivery === "streaming_tts" && event.replayability !== "transient") {
+        this.beginEventResync({ reason: "invalid", problem: { code: "AGENT_EVENT_PAYLOAD_INVALID", message: "流式语音不能从旧事件重放" } });
+        return;
+      }
       await this.playPerformance(payload, event.turn_id);
+      return;
+    }
+    if (event.type === "avatar.performance.producer_finished") {
+      this.liveSpeech.producerFinished(payload);
       return;
     }
     if (event.type === "avatar.performance.interrupted") {
@@ -804,20 +1044,69 @@ class CandidateExperienceRun {
       return;
     }
     if (event.type === "takeover.changed") {
+      this.clearCaptureRecovery();
       this.stopPerformance("human_takeover");
       this.patch({ phase: "paused", floor: payload.status === "active" ? "human" : "none" });
       return;
     }
     if (event.type === "problem") {
+      // A queued VAD error must never replace the actionable safety pause.
+      if (this.state.problem?.recoverable === false && payload.recoverable) return;
+      if (CAPTURE_RECOVERY_CODES.has(payload.code)) {
+        if (!this.isSafetyStopped() && this.matchesCapture(event)) {
+          // An unchanged snapshot is not an ACK. Only the scoped failure for
+          // this retry unlocks it; a previous attempt cannot unlock a new one.
+          if (payload.code === "CAPTURE_RETRY_REQUIRED" && payload.action === "retry_answer"
+            && this.captureRetryCausationId && event.causation_id === this.captureRetryCausationId) {
+            this.captureRetryCausationId = null;
+          }
+          this.applyCaptureRecovery({
+            status: payload.code === "CAPTURE_RECOVERING" ? "recovering" : "retry_required",
+            turnId: event.turn_id, captureId: payload.capture_id,
+          });
+        }
+        return;
+      }
+      // Retaining a capture warning must not swallow transport acknowledgements:
+      // media backfill has its own authorization and failure lifecycle.
       const waiter = this.backfillWaiters.get(event.causation_id);
       if (waiter) {
         this.backfillWaiters.delete(event.causation_id);
         waiter.reject(new Error(payload.message || payload.code || "浏览器音频恢复失败"));
       }
+      if (
+        this.mediaGap
+        && payload.recoverable
+        && payload.action === "reconnect_media"
+        && String(payload.code || "").startsWith("LIVEKIT_EVIDENCE_")
+      ) {
+        this.serverBackfillAuthorized = true;
+        window.clearTimeout(this.backfillAuthorizationTimer);
+        this.backfillAuthorizationTimer = 0;
+        if (this.mediaConnectionState === "connected") {
+          this.recoverMediaGap().catch((error) => this.failClosed(error));
+        }
+      }
+      if (this.state.captureRecovery && payload.recoverable) {
+        if (event.causation_id === this.captureRetryCausationId) {
+          this.captureRetryCausationId = null;
+          this.patch({ captureRecovery: { ...this.state.captureRecovery, retryPending: false } });
+        }
+        return;
+      }
+      this.endpointProblemScope = payload.recoverable === true
+        && payload.action === "continue_listening"
+        && (ANSWER_PREPARATION_WARNING_CODES.has(payload.code) || DETECTOR_WARNING_CODES.has(payload.code))
+        ? { turnId: event.turn_id, captureId: payload.capture_id || this.evidenceCaptureId }
+        : null;
+      this.answerFinishRequested = false;
+      this.answerSubmissionPending = false;
       const retryWarmup = payload.recoverable && payload.action === "retry_warmup";
+      const retryTranscript = payload.recoverable && payload.code === "STT_TRANSCRIPT_UNAVAILABLE";
       const rejectsCurrentEvidenceOpen = Boolean(this.evidenceOpenCausationId)
         && event.causation_id === this.evidenceOpenCausationId;
-      if (!payload.recoverable || retryWarmup || rejectsCurrentEvidenceOpen) {
+      if (!payload.recoverable || retryWarmup || retryTranscript || rejectsCurrentEvidenceOpen) {
+        if (!payload.recoverable) this.captureRetryCausationId = null;
         window.clearTimeout(this.endpointTimer);
         this.endpointTimer = 0;
         this.evidenceOpen = false;
@@ -834,7 +1123,13 @@ class CandidateExperienceRun {
       }
       this.patch({
         problem: payload,
-        phase: retryWarmup ? "preparing" : payload.recoverable ? this.state.phase : "paused",
+        phase: retryWarmup || retryTranscript ? "preparing" : this.endpointProblemScope
+          ? "listening" : payload.recoverable ? this.state.phase : "paused",
+        ...(retryTranscript ? {
+          evidence: { requested: false, ready: false },
+          endpoint: { active: false, deadlineAt: null },
+          captions: { ...this.state.captions, forming: false },
+        } : {}),
         ...(retryWarmup ? {
           calibration: { ...this.state.calibration, status: "retrying", retryRequired: true },
           evidence: { requested: false, ready: false },
@@ -846,42 +1141,107 @@ class CandidateExperienceRun {
           evidence: { requested: false, ready: false },
         } : {}),
         ...(!payload.recoverable ? {
+          captureRecovery: null,
           floor: "none",
           endpoint: { active: false, deadlineAt: null },
           microphone: { ...this.state.microphone, localDetected: false },
           evidence: { requested: false, ready: false },
         } : {}),
       });
-      if (
-        this.mediaGap
-        && payload.recoverable
-        && payload.action === "reconnect_media"
-        && String(payload.code || "").startsWith("LIVEKIT_EVIDENCE_")
-      ) {
-        this.serverBackfillAuthorized = true;
-        window.clearTimeout(this.backfillAuthorizationTimer);
-        this.backfillAuthorizationTimer = 0;
-        if (this.mediaConnectionState === "connected") {
-          this.recoverMediaGap().catch((error) => this.failClosed(error));
-        }
-      }
       if (!payload.recoverable) this.stopPerformance("fatal_problem");
       return;
     }
     if (event.type === "completed") {
-      this.patch({ completion: payload, phase: "completed", floor: "none" });
+      this.captureRetryCausationId = null;
+      this.patch({ completion: payload, phase: "completed", floor: "none", captureRecovery: null });
       await this.shutdownMedia();
     }
+  }
+
+  isSafetyStopped() {
+    return this.closed || Boolean(this.state.completion) || this.state.problem?.recoverable === false
+      || ["paused", "completed"].includes(this.state.phase)
+      || ["paused", "completed", "cancelled", "expired", "report_ready"].includes(this.state.session?.status);
+  }
+
+  matchesCapture(event) {
+    return this.state.calibration.status === "completed" && event.turn_id === this.state.currentQuestion?.turn_id
+      && event.turn_id === this.evidenceTurnId && Boolean(this.evidenceCaptureId)
+      && event.payload.capture_id === this.evidenceCaptureId;
+  }
+
+  currentTranscriptTurnId() {
+    return this.state.currentQuestion?.turn_id || this.state.session?.current_turn_id || null;
+  }
+
+  matchesTranscriptTurn(event) {
+    if (event.payload?.calibration) {
+      return event.turn_id == null && this.state.calibration.status !== "completed";
+    }
+    // A delayed final must not close the next question's microphone gate.
+    // Before a question is known, only explicitly marked warm-up text belongs
+    // to this view; an unscoped formal transcript cannot establish identity.
+    const currentTurnId = this.currentTranscriptTurnId();
+    return Boolean(currentTurnId && event.turn_id === currentTurnId);
+  }
+
+  applyCaptureRecovery(value) {
+    const previous = this.state.captureRecovery;
+    if (previous?.status === "retry_required" && value.status === "recovering" && previous.captureId === value.captureId) return;
+    const recovery = { ...(previous?.captureId === value.captureId ? previous : {}), ...value,
+      retryPending: Boolean(this.captureRetryCausationId) };
+    const retry = value.status === "retry_required";
+    this.answerFinishRequested = false;
+    this.answerSubmissionPending = false;
+    this.endpointProblemScope = null;
+    window.clearTimeout(this.endpointTimer);
+    this.endpointTimer = 0;
+    if (retry) {
+      this.evidenceOpen = false;
+      this.evidenceReady = false;
+      this.evidenceOpenCausationId = null;
+      this.evidenceReassertPending = false;
+      this.speechStartSignaled = false;
+      this.pendingSpeechStop = false;
+    }
+    this.patch({ captureRecovery: recovery, phase: retry ? "answer_retry_required" : "answer_recovering",
+      floor: retry ? "none" : "candidate", endpoint: { active: false, deadlineAt: null },
+      evidence: { requested: this.evidenceOpen, ready: this.evidenceReady },
+      problem: { code: retry ? "CAPTURE_RETRY_REQUIRED" : "CAPTURE_RECOVERING", recoverable: true,
+        action: retry ? "retry_answer" : "continue_listening", message: CAPTURE_RECOVERY_MESSAGES[value.status] },
+      captions: { ...this.state.captions, forming: false },
+      ...(retry ? { serverAudio: { received: false, receivedAt: null }, microphone: { ...this.state.microphone, localDetected: false } } : {}),
+    });
+  }
+
+  clearCaptureRecovery() {
+    this.captureRetryCausationId = null;
+    this.patch({ captureRecovery: null, ...(CAPTURE_RECOVERY_CODES.has(this.state.problem?.code) ? { problem: null } : {}) });
+  }
+
+  clearEndpointWarning(event, allowedCodes) {
+    const problem = this.state.problem;
+    const scope = this.endpointProblemScope;
+    if (
+      problem?.recoverable !== true || problem.action !== "continue_listening"
+      || !allowedCodes.has(problem.code) || !scope?.turnId || !scope.captureId
+      || scope.turnId !== this.evidenceTurnId || event.turn_id !== scope.turnId
+      || scope.captureId !== this.evidenceCaptureId
+      || (event.payload?.capture_id && event.payload.capture_id !== scope.captureId)
+    ) return;
+    this.endpointProblemScope = null;
+    this.patch({ problem: null });
   }
 
   beginEventResync(result) {
     this.eventStream.awaitingSnapshot = true;
     this.stopPerformance("event_stream_resync", false);
+    this.liveSpeech.reset();
     const validation = result.problem || {};
     const isGap = result.reason === "sequence_gap" || result.reason === "duplicate_event_id";
     this.patch({
       connection: { ...this.state.connection, control: "resyncing" },
-      problem: {
+      problem: this.state.problem?.recoverable === false ? this.state.problem : {
         code: validation.code || (isGap ? "AGENT_EVENT_SEQUENCE_GAP" : "AGENT_EVENT_INVALID"),
         message: validation.message || "实时事件顺序不连续，正在从服务端权威快照恢复。",
         recoverable: true,
@@ -915,8 +1275,34 @@ class CandidateExperienceRun {
 
   applySnapshot(payload) {
     const sessionStatus = payload.status;
+    const nextTranscriptTurnId = payload.current_question?.turn_id || payload.current_turn_id || null;
+    const transcriptTurnChanged = nextTranscriptTurnId !== this.currentTranscriptTurnId();
+    const oldRecovery = this.state.captureRecovery;
+    const captureRecovery = sessionStatus === "in_progress" && this.state.problem?.recoverable !== false
+      ? payload.capture_recovery : null;
+    if (oldRecovery && captureRecovery && oldRecovery.captureId !== captureRecovery.capture_id) this.captureRetryCausationId = null;
+    const recoveryTurnChanged = oldRecovery && oldRecovery.turnId !== payload.current_turn_id;
+    if (recoveryTurnChanged) {
+      this.evidenceOpen = false;
+      this.evidenceReady = false;
+      this.evidenceTurnId = null;
+      this.evidenceCaptureId = null;
+      this.evidenceOpenCausationId = null;
+    }
+    if (!captureRecovery && oldRecovery && (Object.hasOwn(payload, "capture_recovery") || recoveryTurnChanged || sessionStatus !== "in_progress")) {
+      this.clearCaptureRecovery();
+    }
+    if (["paused", "completed", "cancelled", "expired"].includes(sessionStatus)
+      || (Object.hasOwn(payload, "active_performance_id") && this.performance
+        && payload.active_performance_id !== this.performance.performance_id)) {
+      this.stopPerformance("authoritative_snapshot", false);
+      this.liveSpeech.reset();
+    }
     const calibrationRetryRequired = Boolean(payload.calibration_retry_required);
     const calibrationStatus = payload.calibration_status || this.state.calibration.status;
+    const warmupJustCompleted = calibrationStatus === "completed"
+      && this.state.calibration.status !== "completed";
+    if (transcriptTurnChanged || warmupJustCompleted) window.clearTimeout(this.captionFreshnessTimer);
     const retryAckPending = this.warmupRetryRequested && Boolean(this.warmupRetryCausationId);
     if (calibrationStatus === "retrying" && !calibrationRetryRequired && retryAckPending) {
       this.acknowledgedWarmupRetryCausationIds.add(this.warmupRetryCausationId);
@@ -940,7 +1326,9 @@ class CandidateExperienceRun {
         this.warmupRetryCausationId = null;
       }
     }
-    if (sessionStatus === "paused" || sessionStatus === "completed") {
+    if (["paused", "completed", "cancelled", "expired", "report_ready"].includes(sessionStatus)) {
+      this.captureRetryCausationId = null;
+      this.answerFinishRequested = false;
       window.clearTimeout(this.endpointTimer);
       this.endpointTimer = 0;
       this.evidenceOpen = false;
@@ -963,13 +1351,17 @@ class CandidateExperienceRun {
         status: calibrationStatus,
         retryRequired: calibrationRetryRequired && !retryAckPending,
       },
+      ...(transcriptTurnChanged || warmupJustCompleted ? {
+        captions: { forming: false, recent: [], full: [] },
+      } : {}),
       ...(calibrationRetryRequired ? {
         endpoint: { active: false, deadlineAt: null },
         microphone: { ...this.state.microphone, localDetected: false },
         evidence: { requested: false, ready: false },
         recovery: this.ring?.snapshot?.() || this.state.recovery,
       } : {}),
-      ...(["paused", "completed"].includes(sessionStatus) ? {
+      ...(["paused", "completed", "cancelled", "expired", "report_ready"].includes(sessionStatus) ? {
+        captureRecovery: null,
         endpoint: { active: false, deadlineAt: null },
         microphone: { ...this.state.microphone, localDetected: false },
         evidence: { requested: false, ready: false },
@@ -978,15 +1370,36 @@ class CandidateExperienceRun {
         ? "paused"
         : sessionStatus === "completed"
           ? "completed"
+          : this.answerSubmissionPending
+            ? "understanding"
           : payload.floor === "candidate" && !this.evidenceReady
             ? "preparing"
+          : payload.floor === "candidate" && this.state.phase === "answer_preparing"
+            ? "answer_preparing"
+          : payload.floor === "candidate" && payload.supplement_confirmation?.status === "awaiting_reply"
+            && payload.supplement_confirmation?.turn_id === payload.current_turn_id
+            ? "awaiting_supplement"
             : phaseForFloor(payload.floor, this.state.phase),
     });
+    if (captureRecovery && calibrationStatus === "completed") {
+      this.evidenceTurnId = captureRecovery.turn_id;
+      this.evidenceCaptureId = captureRecovery.capture_id;
+      if (captureRecovery.status === "recovering") {
+        this.evidenceOpen = true;
+        this.evidenceReady = true;
+        this.evidenceReassertPending = false;
+      }
+      this.applyCaptureRecovery({ status: captureRecovery.status, turnId: captureRecovery.turn_id,
+        captureId: captureRecovery.capture_id, attempt: captureRecovery.attempt, maxAttempts: captureRecovery.max_attempts });
+      return;
+    }
     const reassertEvidenceOpen = this.evidenceReassertPending
       && this.evidenceOpen
       && !this.evidenceReady;
     if (
       sessionStatus === "in_progress"
+      && this.state.captureRecovery?.status !== "retry_required"
+      && !this.answerSubmissionPending
       && payload.floor === "candidate"
       && (!this.evidenceOpen || reassertEvidenceOpen)
       && !calibrationRetryRequired
@@ -1009,6 +1422,7 @@ class CandidateExperienceRun {
     const reasserting = force && this.evidenceOpen && !this.evidenceReady;
     if (
       (this.evidenceOpen && !reasserting)
+      || this.state.captureRecovery?.status === "retry_required"
       || this.state.phase === "paused"
       || (!warmup && !turnId)
       || (calibrationStatus === "retrying"
@@ -1072,15 +1486,22 @@ class CandidateExperienceRun {
   }
 
   async onLocalSpeechStarted(details = {}) {
+    if (this.state.captureRecovery?.status === "retry_required") return;
+    if (this.answerSubmissionPending || (this.state.phase === "understanding" && this.state.calibration.status === "completed")) return;
     if (this.closed || ["paused", "completed"].includes(this.state.phase) || this.state.completion) {
       return;
     }
+    const cancelsPreparation = this.answerFinishRequested || this.state.phase === "answer_preparing";
+    this.answerFinishRequested = false;
+    // A click can happen while VAD is already active. Still send one fresh,
+    // scoped start when withdrawing that hint instead of deduplicating it.
+    if (cancelsPreparation) this.speechStartSignaled = false;
     const detectedAt = this.clock();
-    const agentWasSpeaking = this.state.avatar.status === "speaking";
+    const agentWasSpeaking = this.state.floor === "agent" || Boolean(this.activePlayback);
     this.localSpeechStartedAt = detectedAt;
     this.patch({
       microphone: { ...this.state.microphone, localDetected: true },
-      phase: this.evidenceReady ? "listening" : "preparing",
+      phase: this.state.captureRecovery?.status === "recovering" ? "answer_recovering" : this.evidenceReady ? "listening" : "preparing",
     });
     if (Number.isFinite(Number(details.feedbackLatencyMs))) {
       this.observeMetric("local_microphone_feedback_ms", Number(details.feedbackLatencyMs));
@@ -1107,6 +1528,8 @@ class CandidateExperienceRun {
   }
 
   onLocalSpeechStopped() {
+    if (this.state.captureRecovery?.status === "retry_required") return;
+    if (this.answerSubmissionPending) return;
     if (this.closed || ["paused", "completed"].includes(this.state.phase) || this.state.completion) {
       return;
     }
@@ -1133,7 +1556,7 @@ class CandidateExperienceRun {
       }
       return;
     }
-    this.sendSignal("speech.stopped", { detected_by: "audio_worklet_vad" });
+    this.sendCaptureSignal("speech.stopped");
     this.speechStartSignaled = false;
     // 是否开始 2.5 秒静音收口只能由服务端权威事件决定。客户端若自行倒计时
     // 并切到“理解中”，会在服务端已暂停或没有收到音频时制造虚假进度。
@@ -1141,7 +1564,7 @@ class CandidateExperienceRun {
 
   signalSpeechStarted() {
     if (this.speechStartSignaled || this.socket?.readyState !== WebSocket.OPEN) return false;
-    this.sendSignal("speech.started", { detected_by: "audio_worklet_vad" });
+    this.sendCaptureSignal("speech.started");
     this.speechStartSignaled = true;
     this.pendingSpeechStop = false;
     return true;
@@ -1156,7 +1579,7 @@ class CandidateExperienceRun {
     }
     if (this.speechStartSignaled && this.pendingSpeechStop) {
       this.pendingSpeechStop = false;
-      this.sendSignal("speech.stopped", { detected_by: "audio_worklet_vad" });
+      this.sendCaptureSignal("speech.stopped");
       this.speechStartSignaled = false;
     }
   }
@@ -1164,6 +1587,9 @@ class CandidateExperienceRun {
   appendCaption(text, final) {
     const normalized = String(text || "").trim();
     if (!normalized) return;
+    const previous = this.state.captions.recent.at(-1);
+    if (!final && previous?.text === normalized) return;
+    window.clearTimeout(this.captionFreshnessTimer);
     const full = final
       ? [...this.state.captions.full, { text: normalized, final: true, at: new Date().toISOString() }]
       : this.state.captions.full;
@@ -1171,10 +1597,29 @@ class CandidateExperienceRun {
       ? full.slice(-2)
       : [...full.slice(-1), { text: normalized, final: false, at: new Date().toISOString() }].slice(-2);
     this.patch({ captions: { forming: !final, recent, full } });
+    if (!final) this.captionFreshnessTimer = window.setTimeout(() => {
+      if (!this.closed) this.patch({ captions: { ...this.state.captions, forming: false } });
+    }, 2000);
+  }
+
+  sendCaptureSignal(type) {
+    return this.sendSignal(type, {
+      detected_by: "audio_worklet_vad",
+      ...(this.evidenceReady ? { capture_id: this.evidenceCaptureId } : {}),
+    }, {
+      turnId: this.evidenceReady
+        ? this.evidenceTurnId === "__warmup__" ? null : this.evidenceTurnId
+        : this.state.currentQuestion?.turn_id,
+    });
   }
 
   async playPerformance(performance, turnId) {
+    if (performance?.delivery === "streaming_tts" && this.liveSpeech.hasSeen(performance.performance_id)) return;
     this.stopPerformance("replaced", false);
+    if (performance?.delivery === "streaming_tts") {
+      this.playLivePerformance(performance, turnId);
+      return;
+    }
     if (!performance?.audio_uri || !Array.isArray(performance.visemes) || !performance.visemes.length) {
       await this.failClosed(new Error("数字人表达缺少正式音频或 viseme 时间轴"));
       return;
@@ -1191,7 +1636,16 @@ class CandidateExperienceRun {
     this.audio = audio;
     audio.preload = "auto";
     const onPlay = () => {
-      if (!this.isActivePlayback(playback) || currentPerformance.startedAt != null) return;
+      if (!this.isActivePlayback(playback)) return;
+      window.clearTimeout(playback.watchdog);
+      playback.watchdog = 0;
+      this.patch({ speechPlayback: { status: "playing", message: "面试官正在说话" } });
+      this.reportPlayback(playback, "playing");
+      if (currentPerformance.startedAt != null) {
+        cancelAnimationFrame(this.performanceFrame);
+        this.tickPerformance(playback);
+        return;
+      }
       currentPerformance.startedAt = this.clock();
       currentPerformance.lastTickAt = currentPerformance.startedAt;
       if (this.finalReceivedAt != null) {
@@ -1208,21 +1662,115 @@ class CandidateExperienceRun {
     };
     const onEnded = () => {
       if (!this.isActivePlayback(playback)) return;
+      if (currentPerformance.startedAt == null) {
+        this.blockPlayback(playback, "failed");
+        return;
+      }
       this.finishPerformance(playback);
     };
     const onError = () => {
       if (!this.isActivePlayback(playback)) return;
-      this.failClosed(new Error("数字人正式语音无法播放"));
+      this.blockPlayback(playback, "failed");
     };
-    playback.handlers = { play: onPlay, ended: onEnded, error: onError };
-    audio.addEventListener("play", onPlay);
-    audio.addEventListener("ended", onEnded, { once: true });
-    audio.addEventListener("error", onError, { once: true });
+    const onWaiting = () => {
+      if (!this.isActivePlayback(playback)) return;
+      this.reportPlayback(playback, "buffering");
+      this.patch({ speechPlayback: { status: "loading", message: "正在缓冲面试官语音…" } });
+      this.armPlaybackWatchdog(playback);
+    };
+    playback.handlers = { playing: onPlay, ended: onEnded, error: onError, waiting: onWaiting, stalled: onWaiting };
+    for (const [type, handler] of Object.entries(playback.handlers)) audio.addEventListener(type, handler);
+    await this.startPlayback(playback);
+  }
+
+  reportPlayback(playback, status) {
+    if (!this.isActivePlayback(playback) || playback.reportedStatus === status) return;
+    playback.reportedStatus = status;
+    this.sendSignal("avatar.performance.playback", { performance_id: playback.performance.performance_id, status },
+      { turnId: playback.performance.turnId });
+  }
+
+  armPlaybackWatchdog(playback) {
+    if (playback.watchdog) return;
+    playback.watchdog = window.setTimeout(() => {
+      playback.watchdog = 0;
+      if (this.isActivePlayback(playback)) this.blockPlayback(playback, "failed");
+    }, 8000);
+  }
+
+  blockPlayback(playback, status) {
+    if (!this.isActivePlayback(playback)) return;
+    window.clearTimeout(playback.watchdog);
+    playback.watchdog = 0;
+    playback.audio.pause();
+    cancelAnimationFrame(this.performanceFrame);
+    this.performanceFrame = 0;
+    this.reportPlayback(playback, status);
+    this.patch({ speechPlayback: { status: "blocked", message: status === "blocked"
+      ? "浏览器阻止了语音播放，请点击播放这句话。"
+      : "这句话的语音尚未播放完成，可以重新播放；本题回答仍保留。" },
+      avatar: { ...EMPTY_AVATAR } });
+  }
+
+  async retrySpeech() {
+    const playback = this.activePlayback;
+    if (!playback?.audio || this.isSafetyStopped() || this.state.speechPlayback?.status !== "blocked") return false;
+    // Reuse only this still-active approved utterance. A replacement, pause or
+    // server timeout invalidates the handle; no old question can be replayed.
+    if (playback.audio.error) playback.audio.load?.();
+    await this.startPlayback(playback);
+    return true;
+  }
+
+  async startPlayback(playback) {
+    if (!this.isActivePlayback(playback)) return;
+    const audio = playback.audio;
+    audio.muted = false;
+    audio.volume = 1;
+    this.patch({ speechPlayback: { status: "loading", message: "正在播放面试官语音…" } });
+    this.armPlaybackWatchdog(playback);
     try {
       await audio.play();
     } catch (error) {
       if (!this.isActivePlayback(playback)) return;
-      await this.failClosed(new Error(`数字人正式语音播放被阻止：${error.message || error}`));
+      this.blockPlayback(playback, error?.name === "NotAllowedError" ? "blocked" : "failed");
+    }
+  }
+
+  playLivePerformance(performance, turnId) {
+    const currentPerformance = { ...performance, turnId, startedAt: null, lastCue: "" };
+    const playback = { audio: null, performance: currentPerformance, live: null };
+    this.activePlayback = playback;
+    this.performance = currentPerformance;
+    this.audio = null;
+    const identity = { performance_id: performance.performance_id, output_id: performance.live_audio.output_id };
+    try {
+      playback.live = this.liveSpeech.begin(performance, {
+        onReady: () => {
+          if (this.isActivePlayback(playback)) this.sendSignal("avatar.performance.ready", identity, { turnId });
+        },
+        onPlaying: () => {
+          if (!this.isActivePlayback(playback) || currentPerformance.startedAt !== null) return;
+          currentPerformance.startedAt = this.clock();
+          currentPerformance.lastTickAt = currentPerformance.startedAt;
+          if (this.finalReceivedAt !== null && this.finalReceivedAt !== undefined) {
+            this.observeMetric("final_to_first_audio_cascade_ms", currentPerformance.startedAt - this.finalReceivedAt);
+            this.finalReceivedAt = null;
+          }
+          this.patch({ phase: "responding", avatar: { ...EMPTY_AVATAR, status: "speaking", performanceId: performance.performance_id } });
+          this.tickPerformance(playback);
+        },
+        onFinished: () => {
+          if (!this.isActivePlayback(playback)) return;
+          this.stopPerformance("completed", false, performance.performance_id);
+          this.sendSignal("avatar.performance.stopped", { ...identity, reason: "drained" }, { turnId });
+        },
+        onError: (error) => {
+          if (this.isActivePlayback(playback)) this.failClosed(error);
+        },
+      });
+    } catch (error) {
+      if (this.isActivePlayback(playback)) this.failClosed(error);
     }
   }
 
@@ -1246,8 +1794,12 @@ class CandidateExperienceRun {
       this.observeMetric("avatar_freeze_ms", tickAt - performance.lastTickAt);
     }
     performance.lastTickAt = tickAt;
-    const elapsedMs = Math.max(0, audio.currentTime * 1000 - Number(performance.audio_clock_origin_ms || 0));
-    const viseme = activeCue(performance.visemes, elapsedMs) || { shape: "sil", weight: 0 };
+    const elapsedMs = performance.delivery === "streaming_tts"
+      ? playback.live?.positionMs() || 0
+      : Math.max(0, audio.currentTime * 1000 - Number(performance.audio_clock_origin_ms || 0));
+    if (!this.isActivePlayback(playback)) return;
+    const waitingForLiveAudio = performance.delivery === "streaming_tts" && !playback.live?.isPlaying();
+    const viseme = (!waitingForLiveAudio && activeCue(performance.visemes, elapsedMs)) || { shape: "sil", weight: 0 };
     const gesture = activeCue(performance.gestures || [], elapsedMs) || { gesture: "breathe", intensity: 0.3 };
     const cueKey = `${viseme.shape}:${viseme.weight}:${gesture.gesture}:${gesture.intensity}`;
     if (cueKey !== performance.lastCue) {
@@ -1286,12 +1838,16 @@ class CandidateExperienceRun {
       expectedPerformanceId
       && performance?.performance_id !== expectedPerformanceId
     ) return false;
+    this.metricReporter.clear();
+    window.clearTimeout(playback?.watchdog);
     cancelAnimationFrame(this.performanceFrame);
     this.performanceFrame = 0;
     const audio = playback?.audio || this.audio;
     this.activePlayback = null;
     this.audio = null;
     this.performance = null;
+    playback?.live?.cancel();
+    this.liveSpeech.cancel();
     if (audio) {
       const handlers = playback?.handlers || {};
       for (const [type, handler] of Object.entries(handlers)) {
@@ -1304,7 +1860,7 @@ class CandidateExperienceRun {
         audio.load?.();
       } catch { /* cleanup errors from an invalidated element are not playback failures */ }
     }
-    this.patch({ avatar: { ...EMPTY_AVATAR }, phase: this.state.floor === "candidate" ? "listening" : this.state.phase });
+    this.patch({ speechPlayback: null, avatar: { ...EMPTY_AVATAR }, phase: this.state.floor === "candidate" ? "listening" : this.state.phase });
     if (notify && performance) {
       this.sendSignal("avatar.performance.stopped", { performance_id: performance.performance_id, reason }, { turnId: performance.turnId });
     }
@@ -1342,18 +1898,14 @@ class CandidateExperienceRun {
   }
 
   observeMetric(metric, value) {
-    const numeric = Number(value);
-    if (!Number.isFinite(numeric) || numeric < 0 || numeric > 300_000) return;
-    if (this.socket?.readyState !== WebSocket.OPEN) return;
-    try {
-      this.sendSignal("telemetry.observe", { metric, value: numeric });
-    } catch { /* telemetry must never break the interview */ }
+    this.metricReporter.observe(metric, value);
   }
 
   async failClosed(error) {
     this.stopPerformance("fatal", false);
     this.evidenceOpen = false;
     this.evidenceReady = false;
+    this.answerFinishRequested = false;
     this.evidenceOpenCausationId = null;
     this.acknowledgedWarmupRetryCausationIds.clear();
     this.speechStartSignaled = false;
@@ -1387,6 +1939,7 @@ class CandidateExperienceRun {
   }
 
   async shutdownMedia() {
+    this.liveSpeech.close();
     await this.capture?.close?.();
     this.capture = null;
     await this.media?.close?.();
@@ -1396,6 +1949,7 @@ class CandidateExperienceRun {
   }
 
   async close(reason) {
+    window.clearTimeout(this.captionFreshnessTimer);
     if (this.closed) return;
     this.closed = true;
     this.intentionalClose = true;
@@ -1430,6 +1984,15 @@ class CandidateExperienceRun {
 
   patch(changes, notify = true) {
     this.state = { ...this.state, ...changes };
+    if (["paused", "completed", "answer_retry_required"].includes(this.state.phase)) {
+      this.state = { ...this.state,
+        captions: { ...this.state.captions, forming: false },
+        serverAudio: { received: false, receivedAt: null },
+        microphone: { ...this.state.microphone, localDetected: false },
+      };
+    } else if (this.state.captureRecovery?.status === "recovering") {
+      this.state.captions = { ...this.state.captions, forming: false };
+    }
     if (!notify) return;
     const value = this.snapshot();
     for (const subscriber of this.subscribers) subscriber(value);
@@ -1443,6 +2006,7 @@ class CandidateExperienceRun {
       microphone: { ...this.state.microphone },
       serverAudio: { ...this.state.serverAudio },
       evidence: { ...this.state.evidence },
+      captureRecovery: this.state.captureRecovery ? { ...this.state.captureRecovery } : null,
       captions: {
         forming: this.state.captions.forming,
         recent: [...this.state.captions.recent],
@@ -1458,7 +2022,7 @@ class CandidateExperienceRun {
   }
 }
 
-async function connectLiveKitMedia({ media, stream, onState }) {
+export async function connectLiveKitMedia({ media, stream, onState, onRemoteAudioTrack, onRemoteAudioTrackRemoved }) {
   const { LocalAudioTrack, LocalVideoTrack, Room, RoomEvent, Track } = await import("livekit-client");
   const room = new Room({ adaptiveStream: true, dynacast: true, disconnectOnPageLeave: true });
   const remoteAudioElements = new Set();
@@ -1471,8 +2035,12 @@ async function connectLiveKitMedia({ media, stream, onState }) {
   });
   room.on(RoomEvent.Reconnected, () => onState("connected"));
   room.on(RoomEvent.Disconnected, () => onState("disconnected"));
-  room.on(RoomEvent.TrackSubscribed, (track, _publication, participant) => {
-    if (track.kind !== "audio" || !isAuthorizedTakeoverAudioParticipant(participant)) return;
+  room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
+    if (track.kind !== "audio") return;
+    if (!isAuthorizedTakeoverAudioParticipant(participant)) {
+      onRemoteAudioTrack?.(track, publication, participant);
+      return;
+    }
     const element = track.attach();
     element.autoplay = true;
     element.dataset.interviewHumanAudio = "true";
@@ -1481,6 +2049,7 @@ async function connectLiveKitMedia({ media, stream, onState }) {
     remoteAudioElements.add(element);
   });
   room.on(RoomEvent.TrackUnsubscribed, (track) => {
+    onRemoteAudioTrackRemoved?.(track);
     for (const element of track.detach()) {
       remoteAudioElements.delete(element);
       element.remove();

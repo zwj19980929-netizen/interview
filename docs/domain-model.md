@@ -1,5 +1,86 @@
 # 领域模型
 
+## AnswerDeclined（023）
+
+`answer_declined` 是明确结束本题但未提供技术作答的语义结果，区别于识别失败、转写争议和仍在思考。它保留非空原始服务端发言及可追溯音频，以空能力主张/全部缺失点和next动作完成当前轮次。CandidateAnswer记录这次实际响应而非虚构技术答案，既有ANSWER_SUBMITTED、评分、报告链继续处理；不会绕开Evidence所有权和完整录音门禁。理解意图的confidence不等于答案质量。
+
+## RecognitionEmptyCompletion 与同证据准备复用（022）
+
+`transcript.empty` 是当前识别流完整结束但没有文字的内部结果，不是候选回答、ConversationUtterance或否定意图；不能由静音计时或缺失final推断。连续录音仍保留对应PCM，已经观测到的文字不可因换流被空结果覆盖。只有已有完整final加真实结束确认，并经新完整段收口、输入/所有权/上下文复核，才可提交。
+
+ConfirmedAnswerFinalization可以保留同一capture及完整STT指纹的单份纯准备工作；声音会撤销提交资格，新的文字/不同final/继续补充/失败/关闭会废弃工作。准备结果不是领域提交，旧上下文仍会被拒绝。无新增持久字段或表。
+
+## 补充问答与输入修订（021）
+
+一次补充问答的上下文独立于用于提交的输入revision。已确认结束后续说可撤销提交，但状态回到awaiting_reply继续理解新答复，不清空问答并重问。已确认final同时作为新回复的文本/分段边界；新的finish更新确认，continue/supplement才开启继续作答阶段。已覆盖的partial不算新话语。确认快照只在当前capture进程内保存；无新增持久字段或DDL，重连/失去所有权不能复用旧进程权威。
+
+## 播放事实和声音活动（020）
+
+新增严格AvatarPlaybackReport值对象（performance_id、playing/blocked/failed/buffering），及同名avatar.performance.playback transient事件。仅当前候选控制器、当前题和active performance匹配时接收；不更改floor、不确认答案，不写新的持久字段或表。状态日志只记录会话/题目/performance身份和枚举。浏览器playing只证明媒体开始推进，不能证明输出设备发声。声音活动的幅度门槛、持续时长和新增服务器文字共同维护可撤销输入revision；录音存在、旧字幕仍显示均不等同当前说话。
+
+## 转写歧义与对话边界（019）
+
+TurnUnderstanding 保持旧版本可读，新增理解Prompt v4/v5、组合决策 v3/v4（普通/已确认完成）。已校验语义结果中存在 ambiguities 且 intent 为 answer/clarification_request 时，服务端将 action 限为 clarify、confidence 上限0.64；暂停和重读控制优先。结束确认不等于认可转写准确。无新增持久表；识别术语是冻结材料派生的模型请求数据，不能成为回答或评分证据。
+
+## 已确认答复与活动事实（018）
+
+结束意图与当前输入revision绑定；同一权威回复final可直接进入准备和提交，不能被后续空识别流覆盖。PreparedTurnDecision仍需要原有完整STT指纹、上下文和Evidence最终事务匹配。SpeechActivity是进程内音频事实，区分待定起音、持续语音及非语音；不是转写或结束意图。新增服务端字幕是撤销信号，只有最终证据能形成答案。没有新增持久字段或DDL。
+
+## SpokenSupplementConfirmation（016）
+
+补充确认是本题ConversationUtterance之间的控制对话，不新建InterviewTurn或独立CandidateAnswer。进程内状态listening→speaking→awaiting_reply→classifying→confirmed；新语音撤销未提交确认/准备。server final的精确文本前缀及分段水位作为回复边界，不能把旧话语、修订前缀、播报回声、静音或低置信度答复当作否定确认。当前owner重开capture清除旧确认投影，换题/暂停/失权不得沿用旧批准。agent_runtime.supplement_confirmation持久投影仅含status/turn_id/capture_id；答案仍保留对应整段服务端转写和录音（含控制交谈），理解Prompt明确排除控制话语作为能力证据。新增三个supplement_* ConversationAct，版本supplement_confirmation.v1；确认后的理解写interview_turn_understanding.v3或interview_turn_decision.v2，旧版本保持可读。
+
+## StableTranscriptPreview（015，仓库verified）
+
+进程内、非final的稳定句段预览，与已经过识别收口的 `EvidenceTranscriptSnapshot`/权威 `ConversationUtterance` 不同。稳定前缀不可原地修订；句尾临时识别仍可变化。它只能产生未持久化的 PreparedTurnDecision，不能独立授权答案/追问/评分/录音complete。决策使用全部转写和上下文指纹，最终server final须重新确认；final修订时重新理解而非采用旧决策。句末时间戳及本地发送水位都不是厂商全音频确认水位。无新表或持久状态字段。
+
+## 回答采集恢复（CONTINUOUS-CAPTURE-RECOVERY-014）
+
+AnswerCaptureRecovery 与 InterviewSession.paused 分开：前者保持当前题和未提交回答，有限重建识别流并补送未确认片段；成功后继续自动接话。重试耗尽形成 AnswerRetryRequired，不形成 CandidateAnswer/评分，也不要求企业操作。候选人通过同题重试建立新的capture_revision，旧未完成片段保留且不与重答混合。
+
+`agent_runtime.capture_recovery` 保存status、turn_id、capture_id、attempt/max_attempts及仅特权可见的安全cause_code/stage/capture_revision。状态变更须校验当前会话/题目/owner，旧代结果不可清理新状态。原停止/终态/失权不得自动恢复。沿用JSON文档，无DDL；不更新历史paused会话。
+
+候选同题重试在该聚合另存内部retry_capture_revision，保证失败open后重复重试不重复推进媒体版本。owner的ownership_id必须属于目标interview，而非仅验证同租户任意有效owner。暂停先撤销本地输入，重开前后核对当前域状态；恢复状态持久化失败时必须撤销输入，不能仅记录日志并丢失唯一执行者。
+
+## 路由就绪证据（ROUTE-READINESS-REFRESH-013）
+
+ModelRouteReadiness 区分 healthy、expired、untested、checking、failed、configuration_invalid。健康证据有时间范围；过期仅说明必须重测，不能当作 Provider 故障。对当前模型与连接配置的有效证据才能通过邀请/start，模型配置测试不等于业务路由测试。
+
+ModelRoute 在原 JSON 聚合内保存短期探针所有权和配置指纹，探测开始/完成均使用事务 CAS。外部请求不占数据库事务；探测租约到期可重新取得，只有当前探测所有者且冻结配置仍一致才写入 last_health。配置指纹涵盖路由目标/策略及关联模型、连接的配置 revision，普通健康 version 增长不使同配置无故失效。删除、停用、换模型/凭据与新探测均使旧结果失去写入资格。旧无指纹健康记录只在原有效期内兼容，不永久延长；模型/连接配置修改事务先把受影响的旧证据绑定到修改前配置，因此配置变更后即使模型重新 ready 也必须重测路由，不能通过兼容窗口复用旧证据。
+
+刷新路由证据不签发邀请、不改变预约状态、不创建候选人答案；邀请和 start 仍在最终提交时重验准入。公开候选人自动刷新须先验证邀请、登记、同意、时间窗和有效设备事实；已消费邀请的幂等 start 不调用模型。
+
+## ApprovedSpeechOutput（工作项 012）
+
+当前为默认关闭的实验输出实现。Chrome 停供实测已否定 MediaStream.currentTime 与内容样本同源；
+drained 的目标领域含义仍是实际排空，但现有媒体时钟适配器尚不能提供充分证据，不能默认启用或标为端到端 verified。
+下步必须补明确 source sample→RTP/播放位置映射，或经授权的可计数客户端 PCM 播放 seam；不靠固定尾音延迟伪造确认。
+
+一个已批准 ConversationAct 对应一个可撤销语音输出：唯一 performance/output 标识、当前题/owner/selected-act fence、
+单独的最小权限 LiveKit publisher、严格验证的 PCM 流、播放确认与私有音频归档。
+状态为 preparing → awaiting_client → streaming → producer_finished → drained；任意阶段可 canceled/failed。
+只有已批准文本进入 TTS，不发布推测中的模型片段；Provider EOF 与候选端 drained 不可混同。
+每次 await 后和每次发布前验证原批准仍有效；失效不产生旧声音、不暂停新话轮。
+完成 PCM 复用 AgentExpressionAudioService 的私有 `agent-expression://` 引用归档；失败/中断输出不能伪造完整归档。
+AvatarPerformance 的 live_audio 与 audio_uri 互斥，delivery=streaming_tts 必须有完整轨道绑定。
+不新增数据库表，不改变 CandidateAnswer、评分或权威收音；输出绑定不是候选人答案证据。
+
+## 自动轮次的准备与提交（INTERRUPTIBLE-AUTOMATIC-TURNS-012）
+
+`AnswerEndpointProposal` 是 process-local、可撤销的候选回答结束提议，不是 CandidateAnswer 或题目状态变迁。`EvidenceTranscriptSnapshot` 是从已 seal 的私有音频前缀生成的累计权威 final，保存媒体代次/水位引用但 capture 仍开放；不能把 partial 或客户端文本充当此快照。
+
+`PreparedTurnDecision` 绑定 interview/turn、规范化文本、完整 STT 指纹（置信度、语言、分段、Provider 来源）与冻结题目/根题/追问预算/理解 revision 的上下文指纹。它只持有通过严格合同的理解与待审批追问；不持久化提案、不提前评分，也不因心跳 session.version 变化误失效。准备前冻结、关闭采集前及最终答案/非答案事务重新校验；有声续帧、补传、题目变化或 owner 失效都禁止旧决策提交。
+
+`TurnUnderstanding.prompt_version` 新增 `interview_turn_decision.v1`，历史 understanding v1/v2 仍可读。正常理解＋追问一次生成且分别执行既有安全/预算检查；正式停顿或语义推理失败不再强制手动完成或直接暂停整场。Floor(candidate, answer_preparing) 是继续收音，不是 Floor(none, answer_processing)。无新表/DDL，旧已暂停会话不自动恢复。
+
+## 正式收口与理解合同 v2（TURN-COMPLETION-UNDERSTANDING-011）
+
+VAD 停顿是声音活动事实，不是正式回答完成事实。011 的强制按钮完成已被上面的 012 可撤销自动轮次替代；暖场才有固定静音自动 seal。Evidence、唯一答案和人工最终决策不变。
+
+`TurnUnderstanding.prompt_version` 当前写入 `interview_turn_understanding.v2`，继续允许读取历史 v1，不重算或覆盖历史记录。Provider wire 使用 `evidence_ids`、claim.evidence_id、`covered_point_ids/missing_point_ids`，它们是当次冻结输入中的引用，不是候选人可提交的证据。原文按标点/换行及最多 240 字的连续片段无损分组，重复原文保留不同位置的 ID；所有片段均直接取自 final，不改大小写、技术词或标点。仅通过完整 schema 后才映射回 canonical evidence_quotes/claims/capability_points；canonical schema 和领域规则继续检验。
+
+`UnderstandingProblem` 增加可选固定 `reason_code`：provider_unavailable、wire_schema_invalid、point_duplicates、point_not_frozen、point_partition_invalid、evidence_not_verbatim、answer_evidence_empty、claim_evidence_undeclared；`attempts` 为 1–2。这些只用于内部诊断，候选人/replay 仍只有原先安全 problem 字段。合同纠正只使用原始输入和固定失败类别，不向模型回传不合法响应；两次都失败仍不得创建答案。无数据库迁移。
+
 本文定义岗位题库、简历审阅、预约、实时面试和企业复核的核心实体、状态与存储边界。字段名用于指导数据库 schema、Pydantic schema 和 API 实现。
 
 当前实现已为本页主要聚合建立 versioned document repository，并把 `QuestionSelection`、候选人/计划/题目快照、轮次、回答、转写 revision、评分 revision 和报告 revision 保存在 `InterviewSession` 聚合中。Memory/SQLite 用于本地，PostgreSQL adapter 与迁移已提供 JSONB 持久化、乐观并发、Outbox 幂等、预约单会话/选择槽位约束和强制租户 RLS；真实 PostgreSQL 实例上的迁移、RLS 与查询计划仍属于部署环境验收。联系方式与 Provider 凭证在 repository 边界加密，PDF 原件和解析文本都由 `FileObject + PrivateFileStorage` 托管。
@@ -645,15 +726,19 @@ Avatar FPS 门禁使用候选人界面实际展示的整数帧率：`Math.round(
 
 ### InterviewAgentRuntime 状态与 AgentEvent
 
-`InterviewSession.agent_runtime` 保存当前 InteractionFloor、最后事件序号、已处理 idempotency key、当前 AvatarPerformance、暖场/结束状态、durable `calibration_retry_required`、TakeoverLease、有界 browser backfill batch 与一次冻结的 `authoritative_media_binding`。该 binding 只含 provider、room、服务端签发的 candidate identity、首次 connection ID、绑定时间和 version；建立后，新的控制连接不能替换 room/identity。`AgentEvent` 以 `event_id/session_sequence/type/turn_id/causation_id/occurred_at/replayability/payload` 形成安全传输事实；只有 replayable 事件进入有界历史，瞬时音量和 cue 不进入领域真相。共享历史只保存逐类型 allow-list 的最小载荷；快照、接管 lease/actor、私有媒体 URI、加密信息和能力点由当前领域状态按角色即时重建，不在不同角色间复用。
+`InterviewSession.agent_runtime` 保存当前 InteractionFloor、最后事件序号、已处理且需要领域幂等的信号 key、当前 AvatarPerformance、暖场/结束状态、durable `calibration_retry_required`、TakeoverLease、有界 browser backfill batch 与一次冻结的 `authoritative_media_binding`。该 binding 只含 provider、room、服务端签发的 candidate identity、首次 connection ID、绑定时间和 version；建立后，新的控制连接不能替换 room/identity。`AgentEvent` 以 `event_id/session_sequence/type/turn_id/causation_id/occurred_at/replayability/payload` 形成安全传输事实；只有 replayable 事件进入有界历史，瞬时音量、cue 和 `telemetry.observe` 不进入领域真相。共享历史只保存逐类型 allow-list 的最小载荷；快照、接管 lease/actor、私有媒体 URI、加密信息和能力点由当前领域状态按角色即时重建，不在不同角色间复用。候选人遥测只在 role 校验后作为无 PII 进程指标消费，不写 `processed_signal_keys`、InterviewSession、Evidence journal 或 takeover 状态；非法样本静默丢弃。高频 viseme drift/freeze 在浏览器按 metric 独立收敛为 1 秒窗口最大值，关闭时不保留待发状态。
 
 Evidence 打开是两阶段控制握手，而不是一个本地布尔值：客户端发送 `evidence.stream.open` 后只进入 `requested`，服务端实际建立流或确认幂等 existing-open 后，以 transient `floor.changed(reason=warmup_stream_open|evidence_stream_open)` 和原命令相同的 `causation_id` 确认 `ready`。该确认不进入 replay 历史；断线恢复通过快照和有界 reassert 重新取得当前连接自己的确认。Hub 可向同一候选人的多个控制连接广播 transient 事件，因此客户端只能用本次 open 的 causation 接受 ready；不匹配事件只推进有序 cursor 和安全共享状态，不能打开本地 Evidence gate、补发 speech 或替其他标签页自动认领新流。握手完成前普通候选人 VAD 不发送 `speech.started/stopped`，若候选人已持续发言则 ready 后承接当前 speaking 状态；数字人正在播放时，经更高门槛确认的真实 barge-in 仍须在 200ms 内静音并发送 start。
 
 `InterviewMediaCapture.storage_protection(_policy)` 保存对当前环境真实成立的录像保护描述；生产对象必须同时保存经 Provider 元数据复核的 `encryption`，本地开发录像只允许 `local_private_development` 且 `encryption=null`。二者分离，防止把本机目录误报成服务端加密。
 
-`AuthoritativeEvidenceIngress` 是连接独立的运行态 owner actor，`LiveKitEvidenceIngress` 是其当前 SFU Adapter。同一 InterviewSession 在一个当前 `EvidenceOwnershipEpoch` 内最多存在一个权威 receive-only candidate microphone subscriber、一个私有录音和一个 StreamingSTTSession。它保存音频 ingress sequence、partial/final 和 2.5 秒 endpoint timer；candidate control WebSocket 断开后进入 30 秒 reconnect grace，重连只接管命令投影，不重建 Evidence。
+`AuthoritativeEvidenceIngress` 是连接独立的运行态 owner actor，`LiveKitEvidenceIngress` 是其当前 SFU Adapter。同一 InterviewSession 在一个当前 `EvidenceOwnershipEpoch` 内最多存在一个权威 receive-only candidate microphone subscriber、一个私有录音和一个 StreamingSTTSession。它保存音频 ingress sequence、partial/final 和暖场 2.5 秒 endpoint timer（正式回答由显式完成收口）；candidate control WebSocket 断开后进入 30 秒 reconnect grace，重连只接管命令投影，不重建 Evidence。
 
-`EvidenceOwnership` 不位于 InterviewSession JSON 内，而是独立版本化记录：`owner_instance_id/lease_id/ownership_epoch/lease_expires_at/state/control_connection_id/control_generation/reconnect_grace_expires_at`。租约只使用数据库时钟；owner 更换递增 epoch，续租不改 epoch，control 重连只递增 generation。每个权威提交都携带不可变 `EvidenceCommitFence`，CandidateAnswer 事务内在锁 InterviewSession 之前锁所有权行并重新校验。迟到旧 final、旧 detach 或旧 release 不能覆盖新 owner，也不能形成 CandidateAnswer。
+LiveKit ingress 的进程态 sink 以单调 `accepted_sequence/delivered_sequence` 建立 seal 排空屏障；它不是新的持久领域字段。`evidence.seal` 捕获当时已接受的音频前缀，只有该水位全部通过 `InterviewEvidenceChain` 后才能请求 Provider final；超时按正式 Evidence 故障暂停，暖场进入 durable retry gate。水位之后的房间环境音不属于该前缀，由关闭后的 Evidence gate 忽略，不能形成第二 final 或补写 CandidateAnswer。
+
+partial 仅是可丢的运行态 UI 投影：owner 按 `(kind, turn_id)` latest-wins 合并，不把其投影 I/O 放在 LiveKit 权威音频消费调用栈中。每个 key 最多一个 in-flight 和一个 pending，总 pending key 有界；final/reset/stop 对同 key 关门并等待投影屏障，因此 partial 可合并但不能越过 final。`transcript.final`、私有媒体、checkpoint、CandidateAnswer 与 Evidence fence 都不应用这条可丢通道。权威 track 异常在 `agent_runtime.problems` 中保持统一业务 `code`，并可以附加固定语义白名单校验后的 `cause_code/cause_type` 特权诊断；候选人投影必须移除后两者。
+
+`EvidenceOwnership` 不位于 InterviewSession JSON 内，而是独立版本化记录：`owner_instance_id/lease_id/ownership_epoch/lease_expires_at/state/control_connection_id/control_generation/reconnect_grace_expires_at`。租约只使用数据库时钟；owner 更换递增 epoch，续租不改 epoch，control 重连只递增 generation。周期续租对 scheduler lag、DB latency 和成功/失败只生成无标识符的 best-effort 进程观测，这些指标不属于 EvidenceOwnership、不能延长租约或改变 fence。租约过期以及 owner/lease/epoch 不匹配仍严格 self-fence；旧 owner 即使稍后恢复调度也不能重新取得权威写入资格，control generation 则继续独立保护候选控制命令。每个权威提交都携带不可变 `EvidenceCommitFence`，CandidateAnswer 事务内在锁 InterviewSession 之前锁所有权行并重新校验。迟到旧 final、旧 detach 或旧 release 不能覆盖新 owner，也不能形成 CandidateAnswer。
 
 `EvidenceCommand` 也是独立版本化事实：保存确定性 ID/idempotency hash/request fingerprint、canonical command type、turn/causation、逐类型安全 payload、control generation、target/claimed owner fence、deadline、claim TTL、attempt、状态和最小安全 outcome。状态为 `pending → running → completed|rejected|expired`，retryable failure 或 claim 到期可由当前 owner 重领；同一幂等键不能换成另一请求。owner executor 与控制连接无关，以数据库 polling 为正确性路径、Redis 为 wake hint；remote controller 只等待 journal receipt，不创建新 subscriber/STT/录音。原始幂等键、音频、转写、ticket、participant identity、私有 URI 与 Provider 原始数据不进入该事实；backfill 命令只引用已落私有存储的 file ID/hash/epoch/sequence。
 
@@ -661,9 +746,13 @@ Evidence 打开是两阶段控制握手，而不是一个本地布尔值：客�
 
 每个 `InterviewTurn` 增加版本化 `utterances/current_understanding/conversation_acts`，但轮次状态仍只能由 `InterviewSessionLifecycle` 推进。
 
-暖场是非评分校准阶段：`media.published` 后可运行临时 STT，但不启动媒体录制；候选人页面在收到真实 `session.snapshot` 前只能显示“建立会话”，不得提前渲染自我介绍/暖场题。暖场 final/seal 对同一 capture 是 destructive-once：Provider final 失败后保留第一次真实错误并原子进入 `calibration_status=retrying + calibration_retry_required=true`，不得再次消费同一流或用通用 turn 错误覆盖根因。服务端在 durable retry gate 未清时拒绝 `evidence.stream.open`；页面只提供显式 `warmup.retry`。owner 清 gate 后以同 causation transient `floor.changed(reason=warmup_retry)` 确认；该 live 事实以及 snapshot 的 `retrying + calibration_retry_required=false` 都证明某个候选控制已显式授权 reset，当前 control 可用新 causation open/reassert。客户端记住已消费 retry causation，重复 ACK 不得清除新流；服务端以 control generation fence 和 existing-open 幂等 ACK 阻止旧连接或恢复过程重复创建付费 STT。`warmup.confirm` 必须先删除暖场音频/转写，再启动必需 Egress 和正式首题。结束是一个可观察的 closing handshake：最后答案接受后先停 Evidence/Egress，再创建告别 `ApprovedConversationAct/AvatarPerformance`；只有客户端确认 `avatar.performance.stopped` 或有界超时后，才发布唯一 `completed` 回执。回执只包含提交成功、录制留存说明和人工最终审核声明，不含实时评分。
+暖场是非评分校准阶段：`media.published` 后可运行临时 STT，但不启动媒体录制；候选人页面在收到真实 `session.snapshot` 前只能显示“建立会话”，不得提前渲染自我介绍/暖场题。每次成功 open 创建单调 warm-up epoch。暖场 final/seal 对同一 capture 是 destructive-once：Provider final 或 `audio_stream_failed` 后保留第一次真实错误并原子失效该 epoch、进入 `calibration_status=retrying + calibration_retry_required=true`，不得再次消费同一流、用通用 turn 错误覆盖根因，或采用旧 seal 迟到返回的 final。暖场断流不暂停 InterviewSession，因为其音频不属于答案；正式 Evidence 断流仍失败关闭。服务端在 durable retry gate 未清时拒绝 `evidence.stream.open`；页面只提供显式 `warmup.retry`。owner 必须先恢复 receive-only microphone iterator（必要时重建 subscriber），再清 gate 并以同 causation transient `floor.changed(reason=warmup_retry)` 确认；该 live 事实以及 snapshot 的 `retrying + calibration_retry_required=false` 都证明某个候选控制已显式授权 reset，当前 control 可用新 causation open/reassert。客户端记住已消费 retry causation，重复 ACK 不得清除新流；服务端以 control generation fence 和 existing-open 幂等 ACK 阻止旧连接或恢复过程重复创建付费 STT。`warmup.confirm` 必须先删除暖场音频/转写，再启动必需 Egress 和正式首题。结束是一个可观察的 closing handshake：最后答案接受后先停 Evidence/Egress，再创建告别 `ApprovedConversationAct/AvatarPerformance`；只有客户端确认 `avatar.performance.stopped` 或有界超时后，才发布唯一 `completed` 回执。回执只包含提交成功、录制留存说明和人工最终审核声明，不含实时评分。
 
-候选人本地 VAD 以采样数、采样率和累计毫秒计算持续窗口，不依赖 AudioWorklet 每次回调帧长；candidate floor 使用常规起止窗口，agent-speaking 使用更高能量门槛和确认窗口抑制扬声器回声，同时保留不超过 200ms 的真实打断响应。`REALTIME-WARMUP-VAD-RANGE-003` 当前为“verified（仓库），目标环境复验 pending”。这些运行态收紧不改变题目抽取、冻结证据、权威答案、理解、评分、受控追问、S2S/cascade 决策或人工接管的领域规则。
+`AvatarPerformance.active_performance_id` 是播放结束迁移的 compare-and-clear 条件，不是仅用于显示的元数据。`avatar.performance.stopped` 必须携带非空 ID 且与事务内当前值相等；旧播放的迟到 stop 或重复 stop 不得清除替换播放、不得切换 InteractionFloor，也不得提前建立正式 Evidence/STT。
+
+候选人本地 VAD 以采样数、采样率和累计毫秒计算持续窗口，不依赖 AudioWorklet 每次回调帧长；candidate floor 使用 80ms 开始、800ms 停止的默认持续窗口，agent-speaking 使用更高能量门槛和确认窗口抑制扬声器回声，同时保留不超过 200ms 的真实打断响应。800ms 停止窗口只减少自然短停顿造成的控制命令抖动，不替代暖场服务端 2.5 秒端点；正式回答已在 011 中改用显式完成收口。`REALTIME-WARMUP-VAD-RANGE-003` 当前为“verified（仓库），目标环境复验 pending”。这些运行态收紧不改变题目抽取、冻结证据、权威答案、理解、评分、受控追问、S2S/cascade 决策或人工接管的领域规则。
+
+`EVIDENCE-LEASE-TELEMETRY-004` 当前为“verified（仓库），目标新会话复验 pending”。该项把非权威遥测从领域持久化路径移到进程观测旁路，并补齐严格 Evidence lease 的无 PII 续租观测；它没有修改 InteractionFloor、题目选择/冻结、权威 Evidence/CandidateAnswer、理解、评分、追问、S2S/cascade 或人工接管状态迁移。
 
 人工接管 lease 保存 `lease_id/actor_id/reason/expires_at/version` 及媒体 permit generation/participant identity，TTL 为 60 秒；同一面试最多一个 active lease。所有获取、续租、发言事务复核、释放、到期和 permit 计算使用 transaction database clock，不依赖应用主机时钟。普通企业 ticket 只读；当前 actor 以 `lease_id + expected_version` CAS 一次换取 15 秒、限房间/限 microphone/禁止订阅的 LiveKit permit。接管成功先中断 AI 并将 floor 交给 human；release、lease 丢失或会话终止会移除媒体 participant，并保持 session paused，不自动恢复 AI。
 
@@ -675,7 +764,11 @@ Evidence 打开是两阶段控制握手，而不是一个本地布尔值：客�
 
 `BrowserBackfillBatch` 是 `agent-json-backfill.v1` 的有界恢复事实，冻结 source consumed connection、audio epoch、turn、首尾 client sequence、字节限额与 `ack_through`。每个 chunk 在进入 journal 前先转成私有 FileObject；journal 只引用 file ID/hash/epoch/sequence，当前 database-fenced owner 校验连续性后才注入同一 `InterviewEvidenceChain`。重发 chunk 按 batch/sequence/checksum 幂等，不能形成重复音频或 CandidateAnswer。候选人留存清理覆盖当前/放弃 revision、backfill 帧、CandidateAnswer 音频和 LiveKit Egress object，并将 capture/stream 最小化为 `retention_purged` tombstone。
 
+`EvidenceMediaStream.complete` 只代表当前采集完整，不代表同题已形成 CandidateAnswer。权威 `UTTERANCE_REJECTED` 事务把已封存采集记入 `abandoned_captures`（`reason=utterance_not_accepted`、`rejected_utterance_id`、原 revision/segment/frame/byte checkpoint、可选 `recovered_audio_uri`），单调推进 revision 并清空当前 checkpoint 与 repair 引用；原 utterance 与录音不改写。无明确拒绝结果时不能释放完整采集。新 CandidateAnswer 的 `media_evidence.capture_revision` 绑定实际采集；旧 writer、迟到语义结果与跨 revision repair 均不能写入新采集。暂停的非答案事务可以释放采集，但会话仍 paused，继续收音必须走原恢复权限与状态门禁。
+
 ### 根题证据组与评分 revision
+
+无转写采集不构造 ConversationUtterance：保留原始录音和 `transcription.started/failed(error=STT_TRANSCRIPT_UNAVAILABLE)`，turn 保持 asking；同一事务为 `abandoned_captures` 增加 `reason=transcript_unavailable`、`untranscribed_audio_uri`，并推进 capture revision。它不是答案，也不是语义理解拒绝。`capture_id` 是当前 owner 实时流的控制作用域，区别于 durable `capture_revision`；`endpoint_id` 进一步区分同流中的每次停顿，只控制是否允许自动封存，不授权创建答案。
 
 追问深度可为 1 或 2，但始终 `weight=0`。根题最终评价不是各轮独立相加，而是按 `root_turn_id` 合并主回答与全部权威追问回答，生成新的 root evaluation revision；报告只引用每个根题当前 revision。追问文本、理解结果或人工接管话语都不能单独加分。
 

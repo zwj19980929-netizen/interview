@@ -1,5 +1,96 @@
 # 实时数字人面试系统架构
 
+## 明确结束但没有技术回答（023）
+
+理解层增加answer_declined/next，完整服务端证据明确结束但未提供技术内容时，沿用CandidateAnswer和ANSWER_SUBMITTED事务保存真实响应；所有权、当前题目、完整音频及准备指纹保护保持有效。它不发技术追问，也不进入utterance.not_accepted的澄清循环。评分层从租户隔离持久会话核验答案/理解/发言绑定，全组未作答产生正常0分revision；混合证据只用实际技术响应评分。根回答及追问的审计引用继续保留，候选进度仅统计已回答的不同正式题。
+
+023回归同时修复取消关闭导致的供应商流遗留：ContinuousSTT持有唯一的有界清理任务，调用者取消不撤销清理，重复关闭共享等待；每条流保留2秒关闭期限。服务端原录音、识别与提交语义不变。
+
+## 追问等待与识别完成（022）
+
+供应商正常结束且本段无文字必须区别于超时、断线或丢失结果。内部 `transcript.empty` 仅由完整发送及正常结束确认产生，经网关校验后推进该段音频水位；它不提供文字、不代表否定，不可单独形成答案。任何已见非空partial/稳定预览在跨流恢复时也不能被empty抹去。已确认回答在新完整空段核验后可保留原结束语义，避免VAD活动令无字音频无限重放。
+
+同一capture、completion_confirmed、全部STT指纹一致时，声音只取消本次等待和提交资格，保留一份有界的纯理解/追问准备。新文字、变化的final/上下文、继续补充、失败和关闭会废弃；仍需新的完整快照与全部提交fence，不使用None提交。准备45秒期限从首次启动计算，重入不续期。STT finish最多10秒，恢复每次15秒/最多3次；接收缓冲统一60秒，进入恢复不能缩小已接受的缓冲。字幕按当前题目隔离，旧题final不带入追问且迟到事件不能清当前收音状态。
+
+## 补充确认循环修复（021）
+
+SpokenSupplementConfirmation保留已问上下文，声学或ASR新输入撤销的是准备中的提交，不把问答重置到listening。重复“没有”“下一题”在同一问答中按语义处理；真实新增内容仍可进入继续补充。确认后的文本边界推进到当前final，避免将上次否定和新回复混为原回答后再次询问。AnswerEndpoint记录final已覆盖的文本前缀，迟到/重复partial不取消使用该final的决定。
+
+声学中断后若新完整快照与确认final的全部指纹相同，可以复用结束意图并重新准备；无final或不完整尾部不能复用。慢理解期间继续收音、原有录音唯一性、提交fence和真实改口撤销均保留。确认决策/撤销/播放事实写入专用speech_evidence日志，修复普通模块INFO默认未启用导致诊断缺失；仅有安全字段及文字散列。
+
+## 声音活动与可听播报（020）
+
+端点与连续STT共用INTERVIEWER_TURN_VOICE_RMS下限，默认0.006；20ms/mode3 WebRTC VAD要求近6帧至少5帧同时满足语音特征和音量。收到PCM不是说话事实，所有已接受候选PCM仍录制和送识别。实际_receive_audio返回的当前capture/turn新增服务端文字在投影前通知端点，重复累积文字不重置5秒计时，旧capture及播报期间结果不能撤销新提案。询问后有声但缺final持续5秒会进行一次语音澄清，仍保留未识别音频且不提交旧边界。
+
+客户端普通起音为RMS≥0.006持续120ms，agent floor包含语音生成/缓冲期并使用≥0.05持续160ms的打断门槛。字幕更新灯2秒无新文字熄灭，音频通道不表示正在说话。级联音频明确区分loading/playing/blocked，8秒加载或卡顿受阻时保留当前音频并允许恢复；playing/blocked/failed/buffering回执仅诊断，实际结束仍用原stopped协议。浏览器播放错误不再直接暂停面试，服务端补充播报30秒超时门禁保持。
+
+## STT 补送流控与转写边界（019）
+
+实时收帧仍先写唯一录音，再非阻塞送识别。快照排队尾帧、重开后的未确认片段和积压补送通过 ValidatedSTTStream 的可选容量等待扩展，等待网络发送实际释放空间；LiveKit 接收继续使用独立的有界 PCM 缓冲。单次恢复总预算15秒、三次尝试；单次发送无进展最多5秒，故障仍保留完整录音，绝不通过丢帧换成功。继续补充后遇到无转写片段可以使用已确认边界再次询问，边界只用于对话；未识别音频继续保留，提交仍要求新完整 final。
+
+## 结束确认后的收口（018）
+
+口头答复取得server final后暂不重开识别；同一final供意图与完整答案理解使用，提交前仍核对owner/turn/capture、输入revision、全部STT/上下文指纹及待处理音频。继续/澄清、失败或续说均恢复原采集；关停不重开。记录与PCM接收始终继续，已确认且主动暂停识别的准备窗口最多60秒缓冲，覆盖10秒意图+45秒理解；022起故障/缺final也使用60秒接收预算，防止进入恢复时突然收缩容量。
+
+ServerSpeechActivity为本地WebRTC VAD适配器，固定webrtcvad-wheels==2.0.14、20ms帧、mode3，最近6帧中至少5帧含语音特征且达到配置RMS（020起默认0.006）才声明持续语音；单帧可能起音在下一帧解析前阻止提交，但不立即撤销确认。保留所有PCM；不支持格式、DC故障、检测异常按有声保守处理。端点与连续采集采用同一活动规则；服务端新增字幕也能撤销决定，VAD不能提供文本或授权结束。ASR已有新假设却缺final仍阻塞，不能因VAD未检测到就丢弃。
+
+待定声学起音必须按字节水位关联到最终转写：已被server final覆盖的半帧不能继续阻塞；新的半帧仍阻止提交。稳定预览只因在途有声/待定起音或新ASR尾句而失稳，纯静音PCM正在send不能撤销已准备结果，否则会在持续收音下重复调用模型。此修复不把预览当作厂商处理ACK，最终提交仍等待final和音频fence。
+
+## 静音后的口头确认（SPOKEN-SUPPLEMENT-CONFIRMATION-016）
+
+正式生产入口在 AnswerEndpoint 内安装 SpokenSupplementConfirmation：候选人说话后连续5秒静音触发批准的“是否补充”语音，不直接提交，也不依赖EOT模型概率。实际换说话人时取得server final并冻结答复边界，同一Evidence capture/录音继续保留；询问前不做耗时答案理解。播报期间隔离麦克风回声，已确认的scoped barge-in补回最多200ms起音且只记录一次。候选口头肯定/实质补充继续听，明确否定才进行完整回答理解和既有受控后续动作。未知/低置信度再确认，无答复15秒提醒一次后继续等，30秒无播放ACK只撤销本代输出、不默认完成。此流程替代012/015正式入口的纯EOT自动提交政策；底层可撤销准备/final核验、暖场与014故障恢复仍保留。
+
+## 正常轮次不断流预览（NONCLOSING-STT-SNAPSHOT-015，仓库verified）
+
+正式采集支持独立 `StableTranscriptPreview`：网关验证供应商已稳定句段，ContinuousSTT 统一累积，Evidence 封存 `complete=false` 的录音前缀后才允许语义预计算。预览不是 final/权威 Utterance/完整音频 ACK，不推进生命周期；无稳定句或仍有未定尾句时继续同一连接收音。正常 continue_listening 不 finish/reopen；准备接话后只做一次最终收口，最终全字段指纹变化须重新准备，续说/owner/题目变化撤销旧结果。仅真实异常进入014恢复；未提供预览能力的 Provider 保留原兼容收口路径，试音不变。
+
+## 连续采集自动恢复（CONTINUOUS-CAPTURE-RECOVERY-014）
+
+识别流故障与整场面试暂停分离：`capture_recovery` 集中安全分类，AnswerEndpoint 持有最多3次、单次15秒的重建预算，ContinuousSTT 只做一次旧流清理/重开/未确认PCM补送。正常停顿仍由可撤销音频EOT与权威理解处理，不改成强制按钮；试音原自动完成不变。帧进入Provider前录一次，轮换/恢复新积压最多60秒（022起统一接收预算）；溢出作为不可忽略缺口转同题重答，不能用旧final提交。重放主动让出调度，避免健康sender尚未运行就被突发补送压满。
+
+恢复时保留当前题和收音；耗尽封存不完整证据并关闭本代采集，InterviewSession仍in_progress，候选人可显式重试本题，无需企业人员守候。重试通过既有owner journal、当前turn/capture与私有capture_revision事务创建新代，不混入旧片段。持久恢复状态与UI投影分开：UI慢不杀识别，持久状态/完整性失败则撤销输入并保留安全错误，不能退出唯一worker后继续暗中收音。主动暂停同步撤销输入；Provider重开前后再验证会话/题目/所有权，取消不能复活旧流。
+
+答案提交后的短UI投影失败不阻止后续表达任务调度；批准追问/澄清仍使用自身生命周期，不套用1秒UI时限。历史paused会话不自动恢复；生产服务持续不可用、存储损坏或所有权失效不冒充已恢复。真实中文停顿、长回答与网络抖动验收仍须独立完成，不能由合成回归推断端到端稳定率。
+
+## 邀请与路由就绪刷新（ROUTE-READINESS-REFRESH-013）
+
+健康状态计算与探测协调集中在 Model Route Readiness seam，供 AppointmentAdmission、部署只读 readiness 和模型管理复用；HTTP/页面不自行判断 TTL。过期是待确认，不是已确认故障。GET/基础设施健康接口不调用付费模型，命令路径才在权限和前置条件检查后刷新所需路由；网络等待位于最终邀请/start 事务之外，成功后再次复核全部门禁。
+
+自动刷新有并发/单次/整批时限、失败冷却、持久租约和配置绑定。管理员可单独刷新预约 readiness 而不发邀请；界面完整列出试音、正式 STT、理解、追问和表达 TTS。真正探测失败仍失败关闭，不扩大有效期、不改为 mock、不承诺一次基础 `/readyz` 覆盖所有预约能力。
+
+## 可撤销自动轮次（INTERRUPTIBLE-AUTOMATIC-TURNS-012）
+
+发布范围：自动轮次/合并推理与稳定性修复默认生效；下面的 TTS streaming transport **默认关闭，仅显式实验**。
+真实 Chrome 合成测试表明当前 MediaStream 时钟包含发送端停供静音，不等价于内容 sample playhead；在解决同源映射前沿用可靠私有资产播放，
+不为了展示首包速度启用未验收的抢话/截尾风险。当前本机媒体地址漂移（旧.104→实际.108）已更新；`scripts/local-media.sh doctor` 用于只读检查，
+不能把 HTTP readiness 或信令连接成功当作浏览器 ICE/音频路径成功。
+
+本节替代 011 的强制按钮收口。正式回答使用 `AnswerEndpoint`（提议/撤销/准备/核验）与 `ContinuousSTT`（识别句段轮换/有序缓冲/权威累计 final）两个 seam。VAD 只表示声音活动，本地音频 EOT 概率与最低静音门槛共同产生提议，仍需权威转写和严格理解；不依赖结束词库，也不把静音时长或 STT 句段 final 当作整题结束。`finish_answer` 是可选提前结束建议，新语音同样可以撤销它。暖场仍自动结束。
+
+理解准备期间 Floor 保持 candidate，媒体继续进入同一 Evidence capture；只 seal 私有录音前缀 checkpoint，不能提前标记 complete。识别流轮换期间缓冲至多 5 秒，帧按原顺序且只录一次，缺失 final 的有声段保留并向新流重放，不复用旧 final 冒充完整回答。提交前再次 flush final 并对比全文、置信度、分段与来源；在链锁内复查 owner/capture/输入版本及冻结题目/预算上下文，通过后才同步切断采集并封存。静音尾帧仍保留在私有录音，保守能量门槛只是额外输入失效保护，不构成准确 VAD 的证明。
+
+`prepare_decision` 在后台运行，理解＋受控追问通常合成一次 LLM 请求；短事务执行器不等待模型/TTS。新语音或补传使旧提案失效；准备失败最多 3 次（1 秒、2 秒退避），随后仍收音，不把语义服务暂时故障升级成整场暂停。未知 EOT 不提交，长时间不确定只提示仍在听。媒体损坏/缓冲耗尽/owner 丢失仍安全停止。动态表达在答案提交后后台生成，播放前重查原 owner/turn/act-selection/floor，暂停、换题、接管后的迟到成功或失败均不能影响新轮次。
+
+本轮分阶段计时覆盖 EOT、STT snapshot/final、理解准备、决策提交、TTS 合成/开流/首 PCM/订阅确认、音频导入、远端排空确认及撤销计数，无音频/文本/候选人标签。源码/离线场景验证与目标麦克风/并发/生产验收分开记录；不得以本地 EOT 推理时间代替端到端首音延迟或真实中文轮次准确率。
+
+第二阶段使用 `ApprovedSpeechOutput` 承接已批准动态表达：原 TTS route 的严格 PCM streaming extension → 独立最小权限 LiveKit publisher → 精确绑定的客户端播放器。Provider 开流、候选订阅 ready、首 PCM、唯一 final、本机 source 排空、远端媒体时钟排空是不同阶段；只有最后的当前输出 ACK 才移交 Floor。队列 200ms、20ms 帧、持续 owner/turn/selected-act/performance fence，取消同时停止 Provider 和音轨。预生成题目不改，不支持 streaming 的模型在首 PCM 前回到已有私有资产路径；首 PCM 后失败不整段重播。完整 PCM 经私有资产 seam 归档，供应商 URL 不进入事件。控制连接中断撤销旧轨道，新控制连接只能以新代次重播仍匹配当前题的已批准 act；禁止把不可重放的 transient track 留为永远 active。G2P 和 MediaStream 时钟不等于精确 RTP/sample 对齐，真实浏览器抖动/尾音与端到端首音尚须验收。
+
+## 正式完成确认与理解引用合同（TURN-COMPLETION-UNDERSTANDING-011）
+
+011 曾使用显式 `finish_answer` 收口，其强制按钮语义已被上面的 012 替代；引用合同、安全校验和历史记录仍保留。正式 `speech.stopped(endpoint_countdown_ms=0)` 不是自动 seal 指令；暖场保留 2.5 秒自动端点。资源上限、断线 grace、owner/capture fence 仍有效，不承诺无限录音。
+
+Understanding 保持原有 Module Interface，内部以 `interview_turn_understanding.v2` 让模型选择服务端生成的 E 原文片段 ID、P 冻结能力点 ID；统一 wire schema 检验后精确还原为原领域字段，再执行完整分区、原文引用和 claim 声明检查。不存在模糊匹配、静默补点或模型重写证据。失败只携带固定类别重新生成一次，每次逻辑调用上限 20 秒（合计至多 40 秒）；仍不合法时维持安全暂停且不得产生 CandidateAnswer。成功 JSON 不等于通过领域内容校验，诊断记录拒绝原因/尝试数但不保存原始响应。
+
+百炼 constrained-decoding 不接受 array.uniqueItems：Adapter 仅在发送的厂商 schema 副本中去掉此关键字，网关继续用完整原 schema 检验唯一性；其它约束保留。静音、语义处理、模型格式约束和安全暂停现在分别有明确状态与职责。
+
+## 正式语音同题重说的事务边界
+
+`ENDPOINT-CAPTURE-SCOPE-010`：每次 owner 真正开流生成独立 `capture_id`，通过同 causation 的 transient ready 投影；客户端 VAD 绑定它与 turn，barge-in 在未 ready 时只打断当前表达，不能为后续新流调度停止计时。端点另有每次停顿独立的 `endpoint_id`，服务端在创建/到期/执行 durable seal 时验证作用域，重新开口、换题、同题重说和 reset 会取消旧计时。暖场连续静音收口窗口仍为 2.5 秒；正式回答使用 012 的可撤销提案，不以延长超时掩盖跨流竞态。
+
+Provider 明确返回无 final 时，仅保留录音和 `transcription.started/failed` 事实，不构造空/None utterance、不调用理解/评分；与当前 capture 释放在同一事务完成后，返回可恢复的“未得到有效转写，继续说或重说”，快照驱动新开流。真正的 Provider 故障仍走真实 batch repair；没有真实批量路由时网关拒绝 mock，不冒充补偿成功。已有语义 schema/内容安全暂停、owner fence 与人工恢复权限保持不变。
+
+采集完成与题目作答完成是不同事实（`EVIDENCE-NONANSWER-RECAPTURE-009`）。录音封存后，若权威理解要求澄清、重读、继续听或暂停，`UTTERANCE_REJECTED` 与 durable capture revision 推进在同一事务提交。原 utterance/录音保留，未采纳片段进入既有旧 revision 留存链路；下一次同题开流从空 checkpoint 开始。未决或已采纳的完整采集仍禁止普通 reset/open。转写状态与答案提交除 owner fence 外还校验 capture revision，旧 writer 或跨 revision repair 不能污染新录音。封存命令若在结果应答前崩溃且缺少可确认 receipt，继续按既有失败关闭规则处理，不把新采集当成旧答案。
+
 ## 目标
 
 系统围绕“岗位”组织招聘知识与面试执行，目标闭环如下：
@@ -191,6 +282,8 @@ sequenceDiagram
 - 题目语音是可版本化资产，优先由题库当前 KnowledgeBaseSpeechProfile 预生成；播放失败时按预约策略降级为服务端 TTS 或文字，不能让客户端自报已朗读。
 - 新预约默认 `avatar_mode=local`：服务端只签发当前轮次冻结语音的短期访问地址，浏览器用内置形象和说话状态渲染，不创建云会话。显式 `cloud` 继续走腾讯云 WebRTC/SFU；缺 route 或 Provider 失败时复用同一 local adapter，并返回 `fallback_reason=cloud_unavailable`。历史预约缺少该字段时按 `cloud` 解释，保持旧链路语义。
 - 候选人回答必须在服务端进入 `stt.streaming` 或以完整录音进入 `stt.batch`。流中断时保存音频，轮次保持 `transcribing`，由 `stt.batch` 修复后再评分。
+- receive-only LiveKit ingress 在权威 sink 前维护 `accepted/delivered` 单调水位。`evidence.seal` 先冻结调用时已接收的水位并等待该前缀全部通过录音/STT sink，再允许 Provider final 和 CandidateAnswer；排空超时必须按权威音频故障失败关闭，不能让控制命令越过仍在队列中的音频或用 partial 补答案。浏览器 VAD 的默认停止窗口与 STT 分句静音一致为 800ms，减少自然停顿产生的重复 start/stop 命令，正式回答以显式完成为收口事实，服务端 2.5 秒自动端点只保留给暖场。
+- SQLite 只用于本地开发/测试；事务读写仍直接以 SQLite 为权威，提交后仅把该事务实际增删改的文档、工作项、凭据和调用日志增量同步到进程内兼容读模型。禁止在每条实时命令后反序列化全库；启动/显式重开时才执行完整装载，生产多实例继续使用 PostgreSQL/RLS。
 
 ## 数据流
 
@@ -307,9 +400,13 @@ lease token 提交结果。生题 route 不再内嵌同参数重试，一个 Dur
 
 运行时内部隐藏五条私有链路：Floor 独占 `agent/candidate/human/none` 发言权和 barge-in；Evidence 独占权威音频、唯一 final、录音持久化与 batch repair；Understanding 形成版本化 `ConversationUtterance/TurnUnderstanding`；Decision 只能产出经过预算和安全 gate 的 `ApprovedConversationAct`；Expression 把批准文本变成可中断的 TTS、viseme 与动作时间线。评分 worker 不阻塞下一题，对话动作与评分结论严格分离。
 
-候选人端由 `CandidateInterviewExperience` facade 独占一次设备请求、自拍预览、AudioWorklet VAD、三层声音状态、2.5 秒可取消端点、滚动字幕、控制恢复以及所有资源关闭。2.5 秒表示服务端在连续静音后收口当前回答并开始 final/理解，不等于直接跳到下一题；浏览器只显示服务端 `speech.stopped` 事件，不能自行倒计时并伪造 `understanding`。暂停/完成快照会立即清除端点与本地 VAD 状态，并禁止继续发送候选人语音命令。Evidence open 在 facade 中明确分成 `requested` 与 `ready`：只有单一 fenced owner 在 Provider stream 真正打开后，以同一 causation 投影 transient `floor.changed(reason=warmup_stream_open|evidence_stream_open)`，页面才从“准备识别”进入“正在听”；握手前普通候选人 VAD 不发送 `speech.started/stopped`，控制重连只对未确认 open 有界重提一次并等待新的 causation ACK。若握手期间人仍在持续说话，ready 后承接本地 speaking 状态；已按高置信门槛确认的 agent-speaking barge-in 则仍在 200ms 目标内先静音并发出 start。每次正式表达还拥有唯一 playback identity；本地 barge-in、服务端 interrupt、替换或关闭会先原子失效该 identity、移除旧 `<audio>` 监听器再释放媒体，旧元素迟到的 `error/ended/play()` rejection 不能暂停新会话或确认新表达。AudioWorklet VAD 以 sample count/sample rate 换算持续毫秒，不再依赖浏览器 render quantum 数量；普通发言和 agent-speaking 回声场景使用不同开始门槛，停止也要求持续静音窗口，避免几毫秒 start/stop 抖动。浏览器音频环形缓冲使用非导出 AES-GCM key，硬限 30 秒/2 MiB/32 KiB 帧；只在 ticket 返回 `media.recovery.server_checkpoint + browser_backfill` 且服务端授权 gap 时，才以 JSON `evidence.recovery.begin/chunk/complete` 补传。企业端由独立 monitor 订阅媒体和安全事件；人工接管使用 60 秒可续租独占 lease，普通企业 ticket 不能发布，当前 lease/version 只能交换一个 15 秒、仅 microphone 的媒体许可。AI 立即停止，人工问话保存为 `unscored_intervention`，lease 丢失后断开媒体并保持暂停。
+候选人端由 `CandidateInterviewExperience` facade 独占一次设备请求、自拍预览、AudioWorklet VAD、三层声音状态、暖场 2.5 秒可取消端点、正式完成确认、滚动字幕、控制恢复以及所有资源关闭。正式静音仅提示并继续同一采集，显式完成后才开始 final/理解；浏览器只显示服务端 `speech.stopped` 事件，不能自行倒计时并伪造 `understanding`。暂停/完成快照会立即清除端点与本地 VAD 状态，并禁止继续发送候选人语音命令。Evidence open 在 facade 中明确分成 `requested` 与 `ready`：只有单一 fenced owner 在 Provider stream 真正打开后，以同一 causation 投影 transient `floor.changed(reason=warmup_stream_open|evidence_stream_open)`，页面才从“准备识别”进入“正在听”；握手前普通候选人 VAD 不发送 `speech.started/stopped`，控制重连只对未确认 open 有界重提一次并等待新的 causation ACK。若握手期间人仍在持续说话，ready 后承接本地 speaking 状态；已按高置信门槛确认的 agent-speaking barge-in 则仍在 200ms 目标内先静音并发出 start。每次正式表达还拥有唯一 playback identity；本地 barge-in、服务端 interrupt、替换或关闭会先原子失效该 identity、移除旧 `<audio>` 监听器再释放媒体，旧元素迟到的 `error/ended/play()` rejection 不能暂停新会话或确认新表达。AudioWorklet VAD 以 sample count/sample rate 换算持续毫秒，不再依赖浏览器 render quantum 数量；普通发言和 agent-speaking 回声场景使用不同开始门槛，停止也要求持续静音窗口，避免几毫秒 start/stop 抖动。浏览器音频环形缓冲使用非导出 AES-GCM key，硬限 30 秒/2 MiB/32 KiB 帧；只在 ticket 返回 `media.recovery.server_checkpoint + browser_backfill` 且服务端授权 gap 时，才以 JSON `evidence.recovery.begin/chunk/complete` 补传。企业端由独立 monitor 订阅媒体和安全事件；人工接管使用 60 秒可续租独占 lease，普通企业 ticket 不能发布，当前 lease/version 只能交换一个 15 秒、仅 microphone 的媒体许可。AI 立即停止，人工问话保存为 `unscored_intervention`，lease 丢失后断开媒体并保持暂停。
 
-媒体面决策记录在 [ADR-0002](adr/0002-self-host-livekit-media-plane.md)：自托管 LiveKit 负责 WebRTC/SFU、TURN、分轨和 Participant Egress，业务状态仍在本项目。`LiveKitMediaPlane` 吸收 Egress 的存储差异：本地开发的绝对容器路径在适配层还原为逻辑 object key，生产请求继续携带私有 OSS 配置。`PrivateFileStorage.verify_recording_protection()` 明确区分 `local_private_development` 与可验证的 AES256/KMS，生产不允许降级。一次性 Agent ticket 只授予房间与 microphone/camera 最小权限；未同意视频时 camera grant 为空。候选人发布媒体后只建立 receive-only Evidence，试音期间不启动 Egress；只有 `warmup.confirm` 先删除暖场证据，再在正式首题前启动同意范围内的私有录制。录制不可用时暂停，不可静默无视频降级。receive-only subscriber 以服务端冻结 identity 精确选择 microphone publication，把 16 kHz/mono PCM 按序送入连接独立的 Evidence/STT，慢消费时失败关闭。Evidence 门在 Provider WebSocket 握手完成前无锁丢弃 LiveKit 的环境静音；端点成立后先关闭门、释放链锁，再等待 Provider final，避免无证据静音耗尽两秒缓冲。DashScope duplex adapter 使用独立有界发送队列与后台收/发任务，厂商 `send/recv` 抖动不阻塞 LiveKit 收帧，未发送 PCM 超过两秒才明确失败关闭。`authoritative_media_binding` 不能被新控制连接替换；候选人重连票据会复用冻结的 LiveKit identity，只更新控制 `connection_id` 与 backfill epoch，30 秒 grace 内同一 subscriber、录音、STT 和 endpoint timer 继续存活。
+媒体面决策记录在 [ADR-0002](adr/0002-self-host-livekit-media-plane.md)：自托管 LiveKit 负责 WebRTC/SFU、TURN、分轨和 Participant Egress，业务状态仍在本项目。`LiveKitMediaPlane` 吸收 Egress 的存储差异：本地开发的绝对容器路径在适配层还原为逻辑 object key，生产请求继续携带私有 OSS 配置。`PrivateFileStorage.verify_recording_protection()` 明确区分 `local_private_development` 与可验证的 AES256/KMS，生产不允许降级。一次性 Agent ticket 只授予房间与 microphone/camera 最小权限；未同意视频时 camera grant 为空。候选人发布媒体后只建立 receive-only Evidence，试音期间不启动 Egress；只有 `warmup.confirm` 先删除暖场证据，再在正式首题前启动同意范围内的私有录制。录制不可用时暂停，不可静默无视频降级。receive-only subscriber 以服务端冻结 identity 精确选择 microphone publication，把 16 kHz/mono PCM 按序送入连接独立的 Evidence/STT，慢消费时失败关闭。Evidence 门在 Provider WebSocket 握手完成前无锁丢弃 LiveKit 的环境静音；端点成立后先关闭门、释放链锁，再等待 Provider final。LiveKit sink 与 DashScope sender 都使用默认五秒、硬上限 30 秒的无损有界背压窗口，分别由 `INTERVIEWER_LIVEKIT_INGRESS_BACKPRESSURE_SECONDS` 和模型配置 `stream_send_backpressure_seconds` 调整；短时调度/网络抖动不会立即断流，超限仍明确失败关闭而不丢帧。DashScope duplex adapter 使用独立有界发送队列与后台收/发任务，厂商 `send/recv` 抖动不阻塞 LiveKit 收帧。`authoritative_media_binding` 不能被新控制连接替换；候选人重连票据会复用冻结的 LiveKit identity，只更新控制 `connection_id` 与 backfill epoch，30 秒 grace 内同一 subscriber、录音、STT 和 endpoint timer 继续存活。
+
+`FORMAL-STT-PARTIAL-BACKPRESSURE-005` 进一步收紧这条路径：浏览器上一段播放迟到的 `avatar.performance.stopped` 必须通过当前 `performance_id` 的原子 compare-and-clear，不匹配时不得切换 floor 或提前打开正式 STT。`transcript.partial` 是可丢 UI 投影，从权威收帧回调解耦后按 `(kind, turn_id)` latest-wins 有界合并；final/reset/stop 以顺序屏障清除迟到 partial，非 partial、私有 Evidence、CandidateAnswer 和 fence 仍走原无损链。DashScope 直连 WebSocket 把 LiveKit 的 20ms PCM 合并为约 100ms 供应商包，`use_environment_proxy=false` 显式禁用进程环境代理。LiveKit track 失败另保留去敏 `cause_code/cause_type`供特权诊断，候选人仍只看到统一暂停信息。
+
+`WARMUP-BACKPRESSURE-RECOVERY-006` 把非评分暖场与正式证据的故障策略明确分开：暖场 `audio_stream_failed` 原子失效当前本地 warm-up epoch、取消端点、abort 临时流并进入 `retrying + calibration_retry_required=true`，保持 InterviewSession 运行但要求候选人显式重试；已经开始等待 Provider final 的旧 seal 在返回后还要校验 epoch/track failure，不能投影迟到 final 或确认表达。reset 只有在同一 LiveKit microphone publication 的 lossless iterator 已重启（否则重建 subscriber）后才清 retry gate。正式流没有这个降级，因为其音频属于 CandidateAnswer Evidence，断流仍暂停或进入已有 checkpoint repair/人工接管路径。
 
 所有权决策记录在 [ADR-0004](adr/0004-authoritative-evidence-ownership-fencing.md)。`EvidenceOwnershipCoordinator` 使用独立持久记录和 transaction database clock 原子 claim/renew/release；owner 变更严格递增 `ownership_epoch`，control attach 另外递增 `control_generation`。Streaming STT 和理解可在事务外运行，但 transcription 状态、非答案 utterance 和 CandidateAnswer 事务都必须先锁所有权行并验证 owner/lease/epoch/到期时间。因此旧 owner 即使迟到收到 Provider final，也不能形成第二份答案。
 
@@ -332,5 +429,7 @@ AgentEvent fan-out 先把每个可回放事件收敛为按类型 allow-list 的�
 最后一题接受后，runtime 先停止 Evidence/Egress，再播放可中断告别 `AvatarPerformance`；只有收到 `avatar.performance.stopped` 或有界超时后才发出唯一 `completed` 提交回执，包含录制留存说明与人工审核声明，随即关闭设备/会话。旧 `/live`、`/stt-stream`、`audio-answers`、`avatar/speak` 和 avatar close 路由及多通道前端 runtime 已删除，不存在长期双实现。任何致命故障进入暂停/人工接管，不退回静态图、手动问卷或浏览器 final。
 
 仓库已实现固定词汇的无标签运行指标与离线签名 acceptance runner，可对延迟、WER/实体召回、元意图/能力点、追问安全、断线恢复、未同意视频上行字节、Chrome/Edge/Safari 和试点问卷执行硬 gate。生产报告必须绑定当前部署与不可变发布 revision，组织必须进入显式灰度名单。这些是验收 module，不是通过证明；本机 VRM 已在 `personalProfit` 范围通过资产合同，目标 LiveKit/TURN/Egress/OSS、目标部署使用范围许可、真实 STT/TTS/LLM 路由、金标数据集和受控试点仍为 environment/data pending。
+
+`telemetry.observe` 是候选人鉴权后的无 PII、best-effort 进程观测旁路，不是 Agent 领域命令。合法样本直接进入固定指标词汇并显式让出调度；它不获取领域信号锁，不读写幂等键、InterviewSession、事件历史、Evidence journal 或 takeover 状态，非法/越界样本静默丢弃且不能暂停面试。候选端对 `avatar_viseme_drift_ms` 和 `avatar_freeze_ms` 分指标使用 1 秒窗口，只发送窗口最大值；连接关闭、播放停止或页面关闭时丢弃未发送窗口，其他低频延迟指标仍即时上报。Evidence owner 续租另以无标识符的 `evidence_owner_renew_scheduler_lag_ms`、`evidence_owner_renew_db_latency_ms` 和 `evidence_owner_renew_success` 观测调度、数据库与结果；观测失败不能改变续租正确性，已过期或 fence 不匹配仍严格 self-fence，旧 owner 不能恢复权威 Evidence。该 `EVIDENCE-LEASE-TELEMETRY-004` 合同已在仓库验证，目标新会话仍待复验，不能据此宣称生产完成。
 
 `REALTIME-WARMUP-VAD-RANGE-003` 当前状态为“verified（仓库），目标环境复验 pending”。该项只收紧私有媒体传输、Evidence 握手、暖场失败恢复、本地 VAD 与显示帧率门禁：暖场 final 失败只消费/封存一次原流，持久写入 `calibration_retry_required`，必须由候选人显式 `warmup.retry` 清门后才能新开流；服务端在该 durable gate 未清时拒绝直接 open。owner 执行 reset 后，live `warmup_retry` 或 snapshot 的 `retrying + retry_required=false` 都是已授权恢复事实，当前 control 可用新 causation open/reassert；重复 retry ACK 被忽略，旧 control 由 generation fence 拒绝，existing-open 只重发 ready ACK 而不重复创建付费 Provider 流。VRM FPS 健康判断使用与 UI 相同的显示整数 `Math.round(fps) >= minimum_fps`。面试抽题、冻结证据、答案形成、评分、追问、S2S/cascade 和人工接管业务规则均未改变；目标浏览器新会话中的 LiveKit/STT、私有媒体 seek/Range、扬声器回声与真实打断仍须环境复验。

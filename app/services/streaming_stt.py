@@ -20,6 +20,7 @@ from app.model_gateway.schemas import (
     StreamingAudioConfig,
     StreamingSTTEvent,
     StreamingSTTRequest,
+    StableTranscriptPreview,
 )
 from app.model_gateway.streaming import ValidatedSTTStream
 from app.persistence.interface import Persistence
@@ -31,6 +32,10 @@ from app.services.evidence_media import (
     DurableEvidenceMedia,
     DurableEvidenceMediaWriter,
 )
+from app.services.continuous_stt import ContinuousSTT
+from app.services.recognition_vocabulary import recognition_terms
+from app.adapters.speech_activity import ServerSpeechActivity
+from app.core.interview_agent_metrics import measure_interview_agent_stage
 
 
 class StreamingInterviewSTT:
@@ -78,6 +83,8 @@ class StreamingInterviewSTT:
         )
         self.evidence_media_writer: Optional[DurableEvidenceMediaWriter] = None
         self.last_media_checkpoint: Optional[Dict[str, Any]] = None
+        self.continuous = False
+        self._capture_generation = 0
 
     def validate_candidate_token(self, token: Optional[str]) -> None:
         self.interviews.validate_candidate_token(
@@ -87,6 +94,21 @@ class StreamingInterviewSTT:
     async def open(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         if self.stream or self.recording:
             raise ApiError("STT_STREAM_ALREADY_OPEN", "An STT stream is already open.", status_code=409)
+        self._capture_generation += 1
+        generation = self._capture_generation
+        self.continuous = bool(payload.get("_continuous_capture"))
+        try:
+            return await self._open_capture(payload, generation)
+        except BaseException as exc:
+            # Cancellation during the first provider handshake has allocated
+            # recorders too. Never leave an apparently open capture behind.
+            await self._discard_capture(generation)
+            if isinstance(exc, ProviderError):
+                raise ApiError(exc.code.upper(), exc.message, status_code=502, details=exc.details) from exc
+            raise
+
+    async def _open_capture(self, payload: Dict[str, Any], generation: int) -> List[Dict[str, Any]]:
+        continuous = bool(payload.get("_continuous_capture"))
         turn = self.interviews.require_active_turn(
             self.interview_id,
             payload.get("turn_id"),
@@ -96,6 +118,8 @@ class StreamingInterviewSTT:
             self.interview_id, self.organization_id
         )
         self.turn_id = turn["id"]
+        if continuous:
+            self._assert_capture_active(generation)
         self.content_type = str(payload.get("content_type") or "audio/webm;codecs=opus")
         self.language = str(payload.get("language") or "zh-CN")
         self.development_transcript = payload.get("development_transcript")
@@ -150,22 +174,24 @@ class StreamingInterviewSTT:
             ),
             language=self.language,
             enable_partial=bool(payload.get("enable_partial", True)),
+            recognition_terms=recognition_terms(turn),
             metadata={
                 "development_transcript": self.development_transcript,
                 "confidence": self.development_confidence,
                 "duration_ms": int(payload.get("duration_seconds", 0)) * 1000,
             },
         )
-        try:
-            self.stream = await self.gateway.open_stream(request)
-            ready = [item.model_dump() for item in self.stream.ready_events]
-        except ProviderError as exc:
-            self.recording.abort()
-            self.recording = None
-            if self.evidence_media_writer is not None:
-                self.evidence_media_writer.abort()
-                self.evidence_media_writer = None
-            raise ApiError(exc.code.upper(), exc.message, status_code=502, details=exc.details) from exc
+        self.stream = (await self._open_recognition_stream(request, generation)
+                       if continuous else await self.gateway.open_stream(request))
+        ready = [item.model_dump() for item in self.stream.ready_events]
+        if continuous:
+            self.stream = ContinuousSTT(
+                self.stream, reopen=lambda: self._open_recognition_stream(request, generation),
+                record=self._record_frame,
+                bytes_per_second=sample_rate_hz * channels * 2,
+                speech_activity=ServerSpeechActivity(sample_rate_hz=sample_rate_hz, channels=channels),
+                max_bytes=int(os.getenv("INTERVIEWER_STT_STREAM_MAX_BYTES", "52428800")),
+            )
         if self.dialogue_mode == "s2s":
             dialogue_request = RealtimeSpeechDialogueRequest(
                 organization_id=str(interview.get("organization_id") or "org_default"),
@@ -188,7 +214,17 @@ class StreamingInterviewSTT:
                 metadata={"development_transcript": self.development_transcript or ""},
             )
             try:
-                self.dialogue = await self.gateway.open_speech_dialogue(dialogue_request)
+                dialogue = await self.gateway.open_speech_dialogue(dialogue_request)
+                if continuous:
+                    try:
+                        self._assert_capture_active(generation)
+                    except BaseException:
+                        try:
+                            await asyncio.wait_for(dialogue.abort(), timeout=2.0)
+                        except Exception:
+                            pass
+                        raise
+                self.dialogue = dialogue
                 ready.extend(item.model_dump() for item in self.dialogue.ready_events)
             except ProviderError as exc:
                 # S2S is the low-latency expression track, never the evidence
@@ -196,14 +232,51 @@ class StreamingInterviewSTT:
                 # the retained STT -> policy -> avatar/TTS cascade.
                 self.dialogue = None
                 ready.append(self._dialogue_error(exc.code, "S2S route unavailable; cascade remains active."))
+        if continuous:
+            self._assert_capture_active(generation)
         return ready
+
+    async def _open_recognition_stream(self, request: StreamingSTTRequest,
+                                       generation: int) -> ValidatedSTTStream:
+        # This is a segment/recovery seam, not the high-frequency PCM path.
+        # A current owner may still belong to a paused or superseded question.
+        await self._ensure_capture_active(generation)
+        stream = await self.gateway.open_stream(request)
+        try:
+            self._assert_capture_active(generation)
+        except BaseException:
+            try:
+                await asyncio.wait_for(stream.abort(), timeout=2.0)
+            except Exception:
+                # Cleanup must not replace the authoritative ownership/session
+                # failure or expose a provider response to the caller.
+                pass
+            finally:
+                await self._discard_capture(generation)
+            raise
+        return stream
+
+    async def _discard_capture(self, generation: int) -> None:
+        # A late open may return after close + a new open on the same object.
+        # Its cleanup must never detach the new generation's recorder/stream.
+        if self._capture_generation == generation:
+            try:
+                await self.close(repair_disconnect=False)
+            except Exception:
+                pass
+
+    async def _ensure_capture_active(self, generation: int) -> None:
+        try:
+            self._assert_capture_active(generation)
+        except BaseException:
+            await self._discard_capture(generation)
+            raise
 
     async def send_audio(self, chunk: bytes) -> List[Dict[str, Any]]:
         if not self.stream or not self.recording:
             raise ApiError("STT_STREAM_NOT_OPEN", "Open the STT stream before sending audio.", status_code=409)
-        if self.evidence_media_writer is not None:
-            self.evidence_media_writer.append(chunk)
-        self.recording.append(chunk)
+        if not self.continuous:
+            self._record_frame(chunk)
         try:
             stt_task = self.stream.send_audio(chunk)
             dialogue_task = self.dialogue.send_audio(chunk) if self.dialogue else None
@@ -231,11 +304,97 @@ class StreamingInterviewSTT:
             raise ApiError(exc.code.upper(), exc.message, status_code=502, details=exc.details) from exc
         return [item.model_dump() for item in events] + dialogue_events
 
+    def _record_frame(self, chunk: bytes) -> None:
+        if self.evidence_media_writer is not None:
+            self.evidence_media_writer.append(chunk)
+        if self.recording is None:
+            raise ApiError("STT_STREAM_NOT_OPEN", "Recording is closed.", status_code=409)
+        self.recording.append(chunk)
+
+    @property
+    def supports_stable_preview(self) -> bool:
+        return isinstance(self.stream, ContinuousSTT) and self.stream.supports_stable_preview
+
+    async def transcript_preview(self) -> Optional[StableTranscriptPreview]:
+        if not isinstance(self.stream, ContinuousSTT):
+            raise ApiError("CONTINUOUS_CAPTURE_REQUIRED", "Continuous capture required.", status_code=409)
+        stream, generation = self.stream, self._capture_generation
+        self._assert_commit_allowed()
+        preview = await stream.preview()
+        self._assert_commit_allowed()
+        if stream is not self.stream or generation != self._capture_generation:
+            raise ApiError("TURN_DECISION_STALE", "Capture changed during preview.", status_code=409)
+        return preview
+
+    def checkpoint_for_preparation(self) -> Optional[Dict[str, Any]]:
+        # Full session/turn reads belong at actual preparation, not every
+        # local preview poll. Ownership is checked on both paths.
+        self._assert_capture_active(self._capture_generation)
+        return self.checkpoint_incomplete()
+
+    async def transcript_snapshot(self, *, resume: bool = True) -> Optional[StreamingSTTEvent]:
+        if not isinstance(self.stream, ContinuousSTT):
+            raise ApiError("CONTINUOUS_CAPTURE_REQUIRED", "Continuous capture required.", status_code=409)
+        self._assert_commit_allowed()
+        with measure_interview_agent_stage("stt_snapshot_ms" if resume else "stt_final_ms"):
+            final = await self.stream.snapshot(resume=False)
+        self._assert_commit_allowed()
+        if self.evidence_media_writer is not None:
+            # A durable prefix, NOT a complete answer or a complete capture.
+            checkpoint = self.evidence_media_writer.seal(complete=False)
+            self.last_media_checkpoint = checkpoint.model_dump(mode="json")
+        if resume:
+            await self.stream.resume()
+        return final
+
+    def assert_snapshot_current(self, prepared_decision: Any = None) -> None:
+        if isinstance(self.stream, ContinuousSTT):
+            try:
+                self.stream.assert_can_commit()
+            except ProviderError as exc:
+                if exc.code == "provider_snapshot_stale":
+                    raise ApiError("TURN_DECISION_STALE", "Audio arrived after snapshot.", status_code=409) from exc
+                raise
+            if prepared_decision is not None:
+                self.interviews.assert_prepared_streaming_decision(
+                    prepared_decision, self.stream.confirmed_final(), self.organization_id,
+                )
+
+    async def resume_capture(self) -> None:
+        if isinstance(self.stream, ContinuousSTT):
+            generation = self._capture_generation
+            await self._ensure_capture_active(generation)
+            await self.stream.resume()
+            await self._ensure_capture_active(generation)
+
+    @property
+    def recovery_required(self) -> bool:
+        return isinstance(self.stream, ContinuousSTT) and self.stream.recovery_required
+
+    @property
+    def recovery_error(self) -> Any:
+        return self.stream.recovery_error if isinstance(self.stream, ContinuousSTT) else None
+
+    async def recover_capture(self) -> None:
+        if not isinstance(self.stream, ContinuousSTT):
+            raise ApiError("CONTINUOUS_CAPTURE_REQUIRED", "Continuous capture required.", status_code=409)
+        generation = self._capture_generation
+        await self._ensure_capture_active(generation)
+        await self.stream.recover()
+        await self._ensure_capture_active(generation)
+
+    def checkpoint_incomplete(self) -> Optional[Dict[str, Any]]:
+        self._assert_commit_allowed()
+        if self.evidence_media_writer is not None:
+            self.last_media_checkpoint = self.evidence_media_writer.seal(complete=False).model_dump(mode="json")
+        return self.last_media_checkpoint
+
     async def finish(
         self,
         payload: Dict[str, Any],
         *,
         on_dialogue_event: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None,
+        prepared_decision: Any = None,
     ) -> List[Dict[str, Any]]:
         if not self.stream or not self.recording or not self.turn_id:
             raise ApiError("STT_STREAM_NOT_OPEN", "No STT stream is open.", status_code=409)
@@ -244,13 +403,22 @@ class StreamingInterviewSTT:
         except BaseException:
             await self.close(repair_disconnect=False)
             raise
+        committed_final = None
+        if prepared_decision is not None and isinstance(self.stream, ContinuousSTT):
+            self.assert_snapshot_current(prepared_decision)
+            committed_final = self.stream.commit_final()
         if self.evidence_media_writer is not None:
             checkpoint = self.evidence_media_writer.seal(complete=True)
             self.last_media_checkpoint = checkpoint.model_dump(mode="json")
         recording = self.recording.finish()
         self.recording = None
         try:
-            events = await self.stream.finish()
+            events = [committed_final] if committed_final is not None else await self.stream.finish()
+            if any(item.type == "transcript.empty" for item in events):
+                # A complete recognition with no words is a non-answer; do
+                # not reinterpret it via batch repair or development text.
+                raise ProviderError("provider_final_transcript_missing", "Recognition completed without words.",
+                                    retryable=False)
             final = next(item for item in events if item.type == "transcript.final")
             self._assert_commit_allowed()
             result = await self.interviews.submit_streaming_answer(
@@ -269,8 +437,25 @@ class StreamingInterviewSTT:
                 },
                 self.organization_id,
                 evidence_fence=self.commit_fence,
+                prepared_decision=prepared_decision,
             )
         except (ProviderError, StopIteration) as exc:
+            if getattr(exc, "code", None) == "provider_final_transcript_missing":
+                # No valid transcript is not an answer. Do not manufacture
+                # semantics through a development/batch fallback on silence.
+                result = self.interviews.record_untranscribed_capture(
+                    self.interview_id, {
+                        "turn_id": self.turn_id, "audio_uri": recording.audio_uri,
+                        "content_type": recording.mime_type,
+                        "media_evidence": self._media_evidence_payload(complete=True),
+                    }, self.organization_id, evidence_fence=self.commit_fence,
+                )
+                await self.stream.abort()
+                self.stream = None
+                self.evidence_media_writer = None
+                self.last_result = result
+                await self._abort_dialogue()
+                return [self._non_answer_event(result)]
             try:
                 self._assert_commit_allowed()
                 result = await self.interviews.submit_audio_answer(
@@ -331,7 +516,7 @@ class StreamingInterviewSTT:
                 "payload": self._candidate_followup(result["followup"]),
                 "delivery": "cascade",
             }
-            if self.dialogue:
+            if self.dialogue and prepared_decision is None:
                 followup_text = str(result["followup"].get("question_text") or "").strip()
                 try:
                     dialogue_events = await self.dialogue.commit(
@@ -353,6 +538,8 @@ class StreamingInterviewSTT:
                     )
                 finally:
                     await self._abort_dialogue()
+            elif self.dialogue:
+                await self._abort_dialogue()
             if on_dialogue_event:
                 await on_dialogue_event(followup_event)
             else:
@@ -404,6 +591,7 @@ class StreamingInterviewSTT:
                 "mode": "sealed_segments",
                 "complete": recovered.complete,
                 "stream_id": recovered.stream_id,
+                "capture_revision": recovered.capture_revision,
                 "sealed_segment_count": recovered.sealed_segment_count,
                 "last_sealed_frame_sequence": recovered.last_sealed_frame_sequence,
                 "ownership_epoch": recovered.ownership_epoch,
@@ -525,6 +713,7 @@ class StreamingInterviewSTT:
         self.channels = recovered.channels
         self.last_media_checkpoint = {
             "stream_id": recovered.stream_id,
+            "capture_revision": recovered.capture_revision,
             "interview_id": recovered.interview_id,
             "turn_id": recovered.turn_id,
             "sealed_segment_count": recovered.sealed_segment_count,
@@ -552,6 +741,7 @@ class StreamingInterviewSTT:
                     "mode": "sealed_segments",
                     "complete": recovered.complete,
                     "stream_id": recovered.stream_id,
+                    "capture_revision": recovered.capture_revision,
                     "sealed_segment_count": recovered.sealed_segment_count,
                     "last_sealed_frame_sequence": recovered.last_sealed_frame_sequence,
                     "ownership_epoch": recovered.ownership_epoch,
@@ -566,16 +756,28 @@ class StreamingInterviewSTT:
     async def close(self, *, repair_disconnect: bool = False) -> List[Dict[str, Any]]:
         if repair_disconnect:
             return await self.recover_disconnect()
-        if self.stream:
-            await self.stream.abort()
-            self.stream = None
-        await self._abort_dialogue()
-        if self.recording:
-            self.recording.abort()
-            self.recording = None
-        if self.evidence_media_writer is not None:
-            self.evidence_media_writer.abort()
-            self.evidence_media_writer = None
+        self._capture_generation += 1
+        stream, self.stream = self.stream, None
+        dialogue, self.dialogue = self.dialogue, None
+        recording, self.recording = self.recording, None
+        writer, self.evidence_media_writer = self.evidence_media_writer, None
+        try:
+            if stream is not None:
+                await stream.abort()
+        finally:
+            try:
+                if dialogue is not None:
+                    try:
+                        await dialogue.abort()
+                    except Exception:
+                        pass
+            finally:
+                try:
+                    if recording is not None:
+                        recording.abort()
+                finally:
+                    if writer is not None:
+                        writer.abort()
         return []
 
     @staticmethod
@@ -605,6 +807,22 @@ class StreamingInterviewSTT:
         if self.commit_guard is not None:
             self.commit_guard()
 
+    def _assert_capture_active(self, generation: int) -> None:
+        self._assert_commit_allowed()
+        if generation != self._capture_generation:
+            raise ApiError("INTERVIEW_TURN_NOT_ACTIVE", "Capture was superseded.", status_code=409)
+        session = self.interviews.get_interview(self.interview_id, self.organization_id)
+        if session.get("status") != "in_progress":
+            raise ApiError("INTERVIEW_NOT_IN_PROGRESS", "Interview is not in progress.", status_code=409)
+        state = session.get("agent_runtime") or {}
+        turn = next((item for item in session.get("turns", []) if item.get("id") == self.turn_id), None)
+        if (not self.turn_id or session.get("current_turn_id") != self.turn_id
+                or turn is None or turn.get("status") in {"completed", "skipped", "evaluating"}
+                or any(item.get("turn_id") == self.turn_id for item in session.get("answers", []))
+                or state.get("floor") == "human" or (state.get("takeover") or {}).get("status") == "active"):
+            raise ApiError("INTERVIEW_TURN_NOT_ACTIVE", "Capture no longer belongs to an active candidate turn.",
+                           status_code=409)
+
     def _media_evidence_payload(self, *, complete: bool) -> Optional[Dict[str, Any]]:
         checkpoint = self.last_media_checkpoint
         if checkpoint is None:
@@ -613,6 +831,7 @@ class StreamingInterviewSTT:
             "mode": "sealed_segments",
             "complete": complete,
             "stream_id": checkpoint["stream_id"],
+            "capture_revision": checkpoint["capture_revision"],
             "sealed_segment_count": checkpoint["sealed_segment_count"],
             "last_sealed_frame_sequence": checkpoint[
                 "last_sealed_frame_sequence"

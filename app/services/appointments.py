@@ -49,11 +49,14 @@ class AppointmentService:
         persistence: Optional[Persistence] = None,
         interviews: Optional[InterviewService] = None,
         clock: Optional[Callable[[], datetime]] = None,
+        model_admin: Optional[Any] = None,
     ) -> None:
         self.persistence = persistence or persistence_for(store)
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.admission = AppointmentAdmission()
         self.sensitive = SensitiveDataProtector()
+        self._store = store
+        self._model_admin = model_admin
         self.interviews = interviews or InterviewService(
             store,
             persistence=self.persistence,
@@ -223,6 +226,52 @@ class AppointmentService:
             updated = transaction.interview_appointments.update(appointment, expected_version=expected_version)
             return self._private_projection(updated)
 
+    async def invite_with_refresh(
+        self, appointment_id: str, payload: Dict[str, Any], organization_id: str = "org_default"
+    ) -> Dict[str, Any]:
+        # Invalid/expired/cross-tenant requests must not incur provider work.
+        if self._parse_time(payload["expires_at"]) <= self._now():
+            raise ApiError("INVITATION_EXPIRY_INVALID", "Invitation expiry must be in the future.")
+        with self.persistence.transaction(organization_id) as transaction:
+            appointment = transaction.interview_appointments.get(appointment_id)
+            self._required(appointment, "INTERVIEW_APPOINTMENT_NOT_FOUND", "Interview appointment does not exist.")
+            if appointment["status"] not in {"scheduled", "invited"}:
+                raise ApiError("APPOINTMENT_NOT_INVITABLE", "Appointment cannot be invited in its current state.", status_code=409)
+        await self.refresh_readiness(appointment_id, organization_id)
+        # The synchronous command retains its short final admission transaction.
+        # Cancellation, expiry, plan changes and route changes during await are
+        # not authorized by an earlier successful probe.
+        return self.invite(appointment_id, payload, organization_id)
+
+    async def refresh_readiness(
+        self, appointment_id: str, organization_id: str = "org_default"
+    ) -> Dict[str, Any]:
+        """Refresh required route evidence without issuing or consuming an invite."""
+        def snapshot() -> Dict[str, Any]:
+            with self.persistence.transaction(organization_id) as transaction:
+                appointment = transaction.interview_appointments.get(appointment_id)
+                self._required(appointment, "INTERVIEW_APPOINTMENT_NOT_FOUND", "Interview appointment does not exist.")
+                if appointment["status"] not in {"scheduled", "invited", "registered"}:
+                    raise ApiError("APPOINTMENT_NOT_INVITABLE", "Appointment is not available for readiness refresh.", status_code=409)
+                plan = transaction.interview_plans.get(appointment["plan_id"])
+                self._required(plan, "INTERVIEW_PLAN_NOT_FOUND", "Interview plan does not exist.")
+                if plan.get("status") != "approved":
+                    raise ApiError("INTERVIEW_PLAN_NOT_APPROVED", "Appointment requires an approved plan.", status_code=409)
+                return self._readiness(transaction, plan, appointment=appointment, now=self._now())
+
+        readiness = snapshot()
+        route_ids = sorted({
+            check["route_readiness"]["route_id"]
+            for check in readiness.get("checks", [])
+            if not check.get("ready") and (check.get("route_readiness") or {}).get("route_id")
+        })
+        if route_ids:
+            if self._model_admin is None:
+                from app.services.model_admin import ModelAdminService
+                self._model_admin = ModelAdminService(self._store, persistence=self.persistence)
+            await self._model_admin.refresh_routes(route_ids, organization_id=organization_id)
+        return snapshot()
+
     def invite(
         self, appointment_id: str, payload: Dict[str, Any], organization_id: str = "org_default"
     ) -> Dict[str, Any]:
@@ -234,6 +283,9 @@ class AppointmentService:
             if appointment["status"] not in {"scheduled", "invited"}:
                 raise ApiError("APPOINTMENT_NOT_INVITABLE", "Appointment cannot be invited in its current state.", status_code=409)
             plan = transaction.interview_plans.get(appointment["plan_id"])
+            self._required(plan, "INTERVIEW_PLAN_NOT_FOUND", "Interview plan does not exist.")
+            if plan.get("status") != "approved":
+                raise ApiError("INTERVIEW_PLAN_NOT_APPROVED", "Appointment requires an approved plan.", status_code=409)
             readiness = self._readiness(
                 transaction, plan, appointment=appointment, now=self._now()
             )
@@ -470,10 +522,78 @@ class AppointmentService:
                     expected_version=appointment["version"],
                 )
             device = deepcopy(appointment.get("device_readiness"))
+            can_start = False
+            try:
+                self._validate_public_token(appointment, required_status="registered")
+                intake = next((item for item in transaction.candidate_intakes.list()
+                               if item["appointment_id"] == appointment["id"]), None)
+                if not plan or plan.get("status") != "approved":
+                    raise ApiError("INTERVIEW_PLAN_NOT_APPROVED", "Appointment requires an approved plan.", status_code=409)
+                self.admission.validate_start(appointment, intake, readiness, now=self._now())
+                can_start = True
+            except ApiError:
+                # Display eligibility is the same fact checked by start, not
+                # merely a successful model probe and an old device boolean.
+                pass
         result = deepcopy(readiness)
         result["device_readiness"] = device
-        result["can_start"] = bool(readiness.get("can_start")) and bool(device and device.get("ready"))
+        result["can_start"] = can_start
         return result
+
+    async def readiness_with_refresh(
+        self, token: str, payload: Optional[Dict[str, Any]] = None,
+        organization_id: str = "org_default",
+    ) -> Dict[str, Any]:
+        result = self.readiness(token, payload, organization_id)
+        appointment_id = self._candidate_refresh_target(token, organization_id, strict=False)
+        if appointment_id is None:
+            return result
+        await self.refresh_readiness(appointment_id, organization_id)
+        # Revalidate the token and use fresh evidence after network work. Device
+        # facts are not rewritten here and keep their original expiration.
+        return self.readiness(token, organization_id=organization_id)
+
+    async def start_with_refresh(
+        self, token: str, organization_id: str = "org_default"
+    ) -> Dict[str, Any]:
+        appointment_id = self._candidate_refresh_target(token, organization_id, strict=True)
+        if appointment_id is not None:
+            try:
+                await self.refresh_readiness(appointment_id, organization_id)
+            except ApiError as exc:
+                if exc.code != "APPOINTMENT_NOT_INVITABLE":
+                    raise
+                # Another start may have consumed the invite during the probe.
+                # The original command resolves that exact session or rejects
+                # cancelled/invalid state, without issuing another probe.
+        return self.start(token, organization_id)
+
+    def _candidate_refresh_target(
+        self, token: str, organization_id: str, *, strict: bool,
+    ) -> Optional[str]:
+        with self.persistence.transaction(organization_id) as transaction:
+            appointment = self._appointment_by_token(transaction, token)
+            # Preserve idempotent start without spending on an already consumed
+            # invitation. The final command resolves its existing session.
+            if appointment["status"] == "consumed":
+                return None
+            try:
+                self._validate_public_token(appointment, required_status="registered")
+                plan = transaction.interview_plans.get(appointment["plan_id"])
+                if not plan or plan.get("status") != "approved":
+                    raise ApiError("INTERVIEW_PLAN_NOT_APPROVED", "Appointment requires an approved plan.", status_code=409)
+                intake = next((item for item in transaction.candidate_intakes.list()
+                               if item["appointment_id"] == appointment["id"]), None)
+                readiness = self._readiness(transaction, plan, appointment=appointment, now=self._now())
+                # Consent, appointment window and live device evidence are
+                # checked before the model gate by this single domain rule.
+                self.admission.validate_start(appointment, intake, readiness, now=self._now())
+            except ApiError as exc:
+                if exc.code != "APPOINTMENT_NOT_READY":
+                    if strict:
+                        raise
+                    return None
+            return appointment["id"]
 
     def start(self, token: str, organization_id: str = "org_default") -> Dict[str, Any]:
         with self.persistence.transaction(organization_id) as transaction:

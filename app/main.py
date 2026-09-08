@@ -32,6 +32,7 @@ from app.core.errors import (
 )
 from app.core.auth import AuthAuditMiddleware
 from app.core.access_log import install_sensitive_access_log_filter
+from app.core.speech_diagnostics import configure_speech_diagnostics
 from app.core.rate_limit import public_rate_limiter
 from app.model_gateway.errors import ProviderError
 from app.persistence.errors import PersistenceError
@@ -44,6 +45,7 @@ WEB_DIST_DIR = WEB_DIR / "dist"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     install_sensitive_access_log_filter()
+    configure_speech_diagnostics()
     task = None
     takeover_watchdog = asyncio.create_task(
         run_takeover_lease_watchdog(

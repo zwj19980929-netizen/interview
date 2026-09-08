@@ -9,6 +9,9 @@ channel attaches and resumes event projection.
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
+from pathlib import Path
 from datetime import datetime, timezone
 import weakref
 from dataclasses import dataclass
@@ -22,6 +25,7 @@ from app.adapters.livekit_audio_ingress import (
 from app.adapters.livekit_media import LiveKitMediaPlane
 from app.core.errors import ApiError
 from app.core.ids import new_id
+from app.core.interview_agent_metrics import interview_agent_metrics
 from app.core.time import utc_now
 from app.domain.interview_agent import ClientSignal, FloorOwner, Replayability
 from app.domain.evidence_coordination import (
@@ -32,7 +36,7 @@ from app.domain.evidence_coordination import (
 )
 from app.persistence.provider import persistence_for
 from app.realtime_bus import realtime_event_bus
-from app.services.evidence_coordination import EvidenceOwnershipCoordinator
+from app.services.evidence_coordination import EvidenceOwnershipCoordinator, assert_current_evidence_fence
 from app.services.evidence_command_journal import EvidenceCommandJournal
 from app.services.browser_audio_backfill import BrowserAudioBackfill
 from app.services.interview_evidence import (
@@ -41,9 +45,18 @@ from app.services.interview_evidence import (
     InterviewEvidenceChain,
 )
 from app.services.interviews import InterviewService
+from app.services.answer_endpoint import AnswerEndpoint
+from app.services.spoken_supplement import SpokenSupplementConfirmation
+from app.adapters.speech_activity import ServerSpeechActivity
+from app.core.prompt.contracts import SUPPLEMENT_SPEECH
+from app.services.capture_recovery import classify_capture_failure
+from app.services.evidence_media import DurableEvidenceMedia
+from app.adapters.audio_turn_detector import LocalAudioTurnDetector
 
 if TYPE_CHECKING:
     from app.services.interview_agent import AgentChannel
+
+_LOG = logging.getLogger(__name__)
 
 
 _FAIL_CLOSED_MEDIA_ERRORS = frozenset(
@@ -55,6 +68,7 @@ _FAIL_CLOSED_MEDIA_ERRORS = frozenset(
         "EVIDENCE_MEDIA_CHECKSUM_MISMATCH",
         "EVIDENCE_MEDIA_FORMAT_NOT_RECOVERABLE",
         "EVIDENCE_MEDIA_RECOVERY_INVALID",
+        "LIVEKIT_EVIDENCE_AUDIO_STREAM_FAILED",
         "BROWSER_BACKFILL_FRAME_INVALID",
         "BROWSER_BACKFILL_FRAME_UNAVAILABLE",
         "BROWSER_BACKFILL_CHECKSUM_MISMATCH",
@@ -63,6 +77,10 @@ _FAIL_CLOSED_MEDIA_ERRORS = frozenset(
 _TERMINAL_INTERVIEW_STATUSES = frozenset(
     {"completed", "report_generating", "report_ready"}
 )
+_PARTIAL_PROJECTION_CAPACITY = 16
+_TERMINAL_PRESENTATION_GRACE_SECONDS = 5.0
+
+
 @dataclass(frozen=True)
 class _PendingProjection:
     kind: str
@@ -93,14 +111,47 @@ class ManagedLiveKitEvidenceSession:
         self._start_lock = asyncio.Lock()
         self._delivery_lock = asyncio.Lock()
         self._pending: List[_PendingProjection] = []
+        # Partial transcripts are a lossy UI projection, never authoritative
+        # Evidence.  Keep them off the receive-only audio callback so a slow
+        # session projection cannot consume LiveKit's bounded PCM budget.
+        # There may be one in-flight value plus one latest pending value for
+        # each active (kind, turn) key; finals and all other events continue to
+        # use the lossless delivery path below.
+        self._partial_projection_pending: Dict[
+            tuple[str, Optional[str]], _PendingProjection
+        ] = {}
+        self._partial_projection_active_keys: set[
+            tuple[str, Optional[str]]
+        ] = set()
+        self._partial_projection_wake = asyncio.Event()
+        self._partial_projection_task: Optional[asyncio.Task[None]] = None
+        self._partial_projection_shutdown = False
+        self._partial_projection_failure: Optional[Exception] = None
         self._expiry_task: Optional[asyncio.Task[None]] = None
         self._endpoint_task: Optional[asyncio.Task[None]] = None
+        self._capture_id: Optional[str] = None
+        self._capture_speech_started = False
+        self._endpoint_id: Optional[str] = None
         self._renewal_task: Optional[asyncio.Task[None]] = None
         self._executor_task: Optional[asyncio.Task[None]] = None
         self._owner_recovery_task: Optional[asyncio.Task[None]] = None
         self._command_wake = asyncio.Event()
+        # Warm-up is disposable, but its endpoint command and the receive-only
+        # track fail on different tasks. A local epoch lets the media failure
+        # invalidate an already-running seal before it can publish a stale
+        # calibration final or confirmation act.
+        self._warmup_epoch = 0
+        self._active_warmup_epoch: Optional[int] = None
+        self._failed_warmup_epoch: Optional[int] = None
+        self._recovered_warmup_epoch: Optional[int] = None
+        self._warmup_failure: Optional[Dict[str, Any]] = None
+        self._warmup_ingress_restart_required = False
+        self._warmup_recovery_lock = asyncio.Lock()
         self._stopped = False
         self.last_ingress_state = "not_started"
+        self._answer_endpoint: Optional[AnswerEndpoint] = None
+        self._prepared_finish: Any = None
+        self._presentation_task: Optional[asyncio.Task] = None
 
     @property
     def turn_id(self) -> Optional[str]:
@@ -175,6 +226,7 @@ class ManagedLiveKitEvidenceSession:
                 if self._event_source is channel:
                     self._event_source = None
             self._stopped = True
+            await self._shutdown_partial_projection()
             renewal = self._renewal_task
             self._renewal_task = None
             if renewal is not None:
@@ -450,17 +502,335 @@ class ManagedLiveKitEvidenceSession:
             and not self._turn_has_answer(turn_id)
         )
 
+    def _start_answer_endpoint(self) -> None:
+        capture_id, turn_id = self._capture_id, self.chain.turn_id
+        from app.core.speech_diagnostics import record_turn_control
+
+        def trace(event: str, **details) -> None:
+            record_turn_control(event, interview_id=self.interview_id, turn_id=turn_id,
+                                capture_id=capture_id, **details)
+        with self.persistence.transaction(self.organization_id) as transaction:
+            if self.ownership is not None:
+                assert_current_evidence_fence(transaction, self.ownership.commit_fence())
+            session = transaction.interview_sessions.get(self.interview_id)
+            if session and (session.get("agent_runtime") or {}).get("supplement_confirmation"):
+                session["agent_runtime"].pop("supplement_confirmation", None)
+                transaction.interview_sessions.update(session, expected_version=session["version"])
+
+        async def notify(reason: str) -> None:
+            if self._stopped or self._capture_id != capture_id or not self.chain.is_open:
+                return
+            source = self._channel or self._event_source
+            if reason in {"capture_recovering", "capture_recovered", "capture_retry_required"}:
+                await self._capture_recovery_notice(reason, capture_id, turn_id, source)
+                return
+            if reason == "capture_failed":
+                failure = self._answer_endpoint.failure if self._answer_endpoint else None
+                try:
+                    await self._fatal_ingress_problem(
+                        "CONTINUOUS_CAPTURE_FAILED",
+                        ApiError("CONTINUOUS_CAPTURE_FAILED", "Authoritative capture failed.", status_code=503),
+                        cause_code=failure.cause_code if failure else "CAPTURE_INTERNAL_ERROR",
+                        cause_type=failure.cause_type if failure else "InternalError",
+                        stage=failure.stage if failure else "unknown",
+                    )
+                finally:
+                    await self.chain.abort()
+                if source is not None:
+                    await source._emit_snapshot(None)
+                return
+            if source is None:
+                return
+            if reason in {"understanding_unavailable", "understanding_retry_exhausted", "transcript_unavailable", "detector_unavailable", "endpoint_uncertain"}:
+                message = {
+                    "understanding_unavailable": "已收到语音，暂时无法完成回答理解；正在重试，你也可以继续补充。",
+                    "understanding_retry_exhausted": "语音已保留，但回答理解暂时不可用。恢复后请说话或点击提前结束回答重试。",
+                    "transcript_unavailable": "已收到音频，仍在等待本段最终转写；已有字幕和回答会保留。",
+                    "detector_unavailable": "自动接话暂时不可用，仍在收音；可以继续说或点击提前结束回答。",
+                    "endpoint_uncertain": "我还在听。你可以继续补充；如果已说完，也可以点击提前结束回答。",
+                }[reason]
+                await source._emit("problem", {
+                    "code": reason.upper(), "message": message,
+                    "recoverable": True, "action": "continue_listening", "capture_id": capture_id,
+                }, turn_id=turn_id, causation_id=None, replayability=Replayability.TRANSIENT)
+                return
+            if reason in {"supplement_awaiting_reply", "answer_listening"}:
+                with self.persistence.transaction(self.organization_id) as transaction:
+                    if self.ownership is not None:
+                        assert_current_evidence_fence(transaction, self.ownership.commit_fence())
+                    session = transaction.interview_sessions.get(self.interview_id)
+                    if not session or session.get("status") != "in_progress" or session.get("current_turn_id") != turn_id:
+                        return
+                    session.setdefault("agent_runtime", {})["supplement_confirmation"] = {
+                        "status": "awaiting_reply" if reason == "supplement_awaiting_reply" else "listening",
+                        "turn_id": turn_id, "capture_id": capture_id,
+                    }
+                    transaction.interview_sessions.update(session, expected_version=session["version"])
+            # Preparation is reversible; it must never close the capture gate.
+            source.runtime._set_floor(self.interview_id, FloorOwner.CANDIDATE, reason, self.organization_id)
+            await source._emit("floor.changed", {
+                "owner": "candidate", "reason": reason, "capture_id": capture_id,
+            }, turn_id=turn_id, causation_id=None, replayability=Replayability.TRANSIENT)
+
+        async def commit(decision: Any, guard: Any) -> None:
+            guard()
+            if self._capture_id != capture_id:
+                raise ApiError("TURN_DECISION_STALE", "Capture changed.", status_code=409)
+            source = self._channel or self._event_source
+            if source is None:
+                return
+            proposal_id = new_id("answer_proposal")
+            prepared = (proposal_id, decision, guard)
+            self._prepared_finish = prepared
+            try:
+                await self.dispatch(source, ClientSignal(
+                    type="evidence.finish", idempotency_key=proposal_id, turn_id=turn_id,
+                    payload={"endpoint": "prepared_turn", "capture_id": capture_id,
+                             "proposal_id": proposal_id},
+                ))
+            finally:
+                if self._prepared_finish is prepared:
+                    self._prepared_finish = None
+
+        async def on_failure(exc: BaseException) -> None:
+            # This path is for failed durable recovery transitions, not a slow
+            # browser. Revoke input even if persistence itself is unavailable.
+            if self._capture_id != capture_id:
+                return
+            if hasattr(self.chain, "revoke_audio_input"):
+                self.chain.revoke_audio_input()
+            failure = classify_capture_failure(exc, "commit")
+            await self._fatal_ingress_problem(
+                "CONTINUOUS_CAPTURE_FAILED",
+                ApiError("CONTINUOUS_CAPTURE_FAILED", "Capture recovery state unavailable.", status_code=503),
+                cause_code=failure.cause_code, cause_type=failure.cause_type, stage=failure.stage,
+            )
+            source = self._channel or self._event_source
+            if source is not None:
+                await source._emit_snapshot(None)
+
+        async def speak(kind: str, guard: Any) -> bool:
+            guard()
+            if self._capture_id != capture_id or self._stopped:
+                raise ApiError("TURN_DECISION_STALE", "Capture changed.", status_code=409)
+            source = self._channel or self._event_source
+            if source is None:
+                return False
+            if kind == "playback_timeout":
+                self._assert_owner()
+                session = self.supervisor.interviews.get_interview(self.interview_id, self.organization_id)
+                state = session.get("agent_runtime") or {}
+                if session.get("status") != "in_progress" or session.get("current_turn_id") != turn_id:
+                    return False
+                performance_id = state.get("active_performance_id")
+                if performance_id != getattr(self, "_supplement_performance_id", None):
+                    return False
+                await source._cancel_speech_output()
+                source.runtime._clear_active_performance(self.interview_id, performance_id, self.organization_id)
+                await source._emit("avatar.performance.interrupted", {
+                    "performance_id": performance_id, "reason": "confirmation_playback_timeout", "deadline_ms": 200,
+                }, turn_id=turn_id, causation_id=None, replayability=Replayability.TRANSIENT)
+                await source._set_floor(FloorOwner.CANDIDATE, "confirmation_playback_timeout", None)
+                return True
+            if kind == "pause":
+                source.runtime.interviews.pause_interview(
+                    self.interview_id, reason="candidate_requested_pause", organization_id=self.organization_id,
+                )
+                await self.pause_capture()
+                await source._set_floor(FloorOwner.NONE, "candidate_pause", None)
+                await source._emit_snapshot(None)
+                return True
+            performance = await source._select_act(
+                act_type="supplement_" + kind, text=SUPPLEMENT_SPEECH[kind],
+                turn_id=turn_id, causation_id=None, evidence_refs=[], gesture="listen",
+                approval_guard=guard,
+            )
+            self._supplement_performance_id = performance.performance_id if performance else None
+            return performance is not None
+
+        self._answer_endpoint = AnswerEndpoint(
+            detector=self.supervisor.turn_detector, capture=self.chain, commit=commit, notify=notify,
+            on_failure=on_failure,
+            trace=trace,
+            confirmation=SpokenSupplementConfirmation(speak=speak),
+            speech_activity=ServerSpeechActivity(),
+            threshold=float(os.getenv("INTERVIEWER_TURN_END_THRESHOLD", "0.6")),
+            rms_threshold=float(os.getenv("INTERVIEWER_TURN_VOICE_RMS", "0.006")),
+            min_silence_seconds=float(os.getenv("INTERVIEWER_TURN_MIN_SILENCE_SECONDS", "0.7")),
+        )
+        self._answer_endpoint.start()
+
+    async def confirmation_floor_returned(self, reason: str) -> None:
+        endpoint = self._answer_endpoint
+        confirmation = endpoint.confirmation if endpoint else None
+        if confirmation is None or not confirmation.speaking:
+            return
+        if reason == "candidate_continues":
+            confirmation._after_speech = "listening"
+        confirmation.floor_returned(endpoint)
+        preroll = getattr(self, "_supplement_preroll", [])
+        self._supplement_preroll = []
+        if reason == "barge_in":
+            for pcm in preroll:
+                endpoint.observe_audio(pcm)
+                await self.chain.send_audio(pcm)
+            endpoint.speech_started()
+        await endpoint._notify("supplement_awaiting_reply" if confirmation.phase == "awaiting_reply" else "answer_listening")
+
+    async def _capture_recovery_notice(self, reason: str, capture_id: str, turn_id: str, source: Any) -> None:
+        endpoint = self._answer_endpoint
+        if self._capture_id != capture_id or self._stopped or endpoint is None:
+            return
+        failure = endpoint.failure
+        status = "retry_required" if reason == "capture_retry_required" else "recovering"
+        checkpoint = self.chain.checkpoint_incomplete() if status == "retry_required" else None
+        with self.persistence.transaction(self.organization_id) as transaction:
+            if self.ownership is not None:
+                assert_current_evidence_fence(transaction, self.ownership.commit_fence())
+            session = transaction.interview_sessions.get(self.interview_id)
+            if (not session or session.get("status") != "in_progress"
+                    or session.get("current_turn_id") != turn_id
+                    or any(a.get("turn_id") == turn_id for a in session.get("answers", []))):
+                return
+            state = session.setdefault("agent_runtime", {})
+            if (state.get("takeover") or {}).get("status") == "active":
+                return
+            if reason == "capture_recovered":
+                existing = state.get("capture_recovery") or {}
+                if existing and existing.get("capture_id") != capture_id:
+                    return
+                state.pop("capture_recovery", None)
+            else:
+                state["capture_recovery"] = {
+                    "status": status, "turn_id": turn_id, "capture_id": capture_id,
+                    "attempt": endpoint.recovery_attempt, "max_attempts": endpoint.max_recovery_attempts,
+                    "cause_code": failure.cause_code if failure else "CAPTURE_INTERNAL_ERROR",
+                    "stage": failure.stage if failure else "unknown",
+                    "capture_revision": (checkpoint or {}).get("capture_revision"),
+                }
+            owner = "none" if status == "retry_required" else "candidate"
+            resumed_reason = ("supplement_awaiting_reply"
+                if endpoint.confirmation and endpoint.confirmation.phase in {"awaiting_reply", "classifying"}
+                else "answer_listening")
+            floor_reason = (resumed_reason if reason == "capture_recovered" else
+                            "answer_retry_required" if status == "retry_required" else "answer_recovering")
+            state.update(floor=owner, floor_reason=floor_reason)
+            if reason != "capture_recovered":
+                problems = state.setdefault("problems", [])
+                problems.append({
+                    "code": "CAPTURE_RETRY_REQUIRED" if status == "retry_required" else "CAPTURE_RECOVERING",
+                    "message": "Recognition capture recovery.", "recoverable": True,
+                    "action": "retry_answer" if status == "retry_required" else "continue_listening",
+                    "cause_code": failure.cause_code if failure else "CAPTURE_INTERNAL_ERROR",
+                    "cause_type": failure.cause_type if failure else "InternalError",
+                    "stage": failure.stage if failure else "unknown",
+                    "attempt": endpoint.recovery_attempt, "capture_id": capture_id,
+                    "occurred_at": utc_now(),
+                })
+                del problems[:-20]
+            transaction.interview_sessions.update(session, expected_version=session["version"])
+        if status == "retry_required":
+            # Flush durable PCM above, then close without batch repair or answer
+            # submission. The LiveKit subscription remains, the Evidence gate does not.
+            await self.chain.abort()
+        async def project() -> None:
+            if status == "retry_required":
+                await self._deactivate_partial_projection("formal", turn_id)
+            if source is None or self._capture_id != capture_id or self._stopped:
+                return
+            latest = self.supervisor.interviews.get_interview(self.interview_id, self.organization_id)
+            if latest.get("status") != "in_progress" or latest.get("current_turn_id") != turn_id:
+                return
+            await source._emit("floor.changed", {
+                "owner": owner, "reason": floor_reason, "capture_id": capture_id,
+            }, turn_id=turn_id, causation_id=None, replayability=Replayability.TRANSIENT)
+            if reason != "capture_recovered":
+                await source._emit("problem", {
+                    "code": "CAPTURE_RETRY_REQUIRED" if status == "retry_required" else "CAPTURE_RECOVERING",
+                    "message": "本题需要重试。" if status == "retry_required" else "正在恢复语音识别。",
+                    "recoverable": True, "capture_id": capture_id,
+                    "action": "retry_answer" if status == "retry_required" else "continue_listening",
+                }, turn_id=turn_id, causation_id=None, replayability=Replayability.TRANSIENT)
+            await source._emit_snapshot(None)
+        # Durable state and the capture gate have already changed. A slow or
+        # disconnected control channel must not turn a healthy recovery fatal.
+        try:
+            await asyncio.wait_for(project(), timeout=1)
+        except Exception as exc:
+            _LOG.warning("Capture recovery projection unavailable: error_type=%s", type(exc).__name__)
+
+    async def pause_capture(self) -> None:
+        """A candidate pause revokes capture, never batch-submits its prefix."""
+        self._capture_id = None
+        if self.chain is not None and hasattr(self.chain, "revoke_audio_input"):
+            self.chain.revoke_audio_input()
+        if self._answer_endpoint is not None:
+            await self._answer_endpoint.close()
+            self._answer_endpoint = None
+        if self.chain is not None:
+            await asyncio.wait_for(self.chain.abort(), timeout=3)
+
     async def _finish_with_channel(
-        self, channel: "AgentChannel", signal: ClientSignal
+        self, channel: "AgentChannel", signal: ClientSignal, *, prepared: Any = None
     ) -> None:
-        result = await self.chain.finish(signal.payload)
+        partial_kind = str(self.chain.kind or "")
+        partial_turn_id = self.chain.turn_id
+        completed_capture_id = self._capture_id
+        if prepared is not None:
+            prepared[2]()
+        else:
+            await channel._set_floor(FloorOwner.NONE, "answer_processing", signal.causation_id)
+        try:
+            result = (await self.chain.finish(signal.payload, prepared_decision=prepared[1], commit_guard=prepared[2])
+                      if prepared is not None else await self.chain.finish(signal.payload))
+        finally:
+            if partial_kind and not self.chain.is_open:
+                try:
+                    await asyncio.wait_for(self._deactivate_partial_projection(
+                        partial_kind, partial_turn_id
+                    ), timeout=1)
+                except Exception as exc:
+                    _LOG.warning("Post-capture projection drain unavailable: error_type=%s", type(exc).__name__)
+        self._capture_id = None
+        self._capture_speech_started = False
+        if prepared is not None:
+            channel.runtime._set_floor(
+                self.interview_id, FloorOwner.NONE, "answer_processing", self.organization_id,
+            )
         if result.kind == "warmup":
             await channel._complete_warmup_evidence(result, signal)
             return
+        if prepared is not None:
+            # Domain commit is complete; expression network work must not hold
+            # up the durable control executor or the next barge-in signal.
+            async def present_committed() -> None:
+                try:
+                    await asyncio.wait_for(channel._emit("floor.changed", {
+                        "owner": "none", "reason": "answer_processing", "capture_id": completed_capture_id,
+                    }, turn_id=partial_turn_id, causation_id=signal.causation_id,
+                        replayability=Replayability.TRANSIENT), timeout=1)
+                except Exception as exc:
+                    _LOG.warning("Committed answer floor projection unavailable: error_type=%s", type(exc).__name__)
+                await self._present_formal_result(channel, signal, result)
+            self._presentation_task = asyncio.create_task(present_committed())
+            self._presentation_task.add_done_callback(self._observe_presentation_result)
+            return
+        await self._present_formal_result(channel, signal, result)
+
+    async def _present_formal_result(self, channel: "AgentChannel", signal: ClientSignal, result: Any) -> None:
         for raw in result.events:
             raw = dict(raw)
             raw.setdefault("turn_id", result.turn_id)
-            await channel._project_evidence_event(raw, signal.causation_id)
+            if raw.get("type") in {"followup.selected", "utterance.not_accepted"}:
+                # These handlers select an approved act and may synthesize
+                # speech. They are business work with their own lifecycle,
+                # not UI fanout subject to the short projection deadline.
+                await channel._project_evidence_event(raw, signal.causation_id)
+                continue
+            try:
+                await asyncio.wait_for(channel._project_evidence_event(raw, signal.causation_id), timeout=1)
+            except Exception as exc:
+                _LOG.warning("Committed Evidence event unavailable: error_type=%s", type(exc).__name__)
         await channel._after_formal_evidence_finished(
             result.turn_id,
             signal,
@@ -472,13 +842,23 @@ class ManagedLiveKitEvidenceSession:
             stop_evidence_session=False,
         )
 
+    @staticmethod
+    def _observe_presentation_result(task: asyncio.Task) -> None:
+        if not task.cancelled():
+            error = task.exception()
+            if error is not None:
+                _LOG.warning("Committed answer presentation failed: error_type=%s", type(error).__name__)
+
     async def _schedule_endpoint(self, signal: ClientSignal) -> None:
         await self.cancel_endpoint()
+        self._endpoint_id = new_id("endpoint_scope")
+        signal = signal.model_copy(update={"payload": {**signal.payload, "endpoint_id": self._endpoint_id}})
         self._endpoint_task = asyncio.create_task(
             self._finish_after_endpoint(signal)
         )
 
     async def cancel_endpoint(self) -> None:
+        self._endpoint_id = None
         task = self._endpoint_task
         self._endpoint_task = None
         if task is None or task is asyncio.current_task():
@@ -500,7 +880,11 @@ class ManagedLiveKitEvidenceSession:
         grant = self._require_attached(channel)
         payload = dict(signal.payload)
         if command_type not in {"evidence.open", "evidence.seal", "evidence.backfill"}:
-            payload = {}
+            payload = (
+                {"capture_id": payload["capture_id"]}
+                if command_type in {"speech.started", "speech.stopped", "evidence.continue"} and "capture_id" in payload
+                else {}
+            )
         deadline_seconds = 120.0 if command_type == "evidence.seal" else 30.0
         receipt = self.supervisor.journal.submit(
             grant,
@@ -591,7 +975,8 @@ class ManagedLiveKitEvidenceSession:
         )
         await channel._emit(
             "floor.changed",
-            {"owner": FloorOwner.CANDIDATE.value, "reason": reason},
+            {"owner": FloorOwner.CANDIDATE.value, "reason": reason, "capture_id": self._capture_id},
+            turn_id=self.chain.turn_id,
             causation_id=causation_id,
             # Ready is a command handshake, not durable floor history.  A
             # replay after a later reconnect could incorrectly reopen the
@@ -725,6 +1110,10 @@ class ManagedLiveKitEvidenceSession:
             )
             if content is None:
                 return claimed.turn_id
+            if self._answer_endpoint is not None:
+                # Recovery frames are authoritative new input too. Invalidate
+                # even quiet backfill before allowing the commit executor on.
+                self._answer_endpoint.speech_started()
             result = await self.chain.send_audio(content)
             if result is None:
                 raise ApiError(
@@ -739,23 +1128,131 @@ class ManagedLiveKitEvidenceSession:
                 fence=self.ownership.commit_fence(),
             )
             for raw in result.events:
-                await self._deliver(
+                await self._route_stream_projection(
                     _PendingProjection(result.kind, raw, result.turn_id)
                 )
             return claimed.turn_id
         if claimed.command_type == "evidence.seal":
+            if self.chain.is_open and signal.payload.get("capture_id") and not self._matches_capture(signal):
+                return claimed.turn_id
+            if claimed.payload.get("endpoint") == "semantic_timeout" and self.chain.kind != "warmup":
+                # Silence is not an authoritative answer-complete decision.
+                return claimed.turn_id
+            if claimed.payload.get("endpoint") == "semantic_timeout" and not self._matches_endpoint(signal):
+                # A durable timer command may outlive the capture even after
+                # its process-local timer was cancelled. It is a harmless no-op.
+                return claimed.turn_id
+            prepared = None
+            if claimed.payload.get("endpoint") == "prepared_turn":
+                prepared = self._prepared_finish
+                if (prepared is None or signal.payload.get("proposal_id") != prepared[0]
+                        or not self._matches_capture(signal)):
+                    # A lost owner cannot replay a process-local speculative
+                    # decision. It has no domain effects to recover.
+                    return claimed.turn_id
+                prepared[2]()
+            elif self.chain.kind == "formal" and self._answer_endpoint is not None:
+                if self._matches_capture(signal):
+                    self._answer_endpoint.request_finish()
+                return claimed.turn_id
             await self.cancel_endpoint()
+            if claimed.turn_id is None and not self.chain.is_open:
+                session = self.supervisor.interviews.get_interview(
+                    self.interview_id, self.organization_id
+                )
+                runtime_state = session.get("agent_runtime") or {}
+                if (
+                    runtime_state.get("calibration_status") == "retrying"
+                    and bool(runtime_state.get("calibration_retry_required"))
+                    and self._warmup_failure is not None
+                ):
+                    raise self._warmup_retry_error()
             # 试音流没有正式 turn_id，但同样必须由 2.5 秒端点命令收口。
             # 先处理 warmup，不能落入下面“正式回答必须绑定题目”的校验。
             if self.chain.is_open and self.chain.kind == "warmup":
+                partial_kind = str(self.chain.kind or "warmup")
+                partial_turn_id = self.chain.turn_id
+                warmup_epoch = self._active_warmup_epoch
+                ingress_failure = self._current_ingress_failure()
+                if warmup_epoch is not None and ingress_failure is not None:
+                    failure = await self._recover_failed_warmup_ingress(
+                        source,
+                        warmup_epoch=warmup_epoch,
+                        cause_code=ingress_failure.code,
+                        cause_type=ingress_failure.cause_type,
+                        causation_id=signal.causation_id,
+                    )
+                    raise failure
                 try:
-                    result = await self.chain.finish(signal.payload)
+                    await self._drain_ingress_before_seal()
+                except Exception as exc:
+                    failure = await self._recover_failed_warmup_ingress(
+                        source,
+                        warmup_epoch=warmup_epoch or self._warmup_epoch,
+                        cause_code=self._safe_problem_code(
+                            getattr(exc, "code", "LIVEKIT_INGRESS_SINK_BACKPRESSURE")
+                        ),
+                        cause_type=type(exc).__name__,
+                        causation_id=signal.causation_id,
+                    )
+                    raise failure from exc
+                try:
+                    try:
+                        result = await self.chain.finish(signal.payload)
+                    finally:
+                        await self._deactivate_partial_projection(
+                            partial_kind, partial_turn_id
+                        )
+                except Exception as exc:
+                    failure = await self._recover_failed_warmup_finalize(
+                        source,
+                        signal,
+                        exc,
+                        warmup_epoch=warmup_epoch,
+                    )
+                    raise failure from exc
+                ingress_failure = self._current_ingress_failure()
+                if (
+                    warmup_epoch is not None
+                    and (
+                        self._failed_warmup_epoch == warmup_epoch
+                        or ingress_failure is not None
+                    )
+                ):
+                    failure = await self._recover_failed_warmup_ingress(
+                        source,
+                        warmup_epoch=warmup_epoch,
+                        cause_code=(
+                            ingress_failure.code
+                            if ingress_failure is not None
+                            else str(
+                                (self._warmup_failure or {}).get("cause_code")
+                                or "LIVEKIT_INGRESS_AUDIO_STREAM_FAILED"
+                            )
+                        ),
+                        cause_type=(
+                            ingress_failure.cause_type
+                            if ingress_failure is not None
+                            else str(
+                                (self._warmup_failure or {}).get("cause_type")
+                                or "RuntimeError"
+                            )
+                        ),
+                        causation_id=signal.causation_id,
+                    )
+                    raise failure
+                try:
                     await source._complete_warmup_evidence(result, signal)
                 except Exception as exc:
                     failure = await self._recover_failed_warmup_finalize(
-                        source, signal, exc
+                        source,
+                        signal,
+                        exc,
+                        warmup_epoch=warmup_epoch,
                     )
                     raise failure from exc
+                if self._active_warmup_epoch == warmup_epoch:
+                    self._active_warmup_epoch = None
                 return None
             effective_turn_id = claimed.turn_id or self.turn_id
             if not effective_turn_id:
@@ -772,7 +1269,31 @@ class ManagedLiveKitEvidenceSession:
                 return effective_turn_id
             if self.chain.is_open:
                 try:
-                    await self._finish_with_channel(source, signal)
+                    await self._drain_ingress_before_seal()
+                except Exception as exc:
+                    ingress_failure = self._current_ingress_failure()
+                    cause_code = str(
+                        getattr(ingress_failure, "code", None)
+                        or getattr(exc, "code", None)
+                        or "LIVEKIT_INGRESS_SINK_BACKPRESSURE"
+                    )
+                    cause_type = str(
+                        getattr(ingress_failure, "cause_type", None)
+                        or type(exc).__name__
+                    )
+                    await self._fatal_ingress_problem(
+                        "LIVEKIT_EVIDENCE_AUDIO_STREAM_FAILED",
+                        exc,
+                        cause_code=cause_code,
+                        cause_type=cause_type,
+                    )
+                    raise ApiError(
+                        "LIVEKIT_EVIDENCE_AUDIO_STREAM_FAILED",
+                        "The authoritative audio queue did not drain before the turn was sealed.",
+                        status_code=409,
+                    ) from exc
+                try:
+                    await self._finish_with_channel(source, signal, prepared=prepared)
                 except ApiError as exc:
                     if exc.code in _FAIL_CLOSED_MEDIA_ERRORS:
                         await self._fail_closed_media_recovery(
@@ -795,6 +1316,11 @@ class ManagedLiveKitEvidenceSession:
             return effective_turn_id
         if claimed.command_type == "evidence.reset":
             await self.chain.abort_warmup()
+            await self._deactivate_partial_projection("warmup", None)
+            if self._warmup_ingress_restart_required:
+                await self._restore_ingress_for_warmup_retry(source)
+                self._warmup_ingress_restart_required = False
+            self._active_warmup_epoch = None
             source.runtime._set_calibration(
                 self.interview_id,
                 "retrying",
@@ -863,39 +1389,119 @@ class ManagedLiveKitEvidenceSession:
         source: "AgentChannel",
         signal: ClientSignal,
         exc: Exception,
+        *,
+        warmup_epoch: Optional[int],
     ) -> ApiError:
         """Make one consumed warm-up final terminal but explicitly retryable by user."""
 
-        raw_code = str(getattr(exc, "code", "WARMUP_STT_PROBLEM")).upper()
-        error_code = "".join(
-            character if character.isalnum() or character == "_" else "_"
-            for character in raw_code
-        )[:128].strip("_") or "WARMUP_STT_PROBLEM"
-        source.runtime._set_calibration(
-            self.interview_id,
-            "retrying",
-            self.organization_id,
-            retry_required=True,
-        )
-        await source._set_floor(
-            FloorOwner.CANDIDATE, "warmup_retry", signal.causation_id
-        )
-        problem = {
-            "code": error_code,
-            "message": type(exc).__name__,
-            "recoverable": True,
-            "action": "retry_warmup",
-            "calibration": True,
-        }
-        source.runtime._record_problem(
-            self.interview_id, problem, self.organization_id
-        )
-        await source._emit(
-            "problem",
-            problem,
-            turn_id=None,
+        return await self._recover_warmup_failure(
+            source,
+            warmup_epoch=warmup_epoch,
+            error_code=self._safe_problem_code(
+                getattr(exc, "code", "WARMUP_STT_PROBLEM")
+            ),
+            cause_code=self._safe_problem_code(
+                getattr(exc, "code", "WARMUP_STT_PROBLEM")
+            ),
+            cause_type=type(exc).__name__,
             causation_id=signal.causation_id,
-            replayability=Replayability.REPLAYABLE,
+            restart_ingress=False,
+        )
+
+    async def _recover_failed_warmup_ingress(
+        self,
+        source: "AgentChannel",
+        *,
+        warmup_epoch: int,
+        cause_code: str,
+        cause_type: str,
+        causation_id: Optional[str],
+    ) -> ApiError:
+        return await self._recover_warmup_failure(
+            source,
+            warmup_epoch=warmup_epoch,
+            error_code="LIVEKIT_EVIDENCE_AUDIO_STREAM_FAILED",
+            cause_code=cause_code,
+            cause_type=cause_type,
+            causation_id=causation_id,
+            restart_ingress=True,
+        )
+
+    async def _recover_warmup_failure(
+        self,
+        source: "AgentChannel",
+        *,
+        warmup_epoch: Optional[int],
+        error_code: str,
+        cause_code: str,
+        cause_type: str,
+        causation_id: Optional[str],
+        restart_ingress: bool,
+    ) -> ApiError:
+        """Invalidate one disposable warm-up exactly once across async tasks."""
+
+        epoch = warmup_epoch or self._active_warmup_epoch
+        if epoch is None:
+            return ApiError(
+                self._safe_problem_code(error_code),
+                "Warm-up transcription could not be finalized; retry calibration.",
+                status_code=409,
+            )
+        if self._failed_warmup_epoch != epoch:
+            self._failed_warmup_epoch = epoch
+            self._warmup_failure = {
+                "epoch": epoch,
+                "error_code": self._safe_problem_code(error_code),
+                "cause_code": self._safe_problem_code(cause_code),
+                "cause_type": str(cause_type or "Exception")[:96],
+            }
+        if restart_ingress:
+            self._warmup_ingress_restart_required = True
+
+        async with self._warmup_recovery_lock:
+            if self._recovered_warmup_epoch != epoch:
+                await self.cancel_endpoint()
+                if self.chain is not None:
+                    await self.chain.abort_warmup()
+                await self._deactivate_partial_projection("warmup", None)
+                if self._active_warmup_epoch == epoch:
+                    self._active_warmup_epoch = None
+                source.runtime._set_calibration(
+                    self.interview_id,
+                    "retrying",
+                    self.organization_id,
+                    retry_required=True,
+                )
+                await source._set_floor(
+                    FloorOwner.CANDIDATE, "warmup_retry", causation_id
+                )
+                failure = dict(self._warmup_failure or {})
+                problem = {
+                    "code": str(failure.get("error_code") or error_code),
+                    "message": str(failure.get("cause_type") or "Exception"),
+                    "recoverable": True,
+                    "action": "retry_warmup",
+                    "calibration": True,
+                    "cause_code": str(failure.get("cause_code") or cause_code),
+                    "cause_type": str(failure.get("cause_type") or cause_type),
+                }
+                source.runtime._record_problem(
+                    self.interview_id, problem, self.organization_id
+                )
+                await source._emit(
+                    "problem",
+                    problem,
+                    turn_id=None,
+                    causation_id=causation_id,
+                    replayability=Replayability.REPLAYABLE,
+                )
+                self._recovered_warmup_epoch = epoch
+        return self._warmup_retry_error()
+
+    def _warmup_retry_error(self) -> ApiError:
+        error_code = str(
+            (self._warmup_failure or {}).get("error_code")
+            or "WARMUP_STT_PROBLEM"
         )
         # The warm-up Provider stream has already been consumed/aborted by
         # InterviewEvidenceChain.finish().  Returning a 409 makes the journal
@@ -907,8 +1513,44 @@ class ManagedLiveKitEvidenceSession:
             status_code=409,
         )
 
+    @staticmethod
+    def _safe_problem_code(value: Any) -> str:
+        raw_code = str(value or "WARMUP_STT_PROBLEM").upper()
+        return (
+            "".join(
+                character if character.isalnum() or character == "_" else "_"
+                for character in raw_code
+            )[:128].strip("_")
+            or "WARMUP_STT_PROBLEM"
+        )
+
+    def _current_ingress_failure(self) -> Optional[Any]:
+        if self._ingress is None:
+            return None
+        return getattr(self._ingress, "last_track_failure", None)
+
+    async def _drain_ingress_before_seal(self) -> None:
+        """Fence turn finalization behind the current LiveKit sink watermark."""
+
+        ingress = self._ingress
+        drain = getattr(ingress, "drain", None)
+        if callable(drain):
+            await drain()
+
+    async def _restore_ingress_for_warmup_retry(
+        self, source: "AgentChannel"
+    ) -> None:
+        ingress = self._ingress
+        recover = getattr(ingress, "recover_audio_stream", None)
+        if callable(recover) and await recover():
+            return
+        if ingress is not None:
+            self._ingress = None
+            await ingress.close()
+        await self.ensure_ingress(source.opened.connection_id)
+
     async def _apply_open(
-        self, source: "AgentChannel", signal: ClientSignal
+        self, source: "AgentChannel", signal: ClientSignal, *, retry_capture_id: Optional[str] = None
     ) -> Optional[str]:
         if not self.ingress_connected:
             raise ApiError(
@@ -920,6 +1562,11 @@ class ManagedLiveKitEvidenceSession:
             self.interview_id, self.organization_id
         )
         runtime_state = session.get("agent_runtime") or {}
+        recovery = runtime_state.get("capture_recovery") or {}
+        if recovery.get("status") == "retry_required" and (
+            recovery.get("capture_id") != retry_capture_id or recovery.get("turn_id") != signal.turn_id
+        ):
+            raise ApiError("CAPTURE_RETRY_REQUIRED", "Retry the current failed capture explicitly.", status_code=409)
         calibration = runtime_state.get("calibration_status", "pending")
         if (
             calibration == "retrying"
@@ -934,6 +1581,16 @@ class ManagedLiveKitEvidenceSession:
             if self.chain.turn_id == signal.turn_id or (
                 self.chain.kind == "warmup" and signal.turn_id is None
             ):
+                if (
+                    self.chain.kind == "warmup"
+                    and self._active_warmup_epoch is None
+                ):
+                    self._warmup_epoch += 1
+                    self._active_warmup_epoch = self._warmup_epoch
+                    self._warmup_failure = None
+                self._activate_partial_projection(
+                    str(self.chain.kind or "formal"), self.chain.turn_id
+                )
                 await self._project_open_ready(
                     source,
                     kind=str(self.chain.kind or "formal"),
@@ -945,13 +1602,48 @@ class ManagedLiveKitEvidenceSession:
                 "Another Evidence stream is already open.",
                 status_code=409,
             )
-        result = await self.chain.open(
-            signal.payload,
-            turn_id=signal.turn_id,
-            calibration_status=calibration,
-        )
+        expected_kind = "warmup" if calibration != "completed" else "formal"
+        await self.cancel_endpoint()
+        self._capture_id = None
+        self._capture_speech_started = False
+        expected_turn_id = None if expected_kind == "warmup" else signal.turn_id
+        self._activate_partial_projection(expected_kind, expected_turn_id)
+        try:
+            result = await self.chain.open(
+                signal.payload,
+                turn_id=signal.turn_id,
+                calibration_status=calibration,
+            )
+        except BaseException:
+            await self._deactivate_partial_projection(
+                expected_kind, expected_turn_id
+            )
+            raise
+        self._capture_id = new_id("capture")
+        if retry_capture_id is not None:
+            with self.persistence.transaction(self.organization_id) as transaction:
+                assert_current_evidence_fence(transaction, self.ownership.commit_fence())
+                latest = transaction.interview_sessions.get(self.interview_id)
+                state = latest.setdefault("agent_runtime", {})
+                if ((state.get("capture_recovery") or {}).get("capture_id") == retry_capture_id):
+                    state.pop("capture_recovery", None)
+                    transaction.interview_sessions.update(latest, expected_version=latest["version"])
+        if self._answer_endpoint is not None:
+            await self._answer_endpoint.close()
+            self._answer_endpoint = None
+        if result.kind == "formal" and hasattr(self.chain, "transcript_snapshot"):
+            self._start_answer_endpoint()
+        if (result.kind, result.turn_id) != (expected_kind, expected_turn_id):
+            await self._deactivate_partial_projection(
+                expected_kind, expected_turn_id
+            )
+            self._activate_partial_projection(result.kind, result.turn_id)
+        if result.kind == "warmup":
+            self._warmup_epoch += 1
+            self._active_warmup_epoch = self._warmup_epoch
+            self._warmup_failure = None
         for raw in result.events:
-            await self._deliver(
+            await self._route_stream_projection(
                 _PendingProjection(result.kind, raw, result.turn_id)
             )
         # This transient fact is emitted by the single fenced owner while the
@@ -965,20 +1657,57 @@ class ManagedLiveKitEvidenceSession:
         )
         return result.turn_id
 
+    def _matches_capture(self, signal: ClientSignal) -> bool:
+        return bool(
+            self.chain.is_open
+            and self._capture_id
+            and signal.payload.get("capture_id") == self._capture_id
+            and signal.turn_id == self.chain.turn_id
+        )
+
+    def _matches_endpoint(self, signal: ClientSignal) -> bool:
+        return bool(
+            self._matches_capture(signal)
+            and self._endpoint_id
+            and signal.payload.get("endpoint_id") == self._endpoint_id
+            and not self._capture_speech_started
+        )
+
     async def _apply_speech_started(
         self, source: "AgentChannel", signal: ClientSignal
     ) -> Optional[str]:
-        await self.cancel_endpoint()
         session = source.runtime.interviews.get_interview(
             self.interview_id, self.organization_id
         )
         runtime_state = session.get("agent_runtime") or {}
+        matches = self._matches_capture(signal)
+        if not matches:
+            # An unscoped barge-in may interrupt the current agent performance,
+            # but cannot arm a stop timer for a stream opened afterwards.
+            if (
+                self.chain.is_open
+                or runtime_state.get("floor") != FloorOwner.AGENT.value
+                or not (
+                    signal.turn_id == session.get("current_turn_id")
+                    or (signal.turn_id is None and runtime_state.get("calibration_status") != "completed")
+                )
+            ):
+                return signal.turn_id
+        else:
+            await self.cancel_endpoint()
+            self._capture_speech_started = True
+            if self._answer_endpoint is not None:
+                self._answer_endpoint.speech_started()
         effective_turn_id = signal.turn_id or session.get("current_turn_id")
         if runtime_state.get("calibration_status") == "opening":
             source.runtime._set_calibration(
                 self.interview_id, "listening", self.organization_id
             )
         if runtime_state.get("floor") == FloorOwner.AGENT.value:
+            await source._cancel_speech_output()
+            if self._presentation_task is not None and not self._presentation_task.done():
+                self._presentation_task.cancel()
+                await asyncio.gather(self._presentation_task, return_exceptions=True)
             await source._emit(
                 "avatar.performance.interrupted",
                 {
@@ -1014,25 +1743,95 @@ class ManagedLiveKitEvidenceSession:
     async def _apply_speech_stopped(
         self, source: "AgentChannel", signal: ClientSignal
     ) -> Optional[str]:
-        effective_turn_id = signal.turn_id or self.turn_id
+        if not self._matches_capture(signal) or not self._capture_speech_started:
+            return signal.turn_id
+        self._capture_speech_started = False
+        effective_turn_id = signal.turn_id
+        automatic = self.chain.kind == "warmup"
         await source._emit(
             "speech.stopped",
             {
                 "speaker": "candidate",
-                "endpoint_countdown_ms": 2500,
+                "endpoint_countdown_ms": 2500 if automatic else 0,
                 "cancellable": True,
             },
             turn_id=effective_turn_id,
             causation_id=signal.causation_id,
             replayability=Replayability.TRANSIENT,
         )
-        await self._schedule_endpoint(signal)
+        if automatic:
+            await self._schedule_endpoint(signal)
+        else:
+            await self.cancel_endpoint()
         return effective_turn_id
 
     async def _apply_continue(
         self, source: "AgentChannel", signal: ClientSignal
     ) -> Optional[str]:
+        current = self.supervisor.interviews.get_interview(self.interview_id, self.organization_id)
+        recovery = (current.get("agent_runtime") or {}).get("capture_recovery") or {}
+        if recovery.get("status") == "retry_required":
+            capture_id = str(signal.payload.get("capture_id") or "")
+            if (not signal.turn_id or recovery.get("turn_id") != signal.turn_id
+                    or recovery.get("capture_id") != capture_id or self.chain.is_open):
+                return signal.turn_id
+            if self._answer_endpoint is not None:
+                await self._answer_endpoint.close()
+                self._answer_endpoint = None
+            media = DurableEvidenceMedia(self.store, organization_id=self.organization_id, persistence=self.persistence)
+            if not media.prepare_candidate_retry(
+                interview_id=self.interview_id, turn_id=signal.turn_id,
+                capture_id=capture_id, fence=self.ownership.commit_fence(),
+            ):
+                return signal.turn_id
+            try:
+                # Retry signals contain only the failed capture token. The
+                # authoritative LiveKit format is server-owned, not the STT
+                # request's generic WebM default or arbitrary client metadata.
+                retry_signal = signal.model_copy(update={"payload": {
+                    "content_type": "audio/pcm", "sample_rate_hz": 16000,
+                    "channels": 1, "language": "zh-CN",
+                }})
+                return await self._apply_open(source, retry_signal, retry_capture_id=capture_id)
+            except Exception as exc:
+                failure = classify_capture_failure(exc, "retry")
+                if not failure.requires_new_capture:
+                    raise
+                # Failed retries keep the same durable retry token/revision;
+                # no new answer or orphaned second reset is created.
+                self._capture_id = capture_id
+                with self.persistence.transaction(self.organization_id) as transaction:
+                    assert_current_evidence_fence(transaction, self.ownership.commit_fence())
+                    latest = transaction.interview_sessions.get(self.interview_id)
+                    state = latest.setdefault("agent_runtime", {})
+                    marker = state.get("capture_recovery") or {}
+                    if (latest.get("status") != "in_progress" or latest.get("current_turn_id") != signal.turn_id
+                            or marker.get("capture_id") != capture_id or marker.get("status") != "retry_required"):
+                        return signal.turn_id
+                    marker.update(cause_code=failure.cause_code, stage="retry")
+                    problems = state.setdefault("problems", [])
+                    problems.append({
+                        "code": "CAPTURE_RETRY_REQUIRED", "message": "Recognition retry failed.",
+                        "recoverable": True, "action": "retry_answer", "capture_id": capture_id,
+                        "cause_code": failure.cause_code, "cause_type": failure.cause_type,
+                        "stage": "retry", "occurred_at": utc_now(),
+                    })
+                    del problems[:-20]
+                    transaction.interview_sessions.update(latest, expected_version=latest["version"])
+                await source._emit_snapshot(signal.causation_id)
+                await source._emit("problem", {
+                    "code": "CAPTURE_RETRY_REQUIRED", "message": "语音识别仍未恢复，请稍后重试本题。",
+                    "recoverable": True, "action": "retry_answer", "capture_id": capture_id,
+                }, turn_id=signal.turn_id, causation_id=signal.causation_id, replayability=Replayability.TRANSIENT)
+                return signal.turn_id
+        if not self._matches_capture(signal):
+            return signal.turn_id
         await self.cancel_endpoint()
+        self._capture_speech_started = True
+        if self._answer_endpoint is not None:
+            self._answer_endpoint.speech_started()
+            if self._answer_endpoint.confirmation is not None and not self._answer_endpoint.confirmation.speaking:
+                self._answer_endpoint.confirmation.phase = "listening"
         await source._set_floor(
             FloorOwner.CANDIDATE, "candidate_continues", signal.causation_id
         )
@@ -1074,6 +1873,8 @@ class ManagedLiveKitEvidenceSession:
         )
         self._renewal_task = asyncio.create_task(self._renew_ownership())
         self._executor_task = asyncio.create_task(self._execute_commands())
+        if isinstance(self.chain, InterviewEvidenceChain):
+            self.supervisor.prewarm_turn_detector()
 
     async def _recover_owner_after_loss(self) -> None:
         """Promote the current remote controller after the old lease expires.
@@ -1152,10 +1953,90 @@ class ManagedLiveKitEvidenceSession:
             if self._owner_recovery_task is asyncio.current_task():
                 self._owner_recovery_task = None
 
+    async def _finish_terminal_presentation(self) -> None:
+        """Allow a bounded farewell setup before releasing its live owner.
+
+        Completion of asynchronous evaluation is not cancellation of the
+        already-committed answer's presentation. Pause/fence/shutdown still
+        set ``_stopped`` immediately and cancel the presentation through their
+        existing paths; this grace must never restore that lost authority.
+        """
+        task = self._presentation_task
+        source = self._channel or self._event_source
+        ownership = self.ownership
+        if task is None or task is asyncio.current_task() or source is None or ownership is None:
+            return
+        fence = ownership.commit_fence()
+
+        def current_terminal_state() -> Optional[Dict[str, Any]]:
+            if self._stopped or source._closed or source._terminating:
+                return None
+            if self._presentation_task is not task or self.ownership is None:
+                return None
+            try:
+                with self.persistence.transaction(self.organization_id) as transaction:
+                    assert_current_evidence_fence(transaction, fence)
+                    session = transaction.interview_sessions.get(self.interview_id)
+                    if not session or session.get("status") not in _TERMINAL_INTERVIEW_STATUSES:
+                        return None
+                    state = session.get("agent_runtime") or {}
+                    if (state.get("takeover") or {}).get("status") == "active":
+                        return None
+                    return state
+            except ApiError:
+                return None
+
+        if current_terminal_state() is None:
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=_TERMINAL_PRESENTATION_GRACE_SECONDS)
+        except asyncio.TimeoutError:
+            task.cancel()
+            # A misbehaving provider may suppress cancellation. It must not
+            # hold terminal cleanup indefinitely; the stopped/owner fence in
+            # the expression seam rejects any eventual late result.
+            await asyncio.wait({task}, timeout=0.1)
+        except asyncio.CancelledError:
+            if not task.cancelled():
+                raise
+        except Exception:
+            # The answer is already committed. Failure to speak a farewell
+            # must still leave the candidate with its completion receipt.
+            pass
+        state = current_terminal_state()
+        if state is not None and not (
+            state.get("completion_emitted_at") or state.get("completion_closing_performance_id")
+        ):
+            try:
+                await source._finalize_completion(
+                    causation_id=None, reason="farewell_preparation_unavailable",
+                )
+            except Exception:
+                # The completion marker is durable even if its live fanout
+                # fails; normal snapshot/replay recovery remains available.
+                pass
+        if not task.done() and self._presentation_task is task:
+            self._presentation_task = None
+            task.add_done_callback(lambda completed: None if completed.cancelled() else completed.exception())
+
     async def stop(self, reason: str) -> None:
         if self._stopped:
             return
+        if reason == "interview_completed":
+            previous = getattr(self, "_terminal_stop_task", None)
+            if previous is not None and previous is not asyncio.current_task() and not previous.done():
+                return
+            self._terminal_stop_task = asyncio.current_task()
+            await self._finish_terminal_presentation()
+            if self._stopped:
+                return
         self._stopped = True
+        if self._answer_endpoint is not None:
+            await self._answer_endpoint.close()
+        if self._presentation_task is not None and not self._presentation_task.done():
+            self._presentation_task.cancel()
+            await asyncio.gather(self._presentation_task, return_exceptions=True)
+        await self._shutdown_partial_projection()
         expiry = self._expiry_task
         self._expiry_task = None
         if expiry is not None and expiry is not asyncio.current_task():
@@ -1205,29 +2086,61 @@ class ManagedLiveKitEvidenceSession:
     async def _receive_audio(self, frame: LiveKitIngressAudioFrame) -> None:
         if self._stopped or self.chain is None:
             return
-        result = await self.chain.send_audio(frame.pcm_s16le)
+        if self._partial_projection_failure is not None:
+            raise RuntimeError(
+                "Authoritative transcript projection failed closed"
+            ) from self._partial_projection_failure
+        endpoint = self._answer_endpoint
+        capture_id = self._capture_id
+        if endpoint and endpoint.confirmation and endpoint.confirmation.speaking:
+            # Do not recognise the interviewer's own confirmation prompt as a
+            # candidate reply. Retain only 200 ms to restore a confirmed barge-in.
+            preroll = getattr(self, "_supplement_preroll", [])
+            preroll.append(frame.pcm_s16le)
+            self._supplement_preroll = preroll[-10:]
+            return
+        if self.chain.kind == "formal" and self._answer_endpoint is not None:
+            self._answer_endpoint.observe_audio(frame.pcm_s16le)
+        try:
+            result = await self.chain.send_audio(frame.pcm_s16le)
+        except Exception as exc:
+            # Recognition's bounded buffer/stream can fail while the media
+            # subscription is healthy. Let its existing single endpoint worker
+            # resolve that sticky failure; do not kill the LiveKit consumer or
+            # retry this frame (accepted PCM was already recorded exactly once).
+            failure = classify_capture_failure(exc, "send")
+            if (self.chain.kind == "formal" and self._answer_endpoint is not None
+                    and self.chain.recovery_required and failure.requires_new_capture):
+                return
+            raise
         if result is None:
             return
-        async with self._delivery_lock:
-            if result.first_server_audio:
-                await self._deliver_locked(
-                    _PendingProjection(
-                        "server_audio",
-                        {
-                            "speaker": "candidate",
-                            "local_detected": True,
-                            "server_audio_received": True,
-                            "server_received_at": utc_now(),
-                            "media_transport": "livekit_server_subscriber",
-                            "ingress_sequence": frame.sequence,
-                        },
-                        result.turn_id,
-                    )
+        if result.first_server_audio:
+            await self._deliver(
+                _PendingProjection(
+                    "server_audio",
+                    {
+                        "speaker": "candidate",
+                        "local_detected": True,
+                        "server_audio_received": True,
+                        "server_received_at": utc_now(),
+                        "media_transport": "livekit_server_subscriber",
+                        "ingress_sequence": frame.sequence,
+                    },
+                    result.turn_id,
                 )
-            for raw in result.events:
-                await self._deliver_locked(
-                    _PendingProjection(result.kind, raw, result.turn_id)
-                )
+            )
+        for raw in result.events:
+            if (endpoint is not None and endpoint is self._answer_endpoint
+                    and capture_id == self._capture_id and result.kind == "formal"
+                    and result.turn_id == self.chain.turn_id
+                    and not (endpoint.confirmation and endpoint.confirmation.speaking)
+                    and raw.get("type") in {"transcript.partial", "transcript.final"}
+                    and isinstance(raw.get("text"), str)):
+                endpoint.observe_transcript(raw["text"])
+            await self._route_stream_projection(
+                _PendingProjection(result.kind, raw, result.turn_id)
+            )
 
     async def _receive_state(self, state: str) -> None:
         self.last_ingress_state = state
@@ -1250,6 +2163,22 @@ class ManagedLiveKitEvidenceSession:
         source = self._event_source
         if source is None:
             return
+        if state == "audio_stream_failed" and self._active_warmup_epoch is not None:
+            ingress_failure = self._current_ingress_failure()
+            await self._recover_failed_warmup_ingress(
+                source,
+                warmup_epoch=self._active_warmup_epoch,
+                cause_code=(
+                    getattr(ingress_failure, "code", None)
+                    or "LIVEKIT_INGRESS_AUDIO_STREAM_FAILED"
+                ),
+                cause_type=(
+                    getattr(ingress_failure, "cause_type", None)
+                    or "RuntimeError"
+                ),
+                causation_id=None,
+            )
+            return
         if recoverable:
             self.supervisor.browser_backfill.authorize_gap(
                 interview_id=self.interview_id,
@@ -1263,8 +2192,16 @@ class ManagedLiveKitEvidenceSession:
                 reason=state,
             )
         if not recoverable:
+            ingress_failure = (
+                getattr(self._ingress, "last_track_failure", None)
+                if state == "audio_stream_failed" and self._ingress is not None
+                else None
+            )
             await self._fatal_ingress_problem(
-                "LIVEKIT_EVIDENCE_%s" % state.upper(), RuntimeError(state)
+                "LIVEKIT_EVIDENCE_%s" % state.upper(),
+                RuntimeError(state),
+                cause_code=getattr(ingress_failure, "code", None),
+                cause_type=getattr(ingress_failure, "cause_type", None),
             )
         await source._emit(
             "problem",
@@ -1286,6 +2223,153 @@ class ManagedLiveKitEvidenceSession:
     async def _deliver(self, item: _PendingProjection) -> None:
         async with self._delivery_lock:
             await self._deliver_locked(item)
+
+    async def _route_stream_projection(self, item: _PendingProjection) -> None:
+        """Keep lossy partial UI work out of authoritative audio intake."""
+
+        if item.raw.get("type") == "transcript.partial":
+            self._queue_partial_projection(item)
+            return
+        # Finals, errors and conversation actions are lossless.  They retain
+        # their existing synchronous ordering and failure behavior.
+        await self._deliver(item)
+
+    @staticmethod
+    def _partial_projection_key(
+        kind: str, turn_id: Optional[str]
+    ) -> tuple[str, Optional[str]]:
+        return (str(kind), turn_id)
+
+    def _activate_partial_projection(
+        self, kind: str, turn_id: Optional[str]
+    ) -> None:
+        if self._partial_projection_shutdown:
+            return
+        self._partial_projection_active_keys.add(
+            self._partial_projection_key(kind, turn_id)
+        )
+
+    def _queue_partial_projection(self, item: _PendingProjection) -> None:
+        key = self._partial_projection_key(item.kind, item.turn_id)
+        if (
+            self._stopped
+            or self._partial_projection_shutdown
+            or self._partial_projection_failure is not None
+            or key not in self._partial_projection_active_keys
+        ):
+            return
+        if self._channel is None:
+            # With no controller there is no I/O or database projection to
+            # decouple. Preserve one reconnect snapshot in the existing
+            # coalescing buffer without scheduling background work.
+            self._buffer(item)
+            return
+        if (
+            key not in self._partial_projection_pending
+            and len(self._partial_projection_pending)
+            >= _PARTIAL_PROJECTION_CAPACITY
+        ):
+            # Every value in this structure is transient. Dropping the oldest
+            # key is safe and keeps even malformed/multi-turn Provider output
+            # within a hard process-memory bound.
+            oldest = next(iter(self._partial_projection_pending))
+            self._partial_projection_pending.pop(oldest, None)
+        self._partial_projection_pending[key] = item
+        self._partial_projection_wake.set()
+        task = self._partial_projection_task
+        if task is None or task.done():
+            self._partial_projection_task = asyncio.create_task(
+                self._run_partial_projection()
+            )
+
+    async def _run_partial_projection(self) -> None:
+        current = asyncio.current_task()
+        try:
+            while not self._partial_projection_shutdown:
+                await self._partial_projection_wake.wait()
+                self._partial_projection_wake.clear()
+                while (
+                    self._partial_projection_pending
+                    and not self._partial_projection_shutdown
+                ):
+                    key = next(iter(self._partial_projection_pending))
+                    item = self._partial_projection_pending.pop(key)
+                    async with self._delivery_lock:
+                        if (
+                            self._stopped
+                            or self._partial_projection_shutdown
+                            or key not in self._partial_projection_active_keys
+                        ):
+                            continue
+                        await self._deliver_locked(item)
+                    # _project may complete without a scheduling point when
+                    # Redis is disabled. Give the audio pump and lease renewal
+                    # an explicit chance before projecting another partial.
+                    await asyncio.sleep(0)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            # Projection failure used to escape _receive_audio and terminate
+            # the LiveKit sink. Preserve that fail-closed outcome even though
+            # the lossy projection now runs independently.
+            self._partial_projection_failure = exc
+            self._partial_projection_pending.clear()
+            self._partial_projection_active_keys.clear()
+            if not self._stopped:
+                await self._fatal_ingress_problem(
+                    "LIVEKIT_EVIDENCE_PROJECTION_FAILED", exc
+                )
+        finally:
+            if self._partial_projection_task is current:
+                self._partial_projection_task = None
+
+    async def _deactivate_partial_projection(
+        self, kind: str, turn_id: Optional[str]
+    ) -> None:
+        """Fence one stream's partials before projecting its final/reset."""
+
+        key = self._partial_projection_key(kind, turn_id)
+        self._partial_projection_active_keys.discard(key)
+        self._partial_projection_pending.pop(key, None)
+        # An in-flight partial owns _delivery_lock for its complete projection.
+        # Waiting for that boundary guarantees it cannot arrive after final.
+        async with self._delivery_lock:
+            self._pending = [
+                item
+                for item in self._pending
+                if not (
+                    item.raw.get("type") == "transcript.partial"
+                    and self._partial_projection_key(item.kind, item.turn_id)
+                    == key
+                )
+            ]
+
+    async def _shutdown_partial_projection(self) -> None:
+        """Drop only transient partial work and join any in-flight emission."""
+
+        if self._partial_projection_shutdown:
+            task = self._partial_projection_task
+            if task is not None and task is not asyncio.current_task():
+                await asyncio.gather(task, return_exceptions=True)
+            return
+        self._partial_projection_shutdown = True
+        self._partial_projection_active_keys.clear()
+        self._partial_projection_pending.clear()
+        self._partial_projection_wake.set()
+        # Join an already-started projection before stop returns. A worker that
+        # has not acquired the lock re-checks the shutdown fence and drops its
+        # stale item instead.
+        async with self._delivery_lock:
+            self._pending = [
+                item
+                for item in self._pending
+                if item.raw.get("type") != "transcript.partial"
+            ]
+        task = self._partial_projection_task
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._partial_projection_task = None
 
     async def _deliver_locked(self, item: _PendingProjection) -> None:
         channel = self._channel
@@ -1354,14 +2438,14 @@ class ManagedLiveKitEvidenceSession:
         try:
             await asyncio.sleep(self.supervisor.endpoint_delay_seconds)
             channel = self._channel or self._event_source
-            if channel is None or not self.chain.is_open:
+            if channel is None or not self._matches_endpoint(original):
                 return
             signal = ClientSignal(
                 type="evidence.finish",
                 idempotency_key=new_id("endpoint"),
-                turn_id=original.turn_id or self.chain.turn_id,
+                turn_id=original.turn_id,
                 causation_id=original.causation_id,
-                payload={"endpoint": "semantic_timeout"},
+                payload={"endpoint": "semantic_timeout", "capture_id": original.payload["capture_id"], "endpoint_id": original.payload["endpoint_id"]},
             )
             await self.dispatch(channel, signal)
         except asyncio.CancelledError:
@@ -1381,11 +2465,29 @@ class ManagedLiveKitEvidenceSession:
     async def _renew_ownership(self) -> None:
         try:
             while not self._stopped:
+                loop = asyncio.get_running_loop()
+                scheduled_at = loop.time() + self.supervisor.renew_interval_seconds
                 await asyncio.sleep(self.supervisor.renew_interval_seconds)
                 ownership = self.ownership
                 if ownership is None:
                     return
-                self.ownership = self.supervisor.coordinator.renew(ownership)
+                renew_started_at = loop.time()
+                self._observe_renewal_metric(
+                    "evidence_owner_renew_scheduler_lag_ms",
+                    max(0.0, (renew_started_at - scheduled_at) * 1000.0),
+                )
+                renewed = False
+                try:
+                    self.ownership = self.supervisor.coordinator.renew(ownership)
+                    renewed = True
+                finally:
+                    self._observe_renewal_metric(
+                        "evidence_owner_renew_db_latency_ms",
+                        max(0.0, (loop.time() - renew_started_at) * 1000.0),
+                    )
+                    self._observe_renewal_metric(
+                        "evidence_owner_renew_success", 1.0 if renewed else 0.0
+                    )
                 if self._channel is None and self._control_grace_expired():
                     await self.stop("control_reconnect_grace_expired")
                     return
@@ -1394,12 +2496,29 @@ class ManagedLiveKitEvidenceSession:
         except Exception as exc:
             await self._self_fence(exc)
 
+    @staticmethod
+    def _observe_renewal_metric(name: str, value: float) -> None:
+        """Keep process observability outside the lease correctness boundary."""
+
+        try:
+            interview_agent_metrics().observe(name, value)
+        except Exception:
+            # A stale metrics vocabulary must never stop renewal or weaken the
+            # database fence. Metrics carry no identifiers and are best effort.
+            return
+
     async def _self_fence(self, exc: Exception) -> None:
         """Stop local side effects without attempting repair under a stale fence."""
+        if self._answer_endpoint is not None:
+            await self._answer_endpoint.close()
+        if self._presentation_task is not None and self._presentation_task is not asyncio.current_task():
+            self._presentation_task.cancel()
+            await asyncio.gather(self._presentation_task, return_exceptions=True)
 
         if self._stopped:
             return
         self._stopped = True
+        await self._shutdown_partial_projection()
         ingress = self._ingress
         self._ingress = None
         if ingress is not None:
@@ -1430,6 +2549,7 @@ class ManagedLiveKitEvidenceSession:
         outcome: EvidenceFinishResult,
         channel: "AgentChannel",
     ) -> None:
+        await self._deactivate_partial_projection("formal", outcome.turn_id)
         for raw in outcome.events:
             raw = dict(raw)
             raw.setdefault("turn_id", outcome.turn_id)
@@ -1447,21 +2567,52 @@ class ManagedLiveKitEvidenceSession:
             stop_evidence_session=False,
         )
 
-    async def _fatal_ingress_problem(self, code: str, exc: Exception) -> None:
+    async def _fatal_ingress_problem(
+        self,
+        code: str,
+        exc: Exception,
+        *,
+        cause_code: Optional[str] = None,
+        cause_type: Optional[str] = None,
+        stage: Optional[str] = None,
+    ) -> None:
+        if self.ownership is not None:
+            try:
+                self.supervisor.coordinator.assert_current(self.ownership.commit_fence(), self.organization_id)
+            except ApiError as fence_error:
+                if fence_error.code in {"EVIDENCE_OWNER_FENCED", "EVIDENCE_OWNERSHIP_LOST"}:
+                    return
+                raise
         interviews = self.supervisor.interviews
-        interviews.record_agent_problem(
-            self.interview_id,
-            {
-                "code": code,
-                "message": type(exc).__name__,
-                "recoverable": False,
-                "action": "pause_or_human_takeover",
-            },
-            self.organization_id,
-        )
+        payload = {
+            "code": code,
+            "message": type(exc).__name__,
+            "recoverable": False,
+            "action": "pause_or_human_takeover",
+        }
+        if cause_code:
+            payload["cause_code"] = cause_code
+        if cause_type:
+            payload["cause_type"] = cause_type
+        if stage:
+            payload["stage"] = stage
         interview = interviews.get_interview(
             self.interview_id, self.organization_id
         )
+        existing = (interview.get("agent_runtime") or {}).get("problems") or []
+        last = existing[-1] if existing else {}
+        duplicate = bool(
+            last.get("code") == payload["code"]
+            and (not cause_code or last.get("cause_code") == cause_code)
+            and interview.get("status") != "in_progress"
+        )
+        if not duplicate:
+            interviews.record_agent_problem(
+                self.interview_id, payload, self.organization_id
+            )
+            interview = interviews.get_interview(
+                self.interview_id, self.organization_id
+            )
         if interview.get("status") == "in_progress":
             interviews.pause_interview(
                 self.interview_id,
@@ -1622,6 +2773,7 @@ class LiveKitEvidenceIngressSupervisor:
         coordinator: Optional[EvidenceOwnershipCoordinator] = None,
         journal: Optional[EvidenceCommandJournal] = None,
         command_poll_seconds: float = 0.02,
+        turn_detector: Any = None,
     ) -> None:
         self.store = store
         self.persistence = persistence_for(store)
@@ -1629,6 +2781,10 @@ class LiveKitEvidenceIngressSupervisor:
         self.media_plane = media_plane or LiveKitMediaPlane()
         self.ingress_factory = ingress_factory
         self.evidence_chain_factory = evidence_chain_factory
+        runtime_python = os.getenv("INTERVIEWER_TURN_DETECTOR_PYTHON") or str(
+            Path(__file__).resolve().parents[2] / ".runtime/turn-detector/bin/python")
+        self.turn_detector = turn_detector or LocalAudioTurnDetector(runtime_python)
+        self._detector_warmup_task: Optional[asyncio.Task] = None
         self.endpoint_delay_seconds = max(
             0.001, min(float(endpoint_delay_seconds), 2.5)
         )
@@ -1683,10 +2839,18 @@ class LiveKitEvidenceIngressSupervisor:
             raise
         return session
 
+    def prewarm_turn_detector(self) -> None:
+        if self._detector_warmup_task is None:
+            self._detector_warmup_task = asyncio.create_task(self.turn_detector.predict(bytes(38_400)))
+
     async def shutdown(self) -> None:
         sessions = list(self._sessions.values())
         for session in sessions:
             await session.stop("application_shutdown")
+        if self._detector_warmup_task is not None and not self._detector_warmup_task.done():
+            self._detector_warmup_task.cancel()
+            await asyncio.gather(self._detector_warmup_task, return_exceptions=True)
+        await self.turn_detector.close()
 
     def _remove(self, session: ManagedLiveKitEvidenceSession) -> None:
         key = (session.organization_id, session.interview_id)

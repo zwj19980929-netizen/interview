@@ -40,7 +40,7 @@ _OPEN_PAYLOAD_FIELDS = {
     "language",
     "enable_partial",
 }
-_SEAL_PAYLOAD_FIELDS = {"endpoint"}
+_SEAL_PAYLOAD_FIELDS = {"endpoint", "capture_id", "endpoint_id", "proposal_id"}
 _BACKFILL_PAYLOAD_FIELDS = {
     "batch_id",
     "file_id",
@@ -50,7 +50,7 @@ _BACKFILL_PAYLOAD_FIELDS = {
     "client_sequence",
 }
 _LANGUAGE_RE = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z]{2,4})?$")
-_ENDPOINTS = {"explicit", "semantic_timeout", "candidate_requested"}
+_ENDPOINTS = {"explicit", "semantic_timeout", "candidate_requested", "prepared_turn"}
 _SAFE_REFERENCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,159}$")
 _CHECKSUM_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -433,6 +433,8 @@ class EvidenceCommandJournal:
             allowed = _SEAL_PAYLOAD_FIELDS
         elif submission.command_type == "evidence.backfill":
             allowed = _BACKFILL_PAYLOAD_FIELDS
+        elif submission.command_type in {"speech.started", "speech.stopped", "evidence.continue"}:
+            allowed = {"capture_id"}
         else:
             allowed = set()
         forbidden = sorted(set(payload) - allowed)
@@ -443,6 +445,13 @@ class EvidenceCommandJournal:
                 status_code=422,
                 details={"fields": forbidden},
             )
+        scope = {}
+        for field in ("capture_id", "endpoint_id", "proposal_id"):
+            if field in payload:
+                value = payload[field]
+                if not isinstance(value, str) or len(value) > 128 or not _SAFE_REFERENCE_RE.fullmatch(value):
+                    raise ApiError("EVIDENCE_COMMAND_PAYLOAD_INVALID", "Evidence scope ID is invalid.", status_code=422)
+                scope[field] = value
         if submission.command_type == "evidence.open":
             content_type = str(payload.get("content_type") or "audio/pcm")
             if content_type != "audio/pcm":
@@ -488,7 +497,9 @@ class EvidenceCommandJournal:
                     "Evidence seal endpoint is not supported.",
                     status_code=422,
                 )
-            return {"endpoint": endpoint}
+            if endpoint == "prepared_turn" and not (scope.get("capture_id") and scope.get("proposal_id")):
+                raise ApiError("EVIDENCE_COMMAND_PAYLOAD_INVALID", "Prepared seal needs capture and proposal references.", status_code=422)
+            return {"endpoint": endpoint, **scope}
         if submission.command_type == "evidence.backfill":
             batch_id = str(payload.get("batch_id") or "")
             file_id = str(payload.get("file_id") or "")
@@ -524,7 +535,7 @@ class EvidenceCommandJournal:
                 "audio_epoch": audio_epoch,
                 "client_sequence": client_sequence,
             }
-        return {}
+        return scope
 
     @classmethod
     def _reject_locked(

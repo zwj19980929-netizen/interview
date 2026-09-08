@@ -5,6 +5,21 @@ import pytest
 
 from app.core.prompt.contracts import prompt_contract, structured_output_instruction
 from app.core.prompt.validation import StructuredResponseValidationError, validate_structured_response
+from app.core.prompt.understanding_references import understanding_references
+
+
+def test_understanding_v2_uses_exact_reference_catalog_and_preserves_long_transcripts():
+    transcript = "嗯 FastAPI / Redis，readiness 200。" + "待" * 501 + "\n结束！"
+    context = {"transcript": transcript, "capability_points": ["幂等键", "健康检查"]}
+    references = understanding_references(transcript, context["capability_points"])
+    assert all(text in transcript and len(text) <= 240 for text in references["evidence"].values())
+    assert sum(text.count("待") for text in references["evidence"].values()) == 501
+    contract = prompt_contract("interview_turn_understanding", context)
+    assert contract.version == "interview_turn_understanding.v6"
+    assert "evidence_quotes" not in contract.response_schema["properties"]
+    assert contract.response_schema["properties"]["evidence_ids"]["items"]["enum"] == list(references["evidence"])
+    assert contract.response_schema["properties"]["covered_point_ids"]["items"]["enum"] == ["P1", "P2"]
+    assert "互不相交" in contract.messages[0].content
 
 
 def test_question_generation_prompt_and_response_contract_are_centralized() -> None:

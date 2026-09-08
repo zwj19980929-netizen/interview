@@ -1,6 +1,10 @@
 import asyncio
 import base64
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
+
+import pytest
 
 from app.adapters.livekit_media import LiveKitConfiguration, LiveKitMediaPlane
 from app.core.auth import Principal
@@ -13,6 +17,7 @@ from app.domain.interview_agent import (
 )
 from app.file_storage.provider import reset_private_file_storage_for_tests
 from app.persistence.provider import persistence_for
+from app.persistence.memory import _MemoryTransactionBackend
 from app.repositories.memory import InMemoryStore
 from app.services.evidence_command_journal import EvidenceCommandJournal
 from app.services.evidence_coordination import EvidenceOwnershipCoordinator
@@ -22,6 +27,16 @@ from app.services.interview_evidence import InterviewEvidenceChain
 from app.services.livekit_evidence_ingress import (
     LiveKitEvidenceIngressSupervisor,
 )
+
+
+@pytest.fixture(autouse=True)
+def monotonic_test_database_clock(monkeypatch):
+    # Recovery ordering must not depend on laptop/VM wall-clock resyncs.
+    # Time still advances and leases still expire; only this in-memory test
+    # backend uses a monotonic elapsed offset. Production clocks are unchanged.
+    origin, started = datetime.now(timezone.utc), time.monotonic()
+    monkeypatch.setattr(_MemoryTransactionBackend, "database_now",
+                        lambda _self: origin + timedelta(seconds=time.monotonic() - started))
 from app.services.streaming_stt import StreamingInterviewSTT
 
 
@@ -276,7 +291,7 @@ async def _start_unknown_seal(
         type="evidence.finish",
         idempotency_key="seal_unknown_result",
         turn_id=TURN_ID,
-        payload={"endpoint": "explicit"},
+        payload={"endpoint": "explicit", "capture_id": "capture_old_owner"},
     )
     sending = asyncio.create_task(channel.send(signal))
     await _wait_until(lambda: _command_count(store) == 1)
@@ -303,7 +318,7 @@ async def _reconnect_to_unknown_seal(
         type="evidence.finish",
         idempotency_key="seal_unknown_result",
         turn_id=TURN_ID,
-        payload={"endpoint": "explicit"},
+        payload={"endpoint": "explicit", "capture_id": "capture_old_owner"},
     )
     journal.submit(
         old_owner,
@@ -354,6 +369,17 @@ def _command(store: InMemoryStore) -> dict[str, Any]:
     return commands[0]
 
 
+def _expire_old_owner_after_checkpoint(store, old_owner):
+    # Expire database truth only after the crash fixture is complete. A 200ms
+    # setup lease makes host load decide the owner before the test even seals
+    # its checkpoint; that tests machine speed rather than recovery fencing.
+    with persistence_for(store).transaction(ORGANIZATION_ID) as transaction:
+        ownership = transaction.evidence_ownerships.get(old_owner.ownership_id)
+        assert ownership["ownership_epoch"] == old_owner.ownership_epoch
+        ownership["lease_expires_at"] = (transaction.database_now() - timedelta(seconds=1)).isoformat()
+        transaction.evidence_ownerships.update(ownership, expected_version=ownership["version"])
+
+
 def test_successor_reclaims_unknown_seal_and_repairs_complete_checkpoint_once(
     tmp_path, monkeypatch
 ) -> None:
@@ -365,7 +391,7 @@ def test_successor_reclaims_unknown_seal_and_repairs_complete_checkpoint_once(
         _DevelopmentRecoveryChain.recovery_calls = 0
         store = InMemoryStore()
         _session(store)
-        coordinator = EvidenceOwnershipCoordinator(store, lease_seconds=0.2)
+        coordinator = EvidenceOwnershipCoordinator(store, lease_seconds=30)
         journal = EvidenceCommandJournal(store, claim_seconds=0.08)
         (
             old_owner,
@@ -392,6 +418,7 @@ def test_successor_reclaims_unknown_seal_and_repairs_complete_checkpoint_once(
         assert writer.seal(complete=True).recoverability == "complete"
         # No cooperative release: the former process disappeared after the
         # provider effect became unknown. The successor must use DB lease time.
+        _expire_old_owner_after_checkpoint(store, old_owner)
 
         await asyncio.wait_for(sending, timeout=3)
         await _wait_until(lambda: _command(store)["status"] == "completed")
@@ -434,7 +461,7 @@ def test_successor_treats_existing_answer_as_unknown_seal_effect_receipt(
         _DevelopmentRecoveryChain.recovery_calls = 0
         store = InMemoryStore()
         _session(store)
-        coordinator = EvidenceOwnershipCoordinator(store, lease_seconds=0.2)
+        coordinator = EvidenceOwnershipCoordinator(store, lease_seconds=30)
         journal = EvidenceCommandJournal(store, claim_seconds=0.08)
         (
             old_owner,
@@ -509,7 +536,7 @@ def test_successor_fails_closed_and_pauses_for_incomplete_checkpoint(
         _DevelopmentRecoveryChain.recovery_calls = 0
         store = InMemoryStore()
         _session(store)
-        coordinator = EvidenceOwnershipCoordinator(store, lease_seconds=0.2)
+        coordinator = EvidenceOwnershipCoordinator(store, lease_seconds=30)
         journal = EvidenceCommandJournal(store, claim_seconds=0.08)
         (
             old_owner,
@@ -667,21 +694,51 @@ def test_browser_backfill_and_duplicate_finish_commit_one_candidate_answer(
             type="evidence.finish",
             idempotency_key="browser_finish_once",
             turn_id=TURN_ID,
-            payload={"endpoint": "explicit"},
+            payload={"endpoint": "explicit", "capture_id": managed._capture_id},
         )
+        assert finish.payload["capture_id"]
+        # Explicit finish is a scoped, reversible proposal hint. Its durable
+        # receipt acknowledges the hint, not a synchronous CandidateAnswer.
         await channel.send(finish)
         await channel.send(finish)
+        try:
+            await _wait_until(
+                lambda: len(runtime.interviews.get_interview(INTERVIEW_ID, ORGANIZATION_ID)["answers"]) == 1,
+                timeout=3.0,
+            )
+        except AssertionError:
+            current = runtime.interviews.get_interview(INTERVIEW_ID, ORGANIZATION_ID)
+            raise AssertionError({
+                "status": current["status"], "answer_count": len(current["answers"]),
+                "problem_codes": [item.get("code") for item in current["agent_runtime"].get("problems", [])],
+                "command_states": [(item["command_type"], item["status"],
+                                    (item.get("payload") or {}).get("endpoint"),
+                                    (item.get("outcome") or {}).get("error_code"))
+                                   for item in store.evidence_commands.values()],
+            }) from None
+        await _wait_until(
+            lambda: all(
+                item["status"] == "completed"
+                for item in store.evidence_commands.values()
+                if item.get("interview_id") == INTERVIEW_ID and item["command_type"] == "evidence.seal"
+            ),
+        )
         current = runtime.interviews.get_interview(INTERVIEW_ID, ORGANIZATION_ID)
         assert len(current["answers"]) == 1
         assert current["answers"][0]["turn_id"] == TURN_ID
         assert current["answers"][0]["audio_uri"]
+        assert current["agent_runtime"]["browser_backfill_batches"][batch_id]["status"] == "complete"
         commands = [
             item
             for item in store.evidence_commands.values()
             if item.get("interview_id") == INTERVIEW_ID
         ]
         assert len([item for item in commands if item["command_type"] == "evidence.backfill"]) == 2
-        assert len([item for item in commands if item["command_type"] == "evidence.seal"]) == 1
+        seals = [item for item in commands if item["command_type"] == "evidence.seal"]
+        assert len(seals) == 2  # One idempotent user hint + one actual prepared commit.
+        assert {item["payload"]["endpoint"] for item in seals} == {"explicit", "prepared_turn"}
+        assert all(item["payload"]["capture_id"] == finish.payload["capture_id"] for item in seals)
+        assert all(item["status"] == "completed" for item in seals)
         await channel.close("test_complete")
         await supervisor.shutdown()
         reset_private_file_storage_for_tests()

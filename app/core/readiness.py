@@ -4,12 +4,11 @@ import importlib.util
 import asyncio
 import os
 import shutil
-from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
 from app.adapters.livekit_media import LiveKitMediaPlane
 from app.model_gateway import capabilities as cap
-from app.model_gateway.registry import get_provider_manifest
+from app.services.model_route_readiness import purpose_readiness
 from app.domain.avatar_asset import inspect_licensed_vrm
 from app.operations.production_config import security_configuration_ready
 from app.core.interview_agent_release import realtime_agent_release_status
@@ -66,57 +65,7 @@ async def _scanner_ready() -> bool:
 
 def _route_ready(transaction: Any, capability: str, purpose: str) -> bool:
     """Verify an explicit, healthy, non-mock production route."""
-
-    route = next(
-        (
-            item
-            for item in transaction.model_routes.list()
-            if item.get("enabled", True)
-            and item.get("capability") == capability
-            and item.get("purpose") == purpose
-        ),
-        None,
-    )
-    if route is None:
-        return False
-    model = transaction.model_configurations.get(
-        (route.get("primary") or {}).get("model_configuration_id")
-    )
-    if (
-        model is None
-        or not model.get("enabled", True)
-        or model.get("status") != "ready"
-        or capability not in model.get("supported_capabilities", [])
-        or model.get("provider_id") == "mock"
-    ):
-        return False
-    connection = transaction.provider_connections.get(
-        model.get("provider_connection_id")
-    )
-    if connection is None or not connection.get("enabled", True):
-        return False
-    try:
-        manifest = get_provider_manifest(str(model.get("provider_id") or ""))
-    except KeyError:
-        return False
-    if not manifest.get("implemented") or capability not in manifest.get(
-        "capabilities", []
-    ):
-        return False
-    health = route.get("last_health") or {}
-    try:
-        checked = datetime.fromisoformat(
-            str(health.get("checked_at") or "").replace("Z", "+00:00")
-        )
-    except ValueError:
-        return False
-    ttl = max(1, int((route.get("policy") or {}).get("readiness_ttl_seconds", 60)))
-    if checked.tzinfo is None:
-        return False
-    return bool(
-        health.get("status") == "healthy"
-        and checked + timedelta(seconds=ttl) >= datetime.now(timezone.utc)
-    )
+    return bool(purpose_readiness(transaction, capability, purpose)["ready"])
 
 
 async def deployment_readiness(store: Any) -> Dict[str, Any]:

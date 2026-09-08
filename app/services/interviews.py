@@ -1,10 +1,12 @@
 import base64
 from copy import deepcopy
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import hmac
+import json
 import os
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from app.core.errors import ApiError
 from app.core.ids import new_id
@@ -17,20 +19,39 @@ from app.domain.interview_lifecycle import (
     LifecycleCommandType,
     LifecycleDecision,
 )
-from app.domain.interview_agent import ConversationUtterance
+from app.domain.interview_agent import ConversationUtterance, TurnUnderstanding
 from app.domain.evidence_coordination import EvidenceCommitFence
 from app.model_gateway import capabilities as cap
 from app.model_gateway.gateway import ModelGateway
-from app.model_gateway.schemas import BatchSTTRequest
+from app.model_gateway.schemas import (
+    BatchSTTRequest,
+    ProviderMeta,
+    StableTranscriptPreview,
+    StreamingSTTEvent,
+    TranscriptSegment,
+)
 from app.persistence.interface import Persistence, new_work_item
 from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
 from app.services.evaluation import EvaluationService
 from app.services.evidence_coordination import assert_current_evidence_fence
+from app.services.evidence_media import DurableEvidenceMedia
 from app.services.conversation_understanding import ConversationUnderstandingService
 from app.services.plan_assembly import InterviewPlanAssembly
 from app.services.reports import ReportService
 from app.services.livekit_room_binding import interview_room_name
+
+
+@dataclass(frozen=True)
+class PreparedTurnDecision:
+    """Process-local, validated decision; never accepted from a client payload."""
+    interview_id: str
+    turn_id: str
+    text: str
+    understanding: TurnUnderstanding
+    followup: Dict[str, Any]
+    stt_fingerprint: str
+    context_fingerprint: str
 
 
 class InterviewService:
@@ -475,17 +496,36 @@ class InterviewService:
             problems = session.setdefault("agent_runtime", {}).setdefault(
                 "problems", []
             )
-            problems.append(
-                {
-                    "code": str(
-                        payload.get("code") or "AGENT_RUNTIME_PROBLEM"
-                    )[:128],
-                    "message": str(payload.get("message") or "")[:500],
-                    "recoverable": bool(payload.get("recoverable")),
-                    "action": str(payload.get("action") or "")[:128],
-                    "occurred_at": utc_now(),
-                }
-            )
+            problem = {
+                "code": str(
+                    payload.get("code") or "AGENT_RUNTIME_PROBLEM"
+                )[:128],
+                "message": str(payload.get("message") or "")[:500],
+                "recoverable": bool(payload.get("recoverable")),
+                "action": str(payload.get("action") or "")[:128],
+                "occurred_at": utc_now(),
+            }
+            cause_code = str(payload.get("cause_code") or "").strip().upper()
+            if (
+                cause_code
+                and len(cause_code) <= 96
+                and all(
+                    character.isalnum() or character == "_"
+                    for character in cause_code
+                )
+            ):
+                problem["cause_code"] = cause_code
+            cause_type = str(payload.get("cause_type") or "").strip()
+            if (
+                cause_type
+                and len(cause_type) <= 96
+                and cause_type.isidentifier()
+            ):
+                problem["cause_type"] = cause_type
+            stage = payload.get("stage")
+            if stage in {"send", "snapshot", "resume", "commit", "retry", "understanding", "unknown"}:
+                problem["stage"] = stage
+            problems.append(problem)
             del problems[:-20]
             session["updated_at"] = utc_now()
             return transaction.interview_sessions.update(
@@ -693,6 +733,7 @@ class InterviewService:
         organization_id: str = "org_default",
         *,
         evidence_fence: Optional[EvidenceCommitFence] = None,
+        prepared_decision: Optional[PreparedTurnDecision] = None,
     ) -> Dict[str, Any]:
         transcript_source = payload.get("transcript_source")
         provider = payload.get("stt_provider") or {}
@@ -731,10 +772,18 @@ class InterviewService:
             source=transcript_source,
             created_at=now,
         )
-        understanding = await self.conversation.understand(
-            utterance, source_turn, source_session
-        )
-        if understanding.intent != "answer" or understanding.suggested_action in {
+        if prepared_decision is not None:
+            self._assert_prepared_decision(
+                prepared_decision, source_session, source_turn, payload,
+            )
+            understanding = prepared_decision.understanding.model_copy(
+                update={"utterance_id": utterance.utterance_id}, deep=True,
+            )
+        else:
+            understanding = await self.conversation.understand(
+                utterance, source_turn, source_session
+            )
+        if understanding.intent not in {"answer", "answer_declined"} or understanding.suggested_action in {
             "clarify", "repeat", "continue_listening", "pause"
         }:
             understanding_problem = (
@@ -749,6 +798,8 @@ class InterviewService:
                 turn = self.lifecycle.require_active_turn(
                     session, turn_id, allowed_statuses=("transcribing",)
                 )
+                if prepared_decision is not None:
+                    self._assert_prepared_decision(prepared_decision, session, turn, payload)
                 mutable = self._turn_by_id(session, turn["id"])
                 mutable.setdefault("utterances", []).append(
                     utterance.model_dump(mode="json")
@@ -770,6 +821,15 @@ class InterviewService:
                     ),
                     organization_id,
                 )
+                if evidence_fence is not None and payload.get("media_evidence"):
+                    DurableEvidenceMedia.release_rejected_capture(
+                        transaction,
+                        interview_id=interview_id,
+                        turn_id=turn_id,
+                        media_evidence=payload["media_evidence"],
+                        utterance_id=utterance.utterance_id,
+                        fence=evidence_fence,
+                    )
             return {
                 "accepted": False,
                 "answer": None,
@@ -789,9 +849,9 @@ class InterviewService:
                 ],
             }
 
-        followup_decision = await self.conversation.select_followup(
-            source_session, source_turn, utterance, understanding
-        )
+        followup_decision = (deepcopy(prepared_decision.followup) if prepared_decision is not None
+                             else await self.conversation.select_followup(
+                                 source_session, source_turn, utterance, understanding))
         answer = {
             "id": new_id("ans"),
             "organization_id": organization_id,
@@ -834,10 +894,19 @@ class InterviewService:
             # newer owner has claimed the interview.
             if evidence_fence is not None:
                 assert_current_evidence_fence(transaction, evidence_fence)
+                if payload.get("media_evidence"):
+                    DurableEvidenceMedia.assert_complete_capture(
+                        transaction,
+                        interview_id=interview_id,
+                        turn_id=turn_id,
+                        media_evidence=payload["media_evidence"],
+                    )
             session = self._required(transaction.interview_sessions.get(interview_id))
             turn = self.lifecycle.require_active_turn(
                 session, turn_id, allowed_statuses=("asking", "transcribing")
             )
+            if prepared_decision is not None:
+                self._assert_prepared_decision(prepared_decision, session, turn, payload)
             mutable = self._turn_by_id(session, turn["id"])
             mutable.setdefault("utterances", []).append(utterance.model_dump(mode="json"))
             mutable["current_understanding"] = understanding.model_dump(mode="json")
@@ -949,6 +1018,7 @@ class InterviewService:
                 ),
                 organization_id,
                 evidence_fence=evidence_fence,
+                media_evidence=payload.get("media_evidence"),
             )
         try:
             try:
@@ -979,6 +1049,10 @@ class InterviewService:
                 ),
             )
         except Exception as exc:
+            if getattr(exc, "code", None) == "provider_final_transcript_missing":
+                return self.record_untranscribed_capture(
+                    interview_id, payload, organization_id, evidence_fence=evidence_fence,
+                )
             self._apply_command(
                 interview_id,
                 LifecycleCommand(
@@ -987,6 +1061,7 @@ class InterviewService:
                 ),
                 organization_id,
                 evidence_fence=evidence_fence,
+                media_evidence=payload.get("media_evidence"),
             )
             raise
         result = await self._accept_authoritative_transcript(
@@ -1010,6 +1085,220 @@ class InterviewService:
         result["transcription"] = response.model_dump()
         return result
 
+    def record_untranscribed_capture(
+        self, interview_id: str, payload: Dict[str, Any], organization_id: str = "org_default",
+        *, evidence_fence: Optional[EvidenceCommitFence] = None,
+    ) -> Dict[str, Any]:
+        """Retain audio without inventing an utterance, understanding or answer."""
+        with self.persistence.transaction(organization_id) as transaction:
+            if evidence_fence is not None:
+                assert_current_evidence_fence(transaction, evidence_fence)
+            session = self._required(transaction.interview_sessions.get(interview_id))
+            turn_id = self._resolve_turn_id(session, payload.get("turn_id"), None)
+            turn = self.lifecycle.require_active_turn(session, turn_id, allowed_statuses=("asking", "transcribing"))
+            if evidence_fence is not None:
+                DurableEvidenceMedia.assert_complete_capture(
+                    transaction, interview_id=interview_id, turn_id=turn_id,
+                    media_evidence=payload.get("media_evidence") or {},
+                )
+            if turn["status"] == "asking":
+                decision, _ = self._decide_and_persist(
+                    transaction, session,
+                    LifecycleCommand(LifecycleCommandType.TRANSCRIPTION_STARTED, {
+                        "turn_id": turn_id, "recording": {"audio_uri": payload["audio_uri"], "content_type": payload.get("content_type", "audio/wav")},
+                    }), organization_id,
+                )
+                session = decision.session
+            decision, _ = self._decide_and_persist(
+                transaction, session,
+                LifecycleCommand(LifecycleCommandType.TRANSCRIPTION_FAILED, {
+                    "turn_id": turn_id, "error": "STT_TRANSCRIPT_UNAVAILABLE",
+                }), organization_id,
+            )
+            if evidence_fence is not None:
+                DurableEvidenceMedia.release_untranscribed_capture(
+                    transaction, interview_id=interview_id, turn_id=turn_id,
+                    media_evidence=payload["media_evidence"], audio_uri=payload["audio_uri"], fence=evidence_fence,
+                )
+        return {
+            "accepted": False, "answer": None, "understanding": None,
+            "conversation_action": "continue_listening", "next_turn_id": turn_id,
+            "status": decision.session["status"],
+            "understanding_problem": {
+                "code": "STT_TRANSCRIPT_UNAVAILABLE", "recoverable": True, "action": "continue_listening",
+            },
+        }
+
+    async def prepare_streaming_decision(
+        self, interview_id: str, turn_id: str,
+        final: Union[StreamingSTTEvent, StableTranscriptPreview],
+        organization_id: str = "org_default", *, snapshot_ref: str,
+        completion_confirmed: bool = False,
+    ) -> PreparedTurnDecision:
+        """Prepare from a stable server prefix or final; neither commits an answer."""
+        is_preview = isinstance(final, StableTranscriptPreview)
+        if is_preview:
+            try:
+                final = StableTranscriptPreview.model_validate(final.model_dump(mode="json"))
+                if final.has_unstable_tail or not final.text.strip():
+                    raise ValueError("unstable or empty preview")
+            except (ValueError, TypeError, AttributeError):
+                raise ApiError(
+                    "STREAMING_TRANSCRIPT_INVALID", "Stable server preview required.", status_code=409,
+                ) from None
+        else:
+            self._require_streaming_final(final)
+        session = self.get_interview(interview_id, organization_id)
+        turn = self.lifecycle.require_active_turn(session, turn_id, allowed_statuses=("asking",))
+        # Freeze both identities before awaiting inference. A final may keep
+        # the same text while confidence, timestamps or provider change.
+        stt_fingerprint = self._prepared_stt_fingerprint({
+            "final_transcript": final.text,
+            "stt_confidence": final.confidence,
+            "language": final.language,
+            "transcript_segments": [item.model_dump(mode="json") for item in final.segments],
+            "stt_provider": final.provider.model_dump(mode="json"),
+            "transcript_source": "server_streaming",
+        })
+        context_fingerprint = self._prepared_context_fingerprint(session, turn)
+        if completion_confirmed:
+            session = {**session, "_answer_completion_confirmed": True}
+        if is_preview:
+            understanding, followup = await self.conversation.prepare_preview(
+                final, turn, session, snapshot_ref=snapshot_ref,
+            )
+        else:
+            utterance = ConversationUtterance(
+                utterance_id=new_id("utterance_preview"), revision=1, speaker="candidate",
+                text=final.text.strip(), is_final=True, authoritative=True, audio_uri=snapshot_ref,
+                stt_confidence=final.confidence, source="server_streaming", created_at=utc_now(),
+            )
+            understanding, followup = await self.conversation.prepare_decision(utterance, turn, session)
+        return PreparedTurnDecision(
+            interview_id, turn_id, final.text.strip(), understanding, followup,
+            stt_fingerprint=stt_fingerprint, context_fingerprint=context_fingerprint,
+        )
+
+    @staticmethod
+    def _require_streaming_final(final: StreamingSTTEvent) -> None:
+        if (
+            not isinstance(final, StreamingSTTEvent)
+            or final.type != "transcript.final"
+            or not final.is_final
+            or final.provider is None
+            or not final.provider.provider_id
+            or not final.text.strip()
+        ):
+            raise ApiError("STREAMING_TRANSCRIPT_INVALID", "Server final required.", status_code=409)
+
+    @staticmethod
+    def _prepared_stt_fingerprint(payload: Dict[str, Any]) -> str:
+        """Bind all normalized semantic/provenance fields, not transport ticks."""
+
+        identity = {
+            "text": str(payload["final_transcript"]).strip(),
+            "confidence": float(payload.get("stt_confidence", 0.0)),
+            "language": str(payload.get("language", "zh-CN")),
+            "segments": [
+                TranscriptSegment.model_validate(item).model_dump(mode="json")
+                for item in payload.get("transcript_segments", [])
+            ],
+            "provider": ProviderMeta.model_validate(payload["stt_provider"]).model_dump(mode="json"),
+            "source": payload.get("transcript_source"),
+        }
+        return hashlib.sha256(json.dumps(
+            identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+        ).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _prepared_context_fingerprint(session: Dict[str, Any], turn: Dict[str, Any]) -> str:
+        """Freeze decision inputs without coupling to heartbeat/store versions."""
+
+        root_id = turn.get("root_turn_id") or turn["id"]
+        root = next((item for item in session.get("turns", []) if item.get("id") == root_id), turn)
+        question_fields = (
+            "id", "question_id", "question_snapshot_id", "question_snapshot",
+            "question_spoken_text", "root_turn_id", "parent_turn_id", "is_followup",
+            "followup_depth", "allow_followup", "target_key_points", "phase", "weight",
+        )
+        budget_fields = (
+            "id", "is_followup", "root_turn_id", "parent_turn_id",
+            "followup_depth", "allow_followup", "target_key_points",
+        )
+        current_understanding = turn.get("current_understanding") or {}
+        settings = session.get("settings") or {}
+        context = {
+            "organization_id": session.get("organization_id", "org_default"),
+            "interview_id": session["id"],
+            "current_turn_id": session.get("current_turn_id"),
+            "turn": {key: turn.get(key) for key in question_fields},
+            "root": {key: root.get(key) for key in question_fields},
+            "understanding_revision": {
+                "understanding_id": current_understanding.get("understanding_id"),
+                "revision": current_understanding.get("revision", 0),
+            },
+            "budget_turns": sorted(
+                ({key: item.get(key) for key in budget_fields} for item in session.get("turns", [])),
+                key=lambda item: str(item["id"]),
+            ),
+            "followup_policy": {
+                **ConversationUnderstandingService.DEFAULT_POLICY,
+                **(session.get("followup_policy") or {}),
+            },
+            "scheduled_end_at": session.get("scheduled_end_at"),
+            "settings_scheduled_end_at": settings.get("scheduled_end_at"),
+            "language": settings.get("language", "zh-CN"),
+            "started_at": session.get("started_at"),
+            "estimated_minutes": (session.get("plan_snapshot") or {}).get("estimated_minutes", 0),
+        }
+        return hashlib.sha256(json.dumps(
+            context, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
+        ).encode("utf-8")).hexdigest()
+
+    def _assert_prepared_decision(
+        self, prepared: PreparedTurnDecision, session: Dict[str, Any],
+        turn: Dict[str, Any], payload: Dict[str, Any],
+    ) -> None:
+        try:
+            matches = (
+                prepared.interview_id == session["id"]
+                and prepared.turn_id == turn["id"]
+                and prepared.text == str(payload["final_transcript"]).strip()
+                and hmac.compare_digest(prepared.stt_fingerprint, self._prepared_stt_fingerprint(payload))
+                and hmac.compare_digest(prepared.context_fingerprint, self._prepared_context_fingerprint(session, turn))
+            )
+            if matches and prepared.followup.get("selected"):
+                policy = {
+                    **ConversationUnderstandingService.DEFAULT_POLICY,
+                    **(session.get("followup_policy") or {}),
+                }
+                matches = self.conversation._within_time_budget(
+                    session, int(policy["min_remaining_seconds"]), now=self.clock(),
+                )
+        except (ValueError, TypeError, KeyError, AttributeError):
+            matches = False
+        if not matches:
+            raise ApiError(
+                "TURN_DECISION_STALE", "Prepared evidence or decision context no longer matches final.",
+                status_code=409,
+            )
+
+    def assert_prepared_streaming_decision(
+        self, prepared: PreparedTurnDecision, final: Any, organization_id: str,
+    ) -> None:
+        """Side-effect-free preflight before the capture is detached or sealed."""
+        self._require_streaming_final(final)
+        session = self.get_interview(prepared.interview_id, organization_id)
+        turn = self.lifecycle.require_active_turn(session, prepared.turn_id, allowed_statuses=("asking",))
+        self._assert_prepared_decision(prepared, session, turn, {
+            "final_transcript": final.text,
+            "stt_confidence": final.confidence,
+            "language": final.language,
+            "transcript_segments": [item.model_dump(mode="json") for item in final.segments],
+            "stt_provider": final.provider.model_dump(mode="json") if final.provider else {},
+            "transcript_source": "server_streaming",
+        })
+
     async def submit_streaming_answer(
         self,
         interview_id: str,
@@ -1017,6 +1306,7 @@ class InterviewService:
         organization_id: str = "org_default",
         *,
         evidence_fence: Optional[EvidenceCommitFence] = None,
+        prepared_decision: Optional[PreparedTurnDecision] = None,
     ) -> Dict[str, Any]:
         """Accept only a validated provider final from the server-side stream module."""
         provider = payload.get("provider") or {}
@@ -1031,6 +1321,17 @@ class InterviewService:
         active_turn = self.lifecycle.require_active_turn(
             session, turn_id, allowed_statuses=("asking", "transcribing")
         )
+        if prepared_decision is not None:
+            # Reject before TRANSCRIPTION_STARTED as well as inside the final
+            # effect transaction, so mismatches have no lifecycle side effect.
+            self._assert_prepared_decision(prepared_decision, session, active_turn, {
+                "final_transcript": payload["final_transcript"],
+                "stt_confidence": payload.get("confidence", 0.0),
+                "language": payload.get("language", "zh-CN"),
+                "transcript_segments": payload.get("segments", []),
+                "stt_provider": provider,
+                "transcript_source": "server_streaming",
+            })
         if active_turn.get("status") == "asking":
             self._apply_command(
                 interview_id,
@@ -1046,6 +1347,7 @@ class InterviewService:
                 ),
                 organization_id,
                 evidence_fence=evidence_fence,
+                media_evidence=payload.get("media_evidence"),
             )
         return await self._accept_authoritative_transcript(
             interview_id,
@@ -1064,6 +1366,7 @@ class InterviewService:
             },
             organization_id,
             evidence_fence=evidence_fence,
+            prepared_decision=prepared_decision,
         )
 
     async def regrade_answer(
@@ -1312,11 +1615,19 @@ class InterviewService:
         organization_id: str,
         *,
         evidence_fence: Optional[EvidenceCommitFence] = None,
+        media_evidence: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
         with self.persistence.transaction(organization_id) as transaction:
             if evidence_fence is not None:
                 assert_current_evidence_fence(transaction, evidence_fence)
             session = self._required(transaction.interview_sessions.get(interview_id))
+            if evidence_fence is not None and media_evidence:
+                DurableEvidenceMedia.assert_complete_capture(
+                    transaction,
+                    interview_id=interview_id,
+                    turn_id=command.payload["turn_id"],
+                    media_evidence=media_evidence,
+                )
             decision, work_items = self._decide_and_persist(
                 transaction,
                 session,

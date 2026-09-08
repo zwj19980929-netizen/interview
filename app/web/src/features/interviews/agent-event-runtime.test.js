@@ -96,6 +96,83 @@ describe("ordered AgentEvent runtime", () => {
       code: "AGENT_EVENT_PAYLOAD_INVALID",
     });
   });
+
+  it("accepts only a complete LiveKit binding with no URI for streaming TTS", () => {
+    const live = {
+      ...performance(), audio_uri: null, delivery: "streaming_tts",
+      live_audio: { output_id: "output_1", publisher_identity: "expression:synthetic",
+        track_sid: "TR_one", track_name: "speech_output_1", sample_rate_hz: 24_000, channels: 1 },
+    };
+    expect(validateAgentEvent(event(1, "avatar.performance.started", live)).ok).toBe(true);
+    for (const change of [
+      { audio_uri: "https://provider.example/private.wav" },
+      { live_audio: null },
+      { live_audio: { ...live.live_audio, participant_token: "secret" } },
+      { live_audio: { ...live.live_audio, output_id: "" } },
+      { live_audio: { ...live.live_audio, sample_rate_hz: 16_000 } },
+      { live_audio: { ...live.live_audio, channels: 2 } },
+      { delivery: "cascade", audio_uri: "/managed.wav" },
+    ]) {
+      expect(validateAgentEvent(event(1, "avatar.performance.started", { ...live, ...change })).ok).toBe(false);
+    }
+  });
+
+  it("validates producer EOF without allowing client text, PCM, URLs, or coercion", () => {
+    const finished = { performance_id: "performance_1", output_id: "output_1", total_samples: 48_000, sample_rate_hz: 24_000 };
+    expect(validateAgentEvent(event(2, "avatar.performance.producer_finished", finished)).ok).toBe(true);
+    for (const change of [
+      { total_samples: "48000" }, { total_samples: 0 }, { total_samples: -1 },
+      { total_samples: 14_400_001 }, { sample_rate_hz: 48_000 }, { output_id: "" },
+      { audio_base64: "AA==" }, { provider_url: "https://provider.example" },
+    ]) expect(validateAgentEvent(event(2, "avatar.performance.producer_finished", { ...finished, ...change })).ok).toBe(false);
+  });
+
+  it("accepts optional current performance identity in a candidate snapshot", () => {
+    for (const id of [undefined, null, "performance_current"]) {
+      expect(validateAgentEvent(event(1, "session.snapshot", { ...candidateSnapshot(), active_performance_id: id })).ok).toBe(true);
+    }
+    expect(validateAgentEvent(event(1, "session.snapshot", { ...candidateSnapshot(), active_performance_id: 7 })).ok).toBe(false);
+  });
+
+  it("strictly validates the scoped capture recovery snapshot without internal diagnostics", () => {
+    const recovery = { status: "recovering", turn_id: "turn_1", capture_id: "capture_1", attempt: 1, max_attempts: 3 };
+    const snapshot = { ...candidateSnapshot(), current_turn_id: "turn_1" };
+    for (const capture_recovery of [undefined, null, recovery, { ...recovery, status: "retry_required", attempt: 3 }]) {
+      expect(validateAgentEvent(event(1, "session.snapshot", { ...snapshot, capture_recovery })).ok).toBe(true);
+    }
+    for (const change of [
+      { stage: "provider_snapshot" }, { cause_code: "provider_timeout" }, { attempt: "1" },
+      { attempt: -1 }, { attempt: 4 }, { max_attempts: 4 }, { capture_id: "" }, { capture_id: "bad scope" },
+      { turn_id: "turn_old" }, { status: "auto_resume" },
+    ]) expect(validateAgentEvent(event(1, "session.snapshot", { ...snapshot, capture_recovery: { ...recovery, ...change } })).ok).toBe(false);
+    expect(validateAgentEvent(event(1, "session.snapshot", { ...snapshot, current_question: null, capture_recovery: recovery })).ok).toBe(false);
+  });
+
+  it("validates only safe fields in the current turn's supplement confirmation", () => {
+    const snapshot = { ...candidateSnapshot(), current_turn_id: "turn_1" };
+    const confirmation = { status: "awaiting_reply", turn_id: "turn_1", capture_id: "capture_1" };
+    expect(validateAgentEvent(event(1, "session.snapshot", { ...snapshot, supplement_confirmation: confirmation })).ok).toBe(true);
+    for (const extra of [{ boundary: "private transcript" }, { turn_id: "turn_old" }, { status: "finished" }, { capture_id: "" }]) {
+      expect(validateAgentEvent(event(1, "session.snapshot", { ...snapshot, supplement_confirmation: { ...confirmation, ...extra } })).ok).toBe(false);
+    }
+  });
+
+  it("requires capture and turn scope with the correct floor/action for recovery events", () => {
+    const recoveryEvents = [
+      ["floor.changed", { owner: "candidate", reason: "answer_recovering", capture_id: "capture_1" }],
+      ["floor.changed", { owner: "none", reason: "answer_retry_required", capture_id: "capture_1" }],
+      ["problem", { code: "CAPTURE_RECOVERING", message: "正在恢复", recoverable: true, action: "continue_listening", capture_id: "capture_1" }],
+      ["problem", { code: "CAPTURE_RETRY_REQUIRED", message: "请重试本题", recoverable: true, action: "retry_answer", capture_id: "capture_1" }],
+    ];
+    for (const [type, payload] of recoveryEvents) {
+      const item = { ...event(1, type, payload), turn_id: "turn_1" };
+      expect(validateAgentEvent(item).ok).toBe(true);
+      expect(validateAgentEvent({ ...item, turn_id: null }).ok).toBe(false);
+      expect(validateAgentEvent({ ...item, payload: { ...payload, capture_id: undefined } }).ok).toBe(false);
+      expect(validateAgentEvent({ ...item, payload: { ...payload, cause_type: "ProviderError" } }).ok).toBe(false);
+      expect(validateAgentEvent({ ...item, payload: { ...payload, ...(type === "problem" ? { action: "pause_or_human_takeover" } : { owner: "human" }) } }).ok).toBe(false);
+    }
+  });
 });
 
 function event(sequence, type, payload) {

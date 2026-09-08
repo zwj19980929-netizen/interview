@@ -1,8 +1,9 @@
 import json
 import sqlite3
 from contextlib import contextmanager
+from copy import deepcopy
 from datetime import datetime, timezone
-from typing import Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 from app.persistence.interface import Document, PersistenceTransaction, Predicate, TransactionBackend
 from app.repositories.sqlite import SQLiteStore
@@ -11,6 +12,16 @@ from app.repositories.sqlite import SQLiteStore
 class _SQLiteTransactionBackend(TransactionBackend):
     def __init__(self, connection: sqlite3.Connection) -> None:
         self.connection = connection
+        # SQLite is authoritative inside the transaction.  These deltas only
+        # refresh the legacy in-process read model after a successful commit;
+        # reloading every collection here used to make one tiny realtime
+        # command deserialize the entire local database on the event loop.
+        self._document_updates: Dict[Tuple[str, str], Document] = {}
+        self._document_deletes: Set[Tuple[str, str]] = set()
+        self._work_item_updates: Dict[str, Document] = {}
+        self._secret_updates: Dict[str, Document] = {}
+        self._secret_deletes: Set[str] = set()
+        self._invocation_inserts: List[Document] = []
 
     def database_now(self) -> datetime:
         row = self.connection.execute(
@@ -39,6 +50,7 @@ class _SQLiteTransactionBackend(TransactionBackend):
             "INSERT INTO documents(collection, id, data, updated_at) VALUES (?, ?, ?, ?)",
             (collection, item["id"], json.dumps(item, ensure_ascii=False), _item_time(item)),
         )
+        self._remember_document(collection, item)
 
     def replace_document(self, collection: str, item: Document) -> None:
         cursor = self.connection.execute(
@@ -47,6 +59,7 @@ class _SQLiteTransactionBackend(TransactionBackend):
         )
         if cursor.rowcount != 1:
             raise RuntimeError("Document disappeared during transaction: %s/%s" % (collection, item["id"]))
+        self._remember_document(collection, item)
 
     def delete_documents(self, collection: str, predicate: Predicate) -> None:
         for item in self.list_documents(collection):
@@ -55,6 +68,9 @@ class _SQLiteTransactionBackend(TransactionBackend):
                     "DELETE FROM documents WHERE collection = ? AND id = ?",
                     (collection, item["id"]),
                 )
+                key = (collection, str(item["id"]))
+                self._document_updates.pop(key, None)
+                self._document_deletes.add(key)
 
     def search_question_catalog(
         self,
@@ -131,6 +147,7 @@ class _SQLiteTransactionBackend(TransactionBackend):
                 item["updated_at"],
             ),
         )
+        self._work_item_updates[str(item["id"])] = deepcopy(item)
 
     def replace_work_item(self, item: Document) -> None:
         cursor = self.connection.execute(
@@ -143,6 +160,7 @@ class _SQLiteTransactionBackend(TransactionBackend):
         )
         if cursor.rowcount != 1:
             raise RuntimeError("Work item disappeared during transaction: %s" % item["id"])
+        self._work_item_updates[str(item["id"])] = deepcopy(item)
 
     def get_secret(self, organization_id: str, item_id: str) -> Document:
         row = self.connection.execute(
@@ -161,12 +179,16 @@ class _SQLiteTransactionBackend(TransactionBackend):
             """,
             (item_id, json.dumps(secret, ensure_ascii=False)),
         )
+        self._secret_deletes.discard(item_id)
+        self._secret_updates[item_id] = deepcopy(secret)
 
     def delete_secret(self, organization_id: str, item_id: str) -> None:
         self.connection.execute(
             "DELETE FROM provider_secrets WHERE provider_connection_id = ?",
             (item_id,),
         )
+        self._secret_updates.pop(item_id, None)
+        self._secret_deletes.add(item_id)
 
     def list_invocations(self) -> List[Document]:
         rows = self.connection.execute(
@@ -179,6 +201,27 @@ class _SQLiteTransactionBackend(TransactionBackend):
             "INSERT INTO model_invocations(id, data, created_at) VALUES (?, ?, ?)",
             (item["id"], json.dumps(item, ensure_ascii=False), item.get("created_at")),
         )
+        self._invocation_inserts.append(deepcopy(item))
+
+    def _remember_document(self, collection: str, item: Document) -> None:
+        key = (collection, str(item["id"]))
+        self._document_deletes.discard(key)
+        self._document_updates[key] = deepcopy(item)
+
+    def sync_store_cache(self, store: SQLiteStore) -> None:
+        """Apply only this committed transaction to the compatibility cache."""
+
+        for collection, item_id in self._document_deletes:
+            getattr(store, collection).pop(item_id, None)
+        for (collection, item_id), item in self._document_updates.items():
+            getattr(store, collection)[item_id] = deepcopy(item)
+        for item_id, item in self._work_item_updates.items():
+            store.outbox_work_items[item_id] = deepcopy(item)
+        for item_id in self._secret_deletes:
+            store.provider_secrets.pop(item_id, None)
+        for item_id, secret in self._secret_updates.items():
+            store.provider_secrets[item_id] = deepcopy(secret)
+        store.model_invocations.extend(deepcopy(self._invocation_inserts))
 
 
 class SQLitePersistence:
@@ -198,7 +241,7 @@ class SQLitePersistence:
             raise
         finally:
             connection.close()
-        self.store._load_from_db()
+        backend.sync_store_cache(self.store)
 
 
 def _item_time(item: Document) -> Optional[str]:

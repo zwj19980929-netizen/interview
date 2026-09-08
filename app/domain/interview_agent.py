@@ -52,6 +52,13 @@ class OpenAgentSession(BaseModel):
     capabilities: ClientCapabilities
 
 
+class AvatarPlaybackReport(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    performance_id: str = Field(min_length=1, max_length=128)
+    status: Literal["playing", "blocked", "failed", "buffering"]
+
+
 class ClientSignal(BaseModel):
     """One idempotent input to the runtime.
 
@@ -76,6 +83,8 @@ class ClientSignal(BaseModel):
             raise ValueError("evidence.audio.chunk requires binary audio")
         if self.audio is not None and not (1 <= len(self.audio) <= 256 * 1024):
             raise ValueError("one evidence audio frame must contain 1 to 262144 bytes")
+        if self.type == "avatar.performance.playback":
+            AvatarPlaybackReport.model_validate(self.payload)
         return self
 
 
@@ -93,6 +102,8 @@ class AgentEvent(BaseModel):
         "transcript.final",
         "conversation.act.selected",
         "avatar.performance.started",
+        "avatar.performance.playback",
+        "avatar.performance.producer_finished",
         "avatar.performance.cue",
         "avatar.performance.interrupted",
         "avatar.performance.stopped",
@@ -151,6 +162,19 @@ class GestureCue(BaseModel):
     intensity: float = Field(default=1.0, ge=0, le=1)
 
 
+class LiveSpeechBinding(BaseModel):
+    """Exact approved room-track binding; no credentials or provider URLs."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    output_id: str = Field(min_length=1, max_length=128)
+    publisher_identity: str = Field(min_length=1, max_length=160)
+    track_sid: str = Field(min_length=1, max_length=128)
+    track_name: str = Field(min_length=1, max_length=160)
+    sample_rate_hz: Literal[24000]
+    channels: Literal[1]
+
+
 class AvatarPerformance(BaseModel):
     """One approved, interruptible local avatar performance."""
 
@@ -164,8 +188,21 @@ class AvatarPerformance(BaseModel):
     visemes: List[VisemeCue] = Field(min_length=1, max_length=10_000)
     gestures: List[GestureCue] = Field(default_factory=list, max_length=256)
     alignment_source: Literal["provider_timestamp", "g2p_estimate"]
-    delivery: Literal["pre_generated", "cascade", "s2s"] = "cascade"
+    delivery: Literal["pre_generated", "cascade", "s2s", "streaming_tts"] = "cascade"
+    live_audio: Optional[LiveSpeechBinding] = None
     interruptible: bool = True
+
+    @model_validator(mode="after")
+    def validate_live_audio(self) -> "AvatarPerformance":
+        if self.delivery == "streaming_tts":
+            if self.live_audio is None or self.audio_uri:
+                raise ValueError("streaming TTS requires a track binding and no audio URL")
+            if (self.live_audio.publisher_identity != "expression:%s" % self.performance_id
+                    or self.live_audio.track_name != "approved-expression:%s" % self.performance_id):
+                raise ValueError("live track must belong to this performance")
+        elif self.live_audio is not None:
+            raise ValueError("asset performances cannot include a live track")
+        return self
 
     @field_validator("visemes")
     @classmethod
@@ -240,6 +277,12 @@ class UnderstandingProblem(BaseModel):
     recoverable: bool
     action: Literal["clarify", "pause"]
     retryable: bool
+    reason_code: Optional[Literal[
+        "provider_unavailable", "wire_schema_invalid", "point_duplicates",
+        "point_not_frozen", "point_partition_invalid", "evidence_not_verbatim",
+        "answer_evidence_empty", "claim_evidence_undeclared", "answer_declined_contract_invalid",
+    ]] = None
+    attempts: int = Field(default=1, ge=1, le=2)
 
 
 class TurnUnderstanding(BaseModel):
@@ -247,10 +290,12 @@ class TurnUnderstanding(BaseModel):
 
     understanding_id: str = Field(min_length=1, max_length=128)
     revision: int = Field(ge=1)
-    prompt_version: Literal["interview_turn_understanding.v1"]
+    # v1 remains readable for immutable historical understandings only.
+    prompt_version: Literal["interview_turn_understanding.v1", "interview_turn_understanding.v2", "interview_turn_understanding.v3", "interview_turn_understanding.v4", "interview_turn_understanding.v5", "interview_turn_understanding.v6", "interview_turn_understanding.v7", "interview_turn_decision.v1", "interview_turn_decision.v2", "interview_turn_decision.v3", "interview_turn_decision.v4", "interview_turn_decision.v5", "interview_turn_decision.v6"]
     utterance_id: str = Field(min_length=1, max_length=128)
     intent: Literal[
         "answer",
+        "answer_declined",
         "request_repeat",
         "not_finished",
         "pause",
@@ -287,6 +332,9 @@ class ApprovedConversationAct(BaseModel):
         "warmup_confirmation",
         "closing",
         "unscored_intervention",
+        "supplement_check",
+        "supplement_continue",
+        "supplement_clarify",
     ]
     text: str = Field(min_length=1, max_length=1000)
     turn_id: Optional[str] = Field(default=None, max_length=128)

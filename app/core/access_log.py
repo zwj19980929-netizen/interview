@@ -1,4 +1,4 @@
-"""Redact short-lived credentials from Uvicorn access-log request targets."""
+"""Redact short-lived credentials from HTTP and native media diagnostics."""
 
 from __future__ import annotations
 
@@ -66,11 +66,22 @@ class SensitiveQueryAccessLogFilter(logging.Filter):
         return True
 
 
+class SensitiveMediaLogFilter(logging.Filter):
+    """LiveKit's native FFI includes the rejected JWT in authentication logs."""
+
+    _jwt = re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.msg = self._jwt.sub("[REDACTED_JWT]", record.getMessage())
+        record.args = ()
+        return True
+
+
 def install_sensitive_access_log_filter() -> None:
-    logger = logging.getLogger("uvicorn.access")
-    if any(
-        isinstance(item, SensitiveQueryAccessLogFilter)
-        for item in logger.filters
+    for name, filter_type in (
+        ("uvicorn.access", SensitiveQueryAccessLogFilter),
+        ("livekit", SensitiveMediaLogFilter),
     ):
-        return
-    logger.addFilter(SensitiveQueryAccessLogFilter())
+        logger = logging.getLogger(name)
+        if not any(isinstance(item, filter_type) for item in logger.filters):
+            logger.addFilter(filter_type())

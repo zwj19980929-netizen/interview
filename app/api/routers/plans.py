@@ -110,7 +110,12 @@ async def patch_interview_appointment(
 async def invite_interview_appointment(
     appointment_id: str, payload: InterviewInvitationCreate
 ) -> Dict[str, Any]:
-    return services()["appointments"].invite(appointment_id, payload.model_dump())
+    return await services()["appointments"].invite_with_refresh(appointment_id, payload.model_dump())
+
+
+@router.post("/api/v1/interview-appointments/{appointment_id}/readiness/refresh")
+async def refresh_appointment_readiness(appointment_id: str) -> Dict[str, Any]:
+    return await services()["appointments"].refresh_readiness(appointment_id)
 
 
 @router.post("/api/v1/interview-appointments/{appointment_id}/cancel")
@@ -135,7 +140,7 @@ async def get_candidate_readiness(
     token: str,
     payload: Optional[CandidateReadinessCreate] = None,
 ) -> Dict[str, Any]:
-    return services()["appointments"].readiness(
+    return await services()["appointments"].readiness_with_refresh(
         token,
         payload.model_dump(exclude_unset=True) if payload is not None else None,
     )
@@ -143,7 +148,7 @@ async def get_candidate_readiness(
 
 @router.post("/api/v1/public/interview-invitations/{token}/start")
 async def start_public_interview(token: str) -> Dict[str, Any]:
-    return services()["appointments"].start(token)
+    return await services()["appointments"].start_with_refresh(token)
 
 
 @router.get("/api/v1/public/interviews/{interview_id}")

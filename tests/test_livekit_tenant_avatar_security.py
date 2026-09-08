@@ -481,6 +481,7 @@ def test_development_admission_fails_closed_for_an_explicit_unhealthy_tts_route(
         item for item in healthy["checks"] if item["name"] == "agent_expression_tts"
     )
     assert unhealthy_check["ready"] is False
-    assert unhealthy_check["mode"] == "configured_route_unhealthy"
+    assert unhealthy_check["mode"] == "configured_route_untested"
+    assert unhealthy_check["route_readiness"]["status"] == "untested"
     assert healthy_check["ready"] is True
     assert healthy_check["mode"] == "configured_route"
