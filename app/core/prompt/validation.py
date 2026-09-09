@@ -1,8 +1,16 @@
+import re
 from typing import Any, Dict
 
 
 class StructuredResponseValidationError(ValueError):
     """Raised when parsed AI output violates its declared response rules."""
+
+    def __init__(self, message: str, *, reason_code: str = "invalid", schema_path: str = "$"):
+        # Keep the existing human-readable exception interface. Diagnostics
+        # carry schema locations only, never a failing value or extra key.
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.schema_path = re.sub(r"\[\d+\]", "[]", schema_path)
 
 
 def validate_structured_response(value: Any, schema: Dict[str, Any]) -> None:
@@ -69,4 +77,20 @@ def _matches_type(value: Any, schema_type: str) -> bool:
 
 
 def _fail(reason: str, path: str) -> None:
-    raise StructuredResponseValidationError("AI response %s at %s." % (reason, path))
+    code = {
+        "failed enum validation": "enum",
+        "has the wrong type": "type",
+        "is missing required fields": "required",
+        "has too few properties": "min_properties",
+        "has unexpected fields": "additional_properties",
+        "has too few items": "min_items",
+        "has too many items": "max_items",
+        "contains duplicate items": "unique_items",
+        "is below minimum": "minimum",
+        "is above maximum": "maximum",
+        "is too short or blank": "min_length",
+        "is too long": "max_length",
+    }[reason]
+    raise StructuredResponseValidationError(
+        "AI response %s at %s." % (reason, path), reason_code=code, schema_path=path,
+    )

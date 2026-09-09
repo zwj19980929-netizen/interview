@@ -6,9 +6,28 @@
 
 每个工作项必须包含：日期、ID、目标、关联问题、状态、实际修改文件、验证命令与结果、未完成事项或恢复说明。
 
+## 2026-09-08 · CONFIRMED-PREPARATION-WAIT-024
+
+- 状态：`verified（仓库、真实合成决策与本地加载）`；真实麦克风长会话与外部模型尾部时延仍pending，不标closed。
+- 目标：追查并修复iv_25335313fb1b4dea在正式Celery题收到结束确认后长期整理的问题，说明实际等待阶段。
+- 初始证据：在线仍PID49796/022，023未获得活动面试重启选择，未加载。当前turn_271399205b6b47d9 asking、0个已接受utterance，全会话3份CandidateAnswer；日志反复client/audio input_invalidated后understanding阶段TURN_DECISION_STALE。不能把此等待当作已在评分或生成下一题，不能在未核查时声称单个模型推理用了数分钟。
+- 计划：按会话关联模型耗时、ASR新文字、准备缓存及取消窗口，复现同证据长时间不能提交的路径；保留新话语撤销、完整服务端final、所有权和PCM不丢失约束。改善后台状态可观测性并验证；历史证据不补交、不改写。
+- 深入证据：14:38:25/41两次finish/0.95；14:38:54–14:43:38同输入18次decision.v4（两种request_hash为10次原请求/8次纠正），每次12.328–14.164秒，累计模型234.399秒，处理跨度297秒。它们全部通过网关原始复合Schema后，在后续校验被记为wire_schema_invalid；旧日志未区分reference/canonical/domain/followup gate且未存原响应，不能断言准确失败字段。14:38:38–14:43:51没有新ASR句子，却27次invalidated、25次understanding STALE。
+- 确认的放大缺陷：audio/client会清零_prepare_failures；孤儿后台problem未消费就被丢弃也不计失败；可选追问后置校验失败会连带废弃已验证理解；完成缓存仍建立可取消waiter，45秒后连已成功结果也丢弃。UI另有同快照结果依赖旧local phase的可复现缺陷，准备退出事件丢失后权威awaiting_reply仍显示整理。
+- 实际文件：`app/services/{answer_endpoint,spoken_supplement,conversation_understanding,livekit_evidence_ingress,interview_agent}.py`、`app/core/{speech_diagnostics,prompt/validation}.py`；前端candidate/agent-experience、interviews/agent-event-runtime及其测试，重建dist。新增`tests/{test_confirmed_preparation_liveness,test_preparation_failure_budget,test_optional_followup_isolation,test_answer_preparation_projection,test_followup_rejection_integration,test_speech_budget_diagnostics}.py`；修改`tests/{test_answer_endpoint,test_prepared_turn_decision}.py`相关旧预期。同步架构/API/领域/评分/供应商/存储/CONTEXT/已知问题/进度/路线图。未改模型路由、凭据、DDL、历史答案或024 Prompt版本。
+- 实现：成功同完整证据缓存同步返回，45秒只限制未完成推理；复用路径去掉可取消waiter和重复UI通知。相同服务端文字最多3次失败，provider元数据/音频/client不重置；后台孤儿失败只记一次，新文字按独立预算、回到旧文字保留失败数，显式retry才清理代际。耗尽保留采集并提示原因，不再自动调用模型。完整wire/引用/canonical/业务理解通过后，可选追问被拒绝只返回no_followup，不丢弃理解；真正理解无效仍严格拒绝。日志固定stage/reason/Schema路径及安全会话/轮次/request ID，未知标识回退“-”，无原文和异常正文。
+- 状态恢复：当前turn/capture的answer_preparation在通知之前持久化；snapshot恢复真实准备或已退出状态，前端拒绝旧capture并保留独立evidence.ready门禁。暂停/关闭/换capture/提交后的状态清理失败不会阻止必要的媒体关闭。未新增不准确的准备计时，不以计时授权提交。
+- 前后验证：liveness新8项修前4失败、修后全过；失败预算新回归修前4失败，修后包含100次audio/client活动仅3次实际prepare。预算相关旧测试原本期待新音频自动获得第4次模型调用，按新合同改为新服务端文字才可恢复，保留错误/超时/异常检查。模型侧旧用例将无效wire与合法理解后的可选追问拒绝混为一类，拆分后保留真正合同拒绝。前端首轮93项仅旧“缺状态仍保留preparing”预期失败，更新为权威状态并增加缺事件/错capture回归。
+- 局部结果：端点及预算影响面176 passed/45.40秒（`/private/tmp/interviewer-024-failure-budget-integration-final.log`），-W error::RuntimeWarning通过；可选追问/准备/安全/Prompt/模型等254项通过；安全日志关联补充52项通过。状态新9项及spoken/declined整链28 passed/13.12秒。root真实managed拒绝泄露/已覆盖目标追问整链2 passed，均仅1次模型、PCM和答案唯一、自动下一题（`/private/tmp/interviewer-024-probe-integration.log`）；含预算安全日志3项通过（`/private/tmp/interviewer-024-root-focused.log`）。
+- 完整验证：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -o faulthandler_timeout=30 --tb=short`为**1568 passed/6 skipped in120.09秒**（`/private/tmp/interviewer-024-full.log`），无023的abort警告；后加的投影清理/日志关联另按上述目标测试通过。`npm --prefix app/web test -- --run` **190 passed/14files**（`/private/tmp/interviewer-024-web.log`）；build成功，仅既有VRM大chunk提示（`/private/tmp/interviewer-024-build.log`）。最终compileall与git diff --check通过。
+- 真实模型：`PYTHONPATH=. PYTHONDONTWRITEBYTECODE=1 .venv/bin/python /private/tmp/interviewer-024-real-decision.py`仅发两段新合成文本、不发历史候选原文/录音。技术正文+结束→answer/next，一次决策8.506秒；明确不会+结束→answer_declined/next，一次决策5.336秒，均无problem和重试（`/private/tmp/interviewer-024-real-decision.log`）。这不是原始事故录音的A/B，也不是所有真实长会话时延保证。
+- 本地加载：两次临近检查LiveKit均room_count0；核对PID49796与当前仓库main.py后正常TERM，没有强制kill或打断活动房间。用`/private/tmp/interviewer-024-start.py`启动独立进程**70161**（日志`/private/tmp/interviewer-024-api.log`），保持本地媒体启用、实验流式TTS关闭及既有路由。healthz/readyz/home均200，ready=true；实际首页与资源**index-C_WF3WKO.js**均200且包含answer_preparation协议。023修复同次加载。
+- 历史状态核对：iv_25335313fb1b4dea仍in_progress/version2117/answers3，原当前题asking，updated_at14:50:34Z；iv_3bdec492ad8f4247仍in_progress/version623/answers0，updated_at10:27:02Z。未补交、重置或生成历史评分。旧页面需刷新加载新bundle。
+- 恢复与留痕：所有023未提交修改继续保留；首次只读过程中上一工具回合被系统中断，已重新启动两个只读分析agent，未产生仓库编辑或服务重启。此前023等待切换的记录保留；现已在无活动面试时一并加载，不用合成或健康检查冒充真实长会话体验。
+
 ## 2026-09-08 · EXPLICIT-FINISH-NO-ANSWER-023
 
-- 状态：`in_progress`。
+- 状态：`verified（仓库、真实合成语义与本地加载）`；真实麦克风长会话及生产仍pending，不标closed。
 - 目标：修复 iv_3bdec492ad8f4247 明确“没有补充/进入下一题”仍被播报没听清并反复询问的问题。
 - 初始证据：10:23:58、10:24:34、10:25:28三次补充语义均finish/0.95；完整理解却因无技术回答返回clarification_request/clarify并重开同题capture。第一份73字原文含思考、表示不知道和要求下一题，后两份15/23字为重复明确结束；未发现技术正文被删或022跨题字幕过滤误触发。
 - 计划：补齐明确不会/不再作答的独立语义，区分完成意图、理解置信度和知识覆盖。仅基于服务端完整发言记录真实无技术回答并推进，不伪造claims、不将空识别当否定，保留改口补充/暂停/重读/真实转写争议与提交fence。更新版本化Prompt/Schema、领域及相关接口/评分文档，增加自然语言、真实模型与整链回归。
@@ -21,6 +40,7 @@
 - 清理警告有独立可复现证据：ContinuousSTT.abort在detach供应商流后，wait_for子协程首次运行前被owner取消，裸abort协程未执行且重试已找不到流；最小取消调度中raw_provider_closed=False/capture_closed=True。改`app/services/continuous_stt.py`为capture持有唯一shield清理Task，所有close共享join；每个provider abort预先创建Task，逐流2秒预算且失败不跳过其他流。新增`tests/test_continuous_abort_cleanup.py`的立即取消、并发关闭、异常和有界等待回归；同调度现在关闭为True。识别及提交逻辑不改。
 - 清理验证：`PYTHONTRACEMALLOC=5`定向5 passed无警告（`/private/tmp/interviewer-023-cleanup-after.log`）；连续STT/empty/非关闭/owner/recovery/reopen/probe/declined整链131 passed in18.59s，使用`-W error::RuntimeWarning`仍通过（`/private/tmp/interviewer-023-cleanup-integration.log`）。最终compileall和git diff --check通过。前端未改，不重复重建022 bundle。
 - 本地加载：修复/验证完成，等待活动面试切换选择。两次只读LiveKit均为1房间/2个参与端（iv_6e3a3972ec8d4cc1仍in_progress）；已询问现在重启还是结束后加载，不能默认打断有效收音，也不将代码完成冒充在线生效。
+- 后续加载完成：024验收结束时LiveKit连续room_count0，已正常切换至PID70161、index-C_WF3WKO.js；healthz/readyz/home均200。023全部修复随024生效，原会话仍version623/answers0/updated_at10:27:02Z，未补造提交。
 
 ## 2026-09-08 · FOLLOWUP-LATENCY-AND-CAPTURE-022
 

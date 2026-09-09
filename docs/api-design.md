@@ -1,5 +1,11 @@
 # 接口设计
 
+## 确认后等待状态与失败边界（024）
+
+session.snapshot新增可空 `answer_preparation: {status:"preparing", turn_id:string, capture_id:string}`，仅表示当前候选录音的后台准备状态，不授权结束或形成答案。准备通知持久化当前turn/capture事实，返回收听、失败、换题、换capture、暂停时清理或不再投影；快照按当前身份过滤，不能继承旧题准备。前端以该权威字段及supplement_confirmation修正本地陈旧状态；不能因旧页面曾是answer_preparing而永久保留。evidence.ready仍只由既有采集确认决定。
+
+准备的45秒期限约束尚未完成的模型计算；同一完整证据的成功结果可在新完整final、当前上下文/所有权/录音门禁重新验证后复用，完成结果不因声学取消后的重入时间被强制重算。同一服务端证据的失败预算不能被client/audio活动清零，真实新增文字或明确重试才重新授权预算。完整wire和回答理解均已校验后，可选追问被拒绝不再丢弃有效理解；只放弃不合格追问并记录安全阶段/类别。
+
 ## 明确结束且无技术回答（023）
 
 TurnUnderstanding新增 `intent=answer_declined`，仅表示从完整服务端原文明确理解候选人本题不再作答（例如不会、请求下一题，或独立确认结束且无实质回答）；使用 `suggested_action=next`，非空原文证据、空claims/covered、全部能力点missing，无未解决歧义，不生成技术追问。理解置信度至少0.75，描述对这项意图的把握，不能因知识点缺失而降低为没听清。低语音置信度仍需澄清。理解Prompt为v6/v7、组合决策为v5/v6，历史版本继续可读。

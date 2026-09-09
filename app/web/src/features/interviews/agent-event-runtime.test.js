@@ -157,6 +157,24 @@ describe("ordered AgentEvent runtime", () => {
     }
   });
 
+  it("accepts only scoped candidate preparation facts without granting a capture or exposing internal work", () => {
+    const snapshot = { ...candidateSnapshot(), floor: "candidate", current_turn_id: "turn_1" };
+    const preparation = { status: "preparing", turn_id: "turn_1", capture_id: "capture_1" };
+    for (const answer_preparation of [undefined, null, preparation]) {
+      expect(validateAgentEvent(event(1, "session.snapshot", { ...snapshot, answer_preparation })).ok).toBe(true);
+    }
+    for (const change of [{ status: "done" }, { turn_id: "turn_old" }, { capture_id: "" },
+      { capture_id: "bad scope" }, { ready: true }, { transcript: "private" }, { deadline_ms: 0 }]) {
+      expect(validateAgentEvent(event(1, "session.snapshot", {
+        ...snapshot, answer_preparation: { ...preparation, ...change },
+      })).ok).toBe(false);
+    }
+    for (const change of [{ status: "paused" }, { floor: "agent" }, { calibration_status: "listening" },
+      { capture_recovery: { status: "recovering", turn_id: "turn_1", capture_id: "capture_1", attempt: 1, max_attempts: 3 } }]) {
+      expect(validateAgentEvent(event(1, "session.snapshot", { ...snapshot, ...change, answer_preparation: preparation })).ok).toBe(false);
+    }
+  });
+
   it("requires capture and turn scope with the correct floor/action for recovery events", () => {
     const recoveryEvents = [
       ["floor.changed", { owner: "candidate", reason: "answer_recovering", capture_id: "capture_1" }],

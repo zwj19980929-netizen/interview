@@ -513,13 +513,20 @@ class ManagedLiveKitEvidenceSession:
             if self.ownership is not None:
                 assert_current_evidence_fence(transaction, self.ownership.commit_fence())
             session = transaction.interview_sessions.get(self.interview_id)
-            if session and (session.get("agent_runtime") or {}).get("supplement_confirmation"):
+            if session and any((session.get("agent_runtime") or {}).get(key)
+                               for key in ("supplement_confirmation", "answer_preparation")):
                 session["agent_runtime"].pop("supplement_confirmation", None)
+                session["agent_runtime"].pop("answer_preparation", None)
                 transaction.interview_sessions.update(session, expected_version=session["version"])
 
         async def notify(reason: str) -> None:
             if self._stopped or self._capture_id != capture_id or not self.chain.is_open:
                 return
+            if reason == "answer_preparing":
+                self._persist_answer_preparation(capture_id, turn_id, preparing=True)
+            elif reason in {"answer_listening", "supplement_awaiting_reply", "understanding_unavailable",
+                            "understanding_retry_exhausted", "transcript_unavailable", "capture_failed"}:
+                self._persist_answer_preparation(capture_id, turn_id, preparing=False)
             source = self._channel or self._event_source
             if reason in {"capture_recovering", "capture_recovered", "capture_retry_required"}:
                 await self._capture_recovery_notice(reason, capture_id, turn_id, source)
@@ -539,9 +546,9 @@ class ManagedLiveKitEvidenceSession:
                 if source is not None:
                     await source._emit_snapshot(None)
                 return
-            if source is None:
-                return
             if reason in {"understanding_unavailable", "understanding_retry_exhausted", "transcript_unavailable", "detector_unavailable", "endpoint_uncertain"}:
+                if source is None:
+                    return
                 message = {
                     "understanding_unavailable": "已收到语音，暂时无法完成回答理解；正在重试，你也可以继续补充。",
                     "understanding_retry_exhausted": "语音已保留，但回答理解暂时不可用。恢复后请说话或点击提前结束回答重试。",
@@ -566,6 +573,8 @@ class ManagedLiveKitEvidenceSession:
                         "turn_id": turn_id, "capture_id": capture_id,
                     }
                     transaction.interview_sessions.update(session, expected_version=session["version"])
+            if source is None:
+                return
             # Preparation is reversible; it must never close the capture gate.
             source.runtime._set_floor(self.interview_id, FloorOwner.CANDIDATE, reason, self.organization_id)
             await source._emit("floor.changed", {
@@ -677,6 +686,49 @@ class ManagedLiveKitEvidenceSession:
             endpoint.speech_started()
         await endpoint._notify("supplement_awaiting_reply" if confirmation.phase == "awaiting_reply" else "answer_listening")
 
+    def _persist_answer_preparation(self, capture_id: Optional[str], turn_id: Optional[str], *, preparing: bool) -> None:
+        """Persist the active wait before lossy UI delivery; never change capture readiness."""
+        if not capture_id:
+            return
+        try:
+            with self.persistence.transaction(self.organization_id) as transaction:
+                if self.ownership is not None:
+                    assert_current_evidence_fence(transaction, self.ownership.commit_fence())
+                session = transaction.interview_sessions.get(self.interview_id)
+                if session is None:
+                    return
+                state = session.setdefault("agent_runtime", {})
+                previous = state.get("answer_preparation") or {}
+                if preparing:
+                    if (self._stopped or self._capture_id != capture_id or not self.chain.is_open
+                            or not turn_id or session.get("status") != "in_progress"
+                            or session.get("current_turn_id") != turn_id
+                            or (state.get("takeover") or {}).get("status") == "active"):
+                        return
+                    value = {"status": "preparing", "turn_id": turn_id, "capture_id": capture_id}
+                    if previous == value:
+                        return
+                    state["answer_preparation"] = value
+                else:
+                    if (previous.get("capture_id") != capture_id
+                            or (turn_id is not None and previous.get("turn_id") != turn_id)):
+                        return
+                    state.pop("answer_preparation", None)
+                transaction.interview_sessions.update(session, expected_version=session["version"])
+        except ApiError as exc:
+            # A stale process must not erase its successor's state. Local
+            # shutdown can still proceed after ownership was already lost.
+            if preparing or exc.code not in {"EVIDENCE_OWNER_FENCED", "EVIDENCE_OWNERSHIP_LOST"}:
+                raise
+
+    def _clear_answer_preparation_for_cleanup(self, capture_id: Optional[str], turn_id: Optional[str]) -> None:
+        # Display-state persistence must never prevent media revocation,
+        # resource shutdown, or completion of an already committed answer.
+        try:
+            self._persist_answer_preparation(capture_id, turn_id, preparing=False)
+        except Exception as exc:
+            _LOG.warning("Answer preparation cleanup unavailable: error_type=%s", type(exc).__name__)
+
     async def _capture_recovery_notice(self, reason: str, capture_id: str, turn_id: str, source: Any) -> None:
         endpoint = self._answer_endpoint
         if self._capture_id != capture_id or self._stopped or endpoint is None:
@@ -695,6 +747,8 @@ class ManagedLiveKitEvidenceSession:
             state = session.setdefault("agent_runtime", {})
             if (state.get("takeover") or {}).get("status") == "active":
                 return
+            if (state.get("answer_preparation") or {}).get("capture_id") == capture_id:
+                state.pop("answer_preparation", None)
             if reason == "capture_recovered":
                 existing = state.get("capture_recovery") or {}
                 if existing and existing.get("capture_id") != capture_id:
@@ -761,6 +815,7 @@ class ManagedLiveKitEvidenceSession:
 
     async def pause_capture(self) -> None:
         """A candidate pause revokes capture, never batch-submits its prefix."""
+        self._clear_answer_preparation_for_cleanup(self._capture_id, self.chain.turn_id if self.chain else None)
         self._capture_id = None
         if self.chain is not None and hasattr(self.chain, "revoke_audio_input"):
             self.chain.revoke_audio_input()
@@ -785,6 +840,7 @@ class ManagedLiveKitEvidenceSession:
                       if prepared is not None else await self.chain.finish(signal.payload))
         finally:
             if partial_kind and not self.chain.is_open:
+                self._clear_answer_preparation_for_cleanup(completed_capture_id, partial_turn_id)
                 try:
                     await asyncio.wait_for(self._deactivate_partial_projection(
                         partial_kind, partial_turn_id
@@ -1604,6 +1660,7 @@ class ManagedLiveKitEvidenceSession:
             )
         expected_kind = "warmup" if calibration != "completed" else "formal"
         await self.cancel_endpoint()
+        self._clear_answer_preparation_for_cleanup(self._capture_id, self.chain.turn_id)
         self._capture_id = None
         self._capture_speech_started = False
         expected_turn_id = None if expected_kind == "warmup" else signal.turn_id
@@ -2031,6 +2088,7 @@ class ManagedLiveKitEvidenceSession:
             if self._stopped:
                 return
         self._stopped = True
+        self._clear_answer_preparation_for_cleanup(self._capture_id, self.chain.turn_id if self.chain else None)
         if self._answer_endpoint is not None:
             await self._answer_endpoint.close()
         if self._presentation_task is not None and not self._presentation_task.done():

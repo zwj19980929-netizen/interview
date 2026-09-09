@@ -39,11 +39,12 @@ def record_stt_sentence(*, interview_id: str, turn_id: str, stream_id: str,
 def record_turn_control(event: str, *, interview_id: str, turn_id: str,
                         capture_id: str = None, **details) -> None:
     """Explicit safe fields; arbitrary exception/response bodies never escape."""
-    if event not in {"input_invalidated", "supplement_decided", "proposal_rejected", "audio_playback"}:
+    if event not in {"input_invalidated", "supplement_decided", "proposal_rejected", "audio_playback",
+                     "understanding_retry_budget"}:
         return
     safe = {key: details[key] for key in (
         "revision", "phase", "source", "stage", "cause_code", "intent", "confidence",
-        "performance_id", "status",
+        "performance_id", "status", "failures", "exhausted",
     ) if key in details}
     if isinstance(details.get("text"), str):
         safe.update(text_sha256=hashlib.sha256(details["text"].encode()).hexdigest(),

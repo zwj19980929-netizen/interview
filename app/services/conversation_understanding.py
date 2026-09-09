@@ -51,6 +51,43 @@ class UnderstandingContentError(ValueError):
         super().__init__(reason_code)
 
 
+class FollowupProposalError(ValueError):
+    """A rejected optional proposal cannot invalidate verified answer evidence."""
+
+    def __init__(self, reason_code: str, schema_path: str):
+        self.reason_code = reason_code
+        self.schema_path = schema_path
+        super().__init__(reason_code)
+
+
+def _log_validation_rejection(
+    event: str, exc: Exception, *, stage: str, attempt: int, path: str = "$",
+    interview_id: Optional[str] = None, turn_id: Optional[str] = None,
+    provider_request_id: Optional[str] = None,
+) -> None:
+    """Log fixed diagnostic categories and schema paths, never exception text."""
+    if isinstance(exc, StructuredResponseValidationError):
+        reason = exc.reason_code
+        path += exc.schema_path[1:]
+    elif isinstance(exc, (UnderstandingContentError, FollowupProposalError)):
+        reason = exc.reason_code
+        path = getattr(exc, "schema_path", path)
+    elif isinstance(exc, ProviderError):
+        reason = "wire_schema_invalid"
+    elif isinstance(exc, KeyError):
+        reason = "reference_resolution_invalid"
+    else:
+        reason = "%s_invalid" % stage
+    def safe_id(value: Optional[str]) -> str:
+        return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value) else "-"
+
+    _LOGGER.warning(
+        "%s validation_stage=%s reason=%s path=%s attempt=%d interview_id=%s turn_id=%s provider_request_id=%s",
+        event, stage, reason, path, attempt,
+        safe_id(interview_id), safe_id(turn_id), safe_id(provider_request_id),
+    )
+
+
 class ConversationUnderstandingService:
     DEFAULT_POLICY = {
         "max_depth": 2,
@@ -136,6 +173,8 @@ class ConversationUnderstandingService:
             }
         else:
             for attempt in range(1, 3):
+                stage = "provider"
+                request_id = None
                 try:
                     response = await asyncio.wait_for(
                         self.gateway.invoke(
@@ -158,9 +197,14 @@ class ConversationUnderstandingService:
                         ),
                         timeout=20.0,
                     )
+                    request_id = response.provider.request_id
+                    stage = "wire_schema"
                     validate_structured_response(response.data, contract.response_schema)
+                    stage = "understanding_references"
                     data = resolve_understanding_references(response.data, references)
+                    stage = "understanding_canonical"
                     validate_structured_response(data, understanding_canonical_schema())
+                    stage = "understanding_content"
                     self._validate_understanding_content(data, utterance.text, capability_points)
                     provider = response.provider.model_dump()
                     confidence = min(float(data["confidence"]), utterance.stt_confidence)
@@ -174,11 +218,16 @@ class ConversationUnderstandingService:
                             prompt_version=contract.version,
                         )
                     reason = "wire_schema_invalid"
+                    _log_validation_rejection(
+                        "understanding_contract_rejected", exc, stage=stage, attempt=attempt,
+                        interview_id=interview.get("id"), turn_id=turn.get("id"), provider_request_id=request_id,
+                    )
                 except (StructuredResponseValidationError, ValueError, KeyError, TypeError) as exc:
                     reason = exc.reason_code if isinstance(exc, UnderstandingContentError) else "wire_schema_invalid"
-                # Only fixed reason + counters are logged. No raw response,
-                # exception text, transcript, prompt or candidate identifiers.
-                _LOGGER.warning("understanding_contract_rejected reason=%s attempt=%d", reason, attempt)
+                    _log_validation_rejection(
+                        "understanding_contract_rejected", exc, stage=stage, attempt=attempt,
+                        interview_id=interview.get("id"), turn_id=turn.get("id"), provider_request_id=request_id,
+                    )
                 if attempt == 2:
                     return self._safe_failure_understanding(
                         utterance, turn, capability_points, source="schema_or_content",
@@ -310,6 +359,8 @@ class ConversationUnderstandingService:
         }
         contract = prompt_contract("interview_turn_decision", context)
         for attempt in range(1, 3):
+            stage = "provider"
+            request_id = None
             try:
                 response = await asyncio.wait_for(
                     self.gateway.invoke(
@@ -334,17 +385,23 @@ class ConversationUnderstandingService:
                     ),
                     timeout=20.0,
                 )
+                request_id = response.provider.request_id
                 # Validate the entire composite response before indexing or
                 # resolving any vendor-authored value into domain semantics.
+                stage = "wire_schema"
                 validate_structured_response(response.data, contract.response_schema)
+                stage = "understanding_references"
                 data = resolve_understanding_references(response.data["understanding"], references)
+                stage = "understanding_canonical"
                 validate_structured_response(data, understanding_canonical_schema())
+                stage = "understanding_content"
                 self._validate_understanding_content(data, utterance.text, capability_points)
                 confidence = min(float(data["confidence"]), utterance.stt_confidence)
                 if confidence < float(self.DEFAULT_POLICY["low_confidence_threshold"]):
                     data["suggested_action"] = "clarify"
                 confidence = self._apply_ambiguity_policy(data, confidence)
                 current = turn.get("current_understanding") or {}
+                stage = "understanding_domain"
                 understanding = TurnUnderstanding(
                     understanding_id=new_id("understanding"),
                     revision=int(current.get("revision", 0)) + 1,
@@ -359,26 +416,11 @@ class ConversationUnderstandingService:
                     return understanding, approved_scope
                 if understanding.suggested_action not in {"accept", "followup", "next"}:
                     return understanding, self._no_followup("understanding_not_accepted", scope["policy"])
-                candidate = deepcopy(response.data["followup"])
-                evidence_id = candidate.pop("evidence_id")
-                candidate["evidence_quote"] = references["evidence"][evidence_id] if evidence_id else ""
-                candidate["target_capability_points"] = [
-                    references["capabilities"][key] for key in candidate.pop("target_point_ids")
-                ]
-                self._gate_followup(
-                    candidate,
-                    transcript=utterance.text,
-                    allowed_evidence=approved_scope["evidence"],
-                    allowed_targets=approved_scope["targets"],
-                    difficulty=approved_scope["difficulty"],
-                    root=approved_scope["root"],
-                    max_chars=int(approved_scope["policy"]["max_probe_chars"]),
-                )
-                decision = self._approved_followup_selection(
-                    turn, candidate, approved_scope,
+                return understanding, self._resolve_optional_followup(
+                    response.data["followup"], references, utterance, turn, approved_scope,
                     provider=response.provider.model_dump(), prompt_version=contract.version,
+                    attempt=attempt, interview_id=interview.get("id"),
                 )
-                return understanding, decision
             except (ProviderError, asyncio.TimeoutError) as exc:
                 if getattr(exc, "code", None) != "provider_schema_invalid":
                     failed = self._safe_failure_understanding(
@@ -389,9 +431,17 @@ class ConversationUnderstandingService:
                     )
                     return failed, self._no_followup("understanding_unavailable", scope["policy"])
                 reason = "wire_schema_invalid"
+                _log_validation_rejection(
+                    "turn_decision_contract_rejected", exc, stage=stage, attempt=attempt,
+                    interview_id=interview.get("id"), turn_id=turn.get("id"), provider_request_id=request_id,
+                )
             except (StructuredResponseValidationError, ValueError, KeyError, TypeError) as exc:
                 reason = exc.reason_code if isinstance(exc, UnderstandingContentError) else "wire_schema_invalid"
-            _LOGGER.warning("turn_decision_contract_rejected reason=%s attempt=%d", reason, attempt)
+                _log_validation_rejection(
+                    "turn_decision_contract_rejected", exc, stage=stage, attempt=attempt,
+                    path="$.understanding" if stage.startswith("understanding_") else "$",
+                    interview_id=interview.get("id"), turn_id=turn.get("id"), provider_request_id=request_id,
+                )
             if attempt == 2:
                 failed = self._safe_failure_understanding(
                     utterance, turn, capability_points, source="schema_or_content",
@@ -401,6 +451,44 @@ class ConversationUnderstandingService:
                 return failed, self._no_followup("understanding_unavailable", scope["policy"])
             contract = prompt_contract("interview_turn_decision", {**context, "correction_reason": reason})
         raise AssertionError("bounded decision preparation exhausted without a result")
+
+    def _resolve_optional_followup(
+        self, proposal: Dict[str, Any], references: Dict[str, Any],
+        utterance: ConversationUtterance, turn: Dict[str, Any], scope: Dict[str, Any],
+        *, provider: Dict[str, Any], prompt_version: str, attempt: int, interview_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        # Called only after the complete wire response and canonical/business
+        # understanding have passed validation. A bad optional probe may not
+        # discard that understanding or rerun it against unchanged evidence.
+        stage = "followup_references"
+        try:
+            candidate = deepcopy(proposal)
+            evidence_id = candidate.pop("evidence_id")
+            candidate["evidence_quote"] = references["evidence"][evidence_id] if evidence_id else ""
+            candidate["target_capability_points"] = [
+                references["capabilities"][key] for key in candidate.pop("target_point_ids")
+            ]
+            stage = "followup_gate"
+            self._gate_followup(
+                candidate,
+                transcript=utterance.text,
+                allowed_evidence=scope["evidence"],
+                allowed_targets=scope["targets"],
+                difficulty=scope["difficulty"],
+                root=scope["root"],
+                max_chars=int(scope["policy"]["max_probe_chars"]),
+            )
+            stage = "followup_act"
+            return self._approved_followup_selection(
+                turn, candidate, scope, provider=provider, prompt_version=prompt_version,
+            )
+        except (ValueError, KeyError, TypeError) as exc:
+            _log_validation_rejection(
+                "turn_followup_proposal_rejected", exc, stage=stage, attempt=attempt, path="$.followup",
+                interview_id=interview_id, turn_id=turn.get("id"), provider_request_id=provider.get("request_id"),
+            )
+            # No unapproved/model-authored act and no invented fallback probe.
+            return self._no_followup("followup_proposal_rejected", scope["policy"])
 
     async def select_followup(
         self,
@@ -792,25 +880,25 @@ class ConversationUnderstandingService:
         quote = str(data.get("evidence_quote") or "").strip()
         targets = list(data.get("target_capability_points") or [])
         if not text or len(text) > max_chars or text.count("?") + text.count("？") > 1:
-            raise ValueError("follow-up length/question-count gate failed")
+            raise FollowupProposalError("question_shape_invalid", "$.followup.question_text")
         if quote not in transcript or quote not in allowed_evidence:
-            raise ValueError("follow-up evidence binding failed")
+            raise FollowupProposalError("evidence_binding_invalid", "$.followup.evidence_id")
         if not targets or not set(targets).issubset(set(allowed_targets)):
-            raise ValueError("follow-up capability binding failed")
+            raise FollowupProposalError("capability_binding_invalid", "$.followup.target_point_ids")
         if data.get("difficulty") != difficulty:
-            raise ValueError("follow-up difficulty escalation is forbidden")
+            raise FollowupProposalError("difficulty_escalation", "$.followup.difficulty")
         if (
             data.get("sensitive_attribute_inference")
             or data.get("leaks_answer")
             or _SENSITIVE.search(text)
             or _SENSITIVE.search(quote)
         ):
-            raise ValueError("follow-up safety gate failed")
+            raise FollowupProposalError("safety_gate_rejected", "$.followup")
         standard_answer = str(root.get("question_snapshot", {}).get("standard_answer") or "")
         answer_terms = {term for term in re.findall(r"[A-Za-z0-9_]{4,}|[\u3400-\u9fff]{3,}", standard_answer)}
         leaked = [term for term in answer_terms if term.casefold() in text.casefold()]
         if len(leaked) >= 2:
-            raise ValueError("follow-up answer leakage heuristic failed")
+            raise FollowupProposalError("answer_leakage_heuristic", "$.followup.question_text")
 
     def _fallback_probe(
         self,

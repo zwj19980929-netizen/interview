@@ -90,6 +90,7 @@ const CANDIDATE_SNAPSHOT_KEYS = Object.freeze([
   "current_question", "completed_answers", "total_primary_questions", "active_performance_id",
   "capture_recovery",
   "supplement_confirmation",
+  "answer_preparation",
 ]);
 
 const ENTERPRISE_SNAPSHOT_KEYS = Object.freeze([
@@ -355,7 +356,8 @@ function validateSnapshot(payload, audience) {
     || !validateCurrentQuestion(payload.current_question)
     || !validateTakeover(payload.takeover, audience)
     || !validateCaptureRecovery(payload.capture_recovery, payload)
-    || !validateSupplementConfirmation(payload.supplement_confirmation, payload)) {
+    || !validateSupplementConfirmation(payload.supplement_confirmation, payload)
+    || !validateAnswerPreparation(payload.answer_preparation, payload)) {
     return invalidPayload("session.snapshot");
   }
   if (audience === "enterprise") {
@@ -379,6 +381,15 @@ function validateSupplementConfirmation(value, snapshot) {
     && ["listening", "awaiting_reply"].includes(value.status)
     && scopeId(value.turn_id) && scopeId(value.capture_id)
     && value.turn_id === snapshot.current_turn_id;
+}
+
+function validateAnswerPreparation(value, snapshot) {
+  if (value == null) return true;
+  return isPlainObject(value) && hasExactKeys(value, ["status", "turn_id", "capture_id"])
+    && value.status === "preparing" && scopeId(value.turn_id) && scopeId(value.capture_id)
+    && value.turn_id === snapshot.current_turn_id
+    && snapshot.status === "in_progress" && snapshot.floor === "candidate"
+    && snapshot.calibration_status === "completed" && !snapshot.capture_recovery;
 }
 
 function validateCaptureRecovery(value, snapshot) {

@@ -285,7 +285,12 @@ def test_preparation_failures_keep_listening_without_repeated_calls_or_commit(fa
             assert len(capture.prepares) == 3, "Three failures exhaust this input's retry budget"
             _voice_then_pause(endpoint, clock)
             await _until(lambda: capture.resumes >= 4)
-            assert len(capture.prepares) == 4, "New input starts a fresh bounded budget"
+            assert len(capture.prepares) == 3, "Audio alone cannot restart the same server evidence budget"
+            capture.current_final = _final(capture.current_final.text + "新增服务端补充内容。")
+            endpoint.observe_transcript(capture.current_final.text)
+            clock.value += .8
+            await _until(lambda: len(capture.prepares) == 4)
+            assert len(capture.prepares) == 4, "New server words start a fresh bounded budget"
         else:
             count = len(capture.prepares)
             clock.value += 60

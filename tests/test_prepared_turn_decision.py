@@ -172,18 +172,12 @@ async def test_preflight_ineligible_cases_only_run_existing_understanding(case, 
     lambda d: d["understanding"].update(covered_point_ids=[], missing_point_ids=[]),
     lambda d: d["understanding"].update(missing_point_ids=["P1", "P1"]),
     lambda d: d["understanding"]["claims"][0].update(evidence_id="E999"),
-    lambda d: d["followup"].update(target_point_ids=["P2"]),
     lambda d: d["followup"].update(target_point_ids=["P1", "P1"]),
     lambda d: d["followup"].update(evidence_id="E999"),
-    lambda d: d["followup"].update(question_text="你的婚姻情况是什么？"),
-    lambda d: d["followup"].update(question_text="你如何实现？怎么验证？"),
-    lambda d: d["followup"].update(question_text="recoverable_checkpoint fenced_epoch 如何使用？"),
-    lambda d: d["followup"].update(sensitive_attribute_inference=True),
-    lambda d: d["followup"].update(leaks_answer=True),
     lambda d: d["followup"].update(difficulty="expert"),
 ])
 @pytest.mark.anyio
-async def test_entire_composite_must_pass_schema_evidence_and_safety_before_approval(mutate, caplog):
+async def test_entire_wire_and_understanding_evidence_must_pass_before_approval(mutate, caplog):
     data = _data()
     mutate(data)
     gateway = Gateway(data, data)
@@ -198,6 +192,29 @@ async def test_entire_composite_must_pass_schema_evidence_and_safety_before_appr
     assert TRANSCRIPT not in caplog.text
     assert "婚姻情况" not in caplog.text
     assert "上一轮结果未通过合同校验" in str(gateway.requests[1].messages)
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda d: d["followup"].update(target_point_ids=["P2"]),
+    lambda d: d["followup"].update(question_text="你的婚姻情况是什么？"),
+    lambda d: d["followup"].update(question_text="你如何实现？怎么验证？"),
+    lambda d: d["followup"].update(question_text="recoverable_checkpoint fenced_epoch 如何使用？"),
+    lambda d: d["followup"].update(sensitive_attribute_inference=True),
+    lambda d: d["followup"].update(leaks_answer=True),
+])
+@pytest.mark.anyio
+async def test_optional_probe_safety_rejection_preserves_validated_answer(mutate, caplog):
+    data = _data()
+    mutate(data)
+    gateway = Gateway(data)
+    understanding, decision = await _service(gateway).prepare_decision(*_input())
+    assert len(gateway.requests) == 1
+    assert understanding.problem is None
+    assert understanding.claims and understanding.evidence_quotes == [TRANSCRIPT]
+    assert decision["selected"] is False
+    assert decision["reason"] == "followup_proposal_rejected"
+    assert "conversation_act" not in decision
+    assert TRANSCRIPT not in caplog.text and "婚姻情况" not in caplog.text
 
 
 @pytest.mark.anyio
@@ -218,10 +235,12 @@ async def test_followup_cannot_quote_a_real_but_undeclared_evidence_span():
     utterance = utterance.model_copy(update={"text": TRANSCRIPT + "第二段仅作为背景。"})
     data = _data()
     data["followup"]["evidence_id"] = "E2"
-    gateway = Gateway(data, data)
+    gateway = Gateway(data)
     understanding, decision = await _service(gateway).prepare_decision(utterance, turn, interview)
-    assert understanding.problem.code == "UNDERSTANDING_RESULT_REJECTED"
+    assert len(gateway.requests) == 1 and understanding.problem is None
+    assert understanding.evidence_quotes == [TRANSCRIPT]
     assert decision["selected"] is False
+    assert decision["reason"] == "followup_proposal_rejected"
 
 
 @pytest.mark.anyio

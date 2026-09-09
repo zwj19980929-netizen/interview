@@ -226,6 +226,71 @@ describe("captions belong to the current question", () => {
   });
 });
 
+describe("authoritative answer preparation snapshots", () => {
+  it("recovers a lost exit event instead of preserving stale local preparing forever", async () => {
+    const { run, emit } = await openFormalEndpointHarness();
+    try {
+      emit("floor.changed", { owner: "candidate", reason: "answer_preparing", capture_id: "capture_endpoint" });
+      expect(run.getSnapshot().phase).toBe("answer_preparing");
+      emit("session.snapshot", {
+        ...candidateSnapshot(), floor: "candidate", answer_preparation: null,
+        supplement_confirmation: { status: "awaiting_reply", turn_id: "turn_1", capture_id: "capture_endpoint" },
+      });
+      expect(run.getSnapshot()).toMatchObject({ phase: "awaiting_supplement", evidence: { ready: true } });
+      emit("floor.changed", { owner: "candidate", reason: "answer_preparing", capture_id: "capture_endpoint" });
+      emit("session.snapshot", { ...candidateSnapshot(), floor: "candidate", answer_preparation: null,
+        supplement_confirmation: { status: "listening", turn_id: "turn_1", capture_id: "capture_endpoint" } });
+      expect(run.getSnapshot().phase).toBe("listening");
+    } finally { await run.close(); }
+  });
+
+  it("restores a real preparation from its current capture and ignores a different capture", async () => {
+    const { run, emit } = await openFormalEndpointHarness();
+    try {
+      const preparation = { status: "preparing", turn_id: "turn_1", capture_id: "capture_endpoint" };
+      emit("session.snapshot", { ...candidateSnapshot(), floor: "candidate", answer_preparation: preparation,
+        supplement_confirmation: { status: "awaiting_reply", turn_id: "turn_1", capture_id: "capture_endpoint" } });
+      expect(run.getSnapshot().phase).toBe("answer_preparing");
+      emit("session.snapshot", { ...candidateSnapshot(), floor: "candidate",
+        answer_preparation: { ...preparation, capture_id: "capture_old" } });
+      expect(run.getSnapshot()).toMatchObject({ phase: "listening", evidence: { ready: true } });
+      emit("session.snapshot", { ...candidateSnapshot(), floor: "candidate", answer_preparation: preparation });
+      emit("session.snapshot", { ...candidateSnapshot(), status: "paused", floor: "none", answer_preparation: null });
+      expect(run.getSnapshot()).toMatchObject({ phase: "paused", evidence: { ready: false } });
+    } finally { await run.close(); }
+  });
+
+  it("shows restored preparation before readiness but still waits for the scoped open acknowledgement", async () => {
+    const { run, socket } = await openPlaybackHarness();
+    try {
+      socket.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", {
+        ...candidateSnapshot(), floor: "candidate",
+        answer_preparation: { status: "preparing", turn_id: "turn_1", capture_id: "capture_restored" },
+      })) });
+      expect(run.getSnapshot()).toMatchObject({ phase: "answer_preparing", evidence: { ready: false } });
+      expect(await run.act({ type: "finish_answer" })).toBe(false);
+      socket.emit("message", { data: JSON.stringify({ ...correlatedCandidateEvent(2, "floor.changed", {
+        owner: "candidate", reason: "evidence_stream_open", capture_id: "capture_restored",
+      }, latestSentSignal(socket, "evidence.stream.open")), turn_id: "turn_1" }) });
+      expect(run.getSnapshot()).toMatchObject({ phase: "answer_preparing", evidence: { ready: true } });
+      socket.emit("message", { data: JSON.stringify({ ...candidateEvent(3, "floor.changed", {
+        owner: "candidate", reason: "answer_listening", capture_id: "capture_restored",
+      }), turn_id: "turn_1" }) });
+      expect(run.getSnapshot().phase).toBe("listening");
+    } finally { await run.close(); }
+  });
+
+  it("does not carry the previous question's preparation into the next selected question", async () => {
+    const { run, emit } = await openFormalEndpointHarness();
+    try {
+      emit("floor.changed", { owner: "candidate", reason: "answer_preparing", capture_id: "capture_endpoint" });
+      emit("conversation.act.selected", { act_id: "next_act", act_type: "question", text: "下一题。", approved: true, evaluative: false }, "turn_next");
+      expect(run.getSnapshot().phase).not.toBe("answer_preparing");
+      expect(run.getSnapshot().currentQuestion.turn_id).toBe("turn_next");
+    } finally { await run.close(); }
+  });
+});
+
 describe("candidate metric reporter", () => {
   it("emits at most one maximum viseme drift sample per one-second window", async () => {
     vi.useFakeTimers();
@@ -1157,7 +1222,10 @@ describe("candidate real-time experience contracts", () => {
           owner: "candidate", reason: "answer_preparing", capture_id: "capture_formal",
         }), turn_id: "turn_1",
       }) });
-      socket.emit("message", { data: JSON.stringify(candidateEvent(5, "session.snapshot", { ...candidateSnapshot(), floor: "candidate" })) });
+      socket.emit("message", { data: JSON.stringify(candidateEvent(5, "session.snapshot", {
+        ...candidateSnapshot(), floor: "candidate",
+        answer_preparation: { status: "preparing", turn_id: "turn_1", capture_id: "capture_formal" },
+      })) });
       expect(run.getSnapshot()).toMatchObject({ phase: "answer_preparing", floor: "candidate", evidence: { ready: true } });
       capture.onPcm(new Uint8Array([3, 0, 4, 0]).buffer);
       await vi.runAllTicks();

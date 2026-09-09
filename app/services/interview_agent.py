@@ -2387,6 +2387,19 @@ class InterviewAgentRuntime:
 
     def _snapshot(self, session: Dict[str, Any], principal: Principal) -> Dict[str, Any]:
         current = self._current_turn(session)
+        runtime_state = session.get("agent_runtime") or {}
+        preparation = runtime_state.get("answer_preparation") or {}
+        current_preparation = None
+        if (session.get("status") == "in_progress" and current
+                and runtime_state.get("floor") == FloorOwner.CANDIDATE.value
+                and runtime_state.get("calibration_status") == "completed"
+                and not runtime_state.get("capture_recovery")
+                and (runtime_state.get("takeover") or {}).get("status") != "active"
+                and preparation.get("status") == "preparing"
+                and preparation.get("turn_id") == current["id"]
+                and isinstance(preparation.get("capture_id"), str) and preparation["capture_id"]
+                and not any(answer.get("turn_id") == current["id"] for answer in session.get("answers", []))):
+            current_preparation = {key: preparation[key] for key in ("status", "turn_id", "capture_id")}
         capture = self.media_captures.get_for_interview(
             session["id"], session.get("organization_id", "org_default")
         )
@@ -2399,6 +2412,7 @@ class InterviewAgentRuntime:
             "active_performance_id": (session.get("agent_runtime") or {}).get("active_performance_id"),
             "capture_recovery": candidate_capture_recovery(session),
             "supplement_confirmation": self._supplement_projection(session),
+            "answer_preparation": current_preparation,
             "takeover": self._takeover_projection(
                 (session.get("agent_runtime") or {}).get("takeover"),
                 privileged=False,

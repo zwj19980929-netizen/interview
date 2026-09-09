@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import math
 import logging
 import time
 from array import array
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
 from app.core.errors import ApiError
@@ -15,6 +17,13 @@ from app.services.capture_recovery import CaptureFailure, classify_capture_failu
 
 _LOG = logging.getLogger(__name__)
 _CONFIRMED_PREPARATION_TIMEOUT = 45.0
+
+
+@dataclass
+class _PreparationAttempt:
+    budget_epoch: int
+    evidence_key: str
+    failure_recorded: bool = False
 
 
 class AnswerEndpoint:
@@ -62,12 +71,18 @@ class AnswerEndpoint:
         self._uncertain_revision: Optional[int] = None
         self._retry_at = 0.0
         self._prepare_failures = 0
+        self._preparation_budget_text = ""
+        self._preparation_budget_epoch = 0
+        self._preparation_budget_key = ""
+        self._preparation_failures_by_evidence: dict[str, int] = {}
+        self._preparation_failure_notice_pending = False
         self._last_server_transcript = ""
         self._covered_server_transcript = ""
         self._confirmed_preparation: Optional[asyncio.Task] = None
         self._confirmed_preparation_identity: Any = None
         self._confirmed_preparation_capture: Any = None
         self._confirmed_preparation_deadline = 0.0
+        self._confirmed_preparation_attempt: Optional[_PreparationAttempt] = None
         self._preparation_tasks: set[asyncio.Task] = set()
         self.failure: Optional[CaptureFailure] = None
         self.recovery_attempt = 0
@@ -109,8 +124,8 @@ class AnswerEndpoint:
         self._probability = None
         self._explicit_revision = None
         self._prediction_retry_at = 0
-        self._retry_at = 0
-        self._prepare_failures = 0
+        if not self._prepare_failures:
+            self._retry_at = 0
         if self._inference_task is not None:
             self._inference_task.cancel()
 
@@ -126,6 +141,7 @@ class AnswerEndpoint:
             return
         if text and text != self._last_server_transcript:
             self._last_server_transcript = text
+            self._use_preparation_budget(text)
             self.speech_started(source="transcript")
 
     def cover_transcript(self, final: Any) -> None:
@@ -135,6 +151,7 @@ class AnswerEndpoint:
         same prefix must not cancel the confirmation that used its final.
         """
         if final is not None:
+            self._use_preparation_budget(final.text)
             if (self._confirmed_preparation is not None
                     and self._identity(final) != self._confirmed_preparation_identity):
                 self._discard_confirmed_preparation()
@@ -145,8 +162,7 @@ class AnswerEndpoint:
         self._explicit_revision = self.revision
         self._blocked_revision = None
         self._blocked_preview = None
-        self._retry_at = 0
-        self._prepare_failures = 0
+        self._reset_preparation_budget()
         if self._last_voice is None:
             self._last_voice = self.clock() - self.min_silence_seconds
 
@@ -164,6 +180,7 @@ class AnswerEndpoint:
                 if getattr(self.capture, "recovery_required", False):
                     await self._recover_capture(self.capture.recovery_error, "send")
                     continue
+                await self._publish_preparation_failure()
                 if self._last_voice is None:
                     continue
                 quiet = self.clock() - self._last_voice
@@ -277,16 +294,22 @@ class AnswerEndpoint:
             preview_key = (self.revision, self._identity(final))
             if nonclosing and not already_finalized and preview_key == self._blocked_preview:
                 return
+            self._use_preparation_budget(final.text)
+            if self._prepare_failures >= 3:
+                self._blocked_revision = self.revision
+                await self._understanding_failed(record_failure=False)
+                return
             preparing = True
-            await self._notify("answer_preparing")
-            self.assert_current()
+            if self._completed_confirmed_preparation(final) is None:
+                await self._notify("answer_preparing")
+                self.assert_current()
             stage = "understanding"
             if nonclosing and not already_finalized:
                 observe_interview_agent_metric("stt_preview_prepared", 1)
             prepared = await self._prepare_transcript(final)
             self.assert_current()
             if prepared.understanding.problem is not None:
-                await self._understanding_failed()
+                await self._understanding_failed(record_failure=False)
                 return
             if prepared.understanding.suggested_action == "continue_listening":
                 if nonclosing:
@@ -322,7 +345,7 @@ class AnswerEndpoint:
                 prepared = await self._prepare_transcript(confirmed)
                 self.assert_current()
                 if prepared.understanding.problem is not None:
-                    await self._understanding_failed()
+                    await self._understanding_failed(record_failure=False)
                     return
                 if prepared.understanding.suggested_action == "continue_listening":
                     return
@@ -341,13 +364,13 @@ class AnswerEndpoint:
             if exc.code == "TURN_DECISION_STALE":
                 observe_interview_agent_metric("turn_decision_cancelled", 1)
             elif stage == "understanding" and not failure.safety_violation:
-                await self._understanding_failed()
+                await self._understanding_failed(record_failure=False)
             else:
                 recovery_handled = True
                 await self._recover_capture(exc, stage)
         except asyncio.TimeoutError as exc:
             if stage == "understanding" and not classify_capture_failure(exc, stage).safety_violation:
-                await self._understanding_failed()
+                await self._understanding_failed(record_failure=False)
             else:
                 recovery_handled = True
                 await self._recover_capture(exc, stage)
@@ -358,7 +381,7 @@ class AnswerEndpoint:
             # No transcript, provider response or exception body is logged.
             _LOG.warning("Answer proposal failed: stage=%s error_type=%s", stage, type(exc).__name__)
             if stage == "understanding" and not classify_capture_failure(exc, stage).safety_violation:
-                await self._understanding_failed()
+                await self._understanding_failed(record_failure=False)
             else:
                 recovery_handled = True
                 await self._recover_capture(exc, stage)
@@ -380,34 +403,70 @@ class AnswerEndpoint:
 
     async def _prepare_transcript(self, transcript: Any) -> Any:
         with measure_interview_agent_stage("understanding_prepare_ms"):
+            self._use_preparation_budget(transcript.text)
+            if self._prepare_failures >= 3:
+                raise ApiError("UNDERSTANDING_RETRY_EXHAUSTED", "New server words or an explicit retry are required.",
+                               status_code=503)
             kwargs = {"completion_confirmed": True} if self.confirmation and self.confirmation.confirmed else {}
             if not kwargs or (getattr(transcript, "type", None) != "transcript.final"
                               or not getattr(transcript, "is_final", False)):
                 self._discard_confirmed_preparation()
-                return await self._infer(self.capture.prepare_decision(transcript, **kwargs), timeout=45)
+                attempt = _PreparationAttempt(self._preparation_budget_epoch, self._preparation_budget_key)
+                try:
+                    return await self._infer(self.capture.prepare_decision(transcript, **kwargs), timeout=45,
+                                             preparation_attempt=attempt)
+                except asyncio.TimeoutError:
+                    self._record_preparation_failure(attempt)
+                    raise
             identity = self._identity(transcript)
             if (self._confirmed_preparation_identity != identity
                     or self._confirmed_preparation_capture is not self.capture):
                 self._discard_confirmed_preparation()
             task = self._confirmed_preparation
+            if self._completed_confirmed_preparation(transcript) is not None:
+                # The deadline bounds inference, not the lifetime of its
+                # successful result. Reading ready work must not introduce a
+                # cancellable waiter; the caller still fences this fresh final.
+                return task.result()
             if task is None:
+                attempt = _PreparationAttempt(self._preparation_budget_epoch, self._preparation_budget_key)
                 task = asyncio.create_task(self._bounded_confirmed_preparation(transcript))
                 self._confirmed_preparation = task
                 self._confirmed_preparation_identity = identity
                 self._confirmed_preparation_capture = self.capture
+                self._confirmed_preparation_attempt = attempt
                 self._confirmed_preparation_deadline = (
                     asyncio.get_running_loop().time() + _CONFIRMED_PREPARATION_TIMEOUT
                 )
                 self._preparation_tasks.add(task)
-                task.add_done_callback(self._preparation_finished)
+                task.add_done_callback(lambda done: self._preparation_finished(done, attempt))
+            attempt = self._confirmed_preparation_attempt
             remaining = self._confirmed_preparation_deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
+                self._record_preparation_failure(attempt)
                 self._discard_confirmed_preparation()
                 raise asyncio.TimeoutError()
             # A sound revokes this waiter and commit eligibility immediately.
             # Keep at most one bounded, side-effect-free model preparation; a
             # fresh complete snapshot must match every field before reuse.
-            return await self._infer(self._wait_confirmed_preparation(task), timeout=remaining)
+            try:
+                return await self._infer(self._wait_confirmed_preparation(task), timeout=remaining)
+            except asyncio.TimeoutError:
+                self._record_preparation_failure(attempt)
+                raise
+
+    def _completed_confirmed_preparation(self, transcript: Any) -> Optional[asyncio.Task]:
+        task = self._confirmed_preparation
+        if (not self.confirmation or not self.confirmation.confirmed
+                or getattr(transcript, "type", None) != "transcript.final"
+                or not getattr(transcript, "is_final", False)
+                or self._confirmed_preparation_capture is not self.capture
+                or self._confirmed_preparation_identity != self._identity(transcript)
+                or task is None or not task.done() or task.cancelled()
+                or task.exception() is not None
+                or task.result().understanding.problem is not None):
+            return None
+        return task
 
     async def _bounded_confirmed_preparation(self, transcript: Any) -> Any:
         return await asyncio.wait_for(
@@ -419,23 +478,29 @@ class AnswerEndpoint:
     async def _wait_confirmed_preparation(task: asyncio.Task) -> Any:
         return await asyncio.shield(task)
 
-    def _preparation_finished(self, task: asyncio.Task) -> None:
+    def _preparation_finished(self, task: asyncio.Task, attempt: _PreparationAttempt) -> None:
         self._preparation_tasks.discard(task)
         # Retrieve failures even when acoustic input already cancelled the
         # waiter. Failed/uncertain results must never become cache entries.
-        failed = task.cancelled()
-        if not failed:
-            failed = task.exception() is not None
-        if not failed:
-            failed = task.result().understanding.problem is not None
+        failed = self._observe_preparation_result(task, attempt)
         if failed and self._confirmed_preparation is task:
             self._discard_confirmed_preparation()
+
+    def _observe_preparation_result(self, task: asyncio.Task, attempt: _PreparationAttempt) -> bool:
+        if task.cancelled():
+            return True
+        error = task.exception()
+        failed = error is not None or task.result().understanding.problem is not None
+        if failed and not (isinstance(error, ApiError) and error.code == "TURN_DECISION_STALE"):
+            self._record_preparation_failure(attempt)
+        return failed
 
     def _discard_confirmed_preparation(self) -> None:
         task, self._confirmed_preparation = self._confirmed_preparation, None
         self._confirmed_preparation_identity = None
         self._confirmed_preparation_capture = None
         self._confirmed_preparation_deadline = 0.0
+        self._confirmed_preparation_attempt = None
         if task is not None and not task.done():
             task.cancel()
 
@@ -447,8 +512,13 @@ class AnswerEndpoint:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _infer(self, work: Any, *, timeout: float) -> Any:
+    async def _infer(self, work: Any, *, timeout: float,
+                     preparation_attempt: Optional[_PreparationAttempt] = None) -> Any:
         self._inference_task = asyncio.create_task(work)
+        if preparation_attempt is not None:
+            self._inference_task.add_done_callback(
+                lambda done: self._observe_preparation_result(done, preparation_attempt)
+            )
         try:
             # Child revocation differs from whole-worker cancellation.
             done, _ = await asyncio.wait({self._inference_task}, timeout=timeout)
@@ -515,12 +585,60 @@ class AnswerEndpoint:
             "provider": final.provider.model_dump(mode="json") if final.provider else None,
         }
 
-    async def _understanding_failed(self) -> None:
-        self._prepare_failures += 1
+    def _use_preparation_budget(self, text: str) -> None:
+        # Reopening a provider or revising timestamps cannot buy more model
+        # calls for the same server words. The exact provenance still fences
+        # successful preparation reuse and commit separately.
+        text = text.strip()
+        if text and text != self._preparation_budget_text:
+            self._preparation_budget_text = text
+            self._preparation_budget_key = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            self._prepare_failures = self._preparation_failures_by_evidence.get(self._preparation_budget_key, 0)
+            self._preparation_failure_notice_pending = self._prepare_failures >= 3
+            self._retry_at = 0
+            self._blocked_revision = None
+            self._blocked_preview = None
+
+    def _reset_preparation_budget(self) -> None:
+        self._preparation_budget_epoch += 1
+        self._preparation_failures_by_evidence.clear()
+        self._prepare_failures = 0
+        self._preparation_failure_notice_pending = False
+        self._retry_at = 0
+        self._blocked_revision = None
+        self._blocked_preview = None
+
+    def _record_preparation_failure(self, attempt: Optional[_PreparationAttempt] = None) -> None:
+        evidence_key = self._preparation_budget_key
+        if attempt is not None:
+            if attempt.failure_recorded:
+                return
+            attempt.failure_recorded = True
+            if attempt.budget_epoch != self._preparation_budget_epoch:
+                return
+            evidence_key = attempt.evidence_key
+        failures = self._preparation_failures_by_evidence.get(evidence_key, 0) + 1
+        self._preparation_failures_by_evidence[evidence_key] = failures
+        if evidence_key != self._preparation_budget_key:
+            return
+        self._prepare_failures = failures
         self._retry_at = self.clock() + min(4, self._prepare_failures)
+        self._preparation_failure_notice_pending = True
         if self._prepare_failures >= 3:
             self._blocked_revision = self.revision
-        await self._notify("understanding_retry_exhausted" if self._prepare_failures >= 3 else "understanding_unavailable")
+        self.trace("understanding_retry_budget", failures=self._prepare_failures,
+                   exhausted=self._prepare_failures >= 3, revision=self.revision)
+
+    async def _publish_preparation_failure(self) -> None:
+        if self._preparation_failure_notice_pending:
+            self._preparation_failure_notice_pending = False
+            await self._notify("understanding_retry_exhausted" if self._prepare_failures >= 3
+                               else "understanding_unavailable")
+
+    async def _understanding_failed(self, *, record_failure: bool = True) -> None:
+        if record_failure:
+            self._record_preparation_failure()
+        await self._publish_preparation_failure()
 
     async def _notify(self, reason: str) -> None:
         critical = reason in {"capture_recovering", "capture_recovered", "capture_retry_required", "capture_failed"}

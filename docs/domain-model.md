@@ -1,5 +1,9 @@
 # 领域模型
 
+## 当前回答准备投影（024）
+
+agent_runtime.answer_preparation为可空的当前turn/capture准备事实，status仅为preparing。它描述后台正在处理而非候选人完成许可；过期身份、暂停或非当前采集不得投影，客户端不得用它开启Evidence或提交答案。失败预算属于相同服务端发言证据；声学活动只是撤销候选提交时机，不能抹掉已有推理失败。成功PreparedTurnDecision的复用仍受新完整final及当前上下文保护。
+
 ## AnswerDeclined（023）
 
 `answer_declined` 是明确结束本题但未提供技术作答的语义结果，区别于识别失败、转写争议和仍在思考。它保留非空原始服务端发言及可追溯音频，以空能力主张/全部缺失点和next动作完成当前轮次。CandidateAnswer记录这次实际响应而非虚构技术答案，既有ANSWER_SUBMITTED、评分、报告链继续处理；不会绕开Evidence所有权和完整录音门禁。理解意图的confidence不等于答案质量。

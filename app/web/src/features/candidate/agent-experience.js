@@ -207,6 +207,7 @@ class CandidateExperienceRun {
     this.endpointTimer = 0;
     this.answerFinishRequested = false;
     this.answerSubmissionPending = false;
+    this.answerPreparation = null;
     this.captureRetryCausationId = null;
     this.endpointProblemScope = null;
     this.heartbeatTimer = 0;
@@ -783,6 +784,7 @@ class CandidateExperienceRun {
           payload.capture_id !== this.evidenceCaptureId || event.turn_id !== this.evidenceTurnId
         )) return;
         this.clearEndpointWarning(event, ANSWER_PREPARATION_WARNING_CODES);
+        this.answerPreparation = null;
         this.answerFinishRequested = false;
         this.answerSubmissionPending = true;
         this.evidenceOpen = false;
@@ -809,6 +811,8 @@ class CandidateExperienceRun {
           this.clearEndpointWarning(event, DETECTOR_WARNING_CODES);
           return;
         }
+        this.answerPreparation = payload.reason === "answer_preparing"
+          ? { status: "preparing", turn_id: event.turn_id, capture_id: payload.capture_id } : null;
         if (payload.reason === "answer_listening") {
           this.answerFinishRequested = false;
           this.clearCaptureRecovery();
@@ -826,6 +830,7 @@ class CandidateExperienceRun {
         return;
       }
       if (payload.owner === "agent" || payload.owner === "candidate") this.answerSubmissionPending = false;
+      if (payload.owner !== "candidate" || payload.reason === "barge_in") this.answerPreparation = null;
       if (payload.owner === "agent") this.answerFinishRequested = false;
       const acknowledgesEvidenceReady = payload.owner === "candidate"
         && ["warmup_stream_open", "evidence_stream_open"].includes(payload.reason);
@@ -877,7 +882,7 @@ class CandidateExperienceRun {
       this.patch({
         floor: payload.owner,
         phase: recovery?.status === "recovering" ? "answer_recovering" : payload.owner === "candidate"
-          ? this.evidenceReady ? "listening" : "preparing"
+          ? this.isPreparingAnswer() ? "answer_preparing" : this.evidenceReady ? "listening" : "preparing"
           : phaseForFloor(payload.owner, this.state.phase),
         calibration: {
           ...this.state.calibration,
@@ -964,6 +969,7 @@ class CandidateExperienceRun {
       // During repair this may be a late provider prefix, not an answer commit.
       // Recovery can only be cleared by its scoped ready/listening or snapshot.
       if (this.state.captureRecovery) return;
+      this.answerPreparation = null;
       if (!payload.calibration) this.clearEndpointWarning(event, ANSWER_PREPARATION_WARNING_CODES);
       this.answerFinishRequested = false;
       this.answerSubmissionPending = false;
@@ -1010,9 +1016,15 @@ class CandidateExperienceRun {
       this.currentAct = { ...payload, turnId: event.turn_id };
       if (event.turn_id && ["question", "repeat", "followup"].includes(payload.act_type)) {
         const turnChanged = event.turn_id !== this.currentTranscriptTurnId();
-        if (turnChanged) window.clearTimeout(this.captionFreshnessTimer);
+        if (turnChanged) {
+          window.clearTimeout(this.captionFreshnessTimer);
+          this.answerPreparation = null;
+        }
         this.patch({
           ...(turnChanged ? { captions: { forming: false, recent: [], full: [] } } : {}),
+          ...(turnChanged && this.state.phase === "answer_preparing" ? {
+            phase: this.state.floor === "candidate" ? "preparing" : phaseForFloor(this.state.floor, this.state.phase),
+          } : {}),
           currentQuestion: {
             ...(this.state.currentQuestion || {}),
             turn_id: event.turn_id,
@@ -1121,6 +1133,7 @@ class CandidateExperienceRun {
         this.evidenceTurnId = null;
         if (retryWarmup) this.ring?.clear();
       }
+      if (this.endpointProblemScope || !payload.recoverable) this.answerPreparation = null;
       this.patch({
         problem: payload,
         phase: retryWarmup || retryTranscript ? "preparing" : this.endpointProblemScope
@@ -1174,6 +1187,13 @@ class CandidateExperienceRun {
     return this.state.currentQuestion?.turn_id || this.state.session?.current_turn_id || null;
   }
 
+  isPreparingAnswer(turnId = this.currentTranscriptTurnId()) {
+    const preparation = this.answerPreparation;
+    return preparation?.status === "preparing" && preparation.turn_id === turnId
+      && (!this.evidenceCaptureId || preparation.capture_id === this.evidenceCaptureId)
+      && (!this.evidenceReady || this.evidenceTurnId === turnId);
+  }
+
   matchesTranscriptTurn(event) {
     if (event.payload?.calibration) {
       return event.turn_id == null && this.state.calibration.status !== "completed";
@@ -1191,6 +1211,7 @@ class CandidateExperienceRun {
     const recovery = { ...(previous?.captureId === value.captureId ? previous : {}), ...value,
       retryPending: Boolean(this.captureRetryCausationId) };
     const retry = value.status === "retry_required";
+    this.answerPreparation = null;
     this.answerFinishRequested = false;
     this.answerSubmissionPending = false;
     this.endpointProblemScope = null;
@@ -1276,6 +1297,9 @@ class CandidateExperienceRun {
   applySnapshot(payload) {
     const sessionStatus = payload.status;
     const nextTranscriptTurnId = payload.current_question?.turn_id || payload.current_turn_id || null;
+    this.answerPreparation = sessionStatus === "in_progress" && payload.floor === "candidate"
+      && !payload.capture_recovery && payload.answer_preparation?.turn_id === nextTranscriptTurnId
+      ? payload.answer_preparation : null;
     const transcriptTurnChanged = nextTranscriptTurnId !== this.currentTranscriptTurnId();
     const oldRecovery = this.state.captureRecovery;
     const captureRecovery = sessionStatus === "in_progress" && this.state.problem?.recoverable !== false
@@ -1370,14 +1394,15 @@ class CandidateExperienceRun {
         ? "paused"
         : sessionStatus === "completed"
           ? "completed"
+          : payload.floor === "candidate" && this.isPreparingAnswer(nextTranscriptTurnId)
+            ? "answer_preparing"
           : this.answerSubmissionPending
             ? "understanding"
           : payload.floor === "candidate" && !this.evidenceReady
             ? "preparing"
-          : payload.floor === "candidate" && this.state.phase === "answer_preparing"
-            ? "answer_preparing"
           : payload.floor === "candidate" && payload.supplement_confirmation?.status === "awaiting_reply"
             && payload.supplement_confirmation?.turn_id === payload.current_turn_id
+            && payload.supplement_confirmation?.capture_id === this.evidenceCaptureId
             ? "awaiting_supplement"
             : phaseForFloor(payload.floor, this.state.phase),
     });
@@ -1438,7 +1463,7 @@ class CandidateExperienceRun {
     this.patch({
       serverAudio: { received: false, receivedAt: null },
       evidence: { requested: true, ready: false },
-      phase: "preparing",
+      phase: this.isPreparingAnswer() ? "answer_preparing" : "preparing",
     });
     try {
       const causationId = uniqueId("candidate");

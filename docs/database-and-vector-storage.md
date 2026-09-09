@@ -1,5 +1,9 @@
 # 数据库与向量存储设计
 
+## 准备状态的数据影响（024）
+
+无DDL或旧答案迁移。agent_runtime.answer_preparation保存当前turn/capture的可空准备事实，准备退出、失败或当前录音结束时清理；快照再次按当前会话/录音身份过滤。准备缓存和同文字失败预算属于当前采集进程，不写入候选事实；重启不补交历史答案。固定阶段、原因和Schema路径仅作安全诊断，不新增敏感原文日志。
+
 ## 未作答响应的数据影响（023）
 
 无DDL、表或旧数据迁移。answer_declined保存在现有TurnUnderstanding；非空权威原文、录音、utterance_id和understanding_id仍由CandidateAnswer引用。正常答案事务及Outbox产生评分revision，model_info记录declined_answer.v1及对应理解引用；混合证据保留全部审计ID而不把未作答发言当技术证据。历史会话和评分不回写、不补造提交。

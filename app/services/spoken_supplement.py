@@ -204,5 +204,4 @@ class SpokenSupplementConfirmation:
         self._confirmed_final = final.model_copy(deep=True)
         self.boundary = final.text.strip()
         self._boundary_segments = len(final.segments)
-        await endpoint._notify("answer_preparing")
         await endpoint._propose(final_snapshot=final)

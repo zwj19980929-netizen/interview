@@ -1,5 +1,9 @@
 # 模型供应商插件化设计
 
+## 准备失败的阶段诊断（024）
+
+未更改供应商/模型路由或Prompt版本。网关成功表示原始统一JSON Schema通过，不代表后续引用、canonical、领域或追问审批成功；日志按安全stage/reason及静态schema_path区分这些位置，禁止输出完整AI响应/候选转写/异常正文。可选追问审批失败不触发整份模型重试；同服务端文字的失败预算不能由声音清零。真实模型尾部时延与业务重复调用分别统计，不将所有等待混为单个模型耗时。
+
 ## 未作答意图合同（023）
 
 统一理解Prompt升级至interview_turn_understanding.v6/v7，组合决策至interview_turn_decision.v5/v6；高版本表示已独立确认完成。新增answer_declined枚举，统一Schema和业务内容校验要求next、理解置信度至少0.75、非空客观摘要与真实证据、空claims/covered/ambiguities/contradictions、完整missing；低语音置信度仍不得授权结束。补充答复Prompt为supplement_reply.v2，区分实际技术补充与未解决识别投诉；返回结构不变，逐字证据校验保持。各历史Prompt版本继续可读。Mock参考编号处理和网关安全版本白名单同步；未新增供应商、厂商参数或路由。全组明确未作答采用服务端declined_answer.v1评分规则，来源记录与AI评分来源分开，不新增散落Prompt。
