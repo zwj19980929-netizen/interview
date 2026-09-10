@@ -1,15 +1,21 @@
 from datetime import datetime, timezone
 from copy import deepcopy
 import re
+import os
+import asyncio
 from typing import Any, Dict, List, Optional, Sequence
 
 from app.core.ids import new_id
 from app.core.prompt.contracts import prompt_contract
 from app.core.time import utc_now
 from app.domain.interview_agent import TurnUnderstanding
+from app.domain.scoring_quality import evaluation_answers, project_evaluation, recognition_context
+from app.domain.speech_quality import limit_semantic_confidence
+from app.services.recognition_vocabulary import recognition_terms
+from app.model_gateway.errors import ProviderError
 from app.model_gateway.gateway import ModelGateway
 from app.model_gateway import capabilities as cap
-from app.model_gateway.schemas import ChatJSONRequest
+from app.model_gateway.schemas import ChatJSONRequest, InvocationExecutionBudget
 from app.persistence.interface import Persistence
 from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
@@ -204,10 +210,14 @@ class EvaluationService:
         question_snapshot: Dict[str, Any],
         role_requirement: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        with self.persistence.transaction(answer.get("organization_id", "org_default")) as transaction:
+            source_session = transaction.interview_sessions.get(answer["interview_id"])
+        quality_answers = (evaluation_answers(source_session, {"answer_id": answer["id"],
+            "evidence_answer_ids": answer.get("evidence_answer_ids")}) if source_session else [answer])
         scoring_answer, declined = self._declined_evidence(answer)
         if declined and not scoring_answer["final_transcript"]:
             data, model_info = self._declined_score(answer, question_snapshot, declined)
-            return self._evaluation_revision(answer, question_snapshot, data, model_info)
+            return project_evaluation(self._evaluation_revision(answer, question_snapshot, data, model_info), quality_answers, capture_verification=True)
         contract = prompt_contract(
             "answer_evaluation",
             {
@@ -216,13 +226,17 @@ class EvaluationService:
                 "rubric": question_snapshot.get("rubric", {}),
                 "role_requirement": (role_requirement or {}).get("description", ""),
                 "answer_text": scoring_answer["final_transcript"],
+                "key_points": question_snapshot["key_points"],
+                "question_type": question_snapshot.get("source_type", "position_bank"),
+                "recognition_quality": recognition_context(quality_answers),
+                "recognition_terms": recognition_terms({"question_snapshot": question_snapshot}),
             },
         )
-        response = await self.gateway.invoke(
-            cap.LLM_CHAT_JSON,
-            ChatJSONRequest(
+        request = ChatJSONRequest(
                 organization_id=answer.get("organization_id", "org_default"),
                 purpose="answer_evaluation",
+                execution_budget=InvocationExecutionBudget(timeout_s=120, max_provider_retries=0),
+                max_output_tokens=max(2000, min(16000, int(os.getenv("INTERVIEWER_EVALUATION_OUTPUT_TOKENS", "8000")))),
                 messages=contract.messages,
                 json_schema=contract.response_schema,
                 metadata={
@@ -235,8 +249,21 @@ class EvaluationService:
                     "stt_confidence": answer.get("stt_confidence", 1.0),
                     "prompt_version": contract.version,
                 },
-            )
         )
+        # One larger-budget recovery, never the same truncated request five times.
+        async def score():
+            try:
+                return await self.gateway.invoke(cap.LLM_CHAT_JSON, request)
+            except ProviderError as exc:
+                if exc.code != "provider_output_truncated" or request.max_output_tokens >= 16000:
+                    raise
+                expanded = request.model_copy(update={"max_output_tokens": min(16000, request.max_output_tokens * 2)})
+                return await self.gateway.invoke(cap.LLM_CHAT_JSON, expanded)
+
+        try:
+            response = await asyncio.wait_for(score(), timeout=240)
+        except asyncio.TimeoutError as exc:
+            raise ProviderError("evaluation_timeout", "评分超过本次处理时限，可稍后重试。", retryable=True) from exc
         model_info = {
             "provider_id": response.provider.provider_id,
             "model": response.provider.model,
@@ -248,7 +275,7 @@ class EvaluationService:
                 evidence_filter_version="declined_answer.v1",
                 excluded_declined_answers=declined,
             )
-        return self._evaluation_revision(answer, question_snapshot, response.data, model_info)
+        return project_evaluation(self._evaluation_revision(answer, question_snapshot, response.data, model_info), quality_answers, capture_verification=True)
 
     def _declined_evidence(self, answer: Dict[str, Any]) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
         """Resolve declined facts from persisted server evidence, never input labels."""
@@ -340,7 +367,7 @@ class EvaluationService:
     @staticmethod
     def _declined_score(answer: Dict[str, Any], question: Dict[str, Any],
                         declined: List[Dict[str, Any]]) -> tuple[Dict[str, Any], Dict[str, Any]]:
-        confidence = min(float(answer.get("stt_confidence", 1.0)), *(item["confidence"] for item in declined))
+        confidence = limit_semantic_confidence(min(item["confidence"] for item in declined), answer.get("stt_confidence"))
         dimensions = (["specificity", "technical_depth", "evidence_consistency", "reflection"]
                       if question.get("source_type") == "resume_experience" else
                       ["semantic_correctness", "key_point_coverage", "reasoning_depth", "role_relevance", "communication"])

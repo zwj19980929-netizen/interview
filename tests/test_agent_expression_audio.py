@@ -172,3 +172,100 @@ async def test_cancelled_tts_import_does_not_create_private_audio_or_ready_file(
         assert session["status"] == "in_progress"
         assert session["agent_events"] == []
         assert session["agent_runtime"] == {}
+
+
+@pytest.mark.anyio
+async def test_complete_tts_pcm_is_private_and_skips_provider_download():
+    import io
+    import wave
+    from app.model_gateway.schemas import TTSSynthesizeRequest
+    from test_tts_streaming import FixtureStream, managed
+    raw = FixtureStream()
+    class Gateway:
+        async def open_tts_stream(self, request):
+            return managed(raw)
+    store, storage = InMemoryStore(), _Storage()
+    service = AgentExpressionAudioService(persistence_for(store), storage=storage)
+    result = await service.synthesize_complete_audio(Gateway(), TTSSynthesizeRequest(text="合成测试句。"), interview_id="iv_synthetic", turn_id="turn_1")
+    assert result["audio_uri"].startswith("agent-expression://") and raw.aborted == 1
+    with wave.open(io.BytesIO(next(iter(storage.values.values()))), "rb") as audio:
+        assert audio.getframerate() == 24000 and audio.getnchannels() == 1
+        assert audio.readframes(100) == b"\x01\x00" * 10
+    with persistence_for(store).transaction("org_default") as tx:
+        assert tx.file_objects.list()[0]["source_type"] == "tts_complete_pcm"
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failure", ["missing_final", "bad_final", "transport", "too_large", "cancel", "timeout"])
+async def test_incomplete_tts_never_publishes_or_replays_partial_audio(failure):
+    from app.model_gateway.schemas import TTSSynthesizeRequest
+    from test_tts_streaming import FixtureStream, managed, event
+    started = asyncio.Event()
+    class Stream(FixtureStream):
+        async def events(self):
+            yield event("audio.chunk", 2, pcm_s16le=b"\x01\x00" * 10)
+            started.set()
+            if failure in {"cancel", "timeout"}:
+                await asyncio.Event().wait()
+            elif failure == "transport":
+                raise RuntimeError("synthetic transport failure")
+            elif failure == "bad_final":
+                yield event("audio.final", 3, total_audio_bytes=22)
+            elif failure == "too_large":
+                yield event("audio.final", 3, total_audio_bytes=20)
+    raw = Stream()
+    calls = []
+    class Gateway:
+        async def open_tts_stream(self, request):
+            calls.append(request)
+            return managed(raw)
+    store, storage = InMemoryStore(), _Storage()
+    service = AgentExpressionAudioService(persistence_for(store), storage=storage)
+    if failure == "too_large":
+        service.importer.max_bytes = 50
+    task = asyncio.create_task(service.synthesize_complete_audio(Gateway(), TTSSynthesizeRequest(text="合成测试句。"), interview_id="iv_synthetic", turn_id="turn_1", timeout_s=.03 if failure == "timeout" else 1))
+    if failure == "cancel":
+        await started.wait()
+        task.cancel()
+    with pytest.raises((Exception, asyncio.CancelledError)):
+        await task
+    assert len(calls) == 1 and raw.aborted == 1
+    assert storage.values == {}
+    with persistence_for(store).transaction("org_default") as tx:
+        assert tx.file_objects.list() == []
+
+
+@pytest.mark.anyio
+async def test_only_unsupported_tts_transport_allows_batch_fallback():
+    from app.model_gateway.errors import ProviderError
+    from app.model_gateway.schemas import TTSSynthesizeRequest
+    class Gateway:
+        def __init__(self, code): self.code = code
+        async def open_tts_stream(self, request):
+            raise ProviderError(self.code, "synthetic", retryable=False)
+    service = AgentExpressionAudioService(persistence_for(InMemoryStore()), storage=_Storage())
+    kwargs = dict(interview_id="iv_synthetic", turn_id="turn_1")
+    request = TTSSynthesizeRequest(text="合成测试句。")
+    assert await service.synthesize_complete_audio(Gateway("provider_streaming_not_supported"), request, **kwargs) is None
+    with pytest.raises(ProviderError):
+        await service.synthesize_complete_audio(Gateway("provider_unauthorized"), request, **kwargs)
+
+
+@pytest.mark.anyio
+async def test_complete_pcm_never_turns_mock_audio_into_formal_speech():
+    from types import SimpleNamespace
+    from app.model_gateway.schemas import TTSSynthesizeRequest
+    class Stream:
+        ready_event = SimpleNamespace(provider=SimpleNamespace(provider_id="mock"))
+        aborted = False
+        async def abort(self): self.aborted = True
+        def events(self): raise AssertionError("mock audio cannot be consumed")
+    stream = Stream()
+    class Gateway:
+        async def open_tts_stream(self, request): return stream
+    storage = _Storage()
+    service = AgentExpressionAudioService(persistence_for(InMemoryStore()), storage=storage)
+    with pytest.raises(ApiError) as error:
+        await service.synthesize_complete_audio(Gateway(), TTSSynthesizeRequest(text="合成测试。"), interview_id="iv_synthetic", turn_id="turn_1")
+    assert error.value.code == "AGENT_EXPRESSION_AUDIO_REQUIRED"
+    assert stream.aborted and storage.values == {}

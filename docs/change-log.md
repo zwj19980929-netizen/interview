@@ -6,6 +6,165 @@
 
 每个工作项必须包含：日期、ID、目标、关联问题、状态、实际修改文件、验证命令与结果、未完成事项或恢复说明。
 
+## 2026-09-10 · GIT-DELIVERY-035
+
+- 状态：`verified（本地提交与暂存检查）`；远端推送因自动审批拒绝，等待明确目的地授权。
+- 目标：按用户要求归档并提交本轮025–034已完成的面试修复；当前分支dev，远端origin为现有项目仓库。
+- 范围：现有业务代码、合同/回归测试、文档与受版本管理的前端dist；不纳入被忽略的真实配置、数据库、录音、私有文件或临时运行日志。
+- 提交前依据：沿用034对当前代码的完整验证（后端1668 passed/6 skipped、前端225 passed、生产构建通过）；本轮只做归档检查和日志登记，没有再次改业务代码。
+- 实际检查：115个暂存变更，新增内容仅为实现、测试、诊断设计文档与构建文件；112个现存待归档文件的私钥/GitHub/provider key模式检查无命中，无运行数据/媒体/真实配置。git ls-remote确认远端只有main，指向修改前HEAD 56b232d，当前dev尚无upstream；按用户要求将本地dev作为远端分支同步，不覆盖main、不强制推送。
+- 实际修改文件：本工作项登记`docs/change-log.md`，并清理`app/transport/http/media.py`最后一个多余空行；没有业务行为变更，不重复已通过的全量测试。
+- 失败留痕：初次upstream/origin/dev查询因引用未配置失败，无写入；暂存检查首次发现新增media.py的EOF空行（未暂存diff未覆盖新文件），已清理。之后以git diff --cached --check为准，保留前序验证证据。
+- 提交结果：已在dev创建修复提交，包含115个文件、代码/测试/文档/构建产物；提交前git diff --cached --check通过。随后将本条实际执行结果并入同一尚未发布的本地提交，具体提交号以包含本项的Git历史为准。
+- 远端结果与恢复：`git push -u origin dev`在进程执行前被自动审批拒绝，原因是用户“提交到Git”的指令未被审批器视为对GitHub仓库zwj19980929-netizen/interview这一具体敏感代码目的地的明确授权。没有发生远端代码上传、分支创建或强制覆盖。已向用户说明并请求确认该仓库dev；获得明确授权后可原样重试常规push，本地提交完整保留。
+
+## 2026-09-10 · FOLLOWUP-STABILITY-AND-SPEECH-LATENCY-034
+
+- 状态：`verified（仓库回归、新合成模型实测、本机加载）`；真实长时面试/并发未重新验收，不标closed。
+- 目标：定位 iv_e71152c5e7814a20 追问阶段的理解告警，修复长补充回答分类、重试/熔断和诊断缺陷，按实际耗时优化追问语音等待，保留前序025–033修改。
+- 初始证据：已接受7题，当前为第8轮追问；07:05起失败记录的实际Prompt为supplement_reply.v2，错误为provider_schema_invalid，继而provider_circuit_open。端点同capture失败预算从3继续增长到10，声音revision变化后仍重试；没有依据归因到麦克风、评分或TTS失败。完整原文/音频与凭据不进入诊断输出。
+- 计划：核对Prompt/schema与长回复输出预算，补分类专属有界重试与元数据诊断，测量并优化批准追问的TTS准备/播放路径；补模型合同、真实整链回归和前端提示，同步设计文档。按无活动候选人与worker空闲门禁加载本机，不强行结束面试或改变历史回答。
+- 用户追加体验要求：候选人页面不显示模型、通道、底层故障、FPS等实现术语；等待与可恢复故障使用简短面试用语，只有确实需要用户处理时显示清楚的下一步。保留如实的暂停/录制/同意信息及后台诊断，不能把“掩盖故障”当作修复。
+- 验证与未完成：诊断中；本轮未再次外发真实候选人录音，任何外部模型验证优先用新的合成文本/音频；首次日志查询包含过多STT记录造成截断，后续限定用途和字段。
+
+- 实际修改文件：`.env.example`、`app/core/prompt/contracts.py`、`app/model_gateway/gateway.py`、`app/providers/{mock/provider,dashscope/tts_streaming}.py`、`app/services/{conversation_understanding,spoken_supplement,answer_endpoint,livekit_evidence_ingress,agent_expression_audio,interview_agent}.py`；前端 `candidate/{presentation.js,Page.jsx,VrmAvatar.jsx}` 与 `presentation.test.js`、Page/InvitationPage/VrmAvatar/session-isolation回归及生产dist；后端 `tests/{test_supplement_contracts,test_spoken_supplement,test_agent_expression_audio,test_tts_streaming,test_interview_agent_stage_metrics,test_declined_answer_integration,test_interview_agent_contracts}.py`；同步CONTEXT及架构/API/领域/评分/供应商/存储/问题/进度/路线图文档。025–033未提交修改保留。
+- 分类修复：supplement_reply.v3只输出intent/confidence/evidence_id，服务端恢复逐字证据并再次校验；350输出token、8秒预算、0次provider内部重试，同一原文最多3次端点失败。声学活动不重置，新文字或明确continue_speaking才恢复；重试保持补充边界，不提交旧答案或伪造finish。成功用既有事件清除临时告警，网关记录schema规则与路径用于后续区分实际失败原因。
+- 表达与体验：候选人错误只用受控通俗文案、重试操作和如实停答信息；移除FPS/viseme/底层通道/模型错误正文及重复诊断卡，保留同意说明、录制范围与真实暂停门禁。追问只朗读已校验的问题，原quote保留为证据。动态表达默认收齐受管PCM生成私有完整WAV，省掉供应商URL二次下载，失败/取消/Mock不写正式资产；默认关闭的浏览器实时PCM播放未开启。
+- 真实合成检查：新写的长技术补充、明确结束、犹豫继续三例经配置理解路由分别 **1411/1468/1292ms**，意图均正确且quote精确来自原文。未读取或上传真实录音/简历/候选人回答。初始TTS直取校验失败后，用合成短句仅观察字段/长度/容器头，确认Qwen字符串null、固定44字节WAVE头及stop前usage空通知；已在adapter严格兼容并加故障合同，未知原因/格式和缺final仍拒绝。协议依据及观察边界见供应商设计文档。
+- 修复后TTS对照：同一新写测试句交替三轮，旧batch+下载 **2334/2092/2511ms**，完整PCM **2671/2048/1965ms**，三次均有效final；中位数 **2334→2048ms（约12%）**，平均值仅约4%改善，第一轮新路径更慢。旧下载单独约260–288ms；PCM首片约423–623ms不是用户听到首音，完整播放仍等待final。合成音频长度本身有波动（约7.5–9.2秒），小样本不能保证每次提速或代表真实长追问。日志 `/private/tmp/interviewer-034-benchmark.log`、`interviewer-034-tts-benchmark-final.log`。
+- 验证：定向分类/补充/资产/拒答 **55 passed**；TTS协议/资产/指标定向 **103 passed**。最终后端 `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -o faulthandler_timeout=30 --tb=short` **1668 passed/6 skipped in124.33s**（`/private/tmp/interviewer-034-backend-final.log`）；前端 `npm test -- --run` **225 passed/17 files**（`interviewer-034-web-3.log`）。`npm run build` 成功，只有既有大chunk提示；入口index-6jgz8ceW.js、数字人VrmAvatar-C5QqKbly.js；`git diff --check`通过。
+- 失败留痕：初次合同升级后10个后端旧fixture失败，更新v3wire和历史v1/v2canonical分别验证后通过；候选人文案改动使17项旧文案断言失败，保留交互/隔离/禁用行为断言并更新文案，后续3项遗漏文案修正后全过。首次全后端1649通过、2项batch指标fixture因新增默认PCM路径失败，为旧batch用例显式关闭开关并新增PCM指标用例后全过。供应商合成探针两轮各3次直取失败均在校验前终止，无正式音频落盘；保留失败日志，未静默将失败视为成功。只读搜索两次使用不存在文件路径、部分长输出截断，均改为精确路径；无业务数据副作用。
+- 本机加载：LiveKit只读检查ROOMS=0/ACTIVE_CANDIDATES=0，worker空闲门禁通过后重启API/worker为PID1400/1402；重启后healthz/readyz均200且ready=true，首页实际引用`/web/bundles/index-6jgz8ceW.js`、脚本200。未刷新用户候选人标签、重开摄像头麦克风或重写真实历史回答。模型验证仅留下合成调用的元数据审计与指标，未保存合成音频资产。
+- 未完成/恢复：浏览器旧页需要刷新载入新脚本；真实长时面试、并发下供应商抖动及完整端到端首音验收未宣称通过。需要回退直取可设置INTERVIEWER_BUFFERED_TTS_ENABLED=false恢复原完整文件下载路径；其他修复按上述文件撤回并重建dist，不修改历史数据。旧流式实验与供应商兼容分支尚保留，因此不标closed。
+
+## 2026-09-09 · CANDIDATE-SESSION-ISOLATION-033
+
+- 状态：`verified（前端竞态回归、生产构建、本机脚本加载）`；真实候选人重新入场未执行，不标 closed。
+- 目标：修复从旧面试切换至新预约时混用旧selectedInterview与新candidateToken、旧403/暂停异步结果污染新页面的问题，隔离会话数据/数字人/实时运行状态并如实展示停止状态。
+- 证据：新会话iv_64f16cae229144db于2026-09-10T06:07:06Z创建，状态in_progress，试音warmup_listening，正式答案0；日志中其public GET/avatar-config/avatar-model/agent-ticket全部200、WS accepted。同期旧iv_775785321827419d的avatar-config为409/403，runtime-problems为403。WorkbenchProvider在await前先写token且保留旧selectedInterview；CandidateRoom复用本地startingProblem/avatarReady，没有路由绑定门禁。
+- 计划文件：WorkbenchProvider、Candidate Page/VrmAvatar/资产加载、前端竞态与清理回归、dist及架构/问题/进度/路线图文档。不变更后端认证规则、凭据、历史答案或评分；保留025–032全部未提交修改。
+- 实际修改：`app/web/src/core/WorkbenchProvider.jsx`、`app/web/src/features/candidate/{Page.jsx,VrmAvatar.jsx,vrm-avatar.js,agent-experience.js,VrmAvatar.test.jsx,agent-experience.test.js}`、新增 `session-isolation.test.jsx`、生产 `app/web/dist`；同步 `docs/{architecture,api-design,domain-model,known-issues-and-remediation,development-progress,implementation-roadmap,change-log}.md`。无后端代码、数据库、Prompt、供应商或评分变更，025–032修改保留。
+- 实现：公共投影与其请求凭证原子绑定；候选人房间拒绝不匹配路由，旧加载成功/错误按路由和代次失效，局部错误与ready按会话/凭证重建；旧VRM资产可取消且迟到renderer释放。facade open接收取消signal并在启动步骤间检查，旧请求不能领取新页面预检设备；已领取资源在取消后关闭。当前致命错误取消在途启动、调用真实暂停并停止本地表达/答题，旧暂停回执不影响新页，授权错误文案不再武断标为过期。
+- 验证：最初11项页面/VRM定向通过；增加启动取消和当前发言故障保护、保留原VRM两项合同后，最终 `npm test -- --run` 为 **218 passed/16 files**（新增14项，`/private/tmp/interviewer-033-web-final.log`）。`npm run build` 成功（`/private/tmp/interviewer-033-build.log`），入口 `index-2uYMAki_.js`、数字人 `VrmAvatar-Db-S2mU3.js`，仅既有大 chunk 提示；`git diff --check` 通过。前端单独变更，未重复运行无改动后端全量测试。
+- 本机核验：只读打开后台测试标签，列表正常显示31场面试，DOM script实际为 `/web/bundles/index-2uYMAki_.js`。只读持久层核对原新会话仍in_progress，updated_at仍06:07:55Z，正式答案0；未创建预约、重启API、刷新用户候选人标签、请求真实暂停或再次外发录音。测试标签用完关闭。
+- 失败留痕：初次只读搜索命中dist造成截断，随后限源码；日志读取隐藏ticket。新增启动取消测试fixture最初遗漏视频轨，导致一次媒体校验断言失败、另一次等待超时及相关未处理断言；补齐合成轨后全量无失败。新增VRM测试时覆盖了既有两个测试，复核git diff及时发现并恢复原用例，只为新增signal扩展其断言，再加四项竞态测试，未丢失已有覆盖。只读状态检查首次误用不存在的tx.interviews，改为tx.interview_sessions后成功，无数据写入。
+- 未完成/恢复：浏览器已打开的旧页面仍持有旧脚本，需要刷新当前候选人页加载修复；没有替用户触发新的麦克风/摄像头采集。真实重新入场与生产长时媒体验收未宣称通过。撤回代码需恢复上述前端变更并重建dist，既有数据库和历史证据不受影响。
+
+## 2026-09-09 · INTERVIEW-LIST-FILTER-SEARCH-032
+
+- 状态：`verified（前端全量回归、生产构建与本机页面目测）`
+- 目标：在面试会话列表增加候选人名称搜索和状态筛选，并清晰反馈当前匹配数量。
+- 关联问题：当前列表只能滚动浏览；会话较多时无法快速定位候选人，也无法聚焦报告就绪、正在面试、已超时等特定状态。
+- 计划修改：在 React 列表加入即时名称搜索、基于页面展示状态的分组筛选、匹配数、清除筛选和无结果空状态；补前端交互回归与响应式样式，重建生产 bundle。纯客户端筛选，不修改后端接口、会话状态或业务数据。
+- 实际修改文件：`app/web/src/features/interviews/Page.jsx`、`app/web/src/features/interviews/Page.test.jsx`、`app/web/styles.css`、重建后的 `app/web/dist`，以及本日志。
+- 实际实现：列表上方新增带搜索图标的候选人姓名即时搜索、状态下拉和结果数；搜索会去除首尾空格且不区分拉丁字母大小写。状态筛选复用列表实际展示状态，区分真正进行中、候选人已提交后的评分中、预约待开始、暂停、报告处理中/就绪、超时、普通取消和失败；名称与状态可组合。启用任一条件后页头显示“当前/总数”，提供一键清除；无匹配时保留筛选栏并显示可恢复的空状态。小屏下搜索和状态控件自动堆叠。
+- 验证命令与结果：定向 `npm test -- --run src/features/interviews/Page.test.jsx` 为 **7 passed**；完整前端 `npm test -- --run` 为 **204 passed/15 files**；`npm run build` 成功生成 `index-DYQSnFFU.js` 与 `index-7qeam4aU.css`，只有既有 VRM 大 chunk 提示；`git diff --check` 通过。本机 `127.0.0.1:8000/#interviews` 目测搜索框、状态下拉、结果徽标与表格对齐正常；实际选择“已超时结束”后显示 **27 / 30**，每行均为“已超时结束”，清除筛选恢复30条。
+- 失败留痕与恢复说明：新增测试首次用直接赋值触发 React 受控搜索框，JSDOM 的 value tracker 将其视为未变化，导致两项断言失败；改为通过原生 `HTMLInputElement.value` setter 模拟真实输入后，定向和全量测试均通过。失败只发生在合成测试 DOM，无业务数据或外部副作用。本轮只读打开本地页面、选择状态并清除，没有点击查看、移除、刷新或创建预约；未修改后端接口、状态机或任何真实会话数据。
+
+## 2026-09-09 · INTERVIEW-DEADLINE-RECONCILIATION-031
+
+- 状态：`verified（仓库回归、生产构建、本机补偿与页面目测）`
+- 目标：让超过预约结束时间、且候选人尚未完成全部输入的面试会话自动结束，避免浏览器中途退出后长期残留为“进行中”；统一列表操作列宽度，并在真正进行中的会话不可移除位置明确显示“正在面试中”。
+- 关联问题：当前只在候选人开始时校验预约时间窗，没有后台截止时间回收；`InterviewSession.status=in_progress` 因页面退出不会自然迁移。列表只为终态渲染三点菜单，进行中行的操作区因此留白且与其他行不对齐。
+- 计划修改：通过既有 InterviewSession 生命周期 seam 将超过 `scheduled_end_at` 的未完成会话收口为带明确截止原因的终态，周期任务负责进程重启后的补偿，并停止相关媒体采集/权威 Evidence、发布实时快照；已完成候选人输入、正在评分/报告的会话不误终止。前端以“已超时结束”区分截止收口，并固定次级操作槽，进行中显示“正在面试中”。补领域、服务、后台任务、React 与回归测试，重建生产 bundle，同步架构、接口、领域、存储、统一术语、进度和路线图；不修改回答、评分内容或删除历史证据。
+- 实际修改文件：`.env.example`、`app/main.py`、`app/domain/interview_lifecycle.py`、`app/services/{interviews,interview_agent,livekit_evidence_ingress}.py`、`app/web/src/core/ui.jsx`、`app/web/src/features/interviews/{Page.jsx,Page.test.jsx}`、`app/web/styles.css`、`tests/test_interview_session_aggregate.py`、重建后的 `app/web/dist`；同步 `CONTEXT.md` 与 `docs/{architecture,api-design,domain-model,database-and-vector-storage,development-progress,implementation-roadmap,change-log}.md`。无 DDL、Prompt、评分规则或供应商路由修改。
+- 实际实现：周期 watchdog 默认每15秒调用唯一截止协调入口；使用会话冻结 `scheduled_end_at`，旧会话缺字段时从绑定预约兼容读取。只有 `scheduled/waiting/in_progress/paused` 且没有 `candidate_input_completed_at` 的会话经既有 `CANCEL` 命令收口，写 `termination_reason=appointment_window_expired`、`expired_at`、单条生命周期事件和 metadata-only 审计；随后停止进程内 Evidence/全场媒体并发布快照。已提交输入的评分/报告不误关。列表将该终态显示为“已超时结束”，将提交后的 `in_progress` 显示为“已提交，后台评分中”；操作列保留92px次级槽，可移除终态显示三点菜单，真正进行中显示“正在面试中”，移动端隐藏重复状态文字但保留菜单对齐。
+- 验证命令与结果：后端定向首次 `15 passed`，Evidence/Agent扩展定向 `121 passed`；完整 `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -o faulthandler_timeout=30 --tb=short` 为 **1635 passed/6 skipped in 124.77s**。历史会话 appointment fallback 加入后最终定向 `tests/test_interview_session_aggregate.py` 为 **8 passed**；`compileall` 通过。前端定向 **5 passed**、全量 **202 passed/15 files**；`npm run build` 成功生成 `index-Dd2sueU2.js` 与 `index-K983yCcx.css`，只有既有 VRM 大 chunk 提示；`git diff --check` 通过。本机 API/Worker 为 PID `78516/78517`，`readyz.ready=true`。
+- 本机状态补偿与页面：重载前只读核对有28条 `in_progress/paused` 且无输入完成标记的会话，均已超过预约结束时间（其中一条会话缺冻结结束时间，但绑定预约可提供）；LiveKit无候选人、Worker无活动任务后启动新服务。15秒内28条全部变为 `cancelled + appointment_window_expired`，活动列表归零，31条会话总数和全部证据保留。截图目标 `iv_3bdec492ad8f4247`、`iv_58da3095bac941c6` 各只有1条截止事件。实际1440×900页面目测候选人/时间/状态/操作列对齐，“已超时结束”徽标和右侧三点菜单位置一致；未点击任何移除项。
+- 失败留痕与恢复说明：前端首次定向命令误用仓库根相对路径，Vitest报告未找到文件且无副作用；改为包内路径后5项通过。第一次本机重载误加载 `.env.production.local`，指向已停6天的验证 PostgreSQL/Redis/ClamAV，readiness失败且截止任务未连接数据库、没有改变会话；随即按原本地 SQLite 配置再次通过空闲门禁重载，readiness恢复。截止收口是用户要求的正式生命周期终态，没有自动恢复为进行中的入口；它不删除已接受回答、录音、评分、报告或审计，仍可查看或从列表逻辑移除。
+
+## 2026-09-09 · INTERVIEW-LIST-VISUAL-POLISH-030
+
+- 状态：`verified（前端全量回归、生产构建与本机页面目测）`
+- 目标：优化面试会话列表的视觉层级和操作密度，保留029的列表移除语义与安全约束。
+- 关联问题：当前大白卡与重复描边按钮占用空间过多；禁用的红色“移除”在大量进行中/暂停会话上形成视觉噪声，候选人、时间、状态和操作缺少清晰列对齐。
+- 计划：改为带列标题的紧凑工作台列表，增加候选人头像/会话短编号，将“查看详情”降为轻量操作；只有可移除终态显示三点菜单，危险操作收纳为“移出列表”。补响应式样式、前端交互回归、生产构建与本机目测；不修改后端接口、状态机或任何真实会话数据。
+- 实际修改文件：`app/web/src/features/interviews/Page.jsx`、`app/web/src/features/interviews/Page.test.jsx`、`app/web/styles.css`、重建后的 `app/web/dist`，以及本日志。未修改029后端接口、会话数据或领域状态。
+- 验证命令与结果：定向 `Page.test.jsx` **5 passed**；前端全量 **202 passed/15 files**；`npm run build` 成功，入口 `index-C_Wubcuu.js`、样式 `index-C9pmD4Jx.css`，仅既有 VRM 大 chunk 提示；`git diff --check` 通过。本机 `/#interviews` 实际加载后，桌面列表表头、行分隔、头像、时间/状态对齐、“查看详情”轻操作及终态三点菜单均目测正常。
+- 页面操作与数据边界：只展开并关闭第一条报告就绪会话的三点菜单，确认“移出列表”浮层位置与颜色；没有点击该危险菜单项或确认按钮，31场现有会话保持不变。进行中/暂停会话不渲染三点菜单，报告就绪/已取消会话保留入口。
+- 失败留痕：首次构建工具调用参数字符串不完整，命令未执行；随后使用正确工作目录构建成功。前序临时浏览器标签已脱离当前会话，未复用或操作用户标签，改为新建隐藏本机验收标签；无数据副作用。
+- 未完成事项或恢复说明：本轮仅优化当前桌面与既有小屏断点，没有新增筛选、分页或回收站；这些不是本次视觉调整目标。恢复可回退上述 JSX/CSS 并重建 dist，不涉及数据恢复。
+
+## 2026-09-09 · INTERVIEW-LIST-REMOVAL-029
+
+- 状态：`verified（仓库全量回归、本机页面加载与确认框目测）`
+- 目标：在企业面试会话列表为管理员/面试官增加“移除”入口；采用会话列表逻辑归档，不物理删除候选人资料、回答、评分、报告、录音或审计证据。
+- 关联问题：当前列表只能查看，已取消或报告就绪的会话无法从日常工作区清理；直接删除候选人或会话证据会破坏历史可追溯性。
+- 计划：仅允许移除`cancelled`、`report_ready`终态会话，使用版本并发控制并记录真实操作者审计；默认列表过滤已移除会话，详情仍可按ID读取。前端提供二次确认、状态约束、成功刷新和错误提示；补后端/前端回归并同步接口、领域与存储说明。
+- 实际修改文件：`app/services/interviews.py`、`app/api/routers/interviews.py`、`app/web/src/features/interviews/{Page.jsx,Page.test.jsx}`、`tests/test_interview_session_aggregate.py`，以及生产前端 `app/web/dist` 重建；同步 `docs/{architecture,api-design,domain-model,database-and-vector-storage,development-progress,implementation-roadmap,change-log}.md` 与 `CONTEXT.md`。无 DDL、Prompt、供应商、评分或保留策略变更。
+- 验证命令与结果：定向后端 `tests/test_interview_session_aggregate.py + test_auth_audit.py + test_persistence_contract.py` 为 **31 passed**；前端全量为 **202 passed/15 files**；`npm run build` 成功，入口 `index-BfFVzpTq.js`，只有既有 VRM 大 chunk 提示。第二次完整后端回归为 **1634 passed/6 skipped in 121.54s**；`compileall`、`git diff --check` 通过。本机 `/#interviews` 已加载卡片、可用/禁用移除按钮及二次确认文案；只打开后关闭确认框，未提交真实移除。
+- 本机加载：既有守护重启脚本先确认 LiveKit 无候选人参与者且 Celery 无活动工作，再正常 TERM 并启动 API **72866**、worker **72867**；`healthz=ok`、`readyz.ready=true`，运行中 OpenAPI 的 `/api/v1/interviews/{interview_id}` 同时列出 GET/DELETE。重载后工作台仍显示 31 场原会话和正确状态约束，没有执行任何真实移除；PID/日志继续使用 `/private/tmp/interviewer-025-{pids.json,api.log,worker.log}`。
+- 失败与修正留痕：首次多文件 patch 因存储文档标题上下文不匹配整体未写入，拆分后成功。新后端测试首次沿用取消响应版本，但取消后的实时快照发布已推进聚合版本，正确改为重新读取最新版本后提交，与前端并发 helper 一致。首轮全量为 1633 passed/6 skipped/1 failed，既有自动收音时序用例超过截止约 21ms；该用例隔离复跑 1 passed，第二次全量无失败。沙箱 shell 首次无法直连本机 8000、浏览器直接打开 openapi.json 被客户端拦截；随后按网络权限读取 OpenAPI 并确认旧进程未加载 DELETE，执行有空闲门禁的既有重启脚本后再次读取确认 GET/DELETE 均已加载。以上失败均无数据副作用。
+- 未完成事项或恢复说明：本工作项不提供“已移除”回收站或 UI 恢复入口；详情和证据仍按 ID 保留，敏感数据清除继续走 retention purge。没有修改任何现有会话状态、候选人资料或历史媒体；如需撤回代码，移除新增 DELETE 路由/服务字段过滤/前端入口并重建 dist，已有数据中的可选标记不会破坏旧读取。
+
+## 2026-09-09 · RESUME-TAIL-AND-CHINESE-ASR-028
+
+- 状态：`verified（仓库回归、本机API、新计划与合成ASR）`；真实口音对照和锁屏后的页面目测仍pending，不标closed。
+- 目标：修复计划漏选简历题；默认选同候选人同岗位最新合格审核的最多3道已批准、有简历证据的问题，岗位题之后提问。候选人确认预约后异步生成专属语音，开场不等简历TTS，到尾部逐题校验就绪，未就绪明确跳过且不计0分。补中文术语与流式接口场景识别词表，继续直接语义评分。
+- 证据：iv_775785321827419d 已report_ready，六题全position_bank；冻结plan.resume_review_id为空，而同候选人同岗位存在有效审核及3题approved。PlansPage请求漏传审核，后端也不自动关联。Q5最终服务端转写确有流失/流逝/刘四/Steam，现有热词只提取ASCII；不覆盖中文流式术语。保留历史原文、录音及025–027未提交修改。
+- 计划文件：计划装配、预约准入、会话与生命周期、识别词表/网关合同、计划与预约页面；增加迟到TTS、跳过、组织/候选人边界和中文热词回归，并同步设计文档。
+- 验证/结果/未完成：实施中，尚未加载本机；不修改已经结束的面试题目或伪造历史答案。
+- 数据修复范围补充：为当前候选人/岗位通过既有生成API创建一份新批准计划（原6道岗位槽位数量+3道简历尾题），供后续预约使用。旧计划和已结束会话不变；核对无新增简历TTS任务、无新增预约/通知。先记录再执行，结果与新计划ID随后补充。
+- 实际文件：`app/services/{plan_assembly,interviews,avatar,agent_expression_audio,reports,review,recognition_vocabulary}.py`、`app/domain/{appointment_admission,appointment_speech,interview_lifecycle,recognition_lexicon}.py`、`app/model_gateway/schemas.py`、`app/providers/dashscope/provider.py`、`app/web/src/features/{plans/Page.jsx,interviews/Review.jsx,interviews/Review.test.jsx}`与dist；新增`tests/test_resume_tail.py`并更新position_resume_appointment_flow/recognition_vocabulary。同步架构、API、领域、评分、供应商、存储、CONTEXT、问题、进度、路线图及`docs/resume-tail-and-asr-review.md`。无DDL或供应商路由修改。
+- 行为验收：真实候选人已有3道approved有证据问题；新计划`plan_e173aa922a004cf5`已approved，6岗位+3简历，绑定`resume_review_e0c546ac45f74142`。已有会话JSON前后完全一致，简历TTS任务集合及预约集合均未增加；日志/private/tmp/interviewer-028-plan.log。未向候选人发邮件/邀请。
+- 回归：定向35 passed in3.54s（/private/tmp/interviewer-028-focused-2.log）；完整`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -o faulthandler_timeout=30 --tb=short` **1633 passed/6 skipped in125.07s**（/private/tmp/interviewer-028-full.log）。前端`npm test -- --run` **201 passed/15files**（/private/tmp/interviewer-028-web.log）；`npm run build`通过，index-CKBK5E0m.js，既有大chunk提示。git diff --check通过。
+- 覆盖：默认最新同组织/候选人/岗位合格审核，保留显式选项、最多3题、未批准/删除排除、缺题警告；确认预约后排队且重复登记不重复工作；TTS未就绪直接开场、2题迟到可问/第3题跳过、版本/音色/owner/取消/生产mock不匹配拒绝、已跳过不复活、迟到资产签名播放归属、全简历未就绪时报告只按实际答案计分。中文词表来源/边界、400字符上下文合同及不同模型范围也覆盖。
+- 本机加载：无活动候选人且worker空闲后正常重启API53276/worker53277；healthz/readyz/home均200，LiveKit rooms0。运行日志/PID仍沿用025位置，重启记录/private/tmp/interviewer-028-restart.log。CUA尝试查看页面时Mac锁屏且无法自动解锁，未声称页面目测通过；前端自动化与构建通过。
+- 合成ASR：本机Tingting生成独立14.040375秒示例，经当前真实ASR识别，15.28秒完成，识别出流式响应/流式返回/streaming/RAGFlow/REST API/向量召回/重排；/private/tmp/interviewer-028-synthetic-asr-2.log。只证明此合成例可识别，不等于非标准发音准确率提升已量化。
+- 失败留痕：初次patch上下文不匹配未写入；新测试fixture遗漏组织、错误码断言不符、mock资产无file_id、PCM类型遗漏及报告已自动完成后重复领取，修正后全通过。首次本地房间检查遗漏INTERVIEWER_LOCAL_MEDIA=true导致401，补开关后成功。沙箱系统语音首次产生零长度WAV（仅开流、无识别内容，不计准确率通过），经批准调用本机say重新生成14秒有效音频后完成真实合成识别。
+- 明确待授权事项：候选人既有录音末60秒的再次外发对照被自动审批拒绝，理由为敏感录音重新发送到外部ASR需要明确授权；脚本未执行、未发送该录音，已通过异步问题询问用户，尚未收到答复。没有绕过拒绝，合成测试只读取新的synthetic WAV。原始转写/音视频/分数未改。
+
+
+## 2026-09-09 · DIRECT-SCORING-AND-TERM-RECOGNITION-027
+
+- 状态：`verified（仓库、真实ASR热词接入、本机直接重评与页面）`；真实口音识别质量与生产验收仍pending，不标closed。
+- 用户调整：直接评分和生成报告，不以转写疑点要求人工核验；尽量优化识别，接受候选人术语发音不标准。此项明确替代026的强制待核验产品策略，保留未知置信度真实性、录音、语义容错和可选纠错。
+- 计划：统一质量投影保留有效数值、疑点改为非阻断提示，恢复历史暂定数值并按冻结权重汇总；前端与导出同步。评分Prompt升级v5，加入当题术语表及逐词/字母/近音的上下文理解规则；识别热词补参数自然读法，原文证据不改写。增加回归、真实模型评分及本地加载验证，保留025/026全部未提交工作。
+- 实际文件：`app/domain/scoring_quality.py`、`app/services/{review,reports,evaluation,recognition_vocabulary}.py`、`app/core/prompt/contracts.py`、`app/model_gateway/{schemas,gateway}.py`、`app/web/src/features/interviews/{Review.jsx,Review.test.jsx}`及dist。测试`tests/test_{speech_quality_governance,recognition_vocabulary,interview_processing_recovery,declined_answer_evaluation}.py`。同步架构、API、领域、评分、供应商、存储、CONTEXT、问题、进度、路线图、两个复盘文档与本日志。无DDL、供应商路由、凭据、麦克风采集策略改动。
+- 实现：valid_score验证有限0–100的真实数值；低置信度和转写歧义只保留recognition_warning/flags，旧provisional_score与维度只读恢复，报告按冻结权重恢复总分，缺少实际分数仍unavailable/processing，绝不以失败凑0分。企业完成复核不再要求解决识别提示；原回听纠错接口保持可选、版本/身份/并发绑定。网页和JSON/CSV正常输出分数及非阻断识别提示；不显示null分或强制待核验。
+- 识别与评分：当题原标识优先，再追加下划线/驼峰自然读法，最多100项/64字符/6词，标准答案和候选发言不作为词表来源；原DashScope词权重2和支持模型范围不改。answer_evaluation.v5直接传入术语表，要求按概念/作用/操作语义认可非标准读音，不按发音或置信度额外扣分，疑点仍可提示且证据保留原文。官方接口依据已记录于供应商文档。
+- 自动化：定向 **88 passed in1.40s**（/private/tmp/interviewer-027-focused.log）；完整`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -o faulthandler_timeout=30 --tb=short` **1621 passed/6 skipped in121.84s**（/private/tmp/interviewer-027-full.log）；前端 **200 passed/15files**（/private/tmp/interviewer-027-web.log），build通过（/private/tmp/interviewer-027-build.log，入口index-DhKweXm3.js，既有大chunk提示）；compileall和git diff --check通过。新增覆盖低STT仍出分、可选人工纠错、旧暂定值按3:1权重恢复、不改历史、无效值不能造分、热词来源/边界、页面与导出。
+- 真实ASR合同验收：`interviewer-027-asr-terms.py`对现有qwen-audio-3.0-asr-flash-streaming成功开流并立即关闭；8个词包含worker/task配置的原标识及自然读法，未发送候选录音或创建CandidateAnswer；日志/private/tmp/interviewer-027-asr-terms.log。此项只证明供应商接受新词表，不等于口音识别准确率已测量。
+- 本机加载与原题重评：restart再次确认无活动候选人及空闲worker后正常切换至API **41827**/worker **41828**（/private/tmp/interviewer-027-restart.log，运行日志与PID沿用025文件）。healthz/readyz/home均200；先确认旧第三题66/总分76已可直接读取，再调用已有regrade接口用v5重评第三题，HTTP200，真实DeepSeek成功一次、107.051秒。新第三题 **55**、全场 **75**，其余84/88/81/59/77不变，报告available，transcription_ambiguity仅提示。JSON/CSV均输出数字；原始转写/录音/核验事实散列及所有旧评分/报告内容保持一致，新建1评分revision与1报告revision（共7/2），未伪造回听。结果/private/tmp/interviewer-027-regrade.log。
+- 新分数说明：55是新Prompt下的实际模型重评结果，未手动提分；模型认可CPU/IO调优、prefetch/超时限流相关内容，列出的缺失为broker/result backend选型理由、指数退避/最大次数等重试细节及水平扩展方案。评分变化也说明单次LLM输出仍有波动，不能把本次重评当作公平性已完全校准。
+- 浏览器验收：新版原会话显示第3题55分、总分75/100、6/6完成、无待核验门禁，逐题音视频入口保留、纠错文字明确为可选。旧CUA标签已被关闭，重新定位同一本地URL后验收，无候选表单写入。一次只读诊断误用系统Python缺cryptography，改用项目venv完成；一次文件搜索命中不存在路径/误入dist导致输出截断，均无数据修改。
+- 未完成与边界：真实不同口音、背景噪声和专业术语准确率仍需新实机语音样本验证；未重新转写或改写历史音频/原文。录用决定仍由人负责，可选回听功能继续保留；按用户本次要求，识别不确定性不阻断评分与报告。
+
+## 2026-09-09 · SPEECH-UNDERSTANDING-FAIRNESS-026
+
+- 状态：`verified（仓库、真实合成语义与本机加载/回放）`；真实麦克风长场景和生产验收仍pending，不标closed。
+- 目标：补齐未知识别置信度、基于原文疑点的同题澄清、口语/术语容错与争议评分待核验闭环。
+- 证据：025原会话6题DashScope置信度均被适配器写为1.0；第三题transcription_ambiguity仍以66分计入76分总分。普通评分未按识别质量执行统一保护，澄清话术笼统且重新采集可能丢失此前回答上下文。
+- 计划：统一STT允许未知置信度并保留来源；未知不等于低可信，不阻塞正常语义理解。新增严格原文绑定的澄清焦点，在正式连续采集中保留完整录音/前文；Prompt版本化约束停顿/口头重复/可理解误拼不得扣技术分。统一评分质量门禁、待核验报告及导出、权限/版本绑定的回听确认或修正转写后异步重评；保留历史revision。补充供应商、完整采集、评分/复核/报告与前端回归。
+- 修改与验收：进行中；沿用025全部未提交文件，禁止覆盖其已验证修复。最终记录实际文件、失败尝试、验证结果及本机加载情况。
+- 实现：STT四类适配器不再伪造高可信值；统一schema与聚合保留None/真实低分段，答案记录provider/partial/unavailable/synthetic来源。understanding v8/v9、decision v7/v8强制wire显式返回可空澄清焦点，逐字证据校验；answer_clarification.v1在同一连续采集内播报、保留前文，静音不能重复澄清或提交。answer_evaluation.v4送入实际识别来源与人工核验事实，口语习惯不作为技术/表达扣分依据。
+- 评分与复核：scoring_quality集中处理低可信、原理解歧义和模型争议，保留暂定值、置空确定分数和总分；未知本身不判错。新增版本绑定的transcription-verification接口202，真实登录身份、回听声明、同题并发保护、修正和Outbox同事务；保留原录音、评分及报告revision。旧transcript修正入口也将改文和重评分排队改为同事务。报告/导出/读取/完成回执一致投影；未决评分禁止完成复核。Review页展示待核验、未知置信度、回听表单和重评旧版本提示，前端event codec接受null。
+- 中途验证与留痕：最初定向收集因media_http漏Optional导入失败，修复后运行；一次误用不存在的测试文件导致exit4无测试；SQLite新断言错误地依赖数组顺序，已按evaluation_id核验。首次全量19 failed/1584 passed/6 skipped，均为新Prompt版本断言未同步，后更新；141项定向仅1项旧整段0.95断言未体现分段0.9，按保留低分段合同调整。其后完整1606 passed/6 skipped（123.69秒，/private/tmp/interviewer-026-final-full.log）。
+- 真实合成：沙箱首次网络失败触发短期供应商熔断，未改路由/凭据，获准网络后真实评分2/2成功（同义流畅/口语均98，表达维度100/95，不能宣称完全无偏差）；待正常冷却后真实理解3/3成功。发现可选焦点虽在Prompt要求仍被结构化生成省略，改为wire必填但可null，同步Mock和8个测试fixture的显式字段；最终真实3/3且歧义焦点为原文“它到底是进程内还是独立服务”，解释后next。日志分别为/private/tmp/interviewer-026-semantics.log、-semantics-network.log、-understanding.log、-understanding-focus.log、-understanding-required.log。没有外发旧录音或写入候选答案/回听声明，仅新增常规模型调用审计。
+- 收尾检查：补新Prompt版本审计白名单和5项合同测试；必填焦点调整后定向200 passed（11.86秒，/private/tmp/interviewer-026-required-impact.log）。前端最终200 passed/15files（/private/tmp/interviewer-026-final-web2.log），构建成功（仅既有VRM大chunk提示）；compileall、git diff --check通过。完整最终回归与加载结果待追加。
+
+
+- 实际文件：新增`app/domain/{speech_quality,scoring_quality}.py`、`tests/test_speech_quality_governance.py`、`docs/speech-understanding-review.md`；修改`app/domain/interview_agent.py`、`app/model_gateway/{schemas,gateway}.py`、`app/core/prompt/{contracts,understanding_references}.py`、`app/providers/{dashscope,openai,media_http,volcengine,mock}/provider.py`、`app/schemas/api.py`、`app/api/routers/interviews.py`、`app/services/{continuous_stt,conversation_understanding,spoken_supplement,answer_endpoint,interviews,interview_agent,livekit_evidence_ingress,evaluation,reports,review,fairness}.py`。前端`features/candidate/agent-experience.js`、`features/interviews/{agent-event-runtime.js,agent-event-runtime.test.js,Review.jsx,Review.test.jsx}`、styles.css及dist重建。同步`tests/test_{answer_declined_understanding,declined_answer_evaluation,declined_answer_integration,interview_agent_contracts,model_invocation,optional_followup_isolation,prepared_decision_binding,prepared_turn_decision,prompt_governance,recognition_vocabulary,spoken_supplement_integration,stable_preview_preparation,supplement_contracts,understanding_safety,interview_processing_recovery}.py`；架构、API、领域、评分、供应商、存储、CONTEXT、问题、进度、路线图、025复盘及本日志。025前序改动完整保留，无DDL变更。
+- 必填字段切换留痕：首轮完整运行在Mock和fixture尚未补齐新字段时已加载旧输入，112 failed/1499 passed/6 skipped in253.93s（/private/tmp/interviewer-026-required-target.log）；显式null仅加入完整理解fixture，不放宽字段校验，另增加缺字段拒绝合同测试。全部修改完成后的最终`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -o faulthandler_timeout=30 --tb=short`为 **1612 passed/6 skipped in126.37s**（/private/tmp/interviewer-026-release-full.log）。前端最终 **200 passed**，build入口`index-CxNy0BFP.js`，compileall及git diff --check通过。
+- 本机加载：只读LiveKit为0活动房间，restart脚本再次核验无candidate且Celery空闲后正常TERM并启动API **34432**、worker **34433**（/private/tmp/interviewer-026-restart.log；日志沿用025-api.log/025-worker.log，PID文件沿用025-pids.json）。healthz/readyz/home均200；真实原会话review显示6题评分完成、第三题pending_verification、总分null、6题音频/视频均可用，JSON/CSV导出同样待核验。/private/tmp/interviewer-026-live-check.log记录历史答案/转写/录音引用/评分/报告散列完全不变。
+- 浏览器验收：重新加载真实新版bundle，原会话第三题待核验、原建议66分有明确暂定标识、历史伪1.0显示未知；未勾选真实回听声明时保存按钮禁用。独立WAV时长188.98秒、currentTime17.26、readyState4、无错误且正常播放；本题MP4自动定位到391.82秒后继续播放，1280×720/1056.996秒/readyState4/无错误。已停止验收播放，保留第三题及展开的核验表单，没有点击真实回听声明或提交任何候选更正。
+- 未完成事项：需真人回听第三题并核验实际术语后产生新的正式评分；不能代签回听或给历史答案补知识。真实麦克风长停顿、口音/噪声、专有词逐词准确率、生产外部服务仍待实机验收；当前规则与小样本真实文本探针不保证所有模型评分完全一致。缺陷、操作入口与验证边界见`docs/speech-understanding-review.md`。
+
+## 2026-09-09 · INTERVIEW-REPORT-PLAYBACK-025
+
+- 状态：`verified（仓库、原会话评分恢复与本机浏览器回放）`；生产外部服务验收仍pending，不标closed。
+- 目标：修复面试提交后的评分截断、失败恢复与自动报告闭环；补齐企业全场/逐题音视频回放和录像最终校验。
+- 关联问题与证据：目标会话 `iv_b83f260b6a8744f1` 已于06:51:20Z收齐6份答案，6项评分均dead_letter，每项5次共30次真实调用；DeepSeek输出预算1200且reasoning_tokens=1200、正文为空。6份逐题WAV存在（159.30/130.52/188.98/104.12/116.14/88.06秒），MP4存在（410511004字节），capture却停留hash_pending；StopEgress返回EGRESS_ENDING，缺少异步最终校验。企业页只渲染实时监看，不读取复核与历史媒体，且以private_uri存在误报hash已校验。
+- 计划：评分独立输出预算、有限自适应截断恢复与正确错误分类/租约；持久化录像收尾工作、私有签名与Range回放；真实完成/失败/处理中投影、逐题选择和后台重试；新增合同与集成回归并同步相关设计文档。保留冻结答案、转写和历史评分，恢复仅经过领域/工作接口。
+- 首轮完整验证：1589 passed/6 skipped（117.92秒），前端195 passed/15文件，build成功。初轮2处失败分别为未知RuntimeError需保留可重试语义及Prompt旧版本断言，修正后通过；新增执行预算测试首轮误用了不存在的registry属性，改为既有provider_clients注入后30项通过。
+- 运行恢复留痕：读取进程/本地Python网络受沙箱限制后按授权重试；误套生产环境文件导致本地录制readiness拒绝，随后使用与当前服务一致的本地开发环境，未改变持久配置。只读ListRooms首次使用roomAdmin而无roomList权限返回401，按独立只读roomList grant纠正。重启前确认仅2个企业监看连接、无候选人且worker空闲；首次新API24624/worker24625，数据库先备份至权限0600的/private/tmp/interviewer-025-before-recovery.sqlite3。第一轮恢复已完成录像校验，但6项评分暴露原路由timeout30/retry1：12次真实超时及24次本地熔断拒绝，均未生成评分或改变答案，保留此失败历史。继续补齐通用InvocationExecutionBudget，评分120秒/网关重试0、暂时故障Outbox至少35秒；重新加载API25306/worker25307，先重放一题验证真实模型，避免再次批量失败。
+- 录像验收：LiveKit最终EGRESS_COMPLETE，Provider size与本地410511004字节一致；ffprobe为AAC+H264/1280×720/1056.996秒。浏览器第三题独立WAV duration188.98、readyState4、currentTime递增无错误；对应视频readyState4、1280×720、currentTime383.619从第三题窗口播放无错误。旧视频窗口含读题，不宣称精确剪辑。
+- 最终原会话恢复：首题真实模型90696ms成功后，仅将其余5项通过`POST /api/v1/interviews/iv_b83f260b6a8744f1/processing/retry`重放；6项均在本轮第1次尝试完成，真实耗时52228–90696ms，全部answer_evaluation.v3。最后一题于07:56:08Z落库后自动生成`report_631629298d6c49f7`，session=report_ready、总分76、manual_review；6题顺序分数84/88/66/81/59/77。浏览器无需手动“完成”即自动显示“报告已生成、6/6、待处理0、失败0”。媒体收尾及报告工作也均completed。对比备份确认6份原答案的id/turn_id/audio_uri/final_transcript/created_at/duration_seconds完全一致，未改写历史回答或录音。
+- 最终验证命令及结果：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q -o faulthandler_timeout=30 --tb=short` **1590 passed、6 skipped、119.83秒**（`/private/tmp/interviewer-025-acceptance.log`）；`npm --prefix app/web test -- --run` **195 passed/15files**（`/private/tmp/interviewer-025-web-final.log`）；`npm --prefix app/web run build`成功（`/private/tmp/interviewer-025-build-final.log`），仅既有VRM大chunk提示。`PYTHONPYCACHEPREFIX=/private/tmp/interviewer-025-pycache .venv/bin/python -m compileall -q app`与`git diff --check`通过。新增回归覆盖Memory/SQLite失败单次终止和幂等恢复/自动报告、单次扩展预算、关键点入Prompt、严格嵌套Schema、路由执行预算、ENDING部分文件拒绝/无webhook补偿、视频分块Range/HEAD/416/许可撤销/租户隔离，以及前端切题竞态、时间窗口、处理失败与自动刷新。
+- 实际修改文件：`.env.example`、`CONTEXT.md`；`app/adapters/{livekit_media,local_media,private_media}.py`、`app/api/routers/{interviews,talent}.py`、`app/core/{auth,prompt/contracts}.py`、`app/domain/interview_lifecycle.py`、`app/file_storage/{interface,local,aliyun_oss}.py`、`app/model_gateway/{schemas,gateway}.py`、`app/persistence/interface.py`、`app/services/{evaluation,interviews,media_capture,review,streaming_stt}.py`、`app/transport/http/media.py`、`app/workers/outbox.py`；`app/web/src/core/ui.jsx`、`app/web/src/features/interviews/{Page,Review,Review.test}.jsx`、`app/web/styles.css`及重建`dist/index.html`/3份bundle；`tests/{test_interview_processing_recovery,test_interview_agent_contracts,test_model_invocation,test_recognition_vocabulary}.py`；系统架构/API/领域/检索评分/供应商/存储/已知问题/进度/路线图/本日志及新增`docs/interview-report-playback-review.md`。无需DDL迁移；未改持久化模型路由或凭据。
+- 运行状态与恢复方式：本机API25306和worker25307持续运行新代码，日志分别在`/private/tmp/interviewer-025-{api,worker}.log`；数据库备份保留，不回滚成功评分。将来失败可在复核页“重试未完成处理”沿同一工作ID恢复，成功工作不重复评分；短期媒体许可过期后重新点击播放。旧浏览器页面刷新后加载`index-B5Hiz8-U.js`。
+- 未完成事项与边界：历史MP4仅按题目服务端时间窗口导航；新录音开始/结束时间与时长有自动化覆盖，但尚未另开真实候选人完成一场新面试验证精确回答窗口。真实生产OSS/跨实例/外部凭据与浏览器录制质量仍需部署验收；不能将本机恢复称为生产验收。后续可加入评分尾延迟、dead-letter和录像收尾超时告警；此次不新建监控自动化。
+
 ## 2026-09-08 · CONFIRMED-PREPARATION-WAIT-024
 
 - 状态：`verified（仓库、真实合成决策与本地加载）`；真实麦克风长会话与外部模型尾部时延仍pending，不标closed。

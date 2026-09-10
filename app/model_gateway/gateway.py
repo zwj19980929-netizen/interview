@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from copy import deepcopy
 from dataclasses import dataclass
@@ -225,6 +226,9 @@ class ModelGateway:
         targets = [resolved_route.get("primary") or {}] + list(resolved_route.get("fallbacks") or [])
         policy = resolved_route.get("policy") or {}
         retry_count = min(3, max(0, int(policy.get("retry_count", 0))))
+        execution_budget = getattr(request, "execution_budget", None)
+        if execution_budget is not None:
+            retry_count = min(retry_count, execution_budget.max_provider_retries)
         backoff_ms = min(1000, max(0, int(policy.get("retry_backoff_ms", 0))))
         circuit_threshold = max(0, int(policy.get("circuit_failure_threshold", 3)))
         circuit_recovery_seconds = max(0.0, float(policy.get("circuit_recovery_seconds", 30)))
@@ -234,7 +238,7 @@ class ModelGateway:
         for fallback_index, target in enumerate(targets):
             model_configuration_id = str(target.get("model_configuration_id") or "")
             model = "unknown"
-            timeout_s = max(0.01, float(target.get("timeout_s", 20)))
+            timeout_s = execution_budget.timeout_s if execution_budget is not None else max(0.01, float(target.get("timeout_s", 20)))
             provider_id = "unknown"
             provider_connection_id = "unknown"
             circuit_key = "%s:%s:%s" % (request.organization_id, model_configuration_id, capability)
@@ -908,7 +912,9 @@ class ModelGateway:
                 try:
                     validate_structured_response(response.data, request.json_schema)
                 except StructuredResponseValidationError as exc:
-                    self._schema_error(str(exc))
+                    raise ProviderError("provider_schema_invalid", "Structured response did not match the request contract.",
+                                        retryable=True, details={"schema_reason": exc.reason_code,
+                                                                 "schema_path": exc.schema_path}) from exc
         elif isinstance(request, ChatTextRequest) and isinstance(response, ChatTextResponse):
             if not response.text.strip():
                 self._schema_error("Text response cannot be empty.")
@@ -1024,11 +1030,19 @@ class ModelGateway:
                 "interview_turn_understanding.v1", "interview_turn_understanding.v2", "interview_turn_understanding.v3",
                 "interview_turn_understanding.v4", "interview_turn_understanding.v5",
                 "interview_turn_understanding.v6", "interview_turn_understanding.v7",
+                "interview_turn_understanding.v8", "interview_turn_understanding.v9",
                 "interview_turn_decision.v3", "interview_turn_decision.v4", "answer_evaluation.v2",
+                "answer_evaluation.v3", "answer_evaluation.v4", "answer_evaluation.v5",
                 "interview_turn_decision.v5", "interview_turn_decision.v6",
-                "interview_turn_decision.v1", "interview_turn_decision.v2", "supplement_reply.v1", "supplement_reply.v2",
+                "interview_turn_decision.v7", "interview_turn_decision.v8",
+                "interview_turn_decision.v1", "interview_turn_decision.v2", "supplement_reply.v1", "supplement_reply.v2", "supplement_reply.v3",
             } else None,
             "http_status": diagnostics.get("http_status") if diagnostics.get("http_status") in {400, 404, 409, 413, 422} else None,
+            "schema_reason": diagnostics.get("schema_reason") if diagnostics.get("schema_reason") in {
+                "enum", "type", "required", "min_properties", "additional_properties", "min_items", "max_items",
+                "unique_items", "minimum", "maximum", "min_length", "max_length",
+            } else None,
+            "schema_path": diagnostics.get("schema_path") if re.fullmatch(r"\$[A-Za-z0-9_.\[\]]{0,160}", str(diagnostics.get("schema_path", ""))) else None,
             "rejection_category": diagnostics.get("rejection_category") if diagnostics.get("rejection_category") in {
                 "request_rejected", "structured_schema_rejected", "output_limit_rejected",
             } else None,

@@ -7,6 +7,7 @@ from typing import BinaryIO, Optional
 
 from app.core.errors import ApiError
 from app.core.ids import new_id
+from app.core.time import utc_now
 
 
 SAFE_ID = re.compile(r"^[a-zA-Z0-9_-]+$")
@@ -54,6 +55,9 @@ class RecordingResult:
     audio_uri: str
     mime_type: str
     byte_count: int
+    duration_seconds: Optional[float] = None
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
 
 
 class LocalMediaRecording:
@@ -78,6 +82,7 @@ class LocalMediaRecording:
         self.sample_rate_hz = sample_rate_hz
         self.channels = channels
         self.byte_count = 0
+        self.started_at = None
         self._file: Optional[BinaryIO] = path.open("wb")
         if self.pcm_input:
             pcm_wav_header(0, sample_rate_hz=self.sample_rate_hz, channels=self.channels)
@@ -92,6 +97,7 @@ class LocalMediaRecording:
             raise ApiError("MEDIA_CHUNK_TOO_LARGE", "Audio chunk exceeds the size limit.", status_code=413)
         if self.byte_count + len(chunk) > self.max_recording_bytes:
             raise ApiError("MEDIA_RECORDING_TOO_LARGE", "Audio recording exceeds the size limit.", status_code=413)
+        self.started_at = self.started_at or utc_now()
         self._file.write(chunk)
         self.byte_count += len(chunk)
 
@@ -113,6 +119,8 @@ class LocalMediaRecording:
             audio_uri=self.audio_uri,
             mime_type=self.mime_type,
             byte_count=self.byte_count + (44 if self.pcm_input else 0),
+            duration_seconds=self.byte_count / (self.sample_rate_hz * self.channels * 2) if self.pcm_input else None,
+            started_at=self.started_at, finished_at=utc_now(),
         )
 
     def abort(self) -> None:

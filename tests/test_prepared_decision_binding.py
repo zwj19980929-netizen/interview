@@ -130,7 +130,7 @@ async def test_heartbeat_and_text_edge_whitespace_do_not_invalidate_valid_prepar
     payload["final_transcript"] = TEXT
     result = await service.submit_streaming_answer("iv_binding", payload, prepared_decision=prepared)
     assert result["accepted"] is True
-    assert result["answer"]["stt_confidence"] == 0.95
+    assert result["answer"]["stt_confidence"] == 0.9  # Preserve the lower reported segment confidence.
     assert result["answer"]["transcript_segments"] == payload["segments"]
 
 

@@ -4,6 +4,7 @@ from statistics import mean
 from typing import Any, Dict, List, Optional
 
 from app.core.ids import new_id
+from app.domain.scoring_quality import evaluation_answers, project_evaluation
 from app.core.errors import ApiError
 from app.core.time import utc_now
 from app.persistence.interface import Persistence
@@ -122,13 +123,16 @@ class FairnessEvaluationService:
                 answer = answers.get(evaluation.get("answer_id"))
                 if not answer or answer.get("current_evaluation_id") != evaluation.get("id"):
                     continue
+                evaluation = project_evaluation(evaluation, evaluation_answers(session, evaluation))
+                if evaluation["score"] is None:
+                    continue
                 turn = turns.get(answer.get("turn_id"), {})
                 question = turn.get("question_snapshot", {})
                 current[evaluation["id"]] = {
                     "ai_score": float(evaluation["score"]),
                     "question_type": str(question.get("source_type") or question.get("type") or "unknown"),
                     "language": str(answer.get("language") or "unknown"),
-                    "stt_quality": _stt_quality(float(answer.get("stt_confidence", 0.0))),
+                    "stt_quality": _stt_quality(answer.get("stt_confidence")),
                 }
         missing = sorted(set(label_ids).difference(current))
         if missing:
@@ -199,7 +203,9 @@ class FairnessEvaluationService:
         return result
 
 
-def _stt_quality(confidence: float) -> str:
+def _stt_quality(confidence: Optional[float]) -> str:
+    if confidence is None:
+        return "unknown"
     if confidence >= 0.9:
         return "high"
     if confidence >= 0.75:

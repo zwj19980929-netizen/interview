@@ -244,3 +244,62 @@ def test_low_confidence_speech_is_not_permission_to_finish():
         assert not endpoint.capture.replies and not commits
         await endpoint.close()
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("recovery", ["new_words", "explicit_retry"])
+def test_classification_failures_are_bounded_by_words_not_acoustic_revisions(recovery):
+    async def scenario():
+        endpoint, clock, notices, commits, spoken = setup()
+        await ask(endpoint, clock, spoken)
+        async def fail(reply):
+            raise ValueError("synthetic invalid classifier output")
+        endpoint.capture.classify_impl = fail
+        endpoint.capture.current_final = _final("合成回答结束。我补充一个处理方法。")
+        for attempt in range(3):
+            endpoint.speech_started()
+            clock.value += 5
+            await _until(lambda: endpoint._prepare_failures == attempt + 1)
+        assert len(endpoint.capture.replies) == 3
+        assert "understanding_retry_exhausted" in notices
+        for _ in range(3):
+            endpoint.speech_started()
+            clock.value += 10
+            await asyncio.sleep(.06)
+        assert len(endpoint.capture.replies) == 3
+        assert not commits and endpoint.capture.is_open
+        endpoint.capture.classify_impl = None
+        endpoint.capture.intent = "continue"
+        if recovery == "new_words":
+            endpoint.capture.current_final = _final("合成回答结束。我补充一个处理方法。还有超时重试。")
+            endpoint.observe_transcript(endpoint.capture.current_final.text)
+        else:
+            endpoint.continue_speaking()
+        endpoint.speech_started()
+        clock.value += 5
+        await _until(lambda: spoken[-1] == "continue")
+        assert len(endpoint.capture.replies) == 4
+        assert not commits and endpoint.capture.is_open
+        await endpoint.close()
+    asyncio.run(scenario())
+
+
+def test_successful_reply_retry_clears_transient_warning():
+    async def scenario():
+        endpoint, clock, notices, commits, spoken = setup()
+        await ask(endpoint, clock, spoken)
+        async def classify(reply):
+            if len(endpoint.capture.replies) == 1:
+                raise ValueError("synthetic schema mismatch")
+            return {"intent": "continue", "confidence": .98, "evidence_quote": reply}
+        endpoint.capture.classify_impl = classify
+        endpoint.capture.current_final = _final("合成回答结束。我还想补充。")
+        endpoint.speech_started()
+        clock.value += 1
+        await _until(lambda: "understanding_unavailable" in notices)
+        clock.value += 3
+        await _until(lambda: spoken[-1] == "continue")
+        assert notices.index("understanding_unavailable") < len(notices) - 1
+        assert "supplement_awaiting_reply" in notices[notices.index("understanding_unavailable") + 1:]
+        assert len(endpoint.capture.replies) == 2 and not commits
+        await endpoint.close()
+    asyncio.run(scenario())

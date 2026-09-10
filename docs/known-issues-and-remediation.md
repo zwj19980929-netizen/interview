@@ -1,5 +1,35 @@
 # 已知问题与修复设计
 
+## 2026-09-10 · 追问后的重复理解告警与候选人体验（034）
+
+FOLLOWUP-STABILITY-AND-SPEECH-LATENCY-034 / verified（仓库、新合成路由、本机加载；真实长时未验收）。iv_e71152c5e7814a20的07:05–07:09调用记录确认supplement_reply.v2发生16次provider_schema_invalid、4次provider_circuit_open；不是评分或TTS失败。历史记录缺schema路径，无法断定每次具体是quote长度还是输出截断。端点未约束补充分类次数，声音revision变化使失败继续增长，放大供应商错误。
+
+实现：v3编号证据避免长quote输出；按同一原文三次失败封顶，成功清除临时警告，显式重试可恢复。新增可观察schema规则与路径。候选人用简短等待/重试/暂停提示，移除底层术语和重复诊断卡；真实中断仍停止作答。动态TTS收齐完整PCM后私有落盘，修复实测Qwen字符串null、固定WAVE头与usage空通知适配，完整final之前不得发布。追问不复读冗长原话。验证结果与边界见操作日志034；尚未宣称真实长时面试或所有供应商通过。
+
+最终验收：后端1668 passed/6 skipped、前端225 passed/17 files、构建与diff检查通过；无活动候选人/worker空闲后加载API与worker，ready=true，服务引用新入口index-6jgz8ceW.js。同一句合成TTS三轮完整准备中位数2334→2048ms，首轮新路径更慢，不能保证逐次改善；原始指标、失败留痕和回退办法见[操作日志034](change-log.md)。未重采真实候选人录音，不标closed。
+
+## 2026-09-09 · 候选人错误跨页串场（033）
+
+CANDIDATE-SESSION-ISOLATION-033 / verified（前端竞态回归、生产构建与本机脚本加载；真实重新入场未执行，不标 closed）。根因是 await 前先写新 token，却保留旧 selectedInterview，并复用 CandidateRoom 的 startingProblem/avatarReady；旧会话 avatar-config/runtime-problems 返回403后污染新页。日志中 iv_64f16cae229144db 的公共投影、资产与 agent-ticket 均成功，403 属于旧 iv_775785321827419d，不支持“新凭证已经过期”的判断。
+
+已补原子会话绑定、路由/代次响应过滤、房间按身份重建、旧资产/启动取消及迟到资源释放；当前致命故障隐藏继续发言/播放状态并禁用答题，真实授权错误仍失败关闭。新增14项针对性回归，最终全前端 **218 passed/16 files**，构建和本机入口 index-2uYMAki_.js 加载通过；详细文件、失败留痕与验证范围见[操作日志033](change-log.md)。此次未重新采集候选人音视频或修改真实会话。
+
+## 2026-09-09 · 简历尾题与中文识别（028）
+
+RESUME-TAIL-AND-CHINESE-ASR-028 / verified（仓库、本机API与合成ASR；真实口音及页面目测pending）：已定位计划漏绑定简历审核及英文热词缺少中文流式术语。实现自动关联最多3道简历尾题、预约后生成/开场不阻塞/尾部检查/有原因跳过、迟到语音授权播放及中文术语上下文。定向35项、后端1633 passed/6 skipped、前端201项通过，构建及本机加载完成（API53276/worker53277）；新计划plan_e173aa922a004cf5为6岗位+3简历，未预生成TTS。14秒合成语音能识别目标术语；Mac锁屏，页面目测未做。真实录音对照被自动审批拒绝（敏感录音再次外发需明确授权），等待用户选择，不影响其它验证；真实口音准确率与生产验收不标verified/closed。
+
+## DIRECT-SCORING-AND-TERM-RECOGNITION-027
+
+状态：verified（仓库、真实ASR热词接入、本机原题重评与页面），真实口音质量及生产仍pending。识别争议不再卡住数值分数/总分，未知置信度与可选纠错保留；新增参数逐词读法热词、评分Prompt v5。后端1621 passed/6 skipped、前端200 passed，构建/静态检查通过；API41827/worker41828已加载。第三题真实重评55分、全场75分，JSON/CSV一致，原转写/录音与历史版本保持不变。以下026为历史记录，其强制核验策略已由027取代。详见[说明](speech-understanding-review.md)与[操作日志](change-log.md)。
+
+## SPEECH-UNDERSTANDING-FAIRNESS-026
+
+状态：verified（仓库、真实合成语义与本机加载/回放），真实麦克风长场景及生产仍pending，不标closed。已补齐未知置信度及低可信片段保护、原文焦点澄清并保留同一录音、争议分数与总分待核验、企业回听确认/修正后异步重评。后端1612 passed/6 skipped、前端200 passed、构建和静态检查通过；真实同义流畅/口语样本总分均98，明确解释后可继续，歧义可引用原文焦点。API34432/worker34433已加载，原会话第三题独立录音与视频定位播放正常、总分待核验，历史数据未改写。详见[修复说明](speech-understanding-review.md)与[操作日志](change-log.md)026。
+
+## INTERVIEW-REPORT-PLAYBACK-025
+
+状态：verified（仓库与本机原会话恢复），生产验收仍pending，不标closed。修复评分1200 token默认预算、30秒超时与重复重试、关键点未进Prompt、缺少完成后复核/逐题回放、ENDING立即校验且无人补偿、private_uri误报hash完成、PCM时长为0。后端1590 passed/6 skipped、前端195 passed及build通过；原会话6题真实评分全部恢复并自动生成76分报告，原回答/转写/录音引用保持一致；浏览器独立音频与视频跳转播放成功。历史视频按题目窗口定位，新采集时间窗口尚待新场真实录制验收；完整证据与优化项见[问题复盘](interview-report-playback-review.md)及[操作日志](change-log.md)。
+
 ## CONFIRMED-PREPARATION-WAIT-024（verified：仓库、真实合成决策与本地加载）
 
 iv_25335313fb1b4dea确认结束后同输入18次模型调用、234.399秒模型耗时；均通过原始wire后被后续校验拒绝，旧日志不足以追认具体字段。已修可选追问拒绝连带废弃有效理解、声音刷新失败预算、孤儿失败未计数、完成缓存到期/可取消等待和陈旧整理投影。相同文字3次失败后停止模型重试但保留采集；新文字/显式重试依合同恢复。完整1568项、前端190项通过，另新状态清理与安全日志目标回归通过；真实新合成两段均1次决策（8.506/5.336秒）。无活动房间时已加载PID70161和index-C_WF3WKO.js，023同次生效，历史答案保留。详细失败和验证见日志024；真实麦克风长会话/供应商尾部时延仍pending，不标closed。

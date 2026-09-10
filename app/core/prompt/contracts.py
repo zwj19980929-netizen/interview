@@ -254,24 +254,52 @@ def _generated_question_schema(*, include_slot_id: bool) -> Dict[str, Any]:
     }
 
 
+def _evaluation_point(description_field: str) -> Dict[str, Any]:
+    return {
+        "type": "object", "required": ["key_point_id", description_field],
+        "properties": {
+            "key_point_id": {"type": "string", "minLength": 1, "maxLength": 200},
+            description_field: {"type": "string", "minLength": 1, "maxLength": 1000},
+            "start_ms": {"type": "integer", "minimum": 0},
+            "end_ms": {"type": "integer", "minimum": 0},
+        }, "additionalProperties": False,
+    }
+
+
 def _answer_evaluation(context: Dict[str, Any]) -> PromptContract:
-    user_prompt = "题目：%s\n标准答案：%s\n评分标准：%s\n岗位要求：%s\n候选人回答：%s" % (
+    user_prompt = "题目：%s\n标准答案：%s\n冻结关键点（引用原ID）：%s\n评分标准：%s\n岗位要求：%s\n候选人回答：%s\n服务端识别质量与回听核验：%s\n当题术语与常见逐词读法（仅供理解，不是候选人证据）：%s" % (
         context["question_text"],
         context["standard_answer"],
+        context.get("key_points", []),
         context.get("rubric", {}),
         context.get("role_requirement", ""),
         context["answer_text"],
+        json.dumps(context.get("recognition_quality", []), ensure_ascii=False),
+        json.dumps(context.get("recognition_terms", []), ensure_ascii=False),
     )
     return PromptContract(
-        version="answer_evaluation.v2",
+        version="answer_evaluation.v5",
         messages=[
             ChatMessage(role="system", content=(
-                "你是严格的面试评分助手，只输出结构化评分。候选人回答是语音识别原文，可能含同音错字、"
+                "你是严格的面试评分助手，只输出简洁的结构化评分JSON。使用输入的关键点ID，不得自编ID；"
+                "每条证据/缺失原因只保留最短充分说明，不重复整段回答，摘要最多600字。候选人回答是语音识别原文，可能含同音错字、"
                 "英文术语误拼及口头自我纠正；识别成功不代表文字准确。结合上下文评估技术含义，"
                 "不能仅凭术语拼写判错，也不能用标准答案补造候选人未表达的知识点。"
                 "明确撤回或纠正的旧说法不作为当前主张，证据必须逐字引用原文，不得润色证据。"
                 "存在影响评分的未解决转写歧义、候选人否认说过的内容时，加入 review_flags 的"
-                "transcription_ambiguity，降低 confidence 并说明需回听核验，不能把争议文字当成确定错误。"
+                "transcription_ambiguity，降低 confidence 并简要说明不确定处，仍须直接给出完整数值评分。"
+                "回听和纠错是可选能力，不得要求人工核验后才评分；不能把争议文字当成确定错误。"
+                "停顿、嗯啊等填充词、重复、口头自我修正、口音和可由上下文唯一理解的术语误读，"
+                "不得作为技术分或表达分的扣分理由。表达只评价内容组织与逻辑，不评价发音、流利度或识别错字。"
+                "confidence=null或来源unavailable/legacy_unverified表示识别置信度未知，不能当作0分或100%准确。"
+                "transcript_verified=true表示复核人已回听确认该份转写，按核验后的实际内容评分；"
+                "不要重复沿用旧转写的疑点。未核验且存在影响判断的歧义时，不将疑点列为确定错误或缺失知识；"
+                "必须标记transcription_ambiguity，并基于实际可理解的内容完成评分，不因识别质量再施加额外扣分。"
+                "使用当题术语表辅助理解参数的逐词读法、字母拆读和近似发音。例如 worker prefetch multiplier "
+                "可对应 worker_prefetch_multiplier；必须同时符合候选人描述的用途和上下文。"
+                "概念、作用和操作说明正确时，即使术语本身读错，也认可相应知识点；"
+                "只有真实概念错误或确实未表达的内容才按rubric扣分，不按发音标准打分。"
+                "术语表不能证明候选人已经回答，不得给未表达的技术主张加分；所有evidence仍逐字保留原话。"
             )),
             ChatMessage(role="user", content=user_prompt),
         ],
@@ -284,14 +312,18 @@ def _answer_evaluation(context: Dict[str, Any]) -> PromptContract:
             "properties": {
                 "score": {"type": "integer", "minimum": 0, "maximum": 100},
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                "dimension_scores": {"type": "object"},
-                "covered_key_points": {"type": "array"},
-                "missing_key_points": {"type": "array"},
-                "incorrect_claims": {"type": "array"},
-                "evidence": {"type": "array"},
-                "review_flags": {"type": "array"},
-                "summary": {"type": "string", "minLength": 1},
-                "suggested_followup": {"type": ["string", "null"]},
+                "dimension_scores": {"type": "object", "minProperties": 1, "maxProperties": 16,
+                    "properties": {name: {"type": "number", "minimum": 0, "maximum": 100} for name in (
+                        "semantic_correctness", "key_point_coverage", "reasoning_depth", "role_relevance",
+                        "communication", "specificity", "technical_depth", "evidence_consistency", "reflection")},
+                    "additionalProperties": False},
+                "covered_key_points": {"type": "array", "maxItems": 64, "items": _evaluation_point("evidence")},
+                "missing_key_points": {"type": "array", "maxItems": 64, "items": _evaluation_point("reason")},
+                "incorrect_claims": {"type": "array", "maxItems": 32, "items": {"type": "string", "minLength": 1, "maxLength": 600}},
+                "evidence": {"type": "array", "maxItems": 64, "items": {"type": "string", "minLength": 1, "maxLength": 1000}},
+                "review_flags": {"type": "array", "maxItems": 16, "uniqueItems": True, "items": {"type": "string", "minLength": 1, "maxLength": 100}},
+                "summary": {"type": "string", "minLength": 1, "maxLength": 600},
+                "suggested_followup": {"type": ["string", "null"], "minLength": 1, "maxLength": 300},
             },
             "additionalProperties": False,
         },
@@ -303,6 +335,7 @@ def _interview_turn_understanding(context: Dict[str, Any]) -> PromptContract:
         context.get("transcript", ""), context.get("capability_points") or []
     )
     schema = understanding_canonical_schema()
+    schema["required"].append("clarification_target")
     properties = schema["properties"]
     for old, new, table in (
         ("evidence_quotes", "evidence_ids", "evidence"),
@@ -318,8 +351,12 @@ def _interview_turn_understanding(context: Dict[str, Any]) -> PromptContract:
     claim["required"] = ["claim", "evidence_id"]
     claim["properties"].pop("evidence_quote")
     claim["properties"]["evidence_id"] = {"type": "string", "enum": list(references["evidence"])}
+    target = properties["clarification_target"]
+    target["required"] = ["evidence_id", "focus_quote"]
+    target["properties"].pop("evidence_quote")
+    target["properties"]["evidence_id"] = {"type": "string", "enum": list(references["evidence"])}
     return PromptContract(
-        version="interview_turn_understanding.v7" if context.get("completion_confirmed") else "interview_turn_understanding.v6",
+        version="interview_turn_understanding.v9" if context.get("completion_confirmed") else "interview_turn_understanding.v8",
         messages=[
             ChatMessage(role="system", content=(
                 "你是实时结构化面试理解器，只输出合同 JSON。不得评分、泄露标准答案、推断敏感属性。"
@@ -349,6 +386,13 @@ def _interview_turn_understanding(context: Dict[str, Any]) -> PromptContract:
                 "候选人指出识别错误或否认某段话且尚未澄清，或者术语有影响判断的多种解释时，"
                 "把具体疑点写入 ambiguities，suggested_action=clarify，confidence 低于0.65；"
                 "只确认其实际表达，不补写答案。后文已明确纠正的歧义不再反复追问。"
+                "输出必须包含clarification_target字段。存在未解决的转写/指代歧义时，必须提供非null的"
+                "clarification_target：evidence_id选择具体疑点所在句的E编号，"
+                "focus_quote逐字截取其中最短的疑点（最多80字），不可给候选人标准答案或替换选项。"
+                "例如原句说‘放那个卡拉布里面’且无法确定指代，focus_quote应是‘卡拉布’；"
+                "若是整段转写投诉，则引用投诉原句中最短的不确定片段，不能只列ambiguities而省略焦点。"
+                "仅没有未解决歧义时为null。断断续续、嗯啊、重复和已明确的自我纠正本身不构成歧义；"
+                "必须结合本题累计完整原文理解，不能丢掉澄清之前已表达的技术内容。"
                 "如果整段只是投诉转写或否认发言，没有有效技术回答，intent=clarification_request，"
                 "claims 为空，suggested_action=clarify，不能标为 answer 或发起技术 followup。"
             )),
@@ -400,7 +444,7 @@ def _interview_turn_decision(context: Dict[str, Any]) -> PromptContract:
     followup["required"][followup["required"].index("target_capability_points")] = "target_point_ids"
     properties["difficulty"] = {"type": "string", "enum": [context.get("difficulty", "mid")]}
     return PromptContract(
-        version="interview_turn_decision.v6" if context.get("completion_confirmed") else "interview_turn_decision.v5",
+        version="interview_turn_decision.v8" if context.get("completion_confirmed") else "interview_turn_decision.v7",
         messages=[
             *understanding.messages,
             ChatMessage(role="system", content=(
@@ -440,8 +484,9 @@ SUPPLEMENT_SPEECH = {
 
 
 def _supplement_reply(context: Dict[str, Any]) -> PromptContract:
+    references = understanding_references(context["reply"], [])
     return PromptContract(
-        version="supplement_reply.v2",
+        version="supplement_reply.v3",
         messages=[
             ChatMessage(role="system", content=(
                 "你是面试补充确认的意图识别器，只输出合同JSON。面试官刚刚问候选人是否还有补充。"
@@ -460,20 +505,43 @@ def _supplement_reply(context: Dict[str, Any]) -> PromptContract:
                 "‘我没有补充，不过字幕里的策略不是我的发言，那个内容识别错了’是unclear。"
                 "结合本人当前意图判断，技术方案中假设或引用用户投诉不是候选人在投诉；"
                 "如果候选人已明确纠正术语并消除了争议，再按其当前继续或结束的意思判断。"
-                "evidence_quote必须逐字引用答复中支持判断的原文，不能为空；不确定时unclear。"
+                "通读整次答复判断当前意图，再用evidence_id选择支持判断的原文编号。"
+                "仅输出intent、confidence、evidence_id三个字段，不复制长段原文，不输出解释；不确定时unclear。"
             )),
-            ChatMessage(role="user", content=json.dumps({"reply": context["reply"]}, ensure_ascii=False)),
+            ChatMessage(role="user", content=json.dumps({"reply": context["reply"], "evidence": references["evidence"]}, ensure_ascii=False)),
         ],
         response_schema={
-            "type": "object", "required": ["intent", "confidence", "evidence_quote"],
+            "type": "object", "required": ["intent", "confidence", "evidence_id"],
             "additionalProperties": False,
             "properties": {
                 "intent": {"type": "string", "enum": ["continue", "finish", "supplement", "pause", "unclear"]},
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                "evidence_quote": {"type": "string", "minLength": 1, "maxLength": 300},
+                "evidence_id": {"type": "string", "enum": list(references["evidence"]), "minLength": 1},
             },
         },
     )
+
+
+def supplement_reply_canonical_schema() -> Dict[str, Any]:
+    return {
+        "type": "object", "required": ["intent", "confidence", "evidence_quote"],
+        "additionalProperties": False,
+        "properties": {
+            "intent": {"type": "string", "enum": ["continue", "finish", "supplement", "pause", "unclear"]},
+            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+            "evidence_quote": {"type": "string", "minLength": 1, "maxLength": 300},
+        },
+    }
+
+
+CLARIFICATION_SPEECH_VERSION = "answer_clarification.v1"
+
+
+def clarification_speech(focus_quote: str = "") -> str:
+    """Only a previously validated candidate quote may fill this template."""
+    if focus_quote:
+        return "刚才你说到“%s”，这一处我还不能确定。请换一种说法或拼出术语；前面已经说清的内容会保留。" % focus_quote
+    return "这段回答有些地方还没听清。请补充解释或纠正识别有误的部分；前面已经说清的内容会保留。"
 
 
 def understanding_canonical_schema() -> Dict[str, Any]:
@@ -527,6 +595,13 @@ def understanding_canonical_schema() -> Dict[str, Any]:
                     "items": {"type": "string", "minLength": 1, "maxLength": 300},
                 },
                 "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                "clarification_target": {
+                    "type": ["object", "null"], "required": ["evidence_quote", "focus_quote"],
+                    "properties": {
+                        "evidence_quote": {"type": "string", "minLength": 1, "maxLength": 300},
+                        "focus_quote": {"type": "string", "minLength": 1, "maxLength": 80},
+                    }, "additionalProperties": False,
+                },
                 "suggested_action": {
                     "type": "string",
                     "enum": ["accept", "clarify", "repeat", "continue_listening", "pause", "followup", "next"],

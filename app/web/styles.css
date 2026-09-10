@@ -1891,21 +1891,127 @@ svg {
   line-height: 1.7;
 }
 
+.interview-list-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.interview-search-field {
+  position: relative;
+  width: min(360px, 100%);
+}
+
+.interview-search-field .form-input {
+  min-height: 40px;
+  padding-left: 39px;
+  border-color: #d8e0db;
+  background: var(--surface);
+}
+
+.interview-search-field .form-input:focus {
+  border-color: #8db7a3;
+  box-shadow: 0 0 0 3px rgba(24, 105, 76, 0.09);
+}
+
+.interview-search-icon {
+  position: absolute;
+  top: 50%;
+  left: 13px;
+  z-index: 1;
+  display: grid;
+  width: 17px;
+  height: 17px;
+  color: #7b8981;
+  pointer-events: none;
+  transform: translateY(-50%);
+}
+
+.interview-search-icon svg {
+  width: 100%;
+  height: 100%;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-width: 1.7;
+}
+
+.interview-status-filter {
+  width: 190px;
+  min-height: 40px;
+  border-color: #d8e0db;
+  background-color: var(--surface);
+}
+
+.interview-filter-reset {
+  min-height: 36px;
+  color: var(--green-dark);
+}
+
+.interview-filter-summary {
+  margin-left: auto;
+  padding: 5px 10px;
+  border-radius: 999px;
+  color: var(--ink-muted);
+  background: #f1f5f2;
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.interview-list-panel {
+  position: relative;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  box-shadow: 0 8px 30px rgba(23, 33, 29, 0.035);
+}
+
+.interview-list-head,
+.interview-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 1.35fr) minmax(180px, 0.75fr) 130px minmax(170px, auto);
+  gap: 20px;
+  align-items: center;
+}
+
+.interview-list-head {
+  min-height: 42px;
+  padding: 0 18px;
+  border-bottom: 1px solid var(--line);
+  border-radius: 10px 10px 0 0;
+  color: var(--ink-muted);
+  background: #fafbf9;
+  font-size: 11px;
+  font-weight: 750;
+  letter-spacing: 0.04em;
+}
+
+.interview-list-head > span:last-child {
+  text-align: right;
+}
+
 .interview-list {
   display: grid;
-  gap: 8px;
 }
 
 .interview-row {
-  display: grid;
-  grid-template-columns: minmax(180px, 1.3fr) minmax(140px, 0.7fr) 130px 110px auto;
-  gap: 18px;
-  align-items: center;
-  min-height: 68px;
-  padding: 11px 15px;
-  border: 1px solid var(--line);
-  border-radius: 7px;
+  min-height: 72px;
+  padding: 11px 18px;
+  border-bottom: 1px solid #e8ece9;
   background: var(--surface);
+  transition: background-color 0.14s ease;
+}
+
+.interview-row:last-child {
+  border-bottom: 0;
+  border-radius: 0 0 10px 10px;
+}
+
+.interview-row:hover {
+  background: #fbfdfb;
 }
 
 .candidate-cell {
@@ -1917,15 +2023,20 @@ svg {
 
 .candidate-avatar {
   display: grid;
-  width: 36px;
-  height: 36px;
-  flex: 0 0 36px;
+  width: 40px;
+  height: 40px;
+  flex: 0 0 40px;
   place-items: center;
-  border-radius: 50%;
+  border: 1px solid #d5e9df;
+  border-radius: 11px;
   color: var(--green-dark);
-  background: #dfe9e3;
-  font-size: 13px;
+  background: linear-gradient(145deg, #edf8f2, #dfeee6);
+  font-size: 14px;
   font-weight: 800;
+}
+
+.candidate-copy {
+  min-width: 0;
 }
 
 .candidate-cell strong,
@@ -1937,9 +2048,114 @@ svg {
 }
 
 .candidate-cell small {
-  margin-top: 3px;
+  margin-top: 4px;
   color: var(--ink-muted);
   font-size: 11px;
+  letter-spacing: 0.02em;
+}
+
+.interview-time {
+  color: #56615b;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.interview-actions {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+}
+
+.interview-view-action {
+  color: var(--green-dark);
+}
+
+.interview-view-action > span {
+  margin-left: 2px;
+  transition: transform 0.14s ease;
+}
+
+.interview-view-action:hover > span {
+  transform: translateX(2px);
+}
+
+.interview-secondary-action {
+  display: flex;
+  min-width: 92px;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.interview-action-state {
+  color: var(--green-dark);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.interview-action-menu {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.interview-action-trigger {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  border: 0;
+  border-radius: 7px;
+  color: var(--ink-muted);
+  background: transparent;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  letter-spacing: 1px;
+  list-style: none;
+}
+
+.interview-action-trigger::-webkit-details-marker {
+  display: none;
+}
+
+.interview-action-trigger:hover,
+.interview-action-trigger:focus-visible,
+.interview-action-menu[open] .interview-action-trigger {
+  color: var(--ink);
+  outline: none;
+  background: var(--surface-soft);
+}
+
+.interview-action-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 12;
+  display: grid;
+  min-width: 128px;
+  padding: 5px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.interview-action-popover button {
+  min-height: 36px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--coral);
+  background: transparent;
+  text-align: left;
+}
+
+.interview-action-popover button:hover,
+.interview-action-popover button:focus-visible {
+  outline: none;
+  background: var(--coral-soft);
 }
 
 .workspace-header {
@@ -3335,8 +3551,9 @@ body.candidate-mode .content {
     grid-template-columns: minmax(240px, 1fr) 140px minmax(200px, 260px) auto;
   }
 
+  .interview-list-head,
   .interview-row {
-    grid-template-columns: minmax(180px, 1.2fr) 130px 110px auto;
+    grid-template-columns: minmax(180px, 1.2fr) 155px 110px auto;
   }
 
   .interview-row .interview-plan-cell {
@@ -3427,6 +3644,19 @@ body.candidate-mode .content {
 }
 
 @media (max-width: 680px) {
+  .interview-list-toolbar {
+    align-items: stretch;
+  }
+
+  .interview-search-field,
+  .interview-status-filter {
+    width: 100%;
+  }
+
+  .interview-filter-summary {
+    align-self: center;
+  }
+
   .topbar {
     min-height: 64px;
     padding: 10px 14px;
@@ -3529,11 +3759,27 @@ body.candidate-mode .content {
   .interview-row {
     grid-template-columns: minmax(0, 1fr) auto;
     gap: 10px;
+    min-height: 66px;
+    padding: 10px 12px;
   }
 
+  .interview-list-head,
+  .interview-time,
   .interview-row > .status-badge,
   .interview-row > .muted,
   .interview-row > .interview-plan-cell {
+    display: none;
+  }
+
+  .interview-view-action {
+    padding: 0 8px;
+  }
+
+  .interview-secondary-action {
+    min-width: 34px;
+  }
+
+  .interview-action-state {
     display: none;
   }
 
@@ -3807,6 +4053,7 @@ body.candidate-mode .content {
 .status-stopping,
 .status-stopped,
 .status-cancelled,
+.status-expired,
 .status-dead_letter {
   color: var(--amber);
   background: var(--amber-soft);
@@ -4634,3 +4881,24 @@ body.candidate-mode .content {
     min-height: 280px;
   }
 }
+
+/* Interview processing and private replay */
+.interview-review { display: grid; gap: 20px; margin-top: 24px; }
+.review-question-tabs { display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0; }
+.review-answer { border-top: 1px solid var(--border, #dce3df); padding-top: 20px; }
+.review-transcript { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.8; }
+.review-dimensions { display: flex; flex-wrap: wrap; gap: 24px; }
+.review-dimensions dd { margin: 6px 0; font-weight: 700; }
+.review-player-panel video { display: block; width: 100%; max-height: 65vh; background: #17231e; border-radius: 12px; }
+.review-player-panel audio { width: 100%; }
+.review-report-summary { margin-top: 24px; border-top: 1px solid #dce3df; padding-top: 24px; }
+.review-report-summary .score-value small { font-size: 16px; font-weight: 400; }
+
+.review-player-panel { order: 1; }
+.review-question-panel { order: 2; }
+.review-verification { margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--border, #d9e1dc); }
+.review-verification summary { cursor: pointer; font-weight: 650; }
+.review-verification form { display: grid; gap: .85rem; margin-top: .85rem; }
+.review-verification label { display: grid; gap: .4rem; }
+.review-verification textarea, .review-verification input:not([type="checkbox"]) { width: 100%; box-sizing: border-box; }
+.review-verification label:has(input[type="checkbox"]) { display: flex; align-items: flex-start; gap: .6rem; }

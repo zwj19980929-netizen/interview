@@ -3,6 +3,12 @@ import { describe, expect, it } from "vitest";
 import { OrderedAgentEventStream, validateAgentEvent } from "./agent-event-runtime.js";
 
 describe("ordered AgentEvent runtime", () => {
+  it("accepts unknown transcript confidence without converting it into certainty or a protocol failure", () => {
+    const stream = new OrderedAgentEventStream({ audience: "candidate" });
+    const received = event(1, "transcript.final", { text: "合成术语回答。", confidence: null, authoritative: true, persisted_audio: true });
+    expect(stream.accept(received).action).toBe("apply");
+    expect(received.payload.confidence).toBeNull();
+  });
   it("deduplicates and drops replayed avatar performances", () => {
     const stream = new OrderedAgentEventStream({ audience: "candidate" });
     const started = event(1, "avatar.performance.started", performance());

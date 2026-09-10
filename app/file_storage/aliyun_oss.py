@@ -91,6 +91,14 @@ class AliyunOssFileAdapter:
     def open(self, object_key: str) -> bytes:
         return self.bucket.get_object(object_key).read()
 
+    def iter_bytes(self, object_key: str, *, start: int = 0, end: Optional[int] = None):
+        stream = self.bucket.get_object(object_key, byte_range=(start, end))
+        try:
+            while chunk := stream.read(1024 * 1024):
+                yield chunk
+        finally:
+            stream.close()
+
     def delete(self, object_key: str) -> None:
         self.bucket.delete_object(object_key)
 

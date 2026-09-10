@@ -380,7 +380,7 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
         },
     )
     assert before_speech_ready.status_code == 200, before_speech_ready.text
-    assert before_speech_ready.json()["can_start"] is False
+    assert before_speech_ready.json()["can_start"] is True
 
     asyncio.run(OutboxWorker(get_store()).run_once())
     stored_appointment = api.get(f"/api/v1/interview-appointments/{appointment.json()['id']}").json()
@@ -446,7 +446,8 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
     assert len(session["question_selections"]) == 1
     assert [item["phase"] for item in session["turns"]] == ["position_bank", "resume_experience"]
     resume_turn = next(item for item in session["turns"] if item["phase"] == "resume_experience")
-    assert resume_turn["question_snapshot"]["speech_asset_id"] == speech_asset_id
+    assert resume_turn["question_snapshot"]["speech_asset_id"] is None
+    assert resume_turn["speech_preparation"]["asset_id"] == speech_asset_id
     assert session["plan_snapshot"]["speech_profile_snapshot"] == frozen_profile
 
     for expected_phase in ("position_bank", "resume_experience"):

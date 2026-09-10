@@ -42,7 +42,7 @@ def inputs():
 
 def response():
     return {
-        "understanding": {
+        "understanding": {"clarification_target": None,
             "intent": "answer", "answer_summary": "记录位置用于恢复。",
             "claims": [{"claim": "保留确认位置", "evidence_id": "E1"}],
             "evidence_ids": ["E1"], "covered_point_ids": ["P2"], "missing_point_ids": ["P1"],

@@ -585,7 +585,7 @@ function optionalUnitNumber(value) {
 }
 
 function optionalConfidence(value) {
-  return value === undefined || unitNumber(value);
+  return value == null || unitNumber(value);
 }
 
 function optionalEnum(value, allowed) {

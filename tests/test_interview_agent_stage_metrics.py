@@ -104,7 +104,8 @@ def test_telemetry_or_clock_failure_cannot_change_business_outcome(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_dynamic_expression_separately_measures_synthesis_and_private_import(metrics):
+async def test_dynamic_expression_separately_measures_synthesis_and_private_import(metrics, monkeypatch):
+    monkeypatch.setenv("INTERVIEWER_BUFFERED_TTS_ENABLED", "false")
     async def synthesize(capability, request):
         assert request.purpose == "interview_agent_expression"
         assert request.metadata["approved"] is True
@@ -141,7 +142,8 @@ async def test_dynamic_expression_separately_measures_synthesis_and_private_impo
 
 
 @pytest.mark.anyio
-async def test_failed_tts_records_attempt_without_starting_private_import(metrics):
+async def test_failed_tts_records_attempt_without_starting_private_import(metrics, monkeypatch):
+    monkeypatch.setenv("INTERVIEWER_BUFFERED_TTS_ENABLED", "false")
     async def synthesize(*args):
         raise RuntimeError("provider unavailable")
 
@@ -155,5 +157,23 @@ async def test_failed_tts_records_attempt_without_starting_private_import(metric
             runtime, "iv_stage_test", "turn_stage_test", "请举一个具体例子。",
             "actor_test", "org_default",
         )
+    assert metrics.snapshot()["tts_synthesis_ms"]["count"] == 1
+    assert metrics.snapshot()["tts_asset_import_ms"]["count"] == 0
+
+
+@pytest.mark.anyio
+async def test_complete_pcm_expression_skips_batch_import_but_records_ready_latency(metrics, monkeypatch):
+    monkeypatch.setenv("INTERVIEWER_BUFFERED_TTS_ENABLED", "true")
+    async def complete(gateway, request, **kwargs):
+        assert request.text == "请举一个具体例子。" and request.metadata["approved"]
+        assert kwargs == {"interview_id": "iv_stage_test", "turn_id": "turn_stage_test"}
+        return {"audio_uri": "agent-expression://file_test", "duration_ms": 1500}
+    runtime = SimpleNamespace(
+        interviews=SimpleNamespace(get_interview=lambda *args: {"settings": {}}),
+        _current_turn=lambda session: None, gateway=object(),
+        expression_audio=SimpleNamespace(synthesize_complete_audio=complete),
+    )
+    result = await InterviewAgentRuntime._expression_audio(runtime, "iv_stage_test", "turn_stage_test", "请举一个具体例子。", "actor_test", "org_default")
+    assert result["delivery"] == "cascade" and result["duration_ms"] == 1500
     assert metrics.snapshot()["tts_synthesis_ms"]["count"] == 1
     assert metrics.snapshot()["tts_asset_import_ms"]["count"] == 0

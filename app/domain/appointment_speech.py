@@ -4,6 +4,14 @@ from typing import Any, Dict, List, Optional
 from app.core.time import utc_now
 
 
+def turn_speech_asset_id(turn: Dict[str, Any]) -> Optional[str]:
+    """Runtime binding for deferred resume speech; immutable snapshot otherwise."""
+    if turn.get("deferred_speech"):
+        prepared = turn.get("speech_preparation") or {}
+        return prepared.get("asset_id") if prepared.get("status") == "ready" else None
+    return (turn.get("question_snapshot") or {}).get("speech_asset_id")
+
+
 def summarize_speech_preparation(
     items: List[Dict[str, Any]],
     *,

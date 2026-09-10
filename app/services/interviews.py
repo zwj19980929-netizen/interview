@@ -9,10 +9,12 @@ import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from app.core.errors import ApiError
+from app.model_gateway.errors import ProviderError
+from app.domain.speech_quality import confidence_source, minimum_reported_confidence, transcript_identity
 from app.core.ids import new_id
 from app.core.time import utc_now
 from app.adapters.private_media import read_managed_audio
-from app.domain.appointment_admission import AppointmentAdmission, ensure_utc, format_utc
+from app.domain.appointment_admission import AppointmentAdmission, ensure_utc, format_utc, parse_utc
 from app.domain.interview_lifecycle import (
     InterviewSessionLifecycle,
     LifecycleCommand,
@@ -78,7 +80,129 @@ class InterviewService:
 
     def list_interviews(self, organization_id: str = "org_default") -> List[Dict[str, Any]]:
         with self.persistence.transaction(organization_id) as transaction:
-            return transaction.interview_sessions.list()
+            return [
+                item
+                for item in transaction.interview_sessions.list()
+                if not item.get("list_removed_at")
+            ]
+
+    def expire_overdue_interviews(
+        self,
+        organization_id: str = "org_default",
+    ) -> List[Dict[str, Any]]:
+        """Close unfinished sessions after their frozen appointment deadline.
+
+        Candidate input completion and asynchronous scoring are separate
+        milestones. Once input is complete, the session is intentionally left
+        alone so scoring and report generation can finish after the appointment
+        window. All earlier states are closed through the lifecycle seam.
+        """
+
+        current = ensure_utc(self.clock())
+        occurred_at = format_utc(current)
+        expired: List[Dict[str, Any]] = []
+        with self.persistence.transaction(organization_id) as transaction:
+            for source in transaction.interview_sessions.list():
+                if source.get("status") not in {
+                    "scheduled",
+                    "waiting",
+                    "in_progress",
+                    "paused",
+                }:
+                    continue
+                if source.get("candidate_input_completed_at"):
+                    continue
+                scheduled_end_at = source.get("scheduled_end_at") or (
+                    source.get("settings") or {}
+                ).get("scheduled_end_at")
+                if not scheduled_end_at and source.get("appointment_id"):
+                    appointment = transaction.interview_appointments.get(
+                        source["appointment_id"]
+                    )
+                    scheduled_end_at = (appointment or {}).get("scheduled_end_at")
+                if not scheduled_end_at:
+                    continue
+                try:
+                    deadline = parse_utc(str(scheduled_end_at))
+                except (TypeError, ValueError):
+                    continue
+                if current < deadline:
+                    continue
+                previous_status = str(source.get("status") or "")
+                decision = self.lifecycle.execute(
+                    source,
+                    LifecycleCommand(
+                        LifecycleCommandType.CANCEL,
+                        {"reason": "appointment_window_expired"},
+                    ),
+                    now=occurred_at,
+                )
+                if decision.effects:
+                    raise RuntimeError(
+                        "Deadline cancellation must not enqueue model or report work."
+                    )
+                if not decision.changed:
+                    continue
+                decision.session = transaction.interview_sessions.update(
+                    decision.session,
+                    expected_version=source["version"],
+                )
+                transaction.audit_events.add(
+                    {
+                        "id": new_id("audit"),
+                        "organization_id": organization_id,
+                        "actor_id": "system:interview-deadline",
+                        "action": "interview.appointment_window_expired",
+                        "resource_type": "interview",
+                        "resource_id": source["id"],
+                        "metadata": {
+                            "scheduled_end_at": str(scheduled_end_at),
+                            "previous_status": previous_status,
+                            "status": decision.session["status"],
+                        },
+                        "created_at": occurred_at,
+                    }
+                )
+                expired.append(deepcopy(decision.session))
+        return expired
+
+    def remove_from_list(
+        self,
+        interview_id: str,
+        *,
+        expected_version: int,
+        actor_id: str,
+        organization_id: str = "org_default",
+    ) -> Dict[str, Any]:
+        """Hide a terminal session from workspace lists without deleting evidence."""
+        with self.persistence.transaction(organization_id) as transaction:
+            session = self._required(transaction.interview_sessions.get(interview_id))
+            if session.get("status") not in {"cancelled", "report_ready"}:
+                raise ApiError(
+                    "INTERVIEW_REMOVAL_NOT_ALLOWED",
+                    "Only a cancelled or report-ready interview can be removed from the list.",
+                    status_code=409,
+                )
+            now = utc_now()
+            session["list_removed_at"] = now
+            session["list_removed_by"] = actor_id
+            session["updated_at"] = now
+            updated = transaction.interview_sessions.update(
+                session, expected_version=expected_version
+            )
+            transaction.audit_events.add(
+                {
+                    "id": new_id("audit"),
+                    "organization_id": organization_id,
+                    "actor_id": actor_id,
+                    "action": "interview.removed_from_list",
+                    "resource_type": "interview",
+                    "resource_id": interview_id,
+                    "metadata": {"status": session["status"]},
+                    "created_at": now,
+                }
+            )
+            return updated
 
     def create_from_admitted_appointment(
         self,
@@ -188,10 +312,6 @@ class InterviewService:
             }
             turns: List[Dict[str, Any]] = []
             question_snapshots: List[Dict[str, Any]] = []
-            prepared_speech = {
-                (item.get("question_id"), int(item.get("source_version", 0))): item
-                for item in (appointment.get("speech_preparation") or {}).get("items", [])
-            }
             for blueprint in sorted(turn_blueprints, key=lambda item: item["order"]):
                 source_type = blueprint.get("source_type", "position_bank")
                 question = deepcopy(blueprint.get("frozen_question")) or (
@@ -206,17 +326,8 @@ class InterviewService:
                         status_code=409,
                     )
                 if source_type == "resume_experience":
-                    prepared = prepared_speech.get(
-                        (question["id"], int(question.get("version", 0)))
-                    )
-                    if not prepared or prepared.get("status") != "ready" or not prepared.get("asset_id"):
-                        raise ApiError(
-                            "APPOINTMENT_SPEECH_NOT_READY",
-                            "Resume question speech is not ready for this appointment.",
-                            status_code=409,
-                        )
-                    question["speech_asset_id"] = prepared["asset_id"]
-                    question["speech_status"] = "ready"
+                    question["speech_asset_id"] = None
+                    question["speech_status"] = "deferred"
                 question_snapshot = self._question_snapshot(question, now, source_type=source_type)
                 snapshot_entry = deepcopy(blueprint)
                 snapshot_entry["question_snapshot_id"] = question_snapshot["id"]
@@ -242,6 +353,7 @@ class InterviewService:
                         "weight": float(blueprint.get("weight", 0.0)),
                         "expected_minutes": int(blueprint.get("expected_minutes", 0)),
                         "status": "pending",
+                        "deferred_speech": source_type == "resume_experience",
                         "question_spoken_text": question_snapshot["spoken_text"],
                         "started_at": None,
                         "completed_at": None,
@@ -321,6 +433,7 @@ class InterviewService:
                 "created_at": now,
                 "updated_at": now,
             }
+            self._refresh_deferred_speech(transaction, session)
             decision = self.lifecycle.execute(
                 session,
                 LifecycleCommand(LifecycleCommandType.CREATE),
@@ -768,7 +881,7 @@ class InterviewService:
             is_final=True,
             authoritative=True,
             audio_uri=str(payload["audio_uri"]),
-            stt_confidence=float(payload.get("stt_confidence", 1.0)),
+            stt_confidence=payload.get("stt_confidence"),
             source=transcript_source,
             created_at=now,
         )
@@ -865,7 +978,9 @@ class InterviewService:
             "raw_transcript": payload.get("raw_transcript") or payload["final_transcript"],
             "final_transcript": payload["final_transcript"],
             "audio_uri": payload.get("audio_uri"),
-            "stt_confidence": payload.get("stt_confidence", 1.0),
+            "stt_confidence": payload.get("stt_confidence"),
+            "stt_confidence_source": confidence_source(payload.get("stt_confidence"),
+                payload.get("transcript_segments", []), provider.get("provider_id")),
             "transcript_source": transcript_source,
             "stt_provider": deepcopy(payload.get("stt_provider")),
             "transcript_segments": deepcopy(payload.get("transcript_segments", [])),
@@ -880,6 +995,8 @@ class InterviewService:
             ],
             "language": payload.get("language", "zh-CN"),
             "duration_seconds": payload.get("duration_seconds", 0),
+            "recording_started_at": payload.get("recording_started_at"),
+            "recording_finished_at": payload.get("recording_finished_at"),
             "evaluation_status": "pending",
             "current_evaluation_id": None,
             "evaluation_id": None,
@@ -1073,6 +1190,8 @@ class InterviewService:
                 "stt_confidence": response.confidence,
                 "language": response.language,
                 "duration_seconds": payload.get("duration_seconds", 0),
+                "recording_started_at": payload.get("recording_started_at"),
+                "recording_finished_at": payload.get("recording_finished_at"),
                 "audio_uri": payload["audio_uri"],
                 "transcript_source": response.source,
                 "stt_provider": response.provider.model_dump(),
@@ -1197,7 +1316,7 @@ class InterviewService:
 
         identity = {
             "text": str(payload["final_transcript"]).strip(),
-            "confidence": float(payload.get("stt_confidence", 0.0)),
+            "confidence": payload.get("stt_confidence"),
             "language": str(payload.get("language", "zh-CN")),
             "segments": [
                 TranscriptSegment.model_validate(item).model_dump(mode="json")
@@ -1326,7 +1445,7 @@ class InterviewService:
             # effect transaction, so mismatches have no lifecycle side effect.
             self._assert_prepared_decision(prepared_decision, session, active_turn, {
                 "final_transcript": payload["final_transcript"],
-                "stt_confidence": payload.get("confidence", 0.0),
+                "stt_confidence": payload.get("confidence"),
                 "language": payload.get("language", "zh-CN"),
                 "transcript_segments": payload.get("segments", []),
                 "stt_provider": provider,
@@ -1355,9 +1474,11 @@ class InterviewService:
                 "turn_id": turn_id,
                 "final_transcript": payload["final_transcript"],
                 "raw_transcript": payload["final_transcript"],
-                "stt_confidence": payload.get("confidence", 0.0),
+                "stt_confidence": payload.get("confidence"),
                 "language": payload.get("language", "zh-CN"),
                 "duration_seconds": payload.get("duration_seconds", 0),
+                "recording_started_at": payload.get("recording_started_at"),
+                "recording_finished_at": payload.get("recording_finished_at"),
                 "audio_uri": payload["audio_uri"],
                 "transcript_source": "server_streaming",
                 "stt_provider": deepcopy(provider),
@@ -1430,6 +1551,106 @@ class InterviewService:
             if item["answer_id"] == answer_id
         ]
 
+    def verify_transcription(self, interview_id, answer_id, payload, organization_id="org_default", *, actor_id):
+        """Version-bound human evidence review and regrade request commit together."""
+        if payload.get("audio_reviewed") is not True or not str(payload.get("reason") or "").strip() or not actor_id:
+            raise ApiError("TRANSCRIPTION_REVIEW_REQUIRED", "请先回听录音并填写核验说明。", status_code=422)
+        with self.persistence.transaction(organization_id) as transaction:
+            session = self._required(transaction.interview_sessions.get(interview_id))
+            if session["status"] in {"cancelled", "retention_purged", "report_generating"}:
+                raise ApiError("TRANSCRIPTION_REVIEW_UNAVAILABLE", "当前面试状态不允许核验转写。", status_code=409)
+            answer = self._answer_by_id(session, answer_id)
+            root = answer.get("root_turn_id") or answer["turn_id"]
+            if any(item.get("evaluation_status") == "pending" for item in session.get("answers", [])
+                   if (item.get("root_turn_id") or item["turn_id"]) == root):
+                raise ApiError("TRANSCRIPTION_REVIEW_BUSY", "本题正在评分，请等待后刷新。", status_code=409)
+            revision = int(answer.get("current_transcript_revision", 1))
+            if (answer.get("current_evaluation_id") != payload.get("expected_evaluation_id")
+                or revision != payload.get("expected_transcript_revision")):
+                raise ApiError("TRANSCRIPTION_REVIEW_STALE", "评分或转写已变化，请刷新后重新核验。", status_code=409)
+            if not answer.get("audio_uri"):
+                raise ApiError("ANSWER_AUDIO_NOT_FOUND", "本题缺少可回听的录音。", status_code=409)
+            text = payload.get("final_transcript")
+            if text is not None and (not str(text).strip() or len(text) > 12_000):
+                raise ApiError("TRANSCRIPT_TEXT_REQUIRED", "转写必须为非空且不超过12000字的文本。", status_code=422)
+            now = utc_now()
+            if text is not None and text.strip() != answer["final_transcript"]:
+                revision += 1
+                answer["final_transcript"] = text.strip()
+                answer["current_transcript_revision"] = revision
+                answer["transcript_source"] = "human_correction"
+                answer.setdefault("transcript_revisions", []).append({"revision": revision, "text": text.strip(),
+                    "source": "human_correction", "reason": payload["reason"], "reviewer_id": actor_id, "created_at": now})
+            verification = {"reviewer_id": actor_id, "audio_reviewed": True, "verified_at": now,
+                "reason": payload["reason"], "transcript_identity": transcript_identity(answer),
+                "evaluation_id": payload["expected_evaluation_id"]}
+            answer["transcription_verification"] = verification
+            answer.setdefault("transcription_verification_history", []).append(deepcopy(verification))
+            answer["updated_at"] = now
+            session.pop("review_completion", None)
+            _, work = self._decide_and_persist(transaction, session, LifecycleCommand(
+                LifecycleCommandType.REGRADE_REQUESTED, {"answer_id": answer_id, "trigger_reason": "transcription_verified"}), organization_id)
+            transaction.audit_events.add({"id": new_id("audit"), "organization_id": organization_id,
+                "actor_id": actor_id, "action": "answer.transcription.verified", "resource_type": "candidate_answer",
+                "resource_id": answer_id, "metadata": {"interview_id": interview_id, "transcript_revision": revision,
+                    "previous_evaluation_id": payload["expected_evaluation_id"]}, "created_at": now})
+        return {"answer_id": answer_id, "transcript_revision": revision, "status": "queued", "work_count": len(work)}
+
+    def retry_processing(
+        self, interview_id: str, organization_id: str = "org_default", *, actor_id: str = "reviewer_local"
+    ) -> Dict[str, Any]:
+        """Requeue only current failed work; duplicate clicks share durable identities."""
+        with self.persistence.transaction(organization_id) as transaction:
+            session = self._required(transaction.interview_sessions.get(interview_id))
+            if session.get("status") in {"cancelled", "retention_purged"}:
+                raise ApiError("INTERVIEW_PROCESSING_UNAVAILABLE", "该面试已取消或已清除。", status_code=409)
+            queued = []
+            for answer in session.get("answers", []):
+                if answer.get("evaluation_status") not in {"pending", "failed"}:
+                    continue
+                revision = max((item["revision"] for item in session.get("evaluation_revisions", [])
+                                if item["answer_id"] == answer["id"]), default=0) + 1
+                key = "answer.evaluate:%s:%s" % (answer["id"], revision)
+                work = transaction.outbox.enqueue(new_work_item(
+                    organization_id=organization_id, kind="answer.evaluate", aggregate_id=interview_id,
+                    idempotency_key=key, payload={"interview_id": interview_id, "answer_id": answer["id"],
+                        "revision": revision, "trigger_reason": "processing_recovery",
+                        "evidence_answer_ids": answer.get("pending_evidence_answer_ids")
+                            or answer.get("current_evidence_answer_ids") or [answer["id"]]},
+                ))
+                if work["status"] in {"failed", "dead_letter"}:
+                    work = transaction.outbox.replay(work["id"], reason="enterprise_processing_retry", actor_id=actor_id)
+                if work["status"] in {"pending", "running"}:
+                    queued.append(work["id"])
+            for work in transaction.outbox.list():
+                if (work["kind"] == "interview.report.generate"
+                    and work.get("payload", {}).get("interview_id") == interview_id
+                    and int(work.get("payload", {}).get("revision", 0)) == len(session.get("report_revisions", [])) + 1
+                    and work["status"] in {"failed", "dead_letter"}):
+                    transaction.outbox.replay(work["id"], reason="enterprise_processing_retry", actor_id=actor_id)
+                    queued.append(work["id"])
+            if not self.lifecycle._has_unresolved_evaluations(session) and (
+                session.get("candidate_input_completed_at") or session.get("completed_at")
+            ) and not session.get("current_report_id"):
+                if session["status"] in {"in_progress", "completed"}:
+                    _, report_works = self._decide_and_persist(transaction, session,
+                        LifecycleCommand(LifecycleCommandType.REPORT_REQUESTED, {"trigger_reason": "processing_recovery"}), organization_id)
+                    queued.extend(item["id"] for item in report_works)
+                elif session["status"] in {"report_generating", "report_failed"}:
+                    revision = len(session.get("report_revisions", [])) + 1
+                    work = transaction.outbox.enqueue(new_work_item(
+                        organization_id=organization_id, kind="interview.report.generate", aggregate_id=interview_id,
+                        idempotency_key="interview.report:%s:%s" % (interview_id, revision),
+                        payload={"interview_id": interview_id, "revision": revision, "trigger_reason": "processing_recovery"}))
+                    if work["id"] not in queued:
+                        queued.append(work["id"])
+            transaction.audit_events.add({
+                "id": new_id("audit"), "organization_id": organization_id, "actor_id": actor_id,
+                "action": "interview.processing.retry", "resource_type": "interview", "resource_id": interview_id,
+                "metadata": {"work_count": len(queued)}, "created_at": utc_now(),
+            })
+        return {"interview_id": interview_id, "status": "queued", "work_count": len(queued)}
+
     async def process_outbox_work(
         self,
         work_item_id: str,
@@ -1451,7 +1672,7 @@ class InterviewService:
         organization_id: str,
     ) -> Dict[str, Any]:
         with self.persistence.transaction(organization_id) as transaction:
-            running_work = transaction.outbox.start(work_item_id)
+            running_work = transaction.outbox.start(work_item_id, lease_seconds=300)
             payload = running_work["payload"]
             interview_id = payload["interview_id"]
             answer_id = payload["answer_id"]
@@ -1504,8 +1725,11 @@ class InterviewService:
             with self.persistence.transaction(organization_id) as transaction:
                 failed = transaction.outbox.fail(
                     work_item_id,
-                    str(exc),
+                    "评分服务未完成，请检查模型配置后重试。",
                     lease_token=running_work["lease_token"],
+                    error_code=exc.code if isinstance(exc, ProviderError) else "evaluation_failed",
+                    retryable=exc.retryable if isinstance(exc, ProviderError) else True,
+                    retry_after_seconds=35 if isinstance(exc, ProviderError) and exc.retryable else None,
                 )
                 if failed.get("status") == "dead_letter":
                     session = self._required(transaction.interview_sessions.get(interview_id))
@@ -1514,7 +1738,8 @@ class InterviewService:
                         session,
                         LifecycleCommand(
                             LifecycleCommandType.EVALUATION_FAILED,
-                            {"answer_id": answer_id, "error": str(exc)},
+                            {"answer_id": answer_id, "error": "评分服务未完成，请检查模型配置后重试。",
+                             "error_code": exc.code if isinstance(exc, ProviderError) else "evaluation_failed"},
                         ),
                         organization_id,
                     )
@@ -1643,6 +1868,8 @@ class InterviewService:
         command: LifecycleCommand,
         organization_id: str,
     ) -> Tuple[LifecycleDecision, List[Dict[str, Any]]]:
+        session = deepcopy(session)
+        self._refresh_deferred_speech(transaction, session)
         decision = self.lifecycle.execute(session, command)
         work_items = self._enqueue_effects(transaction, decision.effects, session["id"], organization_id)
         if decision.changed:
@@ -1651,6 +1878,31 @@ class InterviewService:
                 expected_version=session["version"],
             )
         return decision, work_items
+
+    def _refresh_deferred_speech(self, transaction: Any, session: Dict[str, Any]) -> None:
+        """Bind ready assets inside the same transaction that advances a turn."""
+        pending = [turn for turn in session.get("turns", [])
+                   if turn.get("deferred_speech") and turn.get("status") == "pending"]
+        if not pending:
+            return
+        appointment = transaction.interview_appointments.get(session.get("appointment_id")) or {}
+        profile = (session.get("plan_snapshot") or {}).get("speech_profile_snapshot") or {}
+        items = {(item.get("question_id"), item.get("source_version")): item
+                 for item in (appointment.get("speech_preparation") or {}).get("items", [])}
+        production = os.getenv("INTERVIEWER_RUNTIME_ENV", "development").lower() == "production"
+        for turn in pending:
+            frozen = turn["question_snapshot"]
+            source = {"id": frozen["source_question_id"], "version": frozen["source_question_version"]}
+            item = items.get((source["id"], source["version"]))
+            ready = (appointment.get("status") in {"registered", "consumed"}
+                     and appointment.get("plan_id") == session.get("plan_id")
+                     and self.admission._prepared_experience_asset_ready(transaction, item, source, profile))
+            if ready and production:
+                ready = self.admission._speech_asset_is_production_ready(transaction, item.get("asset_id"))
+            turn["speech_preparation"] = {
+                "status": "ready" if ready else "unavailable",
+                "asset_id": item["asset_id"] if ready else None,
+            }
 
     def _enqueue_effects(
         self,
@@ -1852,9 +2104,7 @@ class InterviewService:
         merged = deepcopy(root_answer)
         merged["final_transcript"] = "\n\n".join(sections)
         merged["raw_transcript"] = merged["final_transcript"]
-        merged["stt_confidence"] = min(
-            float(item.get("stt_confidence", 1.0)) for item in ordered
-        )
+        merged["stt_confidence"] = minimum_reported_confidence(*(item.get("stt_confidence") for item in ordered))
         merged["transcript_source"] = "server_authoritative_evidence_group"
         merged["evidence_answer_ids"] = requested
         merged["evidence_utterance_ids"] = [

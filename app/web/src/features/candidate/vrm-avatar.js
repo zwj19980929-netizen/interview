@@ -22,6 +22,7 @@ export async function verifyLicensedVrmAsset({
   candidateSessionToken,
   configUrl,
   fetchImpl = globalThis.fetch,
+  signal,
 } = {}) {
   if (!fetchImpl) throw new AvatarAssetError("无法验证自研 3D 数字人资产");
   if (!interviewId || !candidateSessionToken) {
@@ -32,6 +33,7 @@ export async function verifyLicensedVrmAsset({
   }
   const scopedConfigUrl = configUrl || `${apiBase}/public/interviews/${encodeURIComponent(interviewId)}/avatar-config`;
   const response = await fetchImpl(scopedConfigUrl, {
+    signal,
     cache: "no-store",
     credentials: "same-origin",
     headers: { "X-Candidate-Session-Token": candidateSessionToken },
@@ -69,7 +71,7 @@ function avatarAssetRequestError(code, status) {
   const messages = {
     LICENSED_VRM_NOT_READY: "专属 3D 数字人资产尚未通过授权或完整性校验",
     AVATAR_ASSET_SESSION_NOT_ACTIVE: "当前面试状态不允许加载 3D 数字人",
-    CANDIDATE_SESSION_TOKEN_INVALID: "候选人会话授权已失效",
+    CANDIDATE_SESSION_TOKEN_INVALID: "当前链接的面试会话授权未通过，请重新打开本场面试链接",
     AVATAR_ASSET_CANDIDATE_BINDING_INVALID: "面试与数字人的候选人绑定不完整",
   };
   return new AvatarAssetError(messages[code] || "无法取得经授权的 3D 数字人资产", {

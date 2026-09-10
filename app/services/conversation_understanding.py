@@ -9,8 +9,9 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from app.domain.speech_quality import limit_semantic_confidence
 from app.core.ids import new_id
-from app.core.prompt.contracts import prompt_contract, understanding_canonical_schema
+from app.core.prompt.contracts import prompt_contract, understanding_canonical_schema, supplement_reply_canonical_schema
 from app.core.prompt.understanding_references import (
     understanding_references,
     resolve_understanding_references,
@@ -28,7 +29,7 @@ from app.domain.interview_agent import (
 from app.model_gateway import capabilities as cap
 from app.model_gateway.errors import ProviderError
 from app.model_gateway.gateway import ModelGateway
-from app.model_gateway.schemas import ChatJSONRequest, StableTranscriptPreview
+from app.model_gateway.schemas import ChatJSONRequest, StableTranscriptPreview, InvocationExecutionBudget
 from app.persistence.interface import Persistence
 from app.persistence.provider import persistence_for
 from app.services.meta_intent import MetaIntentDetector
@@ -162,7 +163,7 @@ class ConversationUnderstandingService:
                 "missing_capability_points": capability_points,
                 "ambiguities": [],
                 "contradictions": [],
-                "confidence": min(1.0, utterance.stt_confidence),
+                "confidence": limit_semantic_confidence(1.0, utterance.stt_confidence),
                 "suggested_action": deterministic.action,
             }
             provider = {
@@ -207,7 +208,7 @@ class ConversationUnderstandingService:
                     stage = "understanding_content"
                     self._validate_understanding_content(data, utterance.text, capability_points)
                     provider = response.provider.model_dump()
-                    confidence = min(float(data["confidence"]), utterance.stt_confidence)
+                    confidence = limit_semantic_confidence(float(data["confidence"]), utterance.stt_confidence)
                     break
                 except (ProviderError, asyncio.TimeoutError) as exc:
                     if getattr(exc, "code", None) != "provider_schema_invalid":
@@ -240,7 +241,7 @@ class ConversationUnderstandingService:
             self._validate_understanding_content(
                 data, utterance.text, capability_points
             )
-            confidence = min(float(data["confidence"]), utterance.stt_confidence)
+            confidence = limit_semantic_confidence(float(data["confidence"]), utterance.stt_confidence)
         # An exact, deterministic meta-intent is a control instruction rather
         # than an answer.  It is safe to honour even when the provider reports
         # low acoustic confidence; otherwise "请再说一遍" could be turned into
@@ -286,12 +287,15 @@ class ConversationUnderstandingService:
             organization_id=organization_id, purpose="interview_turn_understanding",
             messages=contract.messages, json_schema=contract.response_schema,
             temperature=0, max_output_tokens=350,
+            execution_budget=InvocationExecutionBudget(timeout_s=8, max_provider_retries=0),
             metadata={"prompt_version": contract.version},
         ))
         validate_structured_response(response.data, contract.response_schema)
-        if response.data["evidence_quote"].strip() not in reply:
-            raise UnderstandingContentError("evidence_not_verbatim")
-        return response.data
+        references = understanding_references(reply, [])
+        data = {"intent": response.data["intent"], "confidence": response.data["confidence"],
+                "evidence_quote": references["evidence"][response.data["evidence_id"]]}
+        validate_structured_response(data, supplement_reply_canonical_schema())
+        return data
 
     async def prepare_preview(
         self,
@@ -396,7 +400,7 @@ class ConversationUnderstandingService:
                 validate_structured_response(data, understanding_canonical_schema())
                 stage = "understanding_content"
                 self._validate_understanding_content(data, utterance.text, capability_points)
-                confidence = min(float(data["confidence"]), utterance.stt_confidence)
+                confidence = limit_semantic_confidence(float(data["confidence"]), utterance.stt_confidence)
                 if confidence < float(self.DEFAULT_POLICY["low_confidence_threshold"]):
                     data["suggested_action"] = "clarify"
                 confidence = self._apply_ambiguity_policy(data, confidence)
@@ -581,7 +585,7 @@ class ConversationUnderstandingService:
         if understanding is not None and understanding.intent != "answer":
             return self._no_followup("meta_or_non_answer", policy)
         confidence = understanding.confidence if understanding is not None else utterance.stt_confidence
-        if confidence < float(policy["low_confidence_threshold"]):
+        if confidence is not None and confidence < float(policy["low_confidence_threshold"]):
             return self._no_followup("low_confidence_clarification_required", policy)
         if not bool(turn.get("allow_followup", False)):
             return self._no_followup("followup_disabled", policy)
@@ -657,9 +661,10 @@ class ConversationUnderstandingService:
 
         quote = str(data["evidence_quote"]).strip()
         core_question = str(data["question_text"]).strip()
-        spoken = "你刚才提到了“%s”，我想确认一个细节：%s" % (quote, core_question)
-        if len(spoken) > int(policy["max_probe_chars"]):
-            spoken = core_question
+        # The validated question already names the missing detail. Keep the
+        # verbatim quote as evidence; repeating a long, hesitant transcript
+        # in the spoken preamble delays the question and amplifies ASR errors.
+        spoken = core_question
         act = ApprovedConversationAct(
             act_id=new_id("conversation_act"),
             act_type="followup",
@@ -790,6 +795,11 @@ class ConversationUnderstandingService:
             item["evidence_quote"] for item in data["claims"]
         ]
         if any(str(quote).strip() not in transcript for quote in quotes):
+            raise UnderstandingContentError("evidence_not_verbatim")
+        target = data.get("clarification_target")
+        if target and (target["evidence_quote"] not in transcript
+                       or target["focus_quote"] not in target["evidence_quote"]
+                       or not data["ambiguities"] or data["intent"] not in {"answer", "clarification_request"}):
             raise UnderstandingContentError("evidence_not_verbatim")
         if data.get("intent") == "answer_declined":
             if (

@@ -19,6 +19,7 @@ from app.services.livekit_evidence_ingress import (
 )
 from app.services.interview_agent import (
     consume_interview_agent_event_bus,
+    run_interview_deadline_watchdog,
     run_takeover_lease_watchdog,
 )
 from app.repositories.provider import get_store
@@ -56,6 +57,18 @@ async def lifespan(app: FastAPI):
         )
     )
     app.state.takeover_lease_watchdog = takeover_watchdog
+    deadline_watchdog = asyncio.create_task(
+        run_interview_deadline_watchdog(
+            get_store(),
+            organization_id=os.getenv(
+                "INTERVIEWER_ORGANIZATION_ID", "org_default"
+            ),
+            interval_seconds=float(
+                os.getenv("INTERVIEWER_INTERVIEW_DEADLINE_SECONDS", "15")
+            ),
+        )
+    )
+    app.state.interview_deadline_watchdog = deadline_watchdog
     event_bus = realtime_event_bus()
     if event_bus.enabled:
         task = asyncio.create_task(consume_interview_agent_event_bus())
@@ -64,7 +77,10 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         takeover_watchdog.cancel()
-        await asyncio.gather(takeover_watchdog, return_exceptions=True)
+        deadline_watchdog.cancel()
+        await asyncio.gather(
+            takeover_watchdog, deadline_watchdog, return_exceptions=True
+        )
         if task is not None:
             task.cancel()
         await shutdown_livekit_evidence_supervisors()

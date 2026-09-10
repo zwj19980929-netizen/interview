@@ -43,7 +43,7 @@ def _input():
 
 def _data():
     return {
-        "understanding": {
+        "understanding": {"clarification_target": None,
             "intent": "answer", "answer_summary": "使用序号记录恢复位置。",
             "claims": [{"claim": "记录确认位置", "evidence_id": "E1"}],
             "evidence_ids": ["E1"], "covered_point_ids": ["P2"],
@@ -91,14 +91,14 @@ async def test_one_inference_prepares_understanding_and_fenced_evidence_bound_fo
 
     assert len(gateway.requests) == 1
     assert gateway.requests[0].purpose == "interview_turn_understanding"
-    assert gateway.requests[0].metadata["prompt_version"] == "interview_turn_decision.v5"
-    assert understanding.prompt_version == "interview_turn_decision.v5"
+    assert gateway.requests[0].metadata["prompt_version"] == "interview_turn_decision.v7"
+    assert understanding.prompt_version == "interview_turn_decision.v7"
     assert understanding.evidence_quotes == [TRANSCRIPT]
     assert understanding.claims[0].evidence_quote == TRANSCRIPT
     assert decision["selected"] is True
     assert decision["target_key_points"] == ["幂等键"]
     assert decision["conversation_act"]["approved_by"] == "controlled_followup_gate"
-    assert decision["conversation_act"]["prompt_version"] == "interview_turn_decision.v5"
+    assert decision["conversation_act"]["prompt_version"] == "interview_turn_decision.v7"
     assert decision["conversation_act"]["evaluative"] is False
     assert decision["followup_depth"] == 1
     assert decision["evidence_quotes"] == [TRANSCRIPT]
@@ -160,7 +160,7 @@ async def test_preflight_ineligible_cases_only_run_existing_understanding(case, 
     gateway = Gateway(_data()["understanding"])
     understanding, decision = await _service(gateway).prepare_decision(utterance, turn, interview)
     assert len(gateway.requests) == 1
-    assert gateway.requests[0].metadata["prompt_version"] == "interview_turn_understanding.v6"
+    assert gateway.requests[0].metadata["prompt_version"] == "interview_turn_understanding.v8"
     assert decision["selected"] is False
     assert decision["reason"] == reason
     if case == "confidence":
@@ -290,7 +290,7 @@ async def test_root_budget_preflight_does_not_start_composite_inference():
     gateway = Gateway(_data()["understanding"])
     _, decision = await _service(gateway).prepare_decision(utterance, turn, interview)
     assert decision["reason"] == "root_budget_exhausted"
-    assert gateway.requests[0].metadata["prompt_version"] == "interview_turn_understanding.v6"
+    assert gateway.requests[0].metadata["prompt_version"] == "interview_turn_understanding.v8"
 
 
 @pytest.mark.parametrize("confidence,action", [(0.1, "followup"), (0.9, "continue_listening")])
@@ -331,7 +331,7 @@ async def test_non_authoritative_transcript_rejected_before_model_invocation():
 def test_composite_prompt_enforces_reference_schema_without_loosening_existing_contract():
     context = {"transcript": TRANSCRIPT, "capability_points": ["幂等键", "确认序号"], "difficulty": "mid"}
     contract = prompt_contract("interview_turn_decision", context)
-    assert contract.version == "interview_turn_decision.v5"
+    assert contract.version == "interview_turn_decision.v7"
     validate_structured_response(_data(), contract.response_schema)
     assert contract.response_schema["properties"]["understanding"] == prompt_contract(
         "interview_turn_understanding", context,
@@ -346,5 +346,5 @@ def test_composite_prompt_enforces_reference_schema_without_loosening_existing_c
 async def test_mock_gateway_returns_composite_contract_through_same_service_interface():
     understanding, decision = await ConversationUnderstandingService(InMemoryStore()).prepare_decision(*_input())
     assert understanding.problem is None
-    assert understanding.prompt_version == "interview_turn_decision.v5"
+    assert understanding.prompt_version == "interview_turn_decision.v7"
     assert decision["selected"] is True

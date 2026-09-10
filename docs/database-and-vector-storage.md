@@ -1,5 +1,38 @@
 # 数据库与向量存储设计
 
+## 2026-09-10 · 诊断与完整语音来源（034）
+
+既有ModelInvocation JSON增加可选schema_reason/schema_path元数据，只记录校验规则代码和schema路径，不持久化被拒绝值/完整Prompt/响应。既有FileObject JSON的source_type增加tts_complete_pcm，沿用agent_expression_audio、组织/面试/题目归属、私有存储checksum与加密门禁。仅在验证完整final+EOF后写ready；取消或格式失败不写入资产。无DDL迁移，不修改历史回答、评分或冻结题库语音。
+
+## 2026-09-09 · 面试截止时间收口（031）
+
+无新表或 DDL。`interviews` JSON 文档沿用 `scheduled_end_at/version`；旧会话缺字段时只读其绑定 appointment 的结束时间；截止收口可选写入 `termination_reason`、`expired_at`、`completed_at` 及生命周期事件。同事务追加 `interview.appointment_window_expired` 审计，只记录会话 ID、原状态、终态和预约结束时间，不包含候选人回答或联系方式。多进程重复扫描由状态前置条件与聚合乐观并发保证幂等；已完成候选人输入的会话不匹配扫描条件。
+
+## 2026-09-09 · 面试列表移除（029）
+
+`interviews` JSON 文档可选保存 `list_removed_at`、`list_removed_by`；沿用 `version` 乐观并发更新，无新增表或 DDL。普通会话列表在组织隔离后过滤 `list_removed_at`，直接读取仍保留完整聚合。移除事务同时追加 metadata-only `interview.removed_from_list` 审计，不能级联删除回答、评分、报告、FileObject 或媒体对象；敏感数据物理清除继续仅由 retention purge 负责。
+
+## 2026-09-09 · 简历尾题与中文识别（028）
+
+028：无DDL。计划assembly_summary新增experience_question_count/target；简历turn增加deferred_speech/speech_preparation及跳过时skip_reason。资产绑定按组织、预约、题目源版本、语音fingerprint与生产可用性校验。报告skipped_questions标明系统原因和counts_toward_score=false，保留全部历史转写和评分revision。
+
+## 027直接评分兼容
+
+无DDL迁移。旧026保存在JSON中的暂定评分通过只读projection恢复为有效数值；若历史报告总分为空，只使用所引用的实际评分和冻结计划权重重算，不覆盖历史记录。新评分直接保存数值和非阻断质量提示。可选转写核验仍审计具体操作者/文本/录音版本，自动出分不会伪造人工确认。
+
+## 026转写核验与争议评分存储
+
+无新表/DDL；在已有InterviewSession JSON聚合中扩展可空stt_confidence、来源、精确转写/录音版本绑定的核验事实、评分质量状态及暂定建议。核验和REGRADE_REQUESTED/Outbox在同事务写入；实际认证操作者写审计，客户端不得指定分数或冒充reviewer。旧评分/报告不原地改写，读取时保护有争议的数字；后续评分与报告追加revision。已核验的历史文本不自动授权后来的转写、追加追问或录音替换。
+
+## 面试提交后的评分与回放修复（025）
+
+收齐回答、评分完成、报告就绪和录像封存是独立事实。评分使用answer_evaluation.v3，冻结关键点ID现在写入实际Prompt；默认8000输出tokens，截断时仅允许一次16000预算重试，总时限240秒，评分工作租约300秒。受信工作流通过通用InvocationExecutionBudget明确单次120秒、网关内重试0次（不继承交互式路由的30秒/重试1次）；Provider暂时故障至少等待35秒再由Outbox重试，避免在30秒熔断窗口内耗尽任务预算。Provider不可重试错误首轮dead-letter，暂时故障保留Outbox退避；错误只保存固定码和去敏提示。失败答案可经processing/retry重排同revision，成功后沿生命周期自动生成报告，不能将失败评分按0分生成正常报告。
+
+StopEgress的ENDING不代表完成：先持久化interview.media.finalize，再请求停止；后台按5秒指数退避（最多8次、单次间隔上限120秒）查询同一egress，COMPLETE且对象非空、字节数/hash/存储保护通过才可回放。失败可由企业显式重试，不依赖webhook必须到达。大录像使用分块摘要和Range传输；签名五分钟、组织/会话/资源绑定、读取审计及清理后撤销保持。
+
+企业复核页显示评分进度/失败及报告，提供全场音视频、独立逐题WAV和按题视频导航，已提交会话停止显示等待实时媒体。新PCM录音按字节计算时长并记录服务端采集起止时间；历史视频只按题目时间窗口定位并明确标示，包含读题/回答，不能承诺逐句精确同步。旧答案与录音不原地改写，无新增表或DDL。
+
+
 ## 准备状态的数据影响（024）
 
 无DDL或旧答案迁移。agent_runtime.answer_preparation保存当前turn/capture的可空准备事实，准备退出、失败或当前录音结束时清理；快照再次按当前会话/录音身份过滤。准备缓存和同文字失败预算属于当前采集进程，不写入候选事实；重启不补交历史答案。固定阶段、原因和Schema路径仅作安全诊断，不新增敏感原文日志。

@@ -14,7 +14,7 @@ from test_prepared_turn_decision import Gateway, _input, _service
 
 def declined_data(transcript):
     references = understanding_references(transcript, ["幂等键", "确认序号"])
-    return {
+    return {"clarification_target": None,
         "intent": "answer_declined", "answer_summary": "候选人表示本题不再作答。",
         "claims": [], "evidence_ids": list(references["evidence"]),
         "covered_point_ids": [], "missing_point_ids": ["P1", "P2"],
@@ -32,8 +32,8 @@ def no_followup():
 
 
 @pytest.mark.parametrize("confirmed,expected_understanding,expected_decision", [
-    (False, "interview_turn_understanding.v6", "interview_turn_decision.v5"),
-    (True, "interview_turn_understanding.v7", "interview_turn_decision.v6"),
+    (False, "interview_turn_understanding.v8", "interview_turn_decision.v7"),
+    (True, "interview_turn_understanding.v9", "interview_turn_decision.v8"),
 ])
 def test_declined_contract_versions_and_reference_schema(confirmed, expected_understanding, expected_decision):
     text = "这部分没有做过，咱们聊下一道吧。"
@@ -93,7 +93,7 @@ async def test_malformed_decline_cannot_become_an_authorized_next_action(change)
 
 
 def test_declined_evidence_must_be_nonblank_even_when_called_after_generic_validation():
-    value = {
+    value = {"clarification_target": None,
         "intent": "answer_declined", "answer_summary": "未作答", "claims": [],
         "evidence_quotes": [" "], "covered_capability_points": [],
         "missing_capability_points": ["幂等键"], "ambiguities": [], "contradictions": [],

@@ -7,6 +7,7 @@ from app.persistence.interface import Persistence
 from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
 from app.repositories.provider import get_store
+from app.services.media_capture import InterviewMediaCaptureService
 from app.services.interviews import InterviewService
 from app.services.catalog import CatalogService
 from app.services.knowledge_base_speech import KnowledgeBaseSpeechService
@@ -87,6 +88,8 @@ class OutboxWorker:
             await self.resume_ingestion.process(item["id"], organization_id)
         elif item["kind"] in {"knowledge_base.import", "knowledge_base.rebuild"}:
             await self.catalog.process_build_work(item["id"], organization_id)
+        elif item["kind"] == "interview.media.finalize":
+            await InterviewMediaCaptureService(self.store, persistence=self.persistence).process_finalization_work(item["id"], organization_id)
         elif item["kind"] in {"answer.evaluate", "interview.report.generate"}:
             result = await self.interviews.process_outbox_work(item["id"], organization_id)
             await self._publish_interview_work(item, result)

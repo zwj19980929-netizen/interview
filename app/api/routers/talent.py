@@ -1,3 +1,5 @@
+from app.transport.http.media import _single_byte_range
+
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Header, Request
@@ -236,39 +238,6 @@ async def get_private_file(token: str, request: Request) -> Response:
     )
 
 
-def _single_byte_range(value: Optional[str], total_bytes: int) -> Any:
-    """Parse one RFC byte range without exposing storage paths in failures."""
-
-    if value is None:
-        return None
-    raw = value.strip()
-    if raw[:6].lower() != "bytes=" or "," in raw or total_bytes < 1:
-        return False
-    specification = raw[6:]
-    if specification.count("-") != 1:
-        return False
-    first, last = specification.split("-", 1)
-    if not first:
-        if not last.isdigit() or len(last) > 20:
-            return False
-        suffix_length = int(last)
-        if suffix_length < 1:
-            return False
-        start = max(0, total_bytes - suffix_length)
-        return start, total_bytes - 1
-    if (
-        not first.isdigit()
-        or len(first) > 20
-        or (last and (not last.isdigit() or len(last) > 20))
-    ):
-        return False
-    start = int(first)
-    if start >= total_bytes:
-        return False
-    end = total_bytes - 1 if not last else min(int(last), total_bytes - 1)
-    if end < start:
-        return False
-    return start, end
 
 
 @router.post("/api/v1/question-speech-assets/{asset_id}/content-url")

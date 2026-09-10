@@ -1,13 +1,42 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
+import { requestWithLatestVersion, semanticIdentity } from "../../../core/concurrency.js";
 import { createAppointmentAndInvite } from "../../../interviews/appointment.js";
 import { useWorkbench } from "../../core/WorkbenchProvider.jsx";
 import { Empty, Field, ModalForm, Status, formatDate } from "../../core/ui.jsx";
 import { createEnterpriseInterviewMonitor } from "./agent-monitor.js";
+import InterviewReview, { useInterviewReview } from "./Review.jsx";
 
 export default function InterviewsPage() {
   const wb = useWorkbench();
   return wb.route.view === "live" ? <LiveInterview /> : <InterviewList />;
+}
+
+const INTERVIEW_STATUS_FILTERS = [
+  { value: "all", label: "全部状态" },
+  { value: "active", label: "正在面试" },
+  { value: "scheduled", label: "待开始" },
+  { value: "paused", label: "已暂停" },
+  { value: "processing", label: "评分 / 报告处理中" },
+  { value: "report_ready", label: "报告就绪" },
+  { value: "expired", label: "已超时结束" },
+  { value: "cancelled", label: "已取消" },
+  { value: "failed", label: "处理失败" },
+];
+
+function interviewDisplayStatus(item) {
+  if (item.status === "cancelled" && item.termination_reason === "appointment_window_expired") return "expired";
+  if (item.status === "in_progress" && item.candidate_input_completed_at) return "scoring_pending";
+  return item.status;
+}
+
+function interviewMatchesStatus(status, filter) {
+  if (filter === "all") return true;
+  if (filter === "active") return status === "in_progress";
+  if (filter === "scheduled") return ["scheduled", "waiting"].includes(status);
+  if (filter === "processing") return ["scoring_pending", "evaluating", "completed", "report_generating"].includes(status);
+  if (filter === "failed") return ["processing_failed", "report_failed", "failed"].includes(status);
+  return status === filter;
 }
 
 function InterviewList() {
@@ -23,6 +52,45 @@ function InterviewList() {
     toast,
   } = useWorkbench();
   const canManage = auth?.roles?.some((role) => ["admin", "interviewer"].includes(role));
+  const [candidateQuery, setCandidateQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState("all");
+  const normalizedQuery = candidateQuery.trim().toLocaleLowerCase("zh-CN");
+  const filteredInterviews = useMemo(() => data.interviews.filter((item) => {
+    const candidateName = String(item.candidate?.name || item.id).toLocaleLowerCase("zh-CN");
+    return candidateName.includes(normalizedQuery)
+      && interviewMatchesStatus(interviewDisplayStatus(item), statusFilter);
+  }), [data.interviews, normalizedQuery, statusFilter]);
+  const hasFilters = Boolean(normalizedQuery || statusFilter !== "all");
+  const removeIdentity = semanticIdentity(["id", "status", "candidate_input_completed_at", "current_report_id", "list_removed_at"]);
+  const remove = (item) => {
+    const candidateName = item.candidate?.name || item.id;
+    const path = `${API}/interviews/${encodeURIComponent(item.id)}`;
+    openModal({
+      title: `移除 ${candidateName}`,
+      body: <ModalForm
+        submitLabel="确认移除"
+        submitVariant="danger"
+        onSubmit={async () => {
+          await requestWithLatestVersion({
+            request,
+            resourcePath: path,
+            snapshot: item,
+            identity: removeIdentity,
+            changedMessage: "这场面试的状态或报告已经变化，请刷新后重新确认移除",
+            perform: (latest) => request(`${path}?expected_version=${latest.version}`, { method: "DELETE" }),
+          });
+          await refresh("interviews");
+          closeModal();
+          toast("已从面试列表移除", "候选人资料、回答、报告、录音和审计记录仍然保留");
+        }}
+      >
+        <div className="delete-warning field-full">
+          <strong>从面试会话列表移除“{candidateName}”？</strong>
+          <p>这里只隐藏当前这场面试，不会删除候选人资料、回答、报告、录音或审计记录。</p>
+        </div>
+      </ModalForm>,
+    });
+  };
   const create = () => openModal({
     title: "创建面试预约",
     body: <AppointmentForm
@@ -49,7 +117,7 @@ function InterviewList() {
   });
   return <>
     <section className="page-header">
-      <div><h1>面试会话</h1><p>{data.interviews.length} 场面试</p></div>
+      <div><h1>面试会话</h1><p>{hasFilters ? `显示 ${filteredInterviews.length} / 共 ${data.interviews.length} 场面试` : `${data.interviews.length} 场面试`}</p></div>
       <div className="page-actions">
         <button className="button button-secondary" onClick={() => refresh("interviews")}>刷新</button>
         {canManage && <button
@@ -59,14 +127,101 @@ function InterviewList() {
         >创建预约</button>}
       </div>
     </section>
-    {data.interviews.length ? <div className="interview-list">
-      {data.interviews.map((item) => <article className="interview-card" key={item.id}>
-        <div><strong>{item.candidate?.name || item.id}</strong><span>{formatDate(item.created_at)}</span></div>
-        <Status value={item.status} />
-        <button className="button button-secondary" onClick={() => navigate("interviews", item.id)}>查看</button>
-      </article>)}
-    </div> : <Empty title="暂无面试会话" copy="生成可用计划后创建预约" />}
+    {data.interviews.length ? <>
+      <section className="interview-list-toolbar" aria-label="筛选面试会话">
+        <label className="interview-search-field">
+          <span className="interview-search-icon" aria-hidden="true">
+            <svg viewBox="0 0 20 20" focusable="false"><circle cx="8.5" cy="8.5" r="5.25" /><path d="m12.5 12.5 4 4" /></svg>
+          </span>
+          <input
+            className="form-input"
+            type="search"
+            aria-label="搜索候选人姓名"
+            placeholder="搜索候选人姓名"
+            value={candidateQuery}
+            onChange={(event) => setCandidateQuery(event.target.value)}
+          />
+        </label>
+        <select
+          className="form-select interview-status-filter"
+          aria-label="按面试状态筛选"
+          value={statusFilter}
+          onChange={(event) => setStatusFilter(event.target.value)}
+        >
+          {INTERVIEW_STATUS_FILTERS.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+        </select>
+        {hasFilters && <button
+          className="button button-ghost button-small interview-filter-reset"
+          type="button"
+          onClick={() => { setCandidateQuery(""); setStatusFilter("all"); }}
+        >清除筛选</button>}
+        <span className="interview-filter-summary" aria-live="polite">{filteredInterviews.length} 条结果</span>
+      </section>
+      {filteredInterviews.length ? <section className="interview-list-panel" aria-label="面试会话列表">
+        <div className="interview-list-head" aria-hidden="true">
+          <span>候选人</span><span>创建时间</span><span>状态</span><span>操作</span>
+        </div>
+        <div className="interview-list">
+          {filteredInterviews.map((item) => {
+            const candidateName = item.candidate?.name || item.id;
+            const removable = ["cancelled", "report_ready"].includes(item.status);
+            const status = interviewDisplayStatus(item);
+            return <article className="interview-row" key={item.id}>
+              <div className="candidate-cell">
+                <span className="candidate-avatar" aria-hidden="true">{candidateInitial(candidateName)}</span>
+                <span className="candidate-copy">
+                  <strong>{candidateName}</strong>
+                  <small>会话 {interviewReference(item.id)}</small>
+                </span>
+              </div>
+              <time className="interview-time" dateTime={item.created_at || undefined}>{formatDate(item.created_at)}</time>
+              <Status value={status} />
+              <div className="interview-actions">
+                <button className="button button-ghost button-small interview-view-action" onClick={() => navigate("interviews", item.id)}>
+                  查看详情 <span aria-hidden="true">→</span>
+                </button>
+                {canManage && <span className="interview-secondary-action">
+                  {removable
+                    ? <InterviewMoreMenu candidateName={candidateName} onRemove={() => remove(item)} />
+                    : item.status === "in_progress" && !item.candidate_input_completed_at
+                      ? <span className="interview-action-state">正在面试中</span>
+                      : null}
+                </span>}
+              </div>
+            </article>;
+          })}
+        </div>
+      </section> : <Empty title="没有匹配的面试" copy="换个候选人姓名或状态试试，也可以清除筛选条件" />}
+    </> : <Empty title="暂无面试会话" copy="生成可用计划后创建预约" />}
   </>;
+}
+
+function candidateInitial(name) {
+  return Array.from(String(name || "候").trim())[0] || "候";
+}
+
+function interviewReference(id) {
+  const value = String(id || "").replace(/^iv_/, "");
+  return value ? value.slice(0, 8).toUpperCase() : "-";
+}
+
+function InterviewMoreMenu({ candidateName, onRemove }) {
+  const close = (event) => event.currentTarget.closest("details")?.removeAttribute("open");
+  return <details
+    className="interview-action-menu"
+    onBlur={(event) => { if (!event.currentTarget.contains(event.relatedTarget)) event.currentTarget.removeAttribute("open"); }}
+    onKeyDown={(event) => {
+      if (event.key === "Escape") {
+        event.currentTarget.removeAttribute("open");
+        event.currentTarget.querySelector("summary")?.focus();
+      }
+    }}
+  >
+    <summary className="interview-action-trigger" role="button" aria-haspopup="menu" aria-label={`${candidateName}的更多操作`}>•••</summary>
+    <div className="interview-action-popover" role="menu">
+      <button type="button" role="menuitem" onClick={(event) => { close(event); onRemove(); }}>移出列表</button>
+    </div>
+  </details>;
 }
 
 function AppointmentForm({ data, request, API, onDone }) {
@@ -245,6 +400,8 @@ function LiveInterview() {
     toast,
   } = useWorkbench();
   const interview = data.selectedInterview;
+  const { review, error: reviewError, reload: reloadReview } = useInterviewReview(interview?.id);
+  const submitted = Boolean(interview?.candidate_input_completed_at || review?.processing?.submitted_at);
   const canManage = auth?.roles?.some((role) => ["admin", "interviewer"].includes(role));
   const [monitorState, setMonitorState] = useState(EMPTY_MONITOR);
   const [takeoverReason, setTakeoverReason] = useState("");
@@ -258,7 +415,7 @@ function LiveInterview() {
   );
 
   useEffect(() => {
-    if (!interview?.id || !["in_progress", "paused"].includes(interview.status)) return undefined;
+    if (!interview?.id || submitted || !["in_progress", "paused"].includes(interview.status)) return undefined;
     let active = true;
     let unsubscribe = () => {};
     monitor.open({
@@ -282,7 +439,7 @@ function LiveInterview() {
       monitorRef.current = null;
       run?.close();
     };
-  }, [auth?.actor_id, canManage, interview?.id, interview?.status, monitor]);
+  }, [auth?.actor_id, canManage, interview?.id, interview?.status, submitted, monitor]);
 
   useEffect(() => {
     if (candidateMediaRef.current && monitorState.candidateStream) {
@@ -293,7 +450,10 @@ function LiveInterview() {
   if (!interview) return <Empty title="面试不可用" copy="未找到指定会话" />;
 
   const current = interview.turns?.find((item) => item.id === interview.current_turn_id);
-  const effectiveStatus = monitorState.session?.status || interview.status;
+  const persistedStatus = review?.status || monitorState.session?.status || interview.status;
+  const effectiveStatus = persistedStatus === "cancelled" && interview.termination_reason === "appointment_window_expired"
+    ? "expired"
+    : persistedStatus;
   const activeTakeover = monitorState.takeover?.status === "active";
   const ownsTakeover = activeTakeover && monitorState.takeover?.actor_id === auth?.actor_id;
   const latestCaption = [...monitorState.captions].reverse().find((item) => item.text);
@@ -348,21 +508,21 @@ function LiveInterview() {
         <div>
           <h1>{interview.candidate?.name || "候选人"}</h1>
           <span>
-            控制 {monitorState.connection.control} · 媒体 {monitorState.connection.media} · 发言权 {monitorState.floor}
+            {submitted ? "回答已提交 · 后台评分与音视频回放" : `控制 ${monitorState.connection.control} · 媒体 ${monitorState.connection.media} · 发言权 ${monitorState.floor}`}
           </span>
         </div>
       </div>
       <div className="workspace-status">
-        <Status value={effectiveStatus} />
-        {canManage && effectiveStatus === "in_progress" && !activeTakeover && <button
+        <Status value={submitted && effectiveStatus === "in_progress" ? (review?.processing?.failed ? "processing_failed" : "scoring_pending") : effectiveStatus} />
+        {canManage && !submitted && effectiveStatus === "in_progress" && !activeTakeover && <button
           className="button button-secondary"
           onClick={() => command("pause")}
         >暂停</button>}
-        {canManage && effectiveStatus === "paused" && !activeTakeover && <button
+        {canManage && !submitted && effectiveStatus === "paused" && !activeTakeover && <button
           className="button button-primary"
           onClick={() => command("recover")}
         >人工确认后恢复 AI</button>}
-        {canManage && ["scheduled", "waiting", "in_progress", "paused"].includes(effectiveStatus) && <button
+        {canManage && !submitted && ["scheduled", "waiting", "in_progress", "paused"].includes(effectiveStatus) && <button
           className="button button-secondary"
           onClick={() => command("cancel")}
         >取消</button>}
@@ -375,7 +535,7 @@ function LiveInterview() {
       <small>系统不会用静态图片伪装成实时监看；请暂停或接管。</small>
     </div>}
 
-    <div className="workspace-grid enterprise-live-grid">
+    {!submitted && !["report_ready", "completed", "report_failed", "report_generating", "cancelled", "expired"].includes(effectiveStatus) && <div className="workspace-grid enterprise-live-grid">
       <section>
         <div className="enterprise-candidate-feed">
           <video ref={candidateMediaRef} autoPlay playsInline aria-label="候选人 LiveKit 实时音视频轨" />
@@ -393,9 +553,9 @@ function LiveInterview() {
         <div className="enterprise-capture-strip">
           <span><small>录像状态</small><strong>{capture?.status || monitorState.session?.recording?.status || "等待媒体发布"}</strong></span>
           <span><small>授权范围</small><strong>{(capture?.consented_scopes || []).join("、") || (interview.record_video ? "音频、视频" : "音频")}</strong></span>
-          <span><small>私有存储</small><strong>{capture?.private_uri ? "已校验 hash" : "尚未完成"}</strong></span>
+          <span><small>私有存储</small><strong>{capture?.status === "completed" && capture?.content_hash ? "完整性校验通过" : "尚未完成"}</strong></span>
         </div>
-        {data.report && <Report report={data.report} />}
+
       </section>
 
       <aside className="session-panel enterprise-agent-panel">
@@ -462,15 +622,7 @@ function LiveInterview() {
           </div>)}
         </div>
       </aside>
-    </div>
+    </div>}
+    <InterviewReview key={interview.id} interviewId={interview.id} review={review} error={reviewError} reload={reloadReview} canManage={auth?.roles?.some((role) => ["admin", "reviewer"].includes(role))} />
   </>;
-}
-
-function Report({ report }) {
-  return <section className="report-panel">
-    <h2>面试报告</h2>
-    <strong className="score-value">{report.overall_score}</strong>
-    <p>{report.recommendation}</p>
-    <p>最终决定由企业人员完成。</p>
-  </section>;
 }

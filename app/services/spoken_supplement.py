@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from app.domain.speech_quality import minimum_reported_confidence
 from typing import Any
 import logging
 
@@ -28,6 +29,7 @@ class SpokenSupplementConfirmation:
         self._playback_started_at = 0.0
         self._missing_reply_since = None
         self._confirmed_final = None
+        self._clarification_revision = None
 
     @property
     def speaking(self) -> bool:
@@ -84,6 +86,8 @@ class SpokenSupplementConfirmation:
             await endpoint._propose()
             return
         if self.phase == "listening":
+            if self._clarification_revision == endpoint.revision:
+                return
             if quiet < self.silence_seconds:
                 return
             endpoint._proposal_revision = endpoint.revision
@@ -105,6 +109,7 @@ class SpokenSupplementConfirmation:
                 await endpoint._notify("transcript_unavailable")
                 return
             self.boundary = final.text.strip()
+            self._clarification_revision = None
             self._boundary_segments = len(final.segments)
             self._reminded = False
             await self._say(endpoint, "check", afterwards="awaiting_reply")
@@ -128,6 +133,30 @@ class SpokenSupplementConfirmation:
         finally:
             if not endpoint._closed and endpoint.capture.is_open:
                 await endpoint.capture.resume_capture()
+
+    async def clarify_answer(self, endpoint: Any, understanding: Any, final: Any) -> None:
+        """Ask within this recording; a correction must retain the earlier answer."""
+        endpoint.assert_current()
+        target = understanding.clarification_target
+        if target and (target.evidence_quote not in final.text or target.focus_quote not in target.evidence_quote):
+            raise ValueError("Clarification target is not grounded in the current final")
+        self.confirmed = False
+        self._confirmed_final = None
+        self.boundary = final.text.strip()
+        self._boundary_segments = len(final.segments)
+        self._clarification_revision = endpoint.revision
+        endpoint._explicit_revision = None
+        endpoint._discard_confirmed_preparation()
+        self.phase, self._after_speech = "speaking", "listening"
+        self._playback_started_at = endpoint.clock()
+        try:
+            spoken = await self.speak("answer_clarify", endpoint.assert_current,
+                                      focus_quote=target.focus_quote if target else "")
+            if not spoken and self.phase == "speaking":
+                self.phase = "listening"
+        except BaseException:
+            self.phase = "listening"
+            raise
 
     async def _reply(self, endpoint: Any, final: Any) -> None:
         endpoint.assert_current()
@@ -164,21 +193,44 @@ class SpokenSupplementConfirmation:
                 await self._accept_finish(endpoint, final)
             return
         segments = final.segments[self._boundary_segments:]
-        confidence = min((s.confidence for s in segments), default=final.confidence)
-        if confidence < 0.65:
+        confidence = minimum_reported_confidence(final.confidence, *(s.confidence for s in segments))
+        if confidence is not None and confidence < 0.65:
             self.boundary = text
             self._boundary_segments = len(final.segments)
             await self._say(endpoint, "clarify", afterwards="awaiting_reply")
             return
         self.phase = "classifying"
+        # Bind classification failures to the same server words as answer
+        # preparation. Acoustic revisions alone cannot buy new model calls.
+        endpoint._use_preparation_budget(text)
+        if endpoint._prepare_failures >= 3:
+            self.phase = "awaiting_reply"
+            endpoint._blocked_revision = endpoint.revision
+            await endpoint._understanding_failed(record_failure=False)
+            return
+        budget_key = endpoint._preparation_budget_key
+        budget_epoch = endpoint._preparation_budget_epoch
         try:
             decision = await endpoint._infer(
                 endpoint.capture.classify_supplement_reply(reply), timeout=10,
             )
             endpoint.assert_current()
+        except Exception as exc:
+            self.phase = "awaiting_reply"
+            if getattr(exc, "code", None) == "TURN_DECISION_STALE":
+                raise
+            if (endpoint._preparation_budget_key != budget_key
+                    or endpoint._preparation_budget_epoch != budget_epoch):
+                return
+            endpoint.trace("supplement_classification_failed", error_type=type(exc).__name__,
+                           cause_code=getattr(exc, "code", "supplement_classification_invalid"))
+            await endpoint._understanding_failed()
+            return
         except BaseException:
             self.phase = "awaiting_reply"
             raise
+        if endpoint._prepare_failures:
+            await endpoint._notify("supplement_awaiting_reply")
         action = decision["intent"]
         endpoint.trace("supplement_decided", intent=action, confidence=decision["confidence"],
                        revision=endpoint.revision, text=reply)

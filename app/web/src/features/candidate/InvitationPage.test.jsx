@@ -69,14 +69,14 @@ describe("candidate model readiness and start wait", () => {
     expect(prepareCandidateMedia).toHaveBeenCalledTimes(1);
     expect(rememberPreflightReport).toHaveBeenCalledTimes(1);
     expect(enter.disabled).toBe(true);
-    expect(enter.textContent).toBe("正在检查模型服务…");
-    expect(host.querySelector('[role="status"]').textContent).toContain("约 30 秒");
+    expect(enter.textContent).toBe("正在准备面试…");
+    expect(host.querySelector('[role="status"]').textContent).toContain("正在准备，请稍等片刻");
     await act(async () => readiness.resolve({ can_start: true }));
     expect(workbench.request).toHaveBeenLastCalledWith("/api/v1/public/interview-invitations/synthetic_token/start", {
       method: "POST", timeoutMs: 40000,
     });
     expect(enter.disabled).toBe(true);
-    expect(enter.textContent).toBe("正在建立安全会话…");
+    expect(enter.textContent).toBe("正在进入面试…");
     await act(async () => start.resolve({ candidate_join_url: "#candidate/synthetic_only" }));
     expect(location.hash).toBe("#candidate/synthetic_only");
     expect(workbench.request).toHaveBeenCalledTimes(2);
@@ -91,7 +91,7 @@ describe("candidate model readiness and start wait", () => {
     expect(workbench.request.mock.calls[0][0]).toMatch(/\/readiness$/);
     expect(enterButton().disabled).toBe(false);
     expect(host.querySelector('[role="status"]')).toBeNull();
-    expect(workbench.toast).toHaveBeenCalledWith("暂时无法进入面试", expect.stringContaining("模型服务"), "error");
+    expect(workbench.toast).toHaveBeenCalledWith("暂时无法进入面试", expect.stringContaining("检查网络或重新打开邀请链接"), "error");
     await act(async () => enterButton().click());
     expect(workbench.request).toHaveBeenCalledTimes(2);
     expect(runCandidatePreflight).toHaveBeenCalledTimes(1);
@@ -107,7 +107,7 @@ describe("candidate model readiness and start wait", () => {
     await act(async () => enterButton().click());
     expect(enterButton().disabled).toBe(false);
     expect(host.querySelector('[role="status"]')).toBeNull();
-    expect(workbench.toast).toHaveBeenCalledWith("暂时无法进入面试", "Synthetic request timeout", "error");
+    expect(workbench.toast).toHaveBeenCalledWith("暂时无法进入面试", "暂时无法进入面试，请检查网络或重新打开邀请链接。", "error");
     for (const [, options] of workbench.request.mock.calls) expect(options.timeoutMs).toBe(40000);
   });
 });

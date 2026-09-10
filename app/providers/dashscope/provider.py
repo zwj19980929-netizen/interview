@@ -245,8 +245,8 @@ class DashScopeProvider(OpenAICompatibleProvider):
         return BatchSTTResponse(
             text=text,
             language=request.language,
-            confidence=1.0,
-            segments=[TranscriptSegment(text=text, confidence=1.0)],
+            confidence=None,
+            segments=[TranscriptSegment(text=text, confidence=None)],
             source="server_batch_repair" if request.purpose == "candidate_answer_repair" else "server_batch",
             provider=ProviderMeta(
                 provider_id=self.provider_id,
@@ -508,13 +508,25 @@ class DashScopeSTTStream:
             # Other models do not accept this vendor parameter.
             if context.model == "qwen-audio-3.0-asr-flash-streaming" and request.recognition_terms:
                 parameters["vocabulary"] = {term: 2 for term in request.recognition_terms}
+            input_payload = {}
+            if context.model in {"qwen-audio-3.0-asr-flash-streaming", "fun-asr-realtime", "fun-asr-realtime-2025-11-07"} and request.recognition_terms:
+                # Official ASR context accepts a domain vocabulary as input_text.
+                # Keep whole terms within its 400-character per-round limit.
+                words = []
+                for term in request.recognition_terms:
+                    if len("、".join([*words, term])) > 400:
+                        break
+                    words.append(term)
+                input_payload = {"context": [{"role": "user", "content": [
+                    {"type": "input_text", "text": "、".join(words)}
+                ]}]}
                 if _language_hint(request.language) == "zh":
                     parameters["language_hints"] = ["zh", "en"]
             await socket.send(json.dumps({
                 "header": {"action": "run-task", "task_id": stream.task_id, "streaming": "duplex"},
                 "payload": {
                     "task_group": "audio", "task": "asr", "function": "recognition", "model": context.model,
-                    "parameters": parameters, "input": {},
+                    "parameters": parameters, "input": input_payload,
                 },
             }, ensure_ascii=False))
             first = await stream._receive_one(timeout=max(1, float(context.timeout_s)))
@@ -622,7 +634,7 @@ class DashScopeSTTStream:
             revision=self._preview_revision,
             text="".join(segment.text for segment in segments),
             language=self.request.language,
-            confidence=1.0,
+            confidence=None,
             segments=[segment.model_copy(deep=True) for segment in segments],
             provider=ProviderMeta(provider_id=self.provider.provider_id, model=self.context.model,
                                   request_id=self.request_id, latency_ms=0),
@@ -920,7 +932,7 @@ class DashScopeSTTStream:
                     end, valid_end = last_end, True
         valid_timing = valid_begin and valid_end and end >= begin
         segment = TranscriptSegment(text=text, start_ms=begin if valid_begin else 0,
-                                    end_ms=end if valid_end else 0, confidence=1.0) if text else None
+                                    end_ms=end if valid_end else 0, confidence=None) if text else None
         previous = self._committed_sentences.get(key) if key is not None else None
         if key is not None and key in self._committed_sentences:
             if sentence.get("sentence_end") and segment != previous:
@@ -1026,7 +1038,7 @@ class DashScopeSTTStream:
             type=event_type,
             text=text,
             language=self.request.language,
-            confidence=1.0 if text else 0.0,
+            confidence=None,
             segments=segments or [],
             is_final=is_final,
             provider=ProviderMeta(provider_id=self.provider.provider_id, model=self.context.model, request_id=self.request_id, latency_ms=0),

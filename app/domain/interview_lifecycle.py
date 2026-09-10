@@ -234,7 +234,11 @@ class InterviewSessionLifecycle:
         session["current_turn_id"] = None
         session["completed_at"] = now
         session["interruption"] = None
-        self._emit(session, events, "interview.cancelled", {"reason": payload.get("reason", "cancelled")}, now)
+        reason = payload.get("reason", "cancelled")
+        if reason == "appointment_window_expired":
+            session["termination_reason"] = reason
+            session["expired_at"] = now
+        self._emit(session, events, "interview.cancelled", {"reason": reason}, now)
 
     def _skip_current_turn(
         self,
@@ -536,6 +540,7 @@ class InterviewSessionLifecycle:
         )
         revision = current_revision + 1
         answer["evaluation_status"] = "pending"
+        answer.pop("evaluation_failure_code", None)
         answer["updated_at"] = now
         self._request_evaluation(session, answer, revision, payload.get("trigger_reason", "manual_regrade"), now, events, effects)
 
@@ -585,6 +590,7 @@ class InterviewSessionLifecycle:
         answer["current_evaluation_id"] = evaluation["id"]
         answer["evaluation_id"] = evaluation["id"]
         answer["evaluation_status"] = "completed"
+        answer.pop("evaluation_failure_code", None)
         answer["updated_at"] = now
         evidence_answer_ids = list(
             evaluation.get("evidence_answer_ids")
@@ -666,6 +672,7 @@ class InterviewSessionLifecycle:
     ) -> None:
         answer = self._answer(session, payload["answer_id"])
         answer["evaluation_status"] = "failed"
+        answer["evaluation_failure_code"] = payload.get("error_code", "evaluation_failed")
         answer["updated_at"] = now
         self._emit(
             session,
@@ -685,7 +692,7 @@ class InterviewSessionLifecycle:
     ) -> None:
         answer = self._answer(session, payload["answer_id"])
         turn = self._turn(session, answer["turn_id"])
-        if answer.get("evaluation_status") != "failed" or turn.get("status") != "evaluating":
+        if answer.get("evaluation_status") != "failed" or turn.get("status") not in {"evaluating", "completed"}:
             self._invalid("A failed evaluation cannot be retried from the current answer state.")
         expected_revision = max(
             [item["revision"] for item in session.get("evaluation_revisions", []) if item["answer_id"] == answer["id"]],
@@ -695,6 +702,7 @@ class InterviewSessionLifecycle:
         if revision != expected_revision:
             self._invalid("Evaluation retry revision does not match the pending append-only revision.")
         answer["evaluation_status"] = "pending"
+        answer.pop("evaluation_failure_code", None)
         answer["updated_at"] = now
         self._emit(
             session,
@@ -826,7 +834,7 @@ class InterviewSessionLifecycle:
     ) -> None:
         if self._has_unresolved_evaluations(session):
             return
-        next_turn = self._first_turn_with_status(session, ("pending",))
+        next_turn = self._next_playable_turn(session, now, events)
         if next_turn is not None:
             previous_phase = session.get("phase")
             next_turn["status"] = "asking"
@@ -859,7 +867,7 @@ class InterviewSessionLifecycle:
     ) -> None:
         """Advance the conversational floor while scoring continues off-path."""
 
-        next_turn = self._first_turn_with_status(session, ("pending",))
+        next_turn = self._next_playable_turn(session, now, events)
         if next_turn is None:
             session["current_turn_id"] = None
             # Candidate input and asynchronous scoring are deliberately
@@ -898,6 +906,21 @@ class InterviewSessionLifecycle:
             {"turn_id": next_turn["id"], "scoring_in_background": True},
             now,
         )
+
+    def _next_playable_turn(self, session: Document, now: str, events: List[Document]) -> Optional[Document]:
+        while True:
+            turn = self._first_turn_with_status(session, ("pending",))
+            if turn is None or not turn.get("deferred_speech"):
+                return turn
+            prepared = turn.get("speech_preparation") or {}
+            if prepared.get("status") == "ready" and prepared.get("asset_id"):
+                return turn
+            turn["status"] = "skipped"
+            turn["skip_reason"] = "resume_speech_not_ready"
+            turn["completed_at"] = now
+            self._emit(session, events, "turn.skipped", {
+                "turn_id": turn["id"], "reason": turn["skip_reason"], "source_type": "resume_experience",
+            }, now)
 
     @staticmethod
     def _has_unresolved_evaluations(session: Document) -> bool:

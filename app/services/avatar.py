@@ -1,5 +1,6 @@
 from typing import Any, Dict, Optional, Protocol
 
+from app.domain.appointment_speech import turn_speech_asset_id
 from app.core.errors import ApiError
 from app.core.ids import new_id
 from app.model_gateway import capabilities as cap
@@ -45,7 +46,7 @@ class LocalAvatarDelivery:
         fallback_reason: Optional[str] = None,
     ) -> AvatarSpeakResponse:
         organization_id = interview.get("organization_id", "org_default")
-        speech_asset_id = turn.get("question_snapshot", {}).get("speech_asset_id")
+        speech_asset_id = turn_speech_asset_id(turn)
         asset: Optional[Dict[str, Any]] = None
         if speech_asset_id:
             with self.persistence.transaction(organization_id) as transaction:
@@ -210,7 +211,7 @@ class AvatarService:
         context = self.interviews.active_turn_context(interview_id, payload.get("turn_id"))
         interview = context["interview"]
         turn = context["turn"]
-        speech_asset_id = turn.get("question_snapshot", {}).get("speech_asset_id")
+        speech_asset_id = turn_speech_asset_id(turn)
         # Historical sessions predate avatar_mode and therefore keep their cloud behavior.
         avatar_mode = interview.get("settings", {}).get("avatar_mode", "cloud")
         if avatar_mode == "cloud":

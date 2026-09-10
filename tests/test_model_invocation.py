@@ -355,3 +355,37 @@ async def test_production_requires_an_explicit_model_route(monkeypatch) -> None:
         await gateway.invoke(cap.LLM_CHAT_JSON, request())
 
     assert default_exc_info.value.code == "provider_route_missing"
+
+
+def test_workflow_execution_budget_prevents_nested_retry_and_owns_timeout():
+    from app.model_gateway.schemas import InvocationExecutionBudget
+    async def scenario():
+        store = configured_store()
+        slow = SlowAdapter()
+        gateway = ModelGateway(store, provider_clients={"openai_compatible": slow})
+        route = {"id": "budget_test", "organization_id": "org_default", "capability": cap.LLM_CHAT_JSON,
+                 "primary": {"model_configuration_id": "model_cfg_primary", "timeout_s": .001},
+                 "fallbacks": [], "policy": {"retry_count": 3}}
+        request = ChatJSONRequest(purpose="synthetic_budget", messages=[ChatMessage(role="user", content="synthetic")],
+                                  execution_budget=InvocationExecutionBudget(timeout_s=1, max_provider_retries=0))
+        result = await gateway.invoke(cap.LLM_CHAT_JSON, request, route=route)
+        assert result.data["score"] == 80 and slow.calls == 1
+        broken = ScriptedAdapter([ProviderError("provider_timeout", "synthetic", retryable=True)])
+        gateway = ModelGateway(store, provider_clients={"openai_compatible": broken})
+        with pytest.raises(ProviderError):
+            await gateway.invoke(cap.LLM_CHAT_JSON, request, route=route)
+        assert broken.calls == 1
+    asyncio.run(scenario())
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize('version', ['answer_evaluation.v4', 'interview_turn_understanding.v8',
+    'interview_turn_understanding.v9', 'interview_turn_decision.v7', 'interview_turn_decision.v8'])
+async def test_current_speech_prompt_versions_are_auditable(version):
+    store = configured_store()
+    adapter = ScriptedAdapter([response()])
+    gateway = ModelGateway(store, provider_clients={'openai_compatible': adapter})
+    payload = request()
+    payload.metadata['prompt_version'] = version
+    await gateway.invoke(cap.LLM_CHAT_JSON, payload, route=route(retry_count=0, fallback=False))
+    assert store.model_invocations[-1]['prompt_version'] == version

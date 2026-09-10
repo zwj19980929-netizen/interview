@@ -18,6 +18,62 @@ import {
   verifyLicensedVrmAsset,
 } from "./vrm-avatar.js";
 
+describe("candidate startup cancellation", () => {
+  it("does not claim the next page's prepared devices when an old avatar request completes late", async () => {
+    let resolveAvatar;
+    const pending = new Promise((resolve) => { resolveAvatar = resolve; });
+    const request = vi.fn();
+    const verifyAvatar = vi.fn(() => pending);
+    const controller = new AbortController();
+    const experience = createCandidateInterviewExperience({ request, verifyAvatar });
+    const opening = experience.open({ interviewId: "old", ticket: "token-old", signal: controller.signal });
+    const rejected = expect(opening).rejects.toMatchObject({ name: "AbortError" });
+    controller.abort();
+    const stop = vi.fn();
+    const stream = { getAudioTracks: () => [{ readyState: "live" }], getVideoTracks: () => [{ readyState: "live" }], getTracks: () => [{ stop }] };
+    prepareCandidateMedia(stream, { speaker_verified: true, microphone_granted: true });
+    resolveAvatar({ ready: true });
+    await rejected;
+    expect(verifyAvatar.mock.calls[0][0].signal.aborted).toBe(true);
+    expect(request).not.toHaveBeenCalled();
+    expect(stop).not.toHaveBeenCalled();
+    expect(claimPreparedCandidateMedia()?.stream).toBe(stream);
+  });
+
+  it("cleans up a cancelled startup after its media connector settles without opening control or capture", async () => {
+    let resolveMedia;
+    let connecting;
+    const reachedMedia = new Promise((resolve) => { connecting = resolve; });
+    const pending = new Promise((resolve) => { resolveMedia = resolve; });
+    const controller = new AbortController();
+    const stop = vi.fn();
+    const stream = { getAudioTracks: () => [{ readyState: "live" }], getVideoTracks: () => [{ readyState: "live" }], getTracks: () => [{ stop }] };
+    prepareCandidateMedia(stream, { speaker_verified: true, microphone_granted: true });
+    const request = vi.fn(async () => ({ media: { status: "ready" } }));
+    const socketFactory = vi.fn();
+    const audioCaptureFactory = vi.fn();
+    const ring = { clear: vi.fn() };
+    const experience = createCandidateInterviewExperience({
+      request, socketFactory, audioCaptureFactory, ringFactory: () => ring,
+      verifyAvatar: async () => ({ ready: true }),
+      mediaConnector: () => { connecting(); return pending; },
+    });
+    const opening = experience.open({ interviewId: "old", ticket: "token-old", signal: controller.signal });
+    const rejected = expect(opening).rejects.toMatchObject({ name: "AbortError" });
+    await reachedMedia;
+    controller.abort();
+    const close = vi.fn();
+    resolveMedia({ close });
+    await rejected;
+    expect(request.mock.calls[0][1].signal.aborted).toBe(true);
+    expect(close).toHaveBeenCalledOnce();
+    expect(stop).toHaveBeenCalledOnce();
+    expect(ring.clear).toHaveBeenCalledOnce();
+    expect(socketFactory).not.toHaveBeenCalled();
+    expect(audioCaptureFactory).not.toHaveBeenCalled();
+  });
+});
+
 describe("spoken supplement confirmation", () => {
   it("keeps the real question visible and restores a scoped voice reply state", async () => {
     const { run, socket } = await openPlaybackHarness();

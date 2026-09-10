@@ -1,5 +1,36 @@
 # 模型供应商插件化设计
 
+## 2026-09-10 · 补充分类与完整音频直取（034）
+
+supplement_reply.v3集中定义Prompt和严格Schema，只返回intent/confidence/evidence_id。长回答不要求模型复写最多300字的quote；服务端按编号恢复精确证据。调用预算8秒、350输出token、0次provider内重试；端点按原文最多三次失败。网关记录白名单schema_reason/schema_path用于区分枚举、类型、长度、字段等错误，保留历史版本。
+
+AgentExpressionAudioService通过既有open_tts_stream收齐完整PCM并私有存储，默认INTERVIEWER_BUFFERED_TTS_ENABLED=true；不支持此传输时使用原batch URL导入。已开始的流失败、超时、取消不自动重播，Mock拒绝；浏览器仍是完整文件播放，INTERVIEWER_STREAMING_TTS_ENABLED=false不变。20秒总准备预算，字节/音频时长与输出终态校验继续由既有网关承担。
+
+合成真实调用发现DashScope Qwen HTTP SSE三项旧适配遗漏：中间finish_reason为字符串“null”，首片带精确PCM16/24k/mono的44字节流式WAVE头，stop前还有一条空audio.data的usage通知。Adapter仅兼容已观察到的固定头（signed-limit占位对），未知头/格式拒绝；空usage通知只允许一次且必须已有PCM，不能视为final，之后仅允许有效stop和EOF。统一网关看到的始终是无容器PCM，不能把文件头当声音或时长。供应商状态/终片规范参照[官方Qwen-TTS接口](https://help.aliyun.com/en/model-studio/qwen-tts-api)；usage空通知和精确首片头依据本次新合成文本的只读字段/容器探针，不声称文档保证所有模型都相同。
+
+## 2026-09-09 · 简历尾题与中文术语（028）
+
+recognition_terms扩展允许统一有限中文技术词表；当题包含FastAPI/RAGFlow/流式等语境时带入流式、stream、streaming、REST API等词，英文标识仍优先，最多100项/64字符。DashScope保持即时热词weight=2；支持context的模型额外收到最多400字符的词表数据，不带标准答案、候选简历正文、候选指令或补造答案的Prompt。官方依据：https://help.aliyun.com/zh/model-studio/fun-asr-client-events 与 https://help.aliyun.com/zh/model-studio/improve-asr-accuracy 。真实口音改善需实测。
+
+## 术语逐词读法与自动评分（027）
+
+识别热词从冻结题干/skills/key_points的技术标识推导；保留原标识优先，再追加下划线、驼峰分词后的自然读法。上限100项，每项2–64字符、最多6个英文词，去重，拒绝双空格/换行/任意正文。DashScope原有支持范围和权重2保持不变，语言提示仍为已有中英配置；仅优化词表，不发送标准答案或候选人文本。评分升级answer_evaluation.v5并进入审计白名单。依据：[阿里云识别准确率说明](https://help.aliyun.com/zh/model-studio/improve-asr-accuracy)与[实时识别客户端事件](https://help.aliyun.com/zh/model-studio/fun-asr-client-events)。热词是识别偏置，不能宣称已保证各种口音准确识别。
+
+## STT置信度与026 Prompt合同
+
+STT事件、稳定预览、句段和batch结果的confidence为严格可空0–1数值，禁止NaN/Infinity；厂商无值则null。DashScope/OpenAI不再硬填1.0，通用HTTP/Volcengine缺省不造值，token avg_logprob不冒充识别置信度。聚合保留所有已报告值中的最小值，原句段保留未知，应用记录partial来源；这是识别服务报告值，不保证经过校准的正确率。
+
+理解合同升级interview_turn_understanding.v8/v9，复合interview_turn_decision.v7/v8，评分answer_evaluation.v4；旧版本保留可读。新增clarification_target为有界E引用+原文focus_quote，不允许编造纠正选项；批准话术在app/core/prompt统一模板answer_clarification.v1。数值未知只让声学门禁不作判断，语义置信度和实际歧义门禁照常执行；既有模型/语音路由及凭据不变。
+
+## 面试提交后的评分与回放修复（025）
+
+收齐回答、评分完成、报告就绪和录像封存是独立事实。评分使用answer_evaluation.v3，冻结关键点ID现在写入实际Prompt；默认8000输出tokens，截断时仅允许一次16000预算重试，总时限240秒，评分工作租约300秒。受信工作流通过通用InvocationExecutionBudget明确单次120秒、网关内重试0次（不继承交互式路由的30秒/重试1次）；Provider暂时故障至少等待35秒再由Outbox重试，避免在30秒熔断窗口内耗尽任务预算。Provider不可重试错误首轮dead-letter，暂时故障保留Outbox退避；错误只保存固定码和去敏提示。失败答案可经processing/retry重排同revision，成功后沿生命周期自动生成报告，不能将失败评分按0分生成正常报告。
+
+StopEgress的ENDING不代表完成：先持久化interview.media.finalize，再请求停止；后台按5秒指数退避（最多8次、单次间隔上限120秒）查询同一egress，COMPLETE且对象非空、字节数/hash/存储保护通过才可回放。失败可由企业显式重试，不依赖webhook必须到达。大录像使用分块摘要和Range传输；签名五分钟、组织/会话/资源绑定、读取审计及清理后撤销保持。
+
+企业复核页显示评分进度/失败及报告，提供全场音视频、独立逐题WAV和按题视频导航，已提交会话停止显示等待实时媒体。新PCM录音按字节计算时长并记录服务端采集起止时间；历史视频只按题目时间窗口定位并明确标示，包含读题/回答，不能承诺逐句精确同步。旧答案与录音不原地改写，无新增表或DDL。
+
+
 ## 准备失败的阶段诊断（024）
 
 未更改供应商/模型路由或Prompt版本。网关成功表示原始统一JSON Schema通过，不代表后续引用、canonical、领域或追问审批成功；日志按安全stage/reason及静态schema_path区分这些位置，禁止输出完整AI响应/候选转写/异常正文。可选追问审批失败不触发整份模型重试；同服务端文字的失败预算不能由声音清零。真实模型尾部时延与业务重复调用分别统计，不将所有等待混为单个模型耗时。

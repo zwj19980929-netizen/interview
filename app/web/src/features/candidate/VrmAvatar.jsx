@@ -19,11 +19,12 @@ export function VrmAvatar({
   const canvasRef = useRef(null);
   const rendererRef = useRef(null);
   const [status, setStatus] = useState("loading");
-  const [fps, setFps] = useState(0);
 
   useEffect(() => {
     let active = true;
     let assetVerified = false;
+    const controller = new AbortController();
+    setStatus("loading");
     const reportFatal = async (error, fallbackCode) => {
       if (!active) return;
       const reported = error instanceof Error ? error : new Error(String(error));
@@ -39,7 +40,9 @@ export function VrmAvatar({
       apiBase,
       interviewId,
       candidateSessionToken,
+      signal: controller.signal,
     }).then((avatarConfig) => {
+      if (!active) return null;
       assetVerified = true;
       return rendererFactory(canvasRef.current, {
         avatarConfig,
@@ -50,7 +53,6 @@ export function VrmAvatar({
         },
         onFps: (value) => {
           if (!active) return;
-          setFps(value);
           onFps?.(value);
         },
         onProblem: (error) => {
@@ -58,6 +60,7 @@ export function VrmAvatar({
         },
       });
     }).then((value) => {
+      if (!value) return;
       if (!active) value.dispose();
       else rendererRef.current = value;
     }).catch((error) => {
@@ -69,6 +72,7 @@ export function VrmAvatar({
     });
     return () => {
       active = false;
+      controller.abort();
       rendererRef.current?.dispose();
       rendererRef.current = null;
     };
@@ -94,13 +98,13 @@ export function VrmAvatar({
   }, [avatar]);
 
   return <div className={`candidate-avatar-stage vrm-avatar-stage is-${status}${avatar?.status === "speaking" ? " is-speaking" : ""}`}>
-    <canvas ref={canvasRef} aria-label="自研 3D 数字人面试官" />
-    {status === "loading" && <div className="vrm-avatar-gate" role="status"><span className="spinner" /><strong>正在验证并加载专属 3D 面试官</strong><small>未通过资产与 WebGL 检查前不会开始正式面试</small></div>}
-    {status === "pausing" && <div className="vrm-avatar-gate is-error" role="status"><strong>3D 数字人不可用，正在确认服务器暂停</strong><small>未确认前请停止作答。</small></div>}
-    {status === "paused" && <div className="vrm-avatar-gate is-error" role="alert"><strong>3D 数字人不可用，面试已在服务器暂停</strong><small>系统不会退回静态图片或假口型，请等待企业面试官接管。</small></div>}
-    {status === "failed" && <div className="vrm-avatar-gate is-error" role="alert"><strong>3D 数字人不可用，服务器暂停尚未确认</strong><small>请停止作答并联系企业面试官。</small></div>}
+    <canvas ref={canvasRef} aria-label="面试官" />
+    {status === "loading" && <div className="vrm-avatar-gate" role="status"><span className="spinner" /><strong>面试官正在准备</strong><small>请稍等片刻</small></div>}
+    {status === "pausing" && <div className="vrm-avatar-gate is-error" role="status"><strong>正在暂停面试</strong><small>请先停止作答。</small></div>}
+    {status === "paused" && <div className="vrm-avatar-gate is-error" role="alert"><strong>面试已暂停</strong><small>请联系面试安排人协助恢复。</small></div>}
+    {status === "failed" && <div className="vrm-avatar-gate is-error" role="alert"><strong>连接中断，请先停止作答</strong><small>请联系面试安排人确认后再继续。</small></div>}
     <div className="candidate-stage-caption">
-      <span><strong>自研实时 3D 面试官</strong><small>{status === "ready" ? `${Math.round(fps)} FPS · viseme 音画同步` : "正式表达链路检查中"}</small></span>
+      <span><strong>面试官</strong></span>
       <span className={`avatar-speaking-badge${avatar?.status === "speaking" ? " is-active" : ""}`}>{avatar?.status === "speaking" ? "正在说话" : "等待发言"}</span>
     </div>
   </div>;

@@ -666,7 +666,10 @@ class LiveKitMediaPlane:
             method,
         )
         owns_client = self._client is None
-        client = self._client or httpx.AsyncClient(timeout=timeout_seconds)
+        client = self._client or httpx.AsyncClient(
+            timeout=timeout_seconds,
+            trust_env=not (self.configuration.runtime_environment == "development" and self.configuration.local_media_enabled),
+        )
         try:
             response = await client.post(
                 endpoint,
@@ -705,7 +708,10 @@ class LiveKitMediaPlane:
             method,
         )
         owns_client = self._client is None
-        client = self._client or httpx.AsyncClient(timeout=timeout_seconds)
+        client = self._client or httpx.AsyncClient(
+            timeout=timeout_seconds,
+            trust_env=not (self.configuration.runtime_environment == "development" and self.configuration.local_media_enabled),
+        )
         try:
             response = await client.post(
                 endpoint,

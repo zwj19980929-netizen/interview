@@ -1017,22 +1017,21 @@ def _transcript_segments(raw: Any) -> List[TranscriptSegment]:
             for word in (item.get("words") or [])
             if isinstance(word, dict) and isinstance(word.get("confidence"), (int, float))
         ]
-        confidence = sum(confidences) / len(confidences) if confidences else 1.0
+        confidence = min(confidences) if confidences else None
         segments.append(
             TranscriptSegment(
                 text=text,
                 start_ms=max(0, int(item.get("start_time") or 0)),
                 end_ms=max(0, int(item.get("end_time") or 0)),
-                confidence=max(0.0, min(1.0, confidence)),
+                confidence=confidence,
             )
         )
     return segments
 
 
-def _segment_confidence(segments: List[TranscriptSegment]) -> float:
-    if not segments:
-        return 1.0
-    return max(0.0, min(1.0, sum(item.confidence for item in segments) / len(segments)))
+def _segment_confidence(segments: List[TranscriptSegment]) -> Optional[float]:
+    known = [item.confidence for item in segments if item.confidence is not None]
+    return min(known) if known else None
 
 
 def _audio_duration_ms(

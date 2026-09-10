@@ -8,6 +8,7 @@ optional downloadable URL; that URL is neither fetched nor returned here.
 import base64
 import binascii
 import json
+import struct
 from contextlib import AsyncExitStack
 from typing import Any, AsyncIterator, Dict
 
@@ -17,6 +18,25 @@ from app.core.ids import new_id
 from app.model_gateway.errors import ProviderError
 from app.model_gateway.schemas import ProviderContext, ProviderMeta, Usage
 from app.model_gateway.tts_streaming import TTSStreamEvent
+
+
+# Observed Qwen HTTP SSE WAVE prefix. Only this exact PCM16/24k/mono
+# streaming container is removed; arbitrary RIFF headers fail closed.
+_STREAM_WAVE_HEADER = struct.pack(
+    "<4sI4s4sIHHIIHH4sI", b"RIFF", 0x7FFFFFBF, b"WAVE", b"fmt ",
+    16, 1, 1, 24000, 48000, 2, 16, b"data", 0x7FFFFF9B,
+)
+
+
+def _usage(payload: Dict[str, Any]) -> Usage:
+    raw = payload.get("usage") or {}
+    if not isinstance(raw, dict):
+        raise _invalid("DashScope TTS usage is invalid.")
+    counts = {key: raw.get(key, 0) for key in ("input_tokens", "output_tokens", "total_tokens")}
+    if any(type(value) is not int or value < 0 for value in [*counts.values(), raw.get("characters", 0)]):
+        raise _invalid("DashScope TTS usage counts are invalid.")
+    counts["total_tokens"] = max(counts["total_tokens"], counts["input_tokens"] + counts["output_tokens"])
+    return Usage(**counts)
 
 
 def _invalid(message: str) -> ProviderError:
@@ -129,6 +149,7 @@ class DashScopeTTSStream:
         self._consumed = True
         final = None
         done_received = False
+        metadata_received = False
         try:
             async for data in _sse_data(self._response):
                 if self._closed:
@@ -166,28 +187,39 @@ class DashScopeTTSStream:
                     raise _invalid("DashScope TTS audio payload is missing.")
                 encoded = audio["data"]
                 reason = output.get("finish_reason")
-                self._sequence += 1
                 if reason == "stop":
                     if encoded or self._bytes == 0:
                         raise _invalid("DashScope TTS terminal payload is empty or contains unexpected PCM.")
-                    raw_usage = payload.get("usage") or {}
-                    if not isinstance(raw_usage, dict):
-                        raise _invalid("DashScope TTS usage is invalid.")
-                    counts = {key: raw_usage.get(key, 0) for key in ("input_tokens", "output_tokens", "total_tokens")}
-                    if any(type(value) is not int or value < 0 for value in counts.values()):
-                        raise _invalid("DashScope TTS token counts are invalid.")
-                    counts["total_tokens"] = max(counts["total_tokens"], counts["input_tokens"] + counts["output_tokens"])
-                    final = self._event("audio.final", total_audio_bytes=self._bytes, usage=Usage(**counts))
+                    self._sequence += 1
+                    final = self._event("audio.final", total_audio_bytes=self._bytes, usage=_usage(payload))
                     continue
-                if reason is not None or not encoded:
+                # Qwen HTTP SSE uses the literal string "null" in current
+                # intermediate chunks; older responses use JSON null.
+                # Neither is terminal, and both still require valid PCM.
+                if reason not in (None, "null"):
                     raise _invalid("DashScope TTS intermediate audio is empty or has an unsupported finish reason.")
+                if not encoded:
+                    # Current Qwen sends one usage-only event before stop.
+                    # This never authorizes a final, nor changes PCM sequence.
+                    if self._bytes == 0 or metadata_received or not isinstance(payload.get("usage"), dict):
+                        raise _invalid("DashScope TTS intermediate audio is empty.")
+                    _usage(payload)
+                    metadata_received = True
+                    continue
+                if metadata_received:
+                    raise _invalid("DashScope TTS emitted PCM after its usage summary.")
                 try:
                     pcm = base64.b64decode(encoded, validate=True)
                 except (ValueError, binascii.Error) as exc:
                     raise _invalid("DashScope TTS PCM is not valid base64.") from exc
+                if self._bytes == 0 and pcm.startswith(b"RIFF"):
+                    if not pcm.startswith(_STREAM_WAVE_HEADER):
+                        raise _invalid("DashScope TTS streaming WAVE format is unsupported.")
+                    pcm = pcm[len(_STREAM_WAVE_HEADER):]
                 if not pcm or len(pcm) % 2 or len(pcm) > 262144:
                     raise _invalid("DashScope TTS PCM chunk is empty, unaligned or too large.")
                 self._bytes += len(pcm)
+                self._sequence += 1
                 yield self._event("audio.chunk", pcm_s16le=pcm)
             if final is None:
                 raise ProviderError("provider_audio_final_missing", "DashScope TTS disconnected before its final payload.", retryable=True)

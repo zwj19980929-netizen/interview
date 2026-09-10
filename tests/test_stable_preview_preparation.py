@@ -102,7 +102,7 @@ async def test_preview_composite_path_keeps_one_inference_and_exact_reference_co
         preview, turn, interview, snapshot_ref="evidence-checkpoint://synthetic/1/1",
     )
     assert len(gateway.requests) == 1
-    assert gateway.requests[0].metadata["prompt_version"] == "interview_turn_decision.v5"
+    assert gateway.requests[0].metadata["prompt_version"] == "interview_turn_decision.v7"
     assert understanding.evidence_quotes == [utterance.text]
     assert understanding.claims[0].evidence_quote == utterance.text
     assert decision["selected"] is True

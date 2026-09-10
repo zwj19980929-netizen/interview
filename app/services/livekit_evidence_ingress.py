@@ -618,7 +618,7 @@ class ManagedLiveKitEvidenceSession:
             if source is not None:
                 await source._emit_snapshot(None)
 
-        async def speak(kind: str, guard: Any) -> bool:
+        async def speak(kind: str, guard: Any, *, focus_quote: str = "") -> bool:
             guard()
             if self._capture_id != capture_id or self._stopped:
                 raise ApiError("TURN_DECISION_STALE", "Capture changed.", status_code=409)
@@ -649,10 +649,13 @@ class ManagedLiveKitEvidenceSession:
                 await source._set_floor(FloorOwner.NONE, "candidate_pause", None)
                 await source._emit_snapshot(None)
                 return True
+            from app.core.prompt.contracts import clarification_speech, CLARIFICATION_SPEECH_VERSION
             performance = await source._select_act(
-                act_type="supplement_" + kind, text=SUPPLEMENT_SPEECH[kind],
+                act_type="clarification" if kind == "answer_clarify" else "supplement_" + kind,
+                text=clarification_speech(focus_quote) if kind == "answer_clarify" else SUPPLEMENT_SPEECH[kind],
                 turn_id=turn_id, causation_id=None, evidence_refs=[], gesture="listen",
                 approval_guard=guard,
+                **({"prompt_version": CLARIFICATION_SPEECH_VERSION} if kind == "answer_clarify" else {}),
             )
             self._supplement_performance_id = performance.performance_id if performance else None
             return performance is not None
@@ -1886,9 +1889,7 @@ class ManagedLiveKitEvidenceSession:
         await self.cancel_endpoint()
         self._capture_speech_started = True
         if self._answer_endpoint is not None:
-            self._answer_endpoint.speech_started()
-            if self._answer_endpoint.confirmation is not None and not self._answer_endpoint.confirmation.speaking:
-                self._answer_endpoint.confirmation.phase = "listening"
+            self._answer_endpoint.continue_speaking()
         await source._set_floor(
             FloorOwner.CANDIDATE, "candidate_continues", signal.causation_id
         )
@@ -2900,6 +2901,19 @@ class LiveKitEvidenceIngressSupervisor:
     def prewarm_turn_detector(self) -> None:
         if self._detector_warmup_task is None:
             self._detector_warmup_task = asyncio.create_task(self.turn_detector.predict(bytes(38_400)))
+
+    async def stop_for_interview(
+        self,
+        interview_id: str,
+        organization_id: str = "org_default",
+        *,
+        reason: str,
+    ) -> None:
+        """Stop the process-local authoritative Evidence owner, if present."""
+
+        session = self._sessions.get((organization_id, interview_id))
+        if session is not None:
+            await session.stop(reason)
 
     async def shutdown(self) -> None:
         sessions = list(self._sessions.values())

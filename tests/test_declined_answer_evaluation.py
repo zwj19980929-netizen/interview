@@ -56,7 +56,7 @@ def session_for(intents, *, followups=False):
         audio_uri = "private-test://declined-%d.wav" % index
         is_followup = followups and index > 0
         root_turn_id = "turn_0" if is_followup else turn_id
-        understanding = {
+        understanding = {"clarification_target": None,
             "understanding_id": understanding_id, "revision": 1,
             "prompt_version": "interview_turn_understanding.v7", "utterance_id": utterance_id,
             "intent": intent, "answer_summary": "明确表示不再作答。" if declined else TECHNICAL,
@@ -148,7 +148,12 @@ async def test_untrusted_or_unbound_declined_tags_cannot_trigger_zero_policy(inv
     persistence = persist(store, session)
     evaluation = await EvaluationService(store, gateway=gateway, persistence=persistence).evaluate_answer(answer, question(0))
     assert gateway.inputs == [answer["final_transcript"]]
-    assert evaluation["score"] == 85 and "scoring_rule_version" not in evaluation["model_info"]
+    assert "scoring_rule_version" not in evaluation["model_info"]
+    if invalid == "ambiguity":
+        assert evaluation["score"] == 85 and evaluation["recognition_warning"]
+        assert "transcription_ambiguity" in evaluation["review_flags"]
+    else:
+        assert evaluation["score"] == 85
 
 
 @pytest.mark.anyio

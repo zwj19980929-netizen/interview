@@ -1,5 +1,50 @@
 # 领域模型
 
+## 2026-09-10 · 补充重试与完整动态音频（034）
+
+同一服务端回答的补充分类失败预算复用 AnswerEndpoint 的内容摘要与显式操作epoch；不会由声音revision单独刷新。失败不生成 Answer，成功恢复逐字证据后才进入原完成/继续/澄清状态迁移，显式继续重置预算但不代表已回答完毕。
+
+FileObject沿用agent_expression_audio用途，新增source_type=tts_complete_pcm，表示通过统一网关验证final+EOF后存储的完整PCM WAVE。权限仍绑定organization/interview/turn、签名读和生产加密校验；Mock不能形成正式可播放资产，取消/不完整内容不进入ready。ApprovedConversationAct.text使用已验证的追问本句，evidence_quotes继续保留原文。
+
+ModelInvocation增加可选schema_reason/schema_path诊断字段（仅规则代码和schema路径、数字索引归一化；不含失败值、完整Prompt或响应），prompt_version白名单纳入supplement_reply.v3。使用既有JSON持久化，无新表或DDL。
+
+## 2026-09-09 · 候选人页面状态归属（033）
+
+客户端 `candidateSession = {interview, token}` 是一次已核验公共投影与其凭证的内存绑定，不是新增领域实体或持久字段；没有 DDL。页面 readiness、局部故障、数字人及实时运行实例全部归属同一面试编号和凭证，切换后不能沿用。前端停止表达不等于 InterviewSession 已暂停：仍须既有服务端生命周期确认，不能用本地状态写回或绕过认证。
+
+## 2026-09-09 · 面试截止时间收口（031）
+
+InterviewSession 冻结的 `scheduled_end_at` 同时是候选人输入截止时间；仅对缺少该旧字段的历史会话从其绑定预约读取结束时间作兼容补偿。截止时仍处于 `scheduled/waiting/in_progress/paused` 且没有 `candidate_input_completed_at` 的会话，通过现有 `CANCEL` 迁移到 `cancelled`，增加 `termination_reason=appointment_window_expired` 与 `expired_at`，并把尚未结束的轮次标为 skipped；已接受的回答、录音和评分 revision 不删除。该原因在工作台投影为“已超时结束”，不新增第二套持久状态。候选人输入已完成而后台评分/报告未完成时不执行截止取消，因为输入完成和异步处理完成是两个独立里程碑。
+
+## 2026-09-09 · 面试列表移除（029）
+
+InterviewSession 的业务生命周期状态不新增“已删除”。只有 `cancelled`、`report_ready` 终态可增加 `list_removed_at`、`list_removed_by` 作为企业工作区列表归档事实；默认集合投影过滤该事实，按 ID 读取及历史证据仍保留。列表移除不等于 CandidateProfile 归档，也不等于 retention purge：不会删除候选人资料、冻结计划、回答、评分 revision、报告、媒体或审计记录。
+
+## 2026-09-09 · 简历尾题与中文术语（028）
+
+计划冻结最多3道简历题，排在全部岗位槽位之后；会话简历turn新增deferred_speech=true及speech_preparation运行时绑定（status/asset_id），冻结题目内容及权重不变。每次生命周期事务读取同预约、同源版本、同语音fingerprint的资产；在轮到该题时才决定asking或skipped，记录skip_reason/时间/事件，迟到资产不能复活已跳过题。历史会话不补题。
+
+## 直接评分合同（027）
+
+AnswerEvaluation.score_status现为available/unavailable；recognition_warning表示transcription_ambiguity或low_stt_confidence，review_flags/quality_warnings继续保留。有效score和dimension_scores不因识别疑点置空。旧provisional_score/provisional_dimension_scores在只读投影恢复；缺少有效值不补造。Report增加recognition_warning_answer_ids与recognition_notice，pending_verification_answer_ids兼容字段为空。报告available正常出总分，processing/unavailable才无总分。transcription_verification及history为可选复核记录，不是分数生效条件。
+
+## 语音质量与转写核验（026）
+
+ConversationUtterance.stt_confidence及统一STT confidence允许null。CandidateAnswer新增stt_confidence_source=provider/partial/unavailable/synthetic；旧缺省来源以legacy_unverified解释，不回写历史1.0。partial代表只有部分句段提供数值，不是整段准确率。新transcription_verification及history绑定当前文本、录音引用和current_transcript_revision的SHA-256、实际reviewer_id、verified_at、audio_reviewed=true及reason。
+
+TurnUnderstanding新增可空clarification_target={evidence_quote,focus_quote}；focus必须是当前原文中的最多80字片段。当前wire必须显式提供该字段（无歧义为null），通过E编号定位；结构、额外字段、枚举、长度、逐字引用和含义状态先验证；只用于澄清，不是评分或答案补全。
+
+AnswerEvaluation增加score_status=available/pending_verification、quality_warnings及当次transcription_verifications。未决时score=null、dimension_scores={}，原模型数字移入provisional_score/provisional_dimension_scores供人审；已知低声学值限制confidence上限。Report增加score_status=available/pending_verification/processing和pending_verification_answer_ids，未决或重新评分时overall_score=null且无维度总分。evaluation_status=completed仍只表示评分计算完成，和可用于总分不同。历史revision不可变，JSON文档字段扩展无需DDL迁移。
+
+## 面试提交后的评分与回放修复（025）
+
+收齐回答、评分完成、报告就绪和录像封存是独立事实。评分使用answer_evaluation.v3，冻结关键点ID现在写入实际Prompt；默认8000输出tokens，截断时仅允许一次16000预算重试，总时限240秒，评分工作租约300秒。受信工作流通过通用InvocationExecutionBudget明确单次120秒、网关内重试0次（不继承交互式路由的30秒/重试1次）；Provider暂时故障至少等待35秒再由Outbox重试，避免在30秒熔断窗口内耗尽任务预算。Provider不可重试错误首轮dead-letter，暂时故障保留Outbox退避；错误只保存固定码和去敏提示。失败答案可经processing/retry重排同revision，成功后沿生命周期自动生成报告，不能将失败评分按0分生成正常报告。
+
+StopEgress的ENDING不代表完成：先持久化interview.media.finalize，再请求停止；后台按5秒指数退避（最多8次、单次间隔上限120秒）查询同一egress，COMPLETE且对象非空、字节数/hash/存储保护通过才可回放。失败可由企业显式重试，不依赖webhook必须到达。大录像使用分块摘要和Range传输；签名五分钟、组织/会话/资源绑定、读取审计及清理后撤销保持。
+
+企业复核页显示评分进度/失败及报告，提供全场音视频、独立逐题WAV和按题视频导航，已提交会话停止显示等待实时媒体。新PCM录音按字节计算时长并记录服务端采集起止时间；历史视频只按题目时间窗口定位并明确标示，包含读题/回答，不能承诺逐句精确同步。旧答案与录音不原地改写，无新增表或DDL。
+
+
 ## 当前回答准备投影（024）
 
 agent_runtime.answer_preparation为可空的当前turn/capture准备事实，status仅为preparing。它描述后台正在处理而非候选人完成许可；过期身份、暂停或非当前采集不得投影，客户端不得用它开启Evidence或提交答案。失败预算属于相同服务端发言证据；声学活动只是撤销候选提交时机，不能抹掉已有推理失败。成功PreparedTurnDecision的复用仍受新完整final及当前上下文保护。

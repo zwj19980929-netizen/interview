@@ -214,7 +214,7 @@ def _required_roles(path: str, method: str = "GET") -> FrozenSet[str]:
         return frozenset({"admin"})
     if path in {"/api/v1/workspace/question-catalog", "/api/v1/workspace/question-overview"}:
         return frozenset({"admin", "interviewer"})
-    if any(marker in path for marker in ("/review", "/audio-url", "/transcript", "/report/export")):
+    if any(marker in path for marker in ("/review", "/audio-url", "/recording-url", "/processing/retry", "/transcript", "/report/export")):
         return frozenset({"admin", "reviewer"})
     if method == "GET" and (path == "/api/v1/interviews" or path.startswith("/api/v1/interviews/")):
         return frozenset({"admin", "interviewer", "reviewer"})

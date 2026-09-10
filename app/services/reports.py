@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from app.core.errors import ApiError
 from app.core.ids import new_id
+from app.domain.scoring_quality import DISPUTE_FLAGS, evaluation_answers, project_evaluation, project_report
 from app.core.time import utc_now
 from app.persistence.interface import Persistence
 from app.persistence.provider import persistence_for
@@ -54,19 +55,22 @@ class ReportService:
         dimension_totals: Dict[str, Dict[str, float]] = {}
 
         for answer in score_bearing_answers:
-            evaluation = current_evaluations.get(answer["id"])
+            original = current_evaluations.get(answer["id"])
+            evaluation = project_evaluation(original, evaluation_answers(interview, original)) if original else None
             if evaluation is None:
                 continue
+            if evaluation["score"] is None:
+                raise ApiError("REPORT_EVALUATION_UNAVAILABLE", "本题尚无有效评分，请重试后台评分。", status_code=409)
             plan_item = item_by_snapshot.get(
                 evaluation["question_snapshot_id"],
                 {"weight": 0.0, "dimension": "general"},
             )
             weight = float(plan_item.get("weight", 0.0))
-            weighted_score += float(evaluation["score"]) * weight
+            weighted_score += float(evaluation["score"] or 0) * weight
             completed_weight += weight
             dimension = plan_item.get("dimension", "general")
             totals = dimension_totals.setdefault(dimension, {"weighted": 0.0, "weight": 0.0})
-            totals["weighted"] += float(evaluation["score"]) * weight
+            totals["weighted"] += float(evaluation["score"] or 0) * weight
             totals["weight"] += weight
             question_evaluations.append(
                 {
@@ -92,7 +96,8 @@ class ReportService:
 
         overall_score = int(round(weighted_score / completed_weight)) if completed_weight else 0
         requires_manual_review = any(
-            item.get("confidence", 1.0) < 0.6 or item.get("review_flags")
+            set(item.get("review_flags") or []) - DISPUTE_FLAGS
+            or (item.get("confidence", 1.0) < 0.6 and not set(item.get("review_flags") or []) & DISPUTE_FLAGS)
             for item in current_evaluations.values()
         )
         job_fit_level = self._job_fit_level(
@@ -107,7 +112,7 @@ class ReportService:
             }
             for dimension, value in sorted(dimension_totals.items())
         ]
-        return {
+        return project_report({
             "id": new_id("report"),
             "organization_id": interview["organization_id"],
             "interview_id": interview["id"],
@@ -119,13 +124,19 @@ class ReportService:
             "risks": ["存在未覆盖关键点，建议人工复核"] if overall_score < 75 else [],
             "followup_suggestions": ["针对缺失关键点安排人工追问"] if overall_score < 75 else [],
             "question_evaluations": question_evaluations,
+            "skipped_questions": [
+                {"turn_id": turn["id"], "question_id": turn["question_id"],
+                 "reason": turn["skip_reason"], "counts_toward_score": False}
+                for turn in interview.get("turns", [])
+                if turn.get("status") == "skipped" and turn.get("skip_reason") == "resume_speech_not_ready"
+            ],
             "evaluation_ids": [item["evaluation_id"] for item in question_evaluations],
             "trigger_reason": trigger_reason,
             "human_decision_required": True,
             "decision_notice": "本报告只提供岗位匹配证据，不自动作出录用或淘汰决定。",
             "generated_by": "system",
             "generated_at": utc_now(),
-        }
+        }, interview)
 
     def get_report(self, interview_id: str, organization_id: str = "org_default") -> Dict[str, Any]:
         interview = self._get_interview(interview_id, organization_id)
@@ -136,7 +147,7 @@ class ReportService:
         )
         if report is None:
             raise ApiError("REPORT_NOT_FOUND", "Interview report is not ready.", status_code=404)
-        return report
+        return project_report(report, interview)
 
     def list_report_revisions(
         self,
@@ -144,7 +155,7 @@ class ReportService:
         organization_id: str = "org_default",
     ) -> List[Dict[str, Any]]:
         interview = self._get_interview(interview_id, organization_id)
-        return deepcopy(interview.get("report_revisions", []))
+        return [project_report(item, interview) for item in interview.get("report_revisions", [])]
 
     def export_report(
         self,
@@ -165,6 +176,9 @@ class ReportService:
             fields = [
                 "interview_id",
                 "overall_score",
+                "score_status",
+                "recognition_notice",
+                "recognition_warning_answer_ids",
                 "job_fit_level",
                 "human_decision_required",
                 "dimension_scores",
@@ -179,6 +193,9 @@ class ReportService:
                 {
                     "interview_id": interview_id,
                     "overall_score": report["overall_score"],
+                    "score_status": report["score_status"],
+                    "recognition_notice": report.get("recognition_notice"),
+                    "recognition_warning_answer_ids": json.dumps(report.get("recognition_warning_answer_ids", [])),
                     "job_fit_level": report["job_fit_level"],
                     "human_decision_required": report["human_decision_required"],
                     "dimension_scores": json.dumps(report.get("dimension_scores", []), ensure_ascii=False),

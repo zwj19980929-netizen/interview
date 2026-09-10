@@ -93,7 +93,7 @@ export function createCandidateInterviewExperience({
 } = {}) {
   if (typeof request !== "function") throw new TypeError("CandidateInterviewExperience requires a request adapter");
   return {
-    async open({ interviewId, ticket }) {
+    async open({ interviewId, ticket, signal }) {
       const run = new CandidateExperienceRun({
         interviewId,
         candidateSessionToken: ticket,
@@ -108,7 +108,7 @@ export function createCandidateInterviewExperience({
         liveAudioFactory,
         clock,
       });
-      await run.open();
+      await run.open(signal);
       return run.interface();
     },
   };
@@ -266,14 +266,20 @@ class CandidateExperienceRun {
     });
   }
 
-  async open() {
+  async open(signal) {
+    const checkActive = () => {
+      if (signal?.aborted) throw new DOMException("面试页面已切换或启动已取消", "AbortError");
+    };
     try {
+      checkActive();
       if (!this.interviewId || !this.candidateSessionToken) throw new Error("面试会话凭据不完整");
       await this.verifyAvatar({
         apiBase: this.apiBase,
         interviewId: this.interviewId,
         candidateSessionToken: this.candidateSessionToken,
+        signal,
       });
+      checkActive();
       const prepared = claimPreparedCandidateMedia();
       if (prepared) {
         this.stream = prepared.stream;
@@ -284,12 +290,14 @@ class CandidateExperienceRun {
         const remembered = readRememberedPreflight();
         this.capabilityReport = { ...result.report, speaker_verified: Boolean(remembered?.speaker_verified) };
       }
+      checkActive();
       if (!this.capabilityReport?.speaker_verified) {
         throw new Error("扬声器尚未由候选人在设备预检中确认，正式面试不会绕过该检查");
       }
       this.ring = this.ringFactory();
       this.patch({ mediaStream: this.stream });
-      this.ticketResponse = await this.issueTicket();
+      this.ticketResponse = await this.issueTicket(signal);
+      checkActive();
       this.patch({
         mediaPolicy: this.ticketResponse.media,
         connection: {
@@ -298,8 +306,10 @@ class CandidateExperienceRun {
         },
       });
       await this.connectMedia(this.ticketResponse.media);
+      checkActive();
       if (typeof this.media?.measureNetwork === "function") {
         const rtcNetwork = await this.media.measureNetwork();
+        checkActive();
         this.capabilityReport = {
           ...this.capabilityReport,
           network_rtt_ms: rtcNetwork.rttMs,
@@ -310,6 +320,7 @@ class CandidateExperienceRun {
         }
       }
       await this.connectControl(this.ticketResponse);
+      checkActive();
       if (this.media) {
         this.sendSignal("media.published", {
           provider: "livekit",
@@ -323,6 +334,7 @@ class CandidateExperienceRun {
         onSpeechStopped: () => this.onLocalSpeechStopped(),
         isAgentSpeaking: () => this.state.floor === "agent" || Boolean(this.activePlayback),
       });
+      checkActive();
       this.heartbeatTimer = window.setInterval(() => {
         if (this.socket?.readyState === WebSocket.OPEN) this.sendSignal("ping", {});
       }, 20_000);
@@ -453,9 +465,10 @@ class CandidateExperienceRun {
     }
   }
 
-  async issueTicket() {
+  async issueTicket(signal) {
     return this.request(`${this.apiBase}/public/interviews/${encodeURIComponent(this.interviewId)}/agent-ticket`, {
       method: "POST",
+      signal,
       headers: { "X-Candidate-Session-Token": this.candidateSessionToken },
     });
   }
@@ -993,7 +1006,7 @@ class CandidateExperienceRun {
           calibration: {
             status: "awaiting_confirmation",
             transcript: String(payload.text || ""),
-            confidence: Number(payload.confidence || 0),
+            confidence: payload.confidence == null ? null : Number(payload.confidence),
             retryRequired: false,
           },
           recovery: this.ring?.snapshot?.() || this.state.recovery,

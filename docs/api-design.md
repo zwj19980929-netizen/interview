@@ -1,5 +1,51 @@
 # 接口设计
 
+## 2026-09-10 · 补充确认合同与候选人提示（034）
+
+不新增 REST、事件类型或客户端文本答案。内部模型 wire 合同 supplement_reply.v3 必须且只含 intent（continue/finish/supplement/pause/unclear）、confidence（0–1真实数值，非bool）、evidence_id（本次服务端原文编号枚举）。网关校验后，ConversationUnderstandingService 恢复原有 intent/confidence/evidence_quote 领域输出并再次校验；v1/v2审计仍可读。350输出token、8秒调用预算、0次网关内部重试；完整回答内容决定三次端点失败预算，acoustic revision不清零。
+
+已有 continue_speaking/evidence.continue 明确用户操作会重置失败预算；若正在等待补充分类重试，保留本次回复边界重新判断，不凭按钮伪造finish。UNDERSTANDING_UNAVAILABLE与UNDERSTANDING_RETRY_EXHAUSTED等既有内部code保留，候选人只按稳定映射显示等待/重试；真实致命错误只在暂停回执后声称已暂停。成功分类用既有 supplement_awaiting_reply 清除旧告警。音频仍下发既有私有audio_uri、duration_ms、visemes及delivery=cascade，不向候选人暴露厂商URL或新PCM传输。
+
+## 2026-09-09 · 候选人调用方会话绑定（033）
+
+REST/WebSocket wire 合同不变。公共面试投影返回后，调用方先核验响应 id 与请求路由一致，再将投影与该请求的 `X-Candidate-Session-Token` 作为同一客户端绑定使用；加载新会话期间不得用新 token 调用旧面试的 avatar-config、agent-ticket 或 runtime-problems。旧路由迟到的成功、403 和暂停回执不得更新当前页面。内部前端 facade 的 open 增加可选 `signal`，仅取消当前启动流程，不扩大权限、不改变预约截止时间或恢复已终止面试。真正的授权失败仍阻止进入房间。
+
+## 2026-09-09 · 面试截止时间收口（031）
+
+本变更不新增公开命令。API 进程按 `INTERVIEWER_INTERVIEW_DEADLINE_SECONDS`（默认 15 秒）扫描会话：当前时间到达冻结的 `scheduled_end_at` 后，尚未完成候选人输入的 `scheduled/waiting/in_progress/paused` 会话通过生命周期取消命令变为 `cancelled`，响应保留 `termination_reason=appointment_window_expired` 与 `expired_at`，并写 `interview.appointment_window_expired` 审计。该收口幂等，重启后会补偿；已有 `candidate_input_completed_at` 的会话继续评分/报告，不因预约时间到达而被取消。前端将此类取消显示为“已超时结束”，仍可查看和按既有终态规则移出列表。
+
+## 2026-09-09 · 面试列表移除（029）
+
+`DELETE /interviews/{id}?expected_version={version}` 供管理员/面试官把单场面试从默认工作区列表逻辑移除。接口只接受 `cancelled` 或 `report_ready` 会话，使用聚合版本做乐观并发控制，并写入 `interview.removed_from_list` 审计；进行中、暂停中、等待中、评分中或报告失败的会话返回 `409 INTERVIEW_REMOVAL_NOT_ALLOWED`。默认 `GET /interviews` 不返回已有 `list_removed_at` 的会话；`GET /interviews/{id}` 仍可按 ID 读取，回答、评分、报告、录音、候选人资料及保留策略均不变。该接口不是候选人隐私清除或物理删除入口。
+
+## 2026-09-09 · 简历尾题与中文术语（028）
+
+生成计划省略 resume_review_id 时自动绑定同组织、同候选人、同岗位最新合格审核，选最多3道已批准且有证据的简历题（不足2道明确警告）。question_count仍指岗位题。assembly_summary增加experience_question_count/experience_question_target。预约确认登记才幂等排队简历TTS；readiness的experience_question_speech增加blocking=false，真实ready仍可为false但不阻塞can_start。正式题结束后逐题决定简历题可用性，turn.skipped携带resume_speech_not_ready原因；报告增加skipped_questions，不生成虚假答案。
+
+## 直接评分与识别提示（027，替代026的强制待核验策略）
+
+评分调用成功即返回score和dimension_scores，score_status=available；review_flags/quality_warnings保留不确定性，transcription_ambiguity及low_stt_confidence不阻断总分和报告。旧pending_verification中保存的provisional_score可只读恢复为数值并按冻结权重汇总，不改历史revision。真正缺失/失败的评分仍不得伪造为0分；重评进行中继续显示processing。报告新增recognition_warning_answer_ids和识别质量提示，JSON/CSV保持一致。transcription-verification作为可选回听纠错入口，不是获得分数或完成复核的前置条件。
+
+StreamingSTTRequest.recognition_terms允许最多100项、每项2–64字符的英文技术标识或最多6词的英文读法。仅从服务端冻结的当题技术词推导，例如worker_prefetch_multiplier与worker prefetch multiplier；原标识优先、去重、边界校验。不传标准答案正文或从候选人发言生成词表。当前适配器原有模型支持范围和词权重不扩大。
+
+## 语音质量、澄清与评分核验（026）
+
+统一STT的confidence为可空0–1数值；null表示厂商未提供，不能用1.0或0.0冒充。新CandidateAnswer持久化stt_confidence_source（provider/partial/unavailable/synthetic）；历史未记录来源的数值仅按legacy_unverified投影。未知声学可信度不自动阻断语义理解，真实低可信仍需澄清。当前理解wire必须显式返回可空clarification_target（无歧义为null），wire为原文E编号与该句内focus_quote，精确还原并校验后才可播报；正式连续采集中的澄清不封存为答案、不丢弃前文。
+
+`POST /interviews/{id}/answers/{answer_id}/transcription-verification`（管理员/复核人）接受expected_evaluation_id、expected_transcript_revision、audio_reviewed=true、reason及可选final_transcript。服务端核对当前评分/转写版本并记录实际认证操作者；空白理由、旧版本或仍在评分拒绝。确认原文或纠正转写均记录核验事实并通过同一事务排队新评分revision，返回202，不修改历史评分、不由客户端填写分数。核验仅绑定当次转写及录音；后续修正、追加追问或重评不得继承无关核验。
+
+复核、报告及JSON/CSV导出增加score_status和待核验题目。存在实质转写歧义或已知低识别置信度的题保留AI建议作为provisional_score，score为null；整体overall_score及维度汇总暂为空，不能按0分或移除权重后生成总分。unknown来源本身是质量提示，不等同争议。旧报告按当前规则进行只读质量投影，历史存储不改写；核验重评通过后产生新的可用报告。复核完成不能跳过未决评分。
+
+## 面试提交、评分恢复与回放（025）
+
+内部ChatJSONRequest增加可选execution_budget（timeout_s: 0–300秒，max_provider_retries: 0–3，拒绝额外字段），只由受信服务代码指定，非HTTP客户端参数。评分设置120秒/0次，整体240秒且Outbox租约300秒；其他调用保持路由原配置。
+
+`GET /interviews/{id}/review` 增加 `processing`（收齐时间、评分完成/失败/待处理数量、报告状态、可重试标志）、脱敏 `recording` 状态和逐题 `playback`（音频可用、录像片段起止秒/时间来源）。页面按服务端状态轮询；提交回执不等于评分成功。逐题评分错误使用固定错误码，不返回Provider正文。
+
+`POST /interviews/{id}/processing/retry` 返回202，仅重排当前失败/孤立的评分、报告与录像收尾工作，保持现有答案和评分revision，不调用模型阻塞HTTP；重复点击不产生重复工作。`POST /interviews/{id}/recording-url` 签发五分钟全场录像读取许可；录像必须完成且有hash、字节数与存储保护事实。逐题音频沿用 `answers/{answer_id}/audio-url`。两种许可均绑定组织、会话、资源和操作者并审计。签名媒体GET/HEAD支持单byte Range（200/206/416）；录像分块读取，不把整场视频加载进应用内存。未完成、已清除或不匹配资源拒绝访问。
+
+按题录像导航使用服务端采集起止时间与Provider文件时钟的交集；旧数据只能提供标明来源的轮次时间窗口，不能冒充精确的单句对齐。逐题WAV为独立答案原录音。
+
 ## 确认后等待状态与失败边界（024）
 
 session.snapshot新增可空 `answer_preparation: {status:"preparing", turn_id:string, capture_id:string}`，仅表示当前候选录音的后台准备状态，不授权结束或形成答案。准备通知持久化当前turn/capture事实，返回收听、失败、换题、换capture、暂停时清理或不再投影；快照按当前身份过滤，不能继承旧题准备。前端以该权威字段及supplement_confirmation修正本地陈旧状态；不能因旧页面曾是answer_preparing而永久保留。evidence.ready仍只由既有采集确认决定。

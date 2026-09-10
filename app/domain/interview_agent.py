@@ -242,7 +242,7 @@ class ConversationUtterance(BaseModel):
     is_final: bool
     authoritative: bool
     audio_uri: Optional[str] = Field(default=None, max_length=2048)
-    stt_confidence: float = Field(ge=0, le=1)
+    stt_confidence: Optional[float] = Field(default=None, ge=0, le=1, allow_inf_nan=False, strict=True)
     source: Literal["server_streaming", "server_batch", "approved_act", "human_intervention"]
     created_at: str = Field(min_length=1, max_length=64)
 
@@ -285,13 +285,25 @@ class UnderstandingProblem(BaseModel):
     attempts: int = Field(default=1, ge=1, le=2)
 
 
+class ClarificationTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    evidence_quote: str = Field(min_length=1, max_length=300)
+    focus_quote: str = Field(min_length=1, max_length=80)
+
+    @model_validator(mode="after")
+    def focus_is_verbatim(self):
+        if not self.focus_quote.strip() or self.focus_quote not in self.evidence_quote:
+            raise ValueError("Clarification focus must be a verbatim evidence span")
+        return self
+
+
 class TurnUnderstanding(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     understanding_id: str = Field(min_length=1, max_length=128)
     revision: int = Field(ge=1)
     # v1 remains readable for immutable historical understandings only.
-    prompt_version: Literal["interview_turn_understanding.v1", "interview_turn_understanding.v2", "interview_turn_understanding.v3", "interview_turn_understanding.v4", "interview_turn_understanding.v5", "interview_turn_understanding.v6", "interview_turn_understanding.v7", "interview_turn_decision.v1", "interview_turn_decision.v2", "interview_turn_decision.v3", "interview_turn_decision.v4", "interview_turn_decision.v5", "interview_turn_decision.v6"]
+    prompt_version: Literal["interview_turn_understanding.v1", "interview_turn_understanding.v2", "interview_turn_understanding.v3", "interview_turn_understanding.v4", "interview_turn_understanding.v5", "interview_turn_understanding.v6", "interview_turn_understanding.v7", "interview_turn_understanding.v8", "interview_turn_understanding.v9", "interview_turn_decision.v1", "interview_turn_decision.v2", "interview_turn_decision.v3", "interview_turn_decision.v4", "interview_turn_decision.v5", "interview_turn_decision.v6", "interview_turn_decision.v7", "interview_turn_decision.v8"]
     utterance_id: str = Field(min_length=1, max_length=128)
     intent: Literal[
         "answer",
@@ -309,6 +321,7 @@ class TurnUnderstanding(BaseModel):
     missing_capability_points: List[str] = Field(default_factory=list, max_length=20)
     ambiguities: List[str] = Field(default_factory=list, max_length=8)
     contradictions: List[str] = Field(default_factory=list, max_length=8)
+    clarification_target: Optional[ClarificationTarget] = None
     confidence: float = Field(ge=0, le=1)
     suggested_action: Literal[
         "accept", "clarify", "repeat", "continue_listening", "pause", "followup", "next"

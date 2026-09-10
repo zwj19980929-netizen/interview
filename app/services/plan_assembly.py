@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from copy import deepcopy
 from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
@@ -87,6 +87,7 @@ class InterviewPlanAssembly:
                 "Role requirement does not exist.",
                 status_code=404,
             )
+        request = self._resolve_resume_review(request, organization_id)
         self._validate_target_scope(request, role, organization_id)
         interview_duration = int(role.get("interview_duration_minutes", 45))
         if request.question_count > interview_duration:
@@ -146,6 +147,12 @@ class InterviewPlanAssembly:
         experience_question_snapshots = self._approved_experience_question_snapshots(
             request.resume_review_id, organization_id
         )
+        summary["experience_question_count"] = len(experience_question_snapshots)
+        summary["experience_question_target"] = 3
+        if len(experience_question_snapshots) < 2:
+            summary.setdefault("warnings", []).append(
+                "简历题不足2道：请确认该候选人在此岗位的合格简历审核中已有批准的问题。"
+            )
         self._rebalance_execution_budget(
             bank_slots,
             experience_question_snapshots,
@@ -179,11 +186,32 @@ class InterviewPlanAssembly:
             current_role = transaction.role_requirements.get(role["id"])
             if current_role is None or current_role["version"] != role["version"]:
                 raise ConcurrencyConflict("RoleRequirement changed while the plan was assembled.")
+            if request.resume_review_id:
+                review = transaction.resume_reviews.get(request.resume_review_id)
+                if not review or effective_screening_outcome(review) != "qualified":
+                    raise ConcurrencyConflict("Resume review changed while the plan was assembled.")
+                for snapshot in experience_question_snapshots:
+                    current = transaction.experience_questions.get(snapshot["id"])
+                    if not current or current["version"] != snapshot["version"] or current.get("status") != "approved":
+                        raise ConcurrencyConflict("Experience question changed while the plan was assembled.")
             if request.approve:
                 self._validate_canonical_plan(transaction, plan)
                 plan["status"] = "approved"
                 plan["approved_at"] = utc_now()
             return transaction.interview_plans.add(plan)
+
+    def _resolve_resume_review(self, request: PlanAssemblyRequest, organization_id: str) -> PlanAssemblyRequest:
+        if request.resume_review_id:
+            return request
+        with self.persistence.transaction(organization_id) as transaction:
+            reviews = [item for item in transaction.resume_reviews.list()
+                       if item.get("candidate_profile_id") == request.candidate_profile_id
+                       and item.get("job_position_id") == request.job_position_id
+                       and effective_screening_outcome(item) == "qualified"]
+        if not reviews:
+            return request
+        latest = max(reviews, key=lambda item: (item.get("created_at", ""), item["id"]))
+        return replace(request, resume_review_id=latest["id"])
 
     def _validate_target_scope(
         self,
@@ -471,6 +499,8 @@ class InterviewPlanAssembly:
         plan: Dict[str, Any],
         question_ids: Sequence[str],
     ) -> List[Dict[str, Any]]:
+        if len(question_ids) > 3 or len(set(question_ids)) != len(question_ids):
+            raise ApiError("EXPERIENCE_QUESTION_COUNT_INVALID", "Select at most three distinct resume questions.", status_code=422)
         snapshots: List[Dict[str, Any]] = []
         for order, question_id in enumerate(question_ids, start=1):
             question = transaction.experience_questions.get(question_id)
@@ -632,7 +662,7 @@ class InterviewPlanAssembly:
                 (
                     item
                     for item in sorted(
-                        transaction.experience_questions.list(), key=lambda value: value["order"]
+                        transaction.experience_questions.list(), key=lambda value: (value["order"], value["id"])
                     )
                     if item["resume_review_id"] == resume_review_id
                     and item["status"] == "approved"
@@ -643,6 +673,8 @@ class InterviewPlanAssembly:
                 snapshot = self._experience_snapshot(item)
                 snapshot["order"] = order
                 result.append(snapshot)
+                if len(result) == 3:
+                    break
             return result
 
     def _interview_speech_profile(

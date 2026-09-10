@@ -1,16 +1,20 @@
 from typing import Any, Dict
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Header, Request
+from starlette.concurrency import run_in_threadpool
+from app.transport.http.media import private_media_response
 from fastapi.responses import Response
 
 from app.core.auth import current_principal
+from app.domain.scoring_quality import project_interview_scores, project_report
 from app.schemas.api import (
     InterviewControlCommand,
     ReviewComplete,
     TakeoverMediaPermitCreate,
     TranscriptCorrection,
+    TranscriptionVerification,
 )
-from app.transport.http.responses import ApiJSONResponse, collection_response
+from app.transport.http.responses import ApiJSONResponse, collection_response, accepted_response
 from app.transport.service_locator import services
 
 
@@ -25,7 +29,22 @@ async def _publish_interview_snapshot(interview_id: str) -> None:
 
 @router.get("/api/v1/interviews")
 async def list_interviews() -> Dict[str, Any]:
-    return collection_response(services()["interviews"].list_interviews())
+    return collection_response(project_interview_scores(item) for item in services()["interviews"].list_interviews())
+
+
+@router.delete("/api/v1/interviews/{interview_id}")
+async def remove_interview_from_list(
+    interview_id: str, expected_version: int
+) -> Dict[str, Any]:
+    principal = current_principal()
+    return project_interview_scores(
+        services()["interviews"].remove_from_list(
+            interview_id,
+            expected_version=expected_version,
+            actor_id=principal.actor_id,
+            organization_id=principal.organization_id,
+        )
+    )
 
 
 @router.post("/api/v1/interviews/{interview_id}/pause")
@@ -75,7 +94,7 @@ async def skip_interview_turn(interview_id: str, payload: InterviewControlComman
 
 @router.get("/api/v1/interviews/{interview_id}")
 async def get_interview(interview_id: str) -> Dict[str, Any]:
-    return services()["interviews"].get_interview(interview_id)
+    return project_interview_scores(services()["interviews"].get_interview(interview_id))
 
 
 @router.post("/api/v1/interviews/{interview_id}/agent-ticket")
@@ -109,7 +128,8 @@ async def regrade_answer(interview_id: str, answer_id: str) -> Dict[str, Any]:
 
 @router.get("/api/v1/interviews/{interview_id}/answers/{answer_id}/evaluations")
 async def list_answer_evaluations(interview_id: str, answer_id: str) -> Dict[str, Any]:
-    return collection_response(services()["interviews"].list_answer_evaluations(interview_id, answer_id))
+    session = project_interview_scores(services()["interviews"].get_interview(interview_id))
+    return collection_response(item for item in session["evaluation_revisions"] if item["answer_id"] == answer_id)
 
 
 @router.post("/api/v1/interviews/{interview_id}/complete")
@@ -119,6 +139,9 @@ async def complete_interview(interview_id: str) -> Dict[str, Any]:
         interview_id, actor_id=current_principal().actor_id
     )
     result["media_capture"] = capture
+    if result.get("report"):
+        result["report"] = project_report(result["report"], result["interview"])
+    result["interview"] = project_interview_scores(result["interview"])
     await _publish_interview_snapshot(interview_id)
     return result
 
@@ -135,7 +158,7 @@ async def export_report(
     x_actor_id: str = Header(default="reviewer_local", alias="X-Actor-Id"),
 ) -> Response:
     exported = services()["reports"].export_report(
-        interview_id, export_format=format, actor_id=x_actor_id
+        interview_id, export_format=format, actor_id=current_principal().actor_id
     )
     return Response(
         content=exported["content"],
@@ -160,17 +183,25 @@ async def get_answer_audio_url(
     answer_id: str,
     x_actor_id: str = Header(default="reviewer_local", alias="X-Actor-Id"),
 ) -> Dict[str, Any]:
-    return services()["review"].audio_url(interview_id, answer_id, reviewer_id=x_actor_id)
+    return services()["review"].audio_url(interview_id, answer_id, reviewer_id=current_principal().actor_id)
 
 
-@router.get("/api/v1/private-media/{token}", include_in_schema=False)
-async def get_private_media(token: str) -> Response:
-    opened = services()["review"].open_audio_grant(token)
-    return Response(
-        content=opened["content"],
-        media_type=opened["content_type"],
-        headers={"Cache-Control": "private, no-store"},
-    )
+@router.api_route("/api/v1/private-media/{token}", methods=["GET", "HEAD"], include_in_schema=False)
+async def get_private_media(token: str, request: Request) -> Response:
+    opened = await run_in_threadpool(services()["review"].open_playback_grant, token)
+    return private_media_response(opened, request)
+
+
+@router.post("/api/v1/interviews/{interview_id}/recording-url")
+async def get_recording_url(interview_id: str) -> Dict[str, Any]:
+    return services()["review"].recording_url(interview_id, reviewer_id=current_principal().actor_id)
+
+
+@router.post("/api/v1/interviews/{interview_id}/processing/retry")
+async def retry_interview_processing(interview_id: str):
+    result = services()["interviews"].retry_processing(interview_id, actor_id=current_principal().actor_id)
+    services()["media_captures"].request_finalization(interview_id, actor_id=current_principal().actor_id)
+    return accepted_response(result)
 
 
 @router.patch("/api/v1/interviews/{interview_id}/answers/{answer_id}/transcript")
@@ -178,10 +209,16 @@ async def correct_answer_transcript(
     interview_id: str, answer_id: str, payload: TranscriptCorrection
 ) -> Dict[str, Any]:
     return await services()["review"].correct_transcript(
-        interview_id, answer_id, payload.model_dump()
+        interview_id, answer_id, {**payload.model_dump(), "reviewer_id": current_principal().actor_id}
     )
+
+
+@router.post("/api/v1/interviews/{interview_id}/answers/{answer_id}/transcription-verification")
+async def verify_answer_transcription(interview_id: str, answer_id: str, payload: TranscriptionVerification):
+    return accepted_response(services()["interviews"].verify_transcription(
+        interview_id, answer_id, payload.model_dump(), actor_id=current_principal().actor_id))
 
 
 @router.post("/api/v1/interviews/{interview_id}/review-complete")
 async def complete_enterprise_review(interview_id: str, payload: ReviewComplete) -> Dict[str, Any]:
-    return services()["review"].complete_review(interview_id, payload.model_dump())
+    return services()["review"].complete_review(interview_id, {**payload.model_dump(), "reviewer_id": current_principal().actor_id})

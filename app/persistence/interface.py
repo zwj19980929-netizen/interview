@@ -266,6 +266,7 @@ class OutboxRepository:
         lease_token: str,
         error_code: Optional[str] = None,
         retryable: Optional[bool] = None,
+        retry_after_seconds: Optional[int] = None,
     ) -> Document:
         item = self._required(item_id)
         self._require_lease(item, lease_token)
@@ -284,6 +285,8 @@ class OutboxRepository:
         else:
             base = max(0, int(item.get("retry_base_seconds", 0)))
             delay = min(int(item.get("retry_max_seconds", 300)), base * (2 ** max(0, int(item["attempt_count"]) - 1)))
+            if retry_after_seconds is not None:
+                delay = max(delay, max(0, min(3600, int(retry_after_seconds))))
             item["available_at"] = _utc_after(delay) if delay else utc_now()
         item["updated_at"] = utc_now()
         self._backend.replace_work_item(item)

@@ -67,10 +67,10 @@ def _semantic_provider(monkeypatch, *, technical=False, probe=False):
     async def invoke(provider, capability, request, context):
         if capability != "llm.chat_json" or request.purpose != "interview_turn_understanding":
             return await original(provider, capability, request, context)
-        if request.metadata.get("prompt_version") == "supplement_reply.v2":
+        if request.metadata.get("prompt_version") == "supplement_reply.v3":
             reply = json.loads(request.messages[-1].content)["reply"]
             intent = "continue" if "再想想" in reply else "finish"
-            data = {"intent": intent, "confidence": .98, "evidence_quote": reply}
+            data = {"intent": intent, "confidence": .98, "evidence_id": "E1"}
             calls.append(("supplement", reply, intent))
         else:
             transcript = request.metadata["transcript"]
@@ -84,7 +84,7 @@ def _semantic_provider(monkeypatch, *, technical=False, probe=False):
                 evidence_id = next(key for key, value in refs["evidence"].items() if value == _TECHNICAL)
                 evidence_ids = [evidence_id]
                 claims = [{"claim": _TECHNICAL, "evidence_id": evidence_id}]
-            data = {
+            data = {"clarification_target": None,
                 "intent": "answer" if technical_response else "answer_declined",
                 "answer_summary": _TECHNICAL if technical_response else "候选人明确表示本题不再作答。",
                 "claims": claims, "evidence_ids": evidence_ids,
@@ -175,7 +175,7 @@ def test_confirmed_decline_preserves_original_audio_and_advances_once(tmp_path, 
             assert acts == ["supplement_check", "question"]
             assert spoken[0] == SUPPLEMENT_SPEECH["check"]
             assert [c[:2] for c in calls if c[0] == "supplement"] == [("supplement", reply)]
-            assert [c[2] for c in calls if c[0] == "understanding"] == ["interview_turn_decision.v6"]
+            assert [c[2] for c in calls if c[0] == "understanding"] == ["interview_turn_decision.v8"]
 
             # Replay the committed journal command and an additional stale
             # capture hint after advancing. Neither can answer the next turn.

@@ -9,6 +9,7 @@ from app.main import create_app
 from app.persistence.provider import persistence_for
 from app.repositories.provider import get_store, reset_store_for_tests
 from app.services.interviews import InterviewService
+from app.services.interview_agent import InterviewAgentRuntime
 from app.workers.outbox import OutboxWorker
 
 
@@ -320,6 +321,126 @@ def test_lifecycle_controls_and_durable_events_share_one_seam() -> None:
         "interview.recovered",
         "interview.cancelled",
     ]
+
+
+def test_terminal_interview_can_be_removed_from_list_without_deleting_evidence() -> None:
+    api = api_client()
+    _, _, plan = create_plan(api)
+    approved = api.patch(
+        "/api/v1/interview-plans/%s" % plan["id"],
+        json={"expected_version": plan["version"], "status": "approved"},
+    )
+    interview = admit_plan(api, approved.json())
+
+    active_removal = api.delete(
+        "/api/v1/interviews/%s?expected_version=%s"
+        % (interview["id"], interview["version"])
+    )
+    assert active_removal.status_code == 409
+    assert active_removal.json()["error"]["code"] == "INTERVIEW_REMOVAL_NOT_ALLOWED"
+
+    cancelled = api.post(
+        "/api/v1/interviews/%s/cancel" % interview["id"],
+        json={"reason": "candidate withdrew"},
+    ).json()
+    stale_removal = api.delete(
+        "/api/v1/interviews/%s?expected_version=%s"
+        % (interview["id"], cancelled["version"] - 1)
+    )
+    assert stale_removal.status_code == 409
+    assert stale_removal.json()["error"]["code"] == "PERSISTENCE_CONFLICT"
+
+    latest = api.get("/api/v1/interviews/%s" % interview["id"]).json()
+    removed = api.delete(
+        "/api/v1/interviews/%s?expected_version=%s"
+        % (interview["id"], latest["version"]),
+        headers={"X-Actor-Id": "interviewer_remove_test"},
+    )
+    assert removed.status_code == 200, removed.text
+    assert removed.json()["status"] == "cancelled"
+    assert removed.json()["list_removed_at"]
+    assert removed.json()["list_removed_by"] == "interviewer_remove_test"
+
+    listed_ids = {
+        item["id"] for item in api.get("/api/v1/interviews").json()["items"]
+    }
+    assert interview["id"] not in listed_ids
+    detail = api.get("/api/v1/interviews/%s" % interview["id"]).json()
+    assert detail["id"] == interview["id"]
+    assert detail["candidate"] == interview["candidate"]
+    assert detail["turns"]
+    with persistence_for(get_store()).transaction("org_default") as transaction:
+        audit = next(
+            item
+            for item in transaction.audit_events.list()
+            if item.get("action") == "interview.removed_from_list"
+            and item.get("resource_id") == interview["id"]
+        )
+    assert audit["actor_id"] == "interviewer_remove_test"
+    assert audit["metadata"] == {"status": "cancelled"}
+
+
+def test_appointment_deadline_closes_unfinished_session_but_not_submitted_processing() -> None:
+    api = api_client()
+    _, _, plan = create_plan(api)
+    approved = api.patch(
+        "/api/v1/interview-plans/%s" % plan["id"],
+        json={"expected_version": plan["version"], "status": "approved"},
+    )
+    interview = admit_plan(api, approved.json())
+    deadline = datetime.now(timezone.utc).replace(microsecond=0)
+    past = (deadline - timedelta(seconds=1)).isoformat().replace("+00:00", "Z")
+
+    with persistence_for(get_store()).transaction("org_default") as transaction:
+        current = transaction.interview_sessions.get(interview["id"])
+        current["scheduled_end_at"] = None
+        current["candidate_input_completed_at"] = past
+        transaction.interview_sessions.update(current, expected_version=current["version"])
+        appointment = transaction.interview_appointments.get(current["appointment_id"])
+        appointment["scheduled_end_at"] = past
+        transaction.interview_appointments.update(
+            appointment, expected_version=appointment["version"]
+        )
+
+    service = InterviewService(get_store(), clock=lambda: deadline)
+    assert service.expire_overdue_interviews() == []
+    assert service.get_interview(interview["id"])["status"] == "in_progress"
+
+    with persistence_for(get_store()).transaction("org_default") as transaction:
+        current = transaction.interview_sessions.get(interview["id"])
+        current["candidate_input_completed_at"] = None
+        transaction.interview_sessions.update(current, expected_version=current["version"])
+
+    assert asyncio.run(InterviewAgentRuntime(get_store()).sweep_overdue_interviews()) == 1
+    current = service.get_interview(interview["id"])
+    assert current["status"] == "cancelled"
+    assert current["termination_reason"] == "appointment_window_expired"
+    assert current["expired_at"] == deadline.isoformat().replace("+00:00", "Z")
+    assert current["completed_at"] == current["expired_at"]
+    assert current["current_turn_id"] is None
+    assert all(
+        turn["status"] not in {"pending", "asking", "answering", "evaluating"}
+        for turn in current["turns"]
+    )
+    assert current["lifecycle_events"][-1]["type"] == "interview.cancelled"
+    assert current["lifecycle_events"][-1]["payload"] == {
+        "reason": "appointment_window_expired"
+    }
+    assert service.expire_overdue_interviews() == []
+
+    with persistence_for(get_store()).transaction("org_default") as transaction:
+        audit = next(
+            item
+            for item in transaction.audit_events.list()
+            if item.get("action") == "interview.appointment_window_expired"
+            and item.get("resource_id") == interview["id"]
+        )
+    assert audit["actor_id"] == "system:interview-deadline"
+    assert audit["metadata"] == {
+        "scheduled_end_at": past,
+        "previous_status": "in_progress",
+        "status": "cancelled",
+    }
 
 
 def test_manual_completion_skips_open_turns_before_requesting_report() -> None:

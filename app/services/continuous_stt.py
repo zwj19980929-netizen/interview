@@ -7,6 +7,7 @@ server finals are joined; recovery never certifies an old prefix as complete.
 """
 
 from __future__ import annotations
+from app.domain.speech_quality import minimum_reported_confidence
 
 import asyncio
 import math
@@ -127,7 +128,7 @@ class ContinuousSTT:
                                                "end_ms": segment.end_ms + offset})
                     for segment in preview.segments
                 ],
-                "confidence": min(previous.confidence, preview.confidence) if previous else preview.confidence,
+                "confidence": minimum_reported_confidence(previous.confidence, preview.confidence) if previous else preview.confidence,
                 "has_unstable_tail": (preview.has_unstable_tail or self._inflight_has_speech
                                       or self._pending_has_speech()),
             })
@@ -296,7 +297,7 @@ class ContinuousSTT:
                         self._final = final.model_copy(update={
                             "text": (previous.text if previous else "") + final.text,
                             "segments": (list(previous.segments) if previous else []) + segments,
-                            "confidence": min(previous.confidence, final.confidence) if previous else final.confidence,
+                            "confidence": minimum_reported_confidence(previous.confidence, final.confidence) if previous else final.confidence,
                         })
                     if not self._unresolved:
                         self._segment_start_bytes = end_bytes

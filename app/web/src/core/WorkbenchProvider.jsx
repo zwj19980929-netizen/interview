@@ -14,20 +14,28 @@ function initialData() {
     selectedKnowledgeBase: null, speechBuilds: [], speechOptions: { current: null, items: [], candidates: [] },
     questionGenerationOptions: { positioning: "", tags: [], items: [], candidates: [] }, questionGenerationBatches: [], selectedGenerationBatch: null,
     questionOverview: { total: 0, ready: 0, recent: [] }, selectedInterview: null, report: null,
-    invitation: null, candidateToken: null,
+    invitation: null, candidateToken: null, candidateSession: null,
   };
 }
 
 const newestFirst = (items = []) => [...items].sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+const routeLoadKey = (route) => JSON.stringify([
+  route.view, route.selectedInterviewId, route.candidateToken, route.invitationToken,
+  route.knowledgeBaseId, route.generation, route.generationBatchId, route.providerConnectionId,
+]);
 
 export function WorkbenchProvider({ children }) {
   const dataRef = useRef(initialData());
   const [, renderVersion] = useState(0);
   const [route, setRoute] = useState(() => parseRoute(window.location.hash));
+  const currentRoute = useRef(route);
+  currentRoute.current = route;
+  const loadGeneration = useRef(0);
   const [auth, setAuth] = useState(null);
   const [authRequired, setAuthRequired] = useState(false);
   const [loading, setLoading] = useState(true);
-  const [fatalError, setFatalError] = useState("");
+  const [loadError, setLoadError] = useState(null);
+  const fatalError = loadError?.routeKey === routeLoadKey(route) ? loadError.message : "";
   const [modal, setModal] = useState(null);
   const [toasts, setToasts] = useState([]);
 
@@ -56,21 +64,33 @@ export function WorkbenchProvider({ children }) {
     window.addEventListener("hashchange", sync);
     return () => window.removeEventListener("hashchange", sync);
   }, []);
+  useEffect(() => () => { loadGeneration.current += 1; }, []);
 
   const load = useCallback(async (activeRoute = route) => {
+    const generation = ++loadGeneration.current;
+    const routeKey = routeLoadKey(activeRoute);
+    const isCurrent = () => generation === loadGeneration.current
+      && routeLoadKey(currentRoute.current) === routeKey;
     setLoading(true);
-    setFatalError("");
+    setLoadError(null);
     try {
       if (activeRoute.view === "invite") {
-        dataRef.current.invitation = await request(`${API}/public/interview-invitations/${encodeURIComponent(activeRoute.invitationToken || "")}`);
+        const invitation = await request(`${API}/public/interview-invitations/${encodeURIComponent(activeRoute.invitationToken || "")}`);
+        if (!isCurrent()) return;
+        dataRef.current.invitation = invitation;
         touch();
         return;
       }
       if (activeRoute.view === "candidate") {
-        dataRef.current.candidateToken = activeRoute.candidateToken;
-        dataRef.current.selectedInterview = await request(`${API}/public/interviews/${encodeURIComponent(activeRoute.selectedInterviewId || "")}`, {
+        const interview = await request(`${API}/public/interviews/${encodeURIComponent(activeRoute.selectedInterviewId || "")}`, {
           headers: { "X-Candidate-Session-Token": activeRoute.candidateToken || "" },
         });
+        if (!isCurrent()) return;
+        if (interview.id !== activeRoute.selectedInterviewId) throw new Error("面试会话响应与当前链接不一致，请重新打开邀请链接。");
+        // Publish the authorized projection and its credential as one binding.
+        dataRef.current.candidateSession = { interview, token: activeRoute.candidateToken };
+        dataRef.current.candidateToken = activeRoute.candidateToken;
+        dataRef.current.selectedInterview = interview;
         if (activeRoute.clearCandidateTokenFromHash) navigate("candidate", activeRoute.selectedInterviewId, { replace: true });
         touch();
         return;
@@ -104,13 +124,13 @@ export function WorkbenchProvider({ children }) {
       }
       touch();
     } catch (error) {
-      setFatalError(error?.message || "工作区加载失败");
+      if (isCurrent()) setLoadError({ routeKey, message: error?.message || "工作区加载失败" });
     } finally {
-      setLoading(false);
+      if (isCurrent()) setLoading(false);
     }
   }, [auth, navigate, query, request, route, touch]);
 
-  useEffect(() => { load(route); }, [route.view, route.knowledgeBaseId, route.generation, route.generationBatchId, route.providerConnectionId, route.selectedInterviewId, route.invitationToken]);
+  useEffect(() => { load(route); }, [route.view, route.knowledgeBaseId, route.generation, route.generationBatchId, route.providerConnectionId, route.selectedInterviewId, route.invitationToken, route.candidateToken]);
 
   const login = useCallback(async (token) => {
     http.setAccessToken(token);

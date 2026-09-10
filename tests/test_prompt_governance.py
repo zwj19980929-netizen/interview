@@ -15,7 +15,7 @@ def test_understanding_v2_uses_exact_reference_catalog_and_preserves_long_transc
     assert all(text in transcript and len(text) <= 240 for text in references["evidence"].values())
     assert sum(text.count("待") for text in references["evidence"].values()) == 501
     contract = prompt_contract("interview_turn_understanding", context)
-    assert contract.version == "interview_turn_understanding.v6"
+    assert contract.version == "interview_turn_understanding.v8"
     assert "evidence_quotes" not in contract.response_schema["properties"]
     assert contract.response_schema["properties"]["evidence_ids"]["items"]["enum"] == list(references["evidence"])
     assert contract.response_schema["properties"]["covered_point_ids"]["items"]["enum"] == ["P1", "P2"]

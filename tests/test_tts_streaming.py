@@ -501,3 +501,64 @@ async def test_qwen_sse_rejects_invalid_base64_and_structured_vendor_error():
     with pytest.raises(ProviderError) as error:
         _ = [item async for item in managed(raw).events()]
     assert error.value.code == "provider_rate_limited" and "synthetic input" not in str(error.value)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("reason", [None, "null"])
+async def test_qwen_http_intermediate_null_variants_require_pcm_and_final(reason):
+    chunk = payload()
+    chunk["output"]["finish_reason"] = reason
+    provider, body = provider_for(sse(chunk, payload(final=True)))
+    stream = await provider.open_tts_stream(TTSSynthesizeRequest(text="合成测试。"), context())
+    result = [item async for item in stream.events()]
+    assert [item.type for item in result] == ["audio.chunk", "audio.final"]
+    assert result[-1].total_audio_bytes == 20 and body.closed
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("reason", ["", "length", "NULL", False, {}, []])
+async def test_qwen_http_unknown_intermediate_reason_is_not_normalized(reason):
+    chunk = payload()
+    chunk["output"]["finish_reason"] = reason
+    provider, body = provider_for(sse(chunk, payload(final=True)))
+    stream = await provider.open_tts_stream(TTSSynthesizeRequest(text="合成测试。"), context())
+    with pytest.raises(ProviderError):
+        _ = [item async for item in stream.events()]
+    assert body.closed
+
+
+@pytest.mark.anyio
+async def test_qwen_current_wire_strips_exact_wave_prefix_and_waits_past_usage_summary():
+    from app.providers.dashscope.tts_streaming import _STREAM_WAVE_HEADER
+    chunk = payload(_STREAM_WAVE_HEADER + b"\x01\x00" * 10)
+    chunk["output"]["finish_reason"] = "null"
+    summary = payload(b"")
+    summary["output"]["finish_reason"] = "null"
+    provider, body = provider_for(sse(chunk, payload(), summary, payload(final=True)))
+    stream = managed(await provider.open_tts_stream(TTSSynthesizeRequest(text="合成测试。"), context()))
+    results = [item async for item in stream.events()]
+    assert [item.sequence for item in results] == [2, 3, 4]
+    assert b"".join(item.pcm_s16le for item in results) == b"\x01\x00" * 20
+    assert results[-1].total_audio_bytes == 40 and body.closed
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("failure", ["no_final", "double_summary", "pcm_after_summary", "bad_usage", "wrong_wave_format"])
+async def test_qwen_wire_compatibility_still_rejects_incomplete_or_inconsistent_audio(failure):
+    from app.providers.dashscope.tts_streaming import _STREAM_WAVE_HEADER
+    summary = payload(b"")
+    summary["output"]["finish_reason"] = "null"
+    items = [payload(), summary, payload(final=True)]
+    if failure == "no_final": items.pop()
+    elif failure == "double_summary": items.insert(2, summary)
+    elif failure == "pcm_after_summary": items.insert(2, payload())
+    elif failure == "bad_usage": summary["usage"] = {"characters": -1}
+    else:
+        malformed = bytearray(_STREAM_WAVE_HEADER)
+        malformed[24:28] = (16000).to_bytes(4, "little")
+        items[0] = payload(bytes(malformed) + b"\x01\x00" * 10)
+    provider, body = provider_for(sse(*items))
+    stream = managed(await provider.open_tts_stream(TTSSynthesizeRequest(text="合成测试。"), context()))
+    with pytest.raises(ProviderError):
+        _ = [item async for item in stream.events()]
+    assert body.closed

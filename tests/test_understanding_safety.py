@@ -151,7 +151,7 @@ def test_retryable_provider_failure_returns_only_approved_clarification() -> Non
 
 def test_invalid_schema_or_non_verbatim_evidence_pauses_fail_closed() -> None:
     transcript = "我使用幂等键记录提交。"
-    invalid = {
+    invalid = {"clarification_target": None,
         "intent": "answer",
         "answer_summary": transcript,
         "claims": [],
@@ -201,7 +201,7 @@ def test_answer_requires_nonempty_verbatim_evidence_and_complete_capability_part
     mutate,
 ) -> None:
     transcript = "我使用幂等键记录提交。"
-    value = {
+    value = {"clarification_target": None,
         "intent": "answer",
         "answer_summary": transcript,
         "claims": [{"claim": "使用幂等键", "evidence_quote": transcript}],

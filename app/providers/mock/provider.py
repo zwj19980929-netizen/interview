@@ -59,10 +59,13 @@ class MockProvider:
         if capability == cap.LLM_CHAT_JSON and isinstance(request, ChatJSONRequest):
             if request.purpose == "answer_evaluation":
                 data = evaluate_answer(request.metadata)
-            elif request.purpose == "interview_turn_understanding" and request.metadata.get("prompt_version") in {"supplement_reply.v1", "supplement_reply.v2"}:
+            elif request.purpose == "interview_turn_understanding" and request.metadata.get("prompt_version") in {"supplement_reply.v1", "supplement_reply.v2", "supplement_reply.v3"}:
                 reply = json.loads(request.messages[-1].content)["reply"]
                 # Offline mock never fabricates permission to finish.
                 data = {"intent": "unclear", "confidence": 0.0, "evidence_quote": reply[:300]}
+                if request.metadata.get("prompt_version") == "supplement_reply.v3":
+                    data = {"intent": "unclear", "confidence": 0.0,
+                            "evidence_id": next(iter(json.loads(request.messages[-1].content)["evidence"]))}
             elif request.purpose == "interview_turn_understanding":
                 from app.core.prompt.understanding_references import understanding_references
 
@@ -73,6 +76,7 @@ class MockProvider:
                 evidence = [transcript[: min(120, len(transcript))]] if transcript else []
                 data = {
                     "intent": "answer",
+                    "clarification_target": None,
                     "answer_summary": transcript[:800],
                     "claims": (
                         [{"claim": transcript[:600], "evidence_quote": evidence[0]}]
@@ -91,9 +95,9 @@ class MockProvider:
                     "interview_turn_understanding.v2", "interview_turn_decision.v1",
                     "interview_turn_understanding.v3", "interview_turn_decision.v2",
                     "interview_turn_understanding.v4", "interview_turn_understanding.v5",
-                    "interview_turn_understanding.v6", "interview_turn_understanding.v7",
+                    "interview_turn_understanding.v6", "interview_turn_understanding.v7", "interview_turn_understanding.v8", "interview_turn_understanding.v9",
                     "interview_turn_decision.v3", "interview_turn_decision.v4",
-                    "interview_turn_decision.v5", "interview_turn_decision.v6",
+                    "interview_turn_decision.v5", "interview_turn_decision.v6", "interview_turn_decision.v7", "interview_turn_decision.v8",
                 }:
                     references = understanding_references(transcript, points)
                     point_ids = {text: key for key, text in references["capabilities"].items()}
@@ -103,7 +107,7 @@ class MockProvider:
                     data["claims"] = [{"claim": transcript[:600], "evidence_id": evidence_ids[0]}] if evidence_ids else []
                     data["covered_point_ids"] = [point_ids[point] for point in data.pop("covered_capability_points")]
                     data["missing_point_ids"] = [point_ids[point] for point in data.pop("missing_capability_points")]
-                    if request.metadata.get("prompt_version") in {"interview_turn_decision.v1", "interview_turn_decision.v2", "interview_turn_decision.v3", "interview_turn_decision.v4", "interview_turn_decision.v5", "interview_turn_decision.v6"}:
+                    if request.metadata.get("prompt_version") in {"interview_turn_decision.v1", "interview_turn_decision.v2", "interview_turn_decision.v3", "interview_turn_decision.v4", "interview_turn_decision.v5", "interview_turn_decision.v6", "interview_turn_decision.v7", "interview_turn_decision.v8"}:
                         probed = set(request.metadata.get("previously_probed_ids") or [])
                         targets = [key for key in data["missing_point_ids"] if key not in probed][:1]
                         selected = bool(targets and evidence_ids)
@@ -579,7 +583,7 @@ def evaluate_answer(metadata: Dict[str, Any]) -> Dict[str, Any]:
         "missing_key_points": missing,
         "incorrect_claims": [],
         "evidence": [item["evidence"] for item in covered],
-        "review_flags": ["low_stt_confidence"] if float(metadata.get("stt_confidence", 1.0)) < 0.6 else [],
+        "review_flags": ["low_stt_confidence"] if metadata.get("stt_confidence") is not None and float(metadata["stt_confidence"]) < 0.6 else [],
         "summary": "回答覆盖了 %s/%s 个关键点。" % (len(covered), len(key_points)),
         "suggested_followup": "请结合实际项目再展开一个具体例子。" if missing else None,
     }

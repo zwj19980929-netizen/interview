@@ -164,7 +164,7 @@ def test_five_second_check_then_spoken_no_submits_original_answer_with_no_button
             await _wait_until(lambda: all(c["status"] == "completed" for c in store.evidence_commands.values()))
             _assert_one_automatic_answer(store, runtime, _PREFIX + "没有补充了。", voice_frames=5, continuation_frames=5)
             assert _current(runtime)["turns"][0]["current_understanding"]["prompt_version"] in {
-                "interview_turn_understanding.v7", "interview_turn_decision.v6",
+                "interview_turn_understanding.v9", "interview_turn_decision.v8",
             }
     asyncio.run(scenario())
 

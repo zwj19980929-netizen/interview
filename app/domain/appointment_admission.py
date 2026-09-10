@@ -113,6 +113,7 @@ class AppointmentAdmission:
         checks.append(
             {
                 "name": "experience_question_speech",
+                "blocking": False,
                 "ready": (
                     experience_speech_local_ready
                     if local_mode
@@ -404,11 +405,11 @@ class AppointmentAdmission:
             check["route_readiness"] = state
             if state["route_id"] is not None and not state["ready"]:
                 check["mode"] = "configured_route_" + ("unhealthy" if state["status"] == "failed" else state["status"])
-        local_ready = all(item["ready"] for item in checks)
-        production_ready = all(item.get("production_ready", item["ready"]) for item in checks)
+        local_ready = all(item["ready"] for item in checks if item.get("blocking", True))
+        production_ready = all(item.get("production_ready", item["ready"]) for item in checks if item.get("blocking", True))
         invite_ready = all(
             item.get("invite_ready", item["ready"] if local_mode else item.get("production_ready", item["ready"]))
-            for item in checks
+            for item in checks if item.get("blocking", True)
         )
         checked_at = ensure_utc(now)
         return {

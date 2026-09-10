@@ -17,7 +17,7 @@ from app.core.ids import new_id
 from app.core.time import utc_now
 from app.file_storage.provider import private_file_storage
 from app.file_storage.interface import PrivateFileStorage
-from app.persistence.interface import Persistence
+from app.persistence.interface import Persistence, new_work_item
 from app.persistence.provider import persistence_for
 from app.services.interviews import InterviewService
 from app.services.livekit_room_binding import (
@@ -59,6 +59,66 @@ class InterviewMediaCaptureService:
                 None,
             )
         return deepcopy(capture) if capture else None
+
+    def _object_digest(self, object_key: str):
+        digest, byte_count = hashlib.sha256(), 0
+        iterator = getattr(self.storage, "iter_bytes", None)
+        chunks = iterator(object_key) if iterator else [self.storage.open(object_key)]
+        for chunk in chunks:
+            digest.update(chunk)
+            byte_count += len(chunk)
+        if not byte_count:
+            raise ValueError("Recording is empty")
+        return "sha256:" + digest.hexdigest(), byte_count
+
+    @staticmethod
+    def _enqueue_finalization(transaction, capture):
+        work = new_work_item(
+            organization_id=capture["organization_id"], kind="interview.media.finalize",
+            aggregate_id=capture["interview_id"], idempotency_key="media.finalize:" + capture["id"],
+            payload={"interview_id": capture["interview_id"], "capture_id": capture["id"]},
+        )
+        work.update(max_attempts=8, retry_base_seconds=5, retry_max_seconds=120)
+        return transaction.outbox.enqueue(work)
+
+    def request_finalization(self, interview_id: str, *, actor_id: str,
+                             organization_id: str = "org_default"):
+        with self.persistence.transaction(organization_id) as transaction:
+            capture = self._capture(transaction, interview_id)
+            if not capture or capture.get("status") not in {"recording", "stopping", "hash_pending"}:
+                return None
+            work = self._enqueue_finalization(transaction, capture)
+            if work["status"] in {"failed", "dead_letter"}:
+                work = transaction.outbox.replay(work["id"], reason="recording_finalization_retry", actor_id=actor_id)
+            return work
+
+    async def process_finalization_work(self, work_item_id: str, organization_id: str = "org_default"):
+        with self.persistence.transaction(organization_id) as transaction:
+            work = transaction.outbox.start(work_item_id, lease_seconds=300)
+            capture = transaction.interview_media_captures.get(work["payload"]["capture_id"])
+        try:
+            if not capture or capture.get("status") in {"completed", "cancelled", "failed", "retention_purged"}:
+                result = capture or {"status": "missing"}
+            else:
+                response = await self.media_plane.list_egress(egress_id=capture["egress_id"], room_name=capture["room_name"])
+                info = next((item for item in self._egress_items(response)
+                             if self._provider_egress_id(item) == capture["egress_id"]), None)
+                if info is None:
+                    raise RuntimeError("Recording provider has no final result")
+                if not self._provider_capture_matches(capture, info):
+                    raise self._provider_binding_error()
+                result = await self.finalize_provider_result(capture["id"], info, actor_id="media_worker",
+                                                              organization_id=organization_id)
+                if result.get("status") != "completed":
+                    raise RuntimeError("Recording has not finished finalization")
+            with self.persistence.transaction(organization_id) as transaction:
+                transaction.outbox.complete(work_item_id, lease_token=work["lease_token"])
+            return result
+        except Exception:
+            with self.persistence.transaction(organization_id) as transaction:
+                transaction.outbox.fail(work_item_id, "录像尚未完成封存或校验，请稍后重试。",
+                                       lease_token=work["lease_token"], error_code="recording_finalization_pending", retryable=True)
+            raise
 
     async def start_for_connection(
         self,
@@ -546,6 +606,7 @@ class InterviewMediaCaptureService:
                 transaction.interview_media_captures.update(
                     current, expected_version=current["version"]
                 )
+        self.request_finalization(interview_id, actor_id=actor_id, organization_id=organization_id)
         try:
             response = await self.media_plane.stop_egress(egress_id)
         except Exception as exc:
@@ -583,19 +644,24 @@ class InterviewMediaCaptureService:
             raise ApiError(
                 "MEDIA_CAPTURE_NOT_FOUND", "Media capture does not exist.", status_code=404
             )
+        if capture.get("status") in {"completed", "cancelled", "retention_purged"}:
+            return capture
+        provider_status = self._provider_status(provider_result)
+        if provider_result.get("error") or provider_status in {"EGRESS_FAILED", "FAILED", "4", "EGRESS_ABORTED", "5"}:
+            self._mark_failed(capture_id, capture["interview_id"], "egress_provider_failed",
+                              RuntimeError("Egress failed"), actor_id=actor_id, organization_id=organization_id)
+            return self.get_for_interview(capture["interview_id"], organization_id)
         object_key = str(capture.get("object_key") or "")
-        content_hash = None
-        byte_count = None
-        if object_key:
+        content_hash, byte_count = None, None
+        # StopEgress normally returns ENDING. A readable partial file is not a completed recording.
+        if object_key and provider_status in {"EGRESS_COMPLETE", "COMPLETE", "3"}:
             try:
-                content = await asyncio.to_thread(
-                    self.storage.open, object_key
-                )
-                content_hash = "sha256:%s" % hashlib.sha256(content).hexdigest()
-                byte_count = len(content)
+                content_hash, byte_count = await asyncio.to_thread(self._object_digest, object_key)
+                files = provider_result.get("file_results") or []
+                expected_size = int(files[0].get("size") or 0) if files else 0
+                if expected_size > 0 and byte_count != expected_size:
+                    content_hash, byte_count = None, None
             except Exception:
-                # Some object stores are eventually consistent. The capture is
-                # kept in `hash_pending`, never presented as fully verified.
                 pass
         storage_protection = None
         encryption = None
@@ -629,6 +695,8 @@ class InterviewMediaCaptureService:
                 raise ApiError(
                     "MEDIA_CAPTURE_NOT_FOUND", "Media capture does not exist.", status_code=404
                 )
+            if current.get("status") in {"completed", "cancelled", "retention_purged"}:
+                return deepcopy(current)
             current.update(
                 {
                     "status": status,
@@ -642,7 +710,7 @@ class InterviewMediaCaptureService:
                         utc_now() if storage_protection else None
                     ),
                     "provider_result": self._provider_projection(provider_result),
-                    "stopped_at": utc_now(),
+                    "stopped_at": current.get("stopped_at") or utc_now(),
                     "updated_at": utc_now(),
                 }
             )
@@ -656,6 +724,8 @@ class InterviewMediaCaptureService:
                 "interview.media_capture.finalized",
                 {"status": status, "content_hash": content_hash},
             )
+            if status == "hash_pending":
+                self._enqueue_finalization(transaction, current)
             return deepcopy(current)
 
     async def handle_provider_webhook(
@@ -743,7 +813,7 @@ class InterviewMediaCaptureService:
         if capture is None:
             raise self._provider_binding_error()
         self._require_provider_binding(capture, binding, room_name, egress_id, info)
-        if self._has_provider_receipt(capture, fingerprint):
+        if self._has_provider_receipt(capture, fingerprint) or capture.get("status") in {"completed", "cancelled", "retention_purged"}:
             return deepcopy(capture)
 
         status = str(info.get("status") or "").upper()
@@ -824,11 +894,11 @@ class InterviewMediaCaptureService:
         object_key = str(capture.get("object_key") or "")
         content_hash = None
         byte_count = None
-        if object_key:
+        if capture.get("status") == "completed":
+            return deepcopy(capture)
+        if object_key and self._provider_status(info) in {"EGRESS_COMPLETE", "COMPLETE", "3"}:
             try:
-                content = await asyncio.to_thread(self.storage.open, object_key)
-                content_hash = "sha256:%s" % hashlib.sha256(content).hexdigest()
-                byte_count = len(content)
+                content_hash, byte_count = await asyncio.to_thread(self._object_digest, object_key)
             except Exception:
                 pass
         storage_protection = None
@@ -875,7 +945,7 @@ class InterviewMediaCaptureService:
                         utc_now() if storage_protection else None
                     ),
                     "provider_result": self._provider_projection(info),
-                    "stopped_at": utc_now(),
+                    "stopped_at": current.get("stopped_at") or utc_now(),
                     "updated_at": utc_now(),
                 }
             )
@@ -896,6 +966,8 @@ class InterviewMediaCaptureService:
                     "provider_event": event_name,
                 },
             )
+            if final_status == "hash_pending":
+                self._enqueue_finalization(transaction, current)
             return deepcopy(current)
 
     @staticmethod

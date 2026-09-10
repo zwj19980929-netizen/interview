@@ -8,17 +8,21 @@ URL from replay history.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 from typing import Any, Dict, Optional
 
 from app.adapters.local_media import pcm_wav_header
+from app.domain.appointment_speech import turn_speech_asset_id
 from app.core.errors import ApiError
 from app.core.ids import new_id
 from app.core.time import utc_now
 from app.file_storage.interface import PrivateFileStorage
 from app.file_storage.provider import private_file_storage
 from app.persistence.interface import Persistence
+from app.model_gateway.errors import ProviderError
+from app.model_gateway.schemas import TTSSynthesizeRequest
 from app.services.private_assets import PrivateAssetImporter
 
 
@@ -53,6 +57,55 @@ class AgentExpressionAudioService:
         self.production = (
             os.getenv("INTERVIEWER_RUNTIME_ENV", "development").lower()
             == "production"
+        )
+
+    async def synthesize_complete_audio(
+        self, gateway: Any, request: TTSSynthesizeRequest, *, interview_id: str,
+        turn_id: Optional[str], timeout_s: float = 20,
+    ) -> Optional[Dict[str, Any]]:
+        """Collect validated PCM before publishing a complete private WAV.
+
+        This avoids a second provider-URL download without exposing a live
+        audio clock to the browser. Only an unsupported transport may fall
+        back to batch; cancellation or partial audio must never be replayed.
+        """
+        open_stream = getattr(gateway, "open_tts_stream", None)
+        if not callable(open_stream):
+            return None
+
+        async def collect():
+            try:
+                stream = await open_stream(request)
+            except ProviderError as exc:
+                if exc.code == "provider_streaming_not_supported":
+                    return None
+                raise
+            pcm = bytearray()
+            completed = False
+            try:
+                if stream.ready_event.provider.provider_id == "mock":
+                    raise ApiError("AGENT_EXPRESSION_AUDIO_REQUIRED", "Development mock speech is not playable formal interview audio.", status_code=503)
+                async for event in stream.events():
+                    if event.type == "audio.chunk":
+                        if len(pcm) + len(event.pcm_s16le) + 44 > self.importer.max_bytes:
+                            raise ApiError("AGENT_EXPRESSION_AUDIO_SIZE_INVALID", "Complete speech exceeds the private asset limit.", status_code=502)
+                        pcm.extend(event.pcm_s16le)
+                    elif event.type == "audio.final":
+                        completed = bool(pcm) and event.total_audio_bytes == len(pcm)
+                if not completed:
+                    raise ApiError("AGENT_EXPRESSION_AUDIO_INVALID", "Complete speech requires a validated final event.", status_code=502)
+                return bytes(pcm), stream.sample_rate_hz, stream.channels
+            finally:
+                await stream.abort()
+
+        result = await asyncio.wait_for(collect(), timeout=timeout_s)
+        if result is None:
+            return None
+        pcm, sample_rate_hz, channels = result
+        return self.store_pcm(
+            organization_id=request.organization_id, interview_id=interview_id, turn_id=turn_id,
+            pcm_s16le=pcm, sample_rate_hz=sample_rate_hz, channels=channels,
+            source_type="tts_complete_pcm",
         )
 
     def store_pcm(
@@ -274,9 +327,9 @@ class AgentExpressionAudioService:
         if session is None:
             return False
         asset_ids = {
-            str((turn.get("question_snapshot") or {}).get("speech_asset_id"))
+            str(turn_speech_asset_id(turn))
             for turn in session.get("turns", [])
-            if (turn.get("question_snapshot") or {}).get("speech_asset_id")
+            if turn_speech_asset_id(turn)
         }
         for asset_id in asset_ids:
             asset = transaction.question_speech_assets.get(asset_id)

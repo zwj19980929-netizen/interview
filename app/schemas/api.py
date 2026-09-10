@@ -396,6 +396,22 @@ class TranscriptCorrection(BaseModel):
     reviewer_id: str = "reviewer_local"
 
 
+class TranscriptionVerification(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    expected_evaluation_id: str = Field(min_length=1, max_length=128)
+    expected_transcript_revision: int = Field(ge=1)
+    audio_reviewed: Literal[True]
+    reason: str = Field(min_length=1, max_length=500)
+    final_transcript: Optional[str] = Field(default=None, min_length=1, max_length=12_000)
+
+    @field_validator("audio_reviewed", mode="before")
+    @classmethod
+    def require_explicit_review(cls, value):
+        if value is not True:
+            raise ValueError("Audio review requires an explicit true attestation")
+        return value
+
+
 class ReviewComplete(BaseModel):
     reviewer_id: str = "reviewer_local"
     notes: str = ""

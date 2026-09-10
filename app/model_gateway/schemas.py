@@ -22,9 +22,17 @@ class ChatMessage(BaseModel):
     content: str
 
 
+class InvocationExecutionBudget(BaseModel):
+    """Trusted application workflow limits; never provider-specific payload fields."""
+    model_config = ConfigDict(extra="forbid")
+    timeout_s: float = Field(gt=0, le=300)
+    max_provider_retries: int = Field(default=0, ge=0, le=3)
+
+
 class ChatJSONRequest(BaseModel):
     organization_id: str = "org_default"
     purpose: str = Field(min_length=1)
+    execution_budget: Optional[InvocationExecutionBudget] = None
     messages: List[ChatMessage] = Field(min_length=1)
     json_schema: Dict[str, Any] = Field(default_factory=dict)
     temperature: float = 0.1
@@ -70,7 +78,7 @@ class TranscriptEvent(BaseModel):
     type: str
     text: str
     language: str = "zh-CN"
-    confidence: float = 1.0
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False, strict=True)
     start_ms: int = 0
     end_ms: int = 0
     provider: Optional[ProviderMeta] = None
@@ -80,7 +88,14 @@ class TranscriptSegment(BaseModel):
     text: str
     start_ms: int = 0
     end_ms: int = 0
-    confidence: float = 1.0
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False, strict=True)
+
+
+def _preserve_reported_low_confidence(result):
+    values = [result.confidence, *(item.confidence for item in result.segments)]
+    known = [value for value in values if value is not None]
+    result.confidence = min(known) if known else None
+    return result
 
 
 class StreamingAudioConfig(BaseModel):
@@ -105,9 +120,12 @@ class StreamingSTTRequest(BaseModel):
     @classmethod
     def validate_recognition_terms(cls, terms: List[str]) -> List[str]:
         import re
+        from app.domain.recognition_lexicon import CHINESE_TECHNICAL_TERMS
         if (len({term.casefold() for term in terms}) != len(terms)
-                or any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_+.#-]{1,63}", term) for term in terms)):
-            raise ValueError("Recognition terms must be unique bounded technical identifiers")
+                or any(len(term) > 64 or (term not in CHINESE_TECHNICAL_TERMS and not re.fullmatch(
+                    r"(?:[A-Za-z][A-Za-z0-9_+.#-]{1,63}|[A-Za-z]{2,}(?: [A-Za-z]{2,}){1,5})", term
+                )) for term in terms)):
+            raise ValueError("Recognition terms must be unique bounded technical identifiers or spoken forms")
         return terms
 
 
@@ -124,11 +142,12 @@ class StreamingSTTEvent(BaseModel):
     ]
     text: str = ""
     language: str = "zh-CN"
-    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False, strict=True)
     segments: List[TranscriptSegment] = Field(default_factory=list)
     is_final: bool = False
     error_code: Optional[str] = None
     provider: Optional[ProviderMeta] = None
+    _recognition_quality = model_validator(mode="after")(_preserve_reported_low_confidence)
 
     @model_validator(mode="before")
     @classmethod
@@ -162,10 +181,11 @@ class StableTranscriptPreview(BaseModel):
     revision: int = Field(ge=1)
     text: str = Field(min_length=1, max_length=100_000)
     language: str = Field(min_length=1, max_length=128)
-    confidence: float = Field(ge=0.0, le=1.0, allow_inf_nan=False)
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False, strict=True)
     segments: List[TranscriptSegment] = Field(min_length=1, max_length=10_000)
     provider: ProviderMeta
     has_unstable_tail: bool
+    _recognition_quality = model_validator(mode="after")(_preserve_reported_low_confidence)
 
     @model_validator(mode="before")
     @classmethod
@@ -215,8 +235,8 @@ class StableTranscriptPreview(BaseModel):
                 not segment.text.strip()
                 or segment.start_ms < previous_end
                 or segment.end_ms < segment.start_ms
-                or not math.isfinite(segment.confidence)
-                or not 0 <= segment.confidence <= 1
+                or (segment.confidence is not None and (not math.isfinite(segment.confidence)
+                    or not 0 <= segment.confidence <= 1))
             ):
                 raise ValueError("Stable preview segments are invalid or out of order.")
             previous_end = segment.end_ms
@@ -294,10 +314,11 @@ class BatchSTTRequest(BaseModel):
 class BatchSTTResponse(BaseModel):
     text: str
     language: str = "zh-CN"
-    confidence: float = 1.0
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0, allow_inf_nan=False, strict=True)
     segments: List[TranscriptSegment] = Field(default_factory=list)
     source: str = "server_batch"
     provider: ProviderMeta
+    _recognition_quality = model_validator(mode="after")(_preserve_reported_low_confidence)
 
 
 class TTSSynthesizeRequest(BaseModel):

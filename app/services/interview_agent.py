@@ -1673,6 +1673,7 @@ class AgentChannel:
         gesture: str,
         expression: Optional[Dict[str, Any]] = None,
         approval_guard: Any = None,
+        prompt_version: Optional[str] = None,
     ) -> Optional[AvatarPerformance]:
         if not text.strip():
             raise ApiError("CONVERSATION_ACT_EMPTY", "Approved conversation act is empty.", status_code=409)
@@ -1757,6 +1758,7 @@ class AgentChannel:
             evidence_quotes=evidence_refs,
             approved_by="interview_agent_runtime",
             organization_id=self.organization_id,
+            **({"prompt_version": prompt_version} if prompt_version else {}),
         )
         await self._set_floor(FloorOwner.AGENT, "approved_conversation_act", causation_id)
         selected_event = await self._emit(
@@ -2308,6 +2310,40 @@ class InterviewAgentRuntime:
                 {"status": "lost", "ai_resumed": False},
             )
         return expired_count
+
+    async def sweep_overdue_interviews(
+        self, organization_id: str = "org_default"
+    ) -> int:
+        """Close appointment-window overruns and release their live resources."""
+
+        expired = self.interviews.expire_overdue_interviews(organization_id)
+        for session in expired:
+            interview_id = str(session["id"])
+            try:
+                await self.evidence_ingress.stop_for_interview(
+                    interview_id,
+                    organization_id,
+                    reason="appointment_window_expired",
+                )
+            except Exception:
+                # The persisted terminal state already fences new evidence.
+                # A later provider cleanup can recover independently.
+                pass
+            try:
+                await self.media_captures.stop_for_interview(
+                    interview_id,
+                    actor_id="system:interview-deadline",
+                    organization_id=organization_id,
+                )
+            except Exception:
+                # MediaCapture records provider failures on its own aggregate.
+                pass
+            try:
+                await self.publish_snapshot(interview_id, organization_id)
+            except Exception:
+                # Durable state remains authoritative across reconnects.
+                pass
+        return len(expired)
 
     async def _publish_system_event(
         self,
@@ -2931,6 +2967,7 @@ class InterviewAgentRuntime:
         evidence_quotes: List[str],
         approved_by: str,
         organization_id: str,
+        prompt_version: Optional[str] = None,
     ) -> ApprovedConversationAct:
         """Persist the exact strong act that is eligible for expression.
 
@@ -3028,10 +3065,10 @@ class InterviewAgentRuntime:
                 evaluative=False,
                 approved_by=approved_by,
                 prompt_version=(
-                    "controlled_followup.v1"
+                    prompt_version or "controlled_followup.v1"
                     if act_type == "followup"
-                    else "supplement_confirmation.v1" if act_type.startswith("supplement_")
-                    else None
+                    else prompt_version or ("supplement_confirmation.v1" if act_type.startswith("supplement_")
+                    else None)
                 ),
                 created_at=utc_now(),
             )
@@ -3463,19 +3500,23 @@ class InterviewAgentRuntime:
                 }
             # 题目预生成阶段可能仍返回开发占位结果。正式面试不能让浏览器
             # 自行朗读，但也不能因此直接暂停；统一回落到服务端受管 TTS。
+        request = TTSSynthesizeRequest(
+            organization_id=organization_id,
+            purpose="interview_agent_expression",
+            text=text,
+            language=session.get("settings", {}).get("language", "zh-CN"),
+            voice_profile_id=session.get("settings", {}).get("voice_profile_id") or "voice_default_cn",
+            format="audio/wav",
+            metadata={"interview_id": interview_id, "turn_id": turn_id, "approved": True},
+        )
         with measure_interview_agent_stage("tts_synthesis_ms"):
-            response = await self.gateway.invoke(
-                cap.TTS_SYNTHESIZE,
-                TTSSynthesizeRequest(
-                    organization_id=organization_id,
-                    purpose="interview_agent_expression",
-                    text=text,
-                    language=session.get("settings", {}).get("language", "zh-CN"),
-                    voice_profile_id=session.get("settings", {}).get("voice_profile_id") or "voice_default_cn",
-                    format="audio/wav",
-                    metadata={"interview_id": interview_id, "turn_id": turn_id, "approved": True},
-                ),
-            )
+            if os.getenv("INTERVIEWER_BUFFERED_TTS_ENABLED", "true").lower() == "true":
+                materialized = await self.expression_audio.synthesize_complete_audio(
+                    self.gateway, request, interview_id=interview_id, turn_id=turn_id,
+                )
+                if materialized is not None:
+                    return {**materialized, "visemes": [], "delivery": "cascade"}
+            response = await self.gateway.invoke(cap.TTS_SYNTHESIZE, request)
         with measure_interview_agent_stage("tts_asset_import_ms"):
             materialized = await self.expression_audio.import_tts(
                 organization_id=organization_id,
@@ -3694,3 +3735,24 @@ async def run_takeover_lease_watchdog(
             # are also captured by the runtime when the lease was consumed.
             pass
         await asyncio.sleep(max(0.1, float(interval_seconds)))
+
+
+async def run_interview_deadline_watchdog(
+    store: Any,
+    *,
+    organization_id: str = "org_default",
+    interval_seconds: float = 15.0,
+) -> None:
+    """Periodically reconcile appointment deadlines, including after restart."""
+
+    runtime = InterviewAgentRuntime(store)
+    interval = max(0.1, float(interval_seconds))
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await runtime.sweep_overdue_interviews(organization_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # Persisted state is retried on the next bounded pass.
+            pass

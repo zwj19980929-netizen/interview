@@ -24,6 +24,11 @@ def understanding_references(transcript, capability_points):
 
 def resolve_understanding_references(data, references):
     result = deepcopy(data)
+    target = result.get("clarification_target")
+    if target:
+        target["evidence_quote"] = references["evidence"][target.pop("evidence_id")]
+        if target["focus_quote"] not in target["evidence_quote"]:
+            raise ValueError("Clarification focus is not verbatim")
     result["evidence_quotes"] = [references["evidence"][key] for key in result.pop("evidence_ids")]
     for claim in result["claims"]:
         claim["evidence_quote"] = references["evidence"][claim.pop("evidence_id")]

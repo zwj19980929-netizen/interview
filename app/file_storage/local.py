@@ -73,6 +73,18 @@ class LocalPrivateFileAdapter:
     def open(self, object_key: str) -> bytes:
         return self._path(object_key).read_bytes()
 
+    def iter_bytes(self, object_key: str, *, start: int = 0, end: Optional[int] = None):
+        with self._path(object_key).open("rb") as stream:
+            stream.seek(start)
+            remaining = None if end is None else end - start + 1
+            while remaining is None or remaining > 0:
+                chunk = stream.read(1024 * 1024 if remaining is None else min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                yield chunk
+                if remaining is not None:
+                    remaining -= len(chunk)
+
     def delete(self, object_key: str) -> None:
         path = self._path(object_key)
         if path.exists():

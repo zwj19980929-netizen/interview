@@ -166,8 +166,8 @@ class OpenAIProvider(OpenAICompatibleProvider):
         return BatchSTTResponse(
             text=text,
             language=request.language,
-            confidence=1.0,
-            segments=[TranscriptSegment(text=text, confidence=1.0)],
+            confidence=None,
+            segments=[TranscriptSegment(text=text, confidence=None)],
             source="server_batch_repair" if request.purpose == "candidate_answer_repair" else "server_batch",
             provider=ProviderMeta(
                 provider_id=self.provider_id,

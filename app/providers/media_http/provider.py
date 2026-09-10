@@ -1,7 +1,7 @@
 import base64
 import math
 from tempfile import SpooledTemporaryFile
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -287,21 +287,17 @@ def _segments(values: List[Any], fallback_text: str) -> List[TranscriptSegment]:
             end *= 1000
         result.append(TranscriptSegment(
             text=str(item["text"]).strip(), start_ms=max(0, int(start)), end_ms=max(0, int(end)),
-            confidence=max(0.0, min(1.0, float(item.get("confidence", 1.0)))),
+            confidence=item.get("confidence"),
         ))
-    return result or [TranscriptSegment(text=fallback_text, confidence=1.0)]
+    return result or [TranscriptSegment(text=fallback_text, confidence=None)]
 
 
-def _confidence(payload: Dict[str, Any], segments: List[TranscriptSegment]) -> float:
+def _confidence(payload: Dict[str, Any], segments: List[TranscriptSegment]) -> Optional[float]:
     if payload.get("confidence") is not None:
         return max(0.0, min(1.0, float(payload["confidence"])))
-    probabilities = []
-    for item in payload.get("segments") or []:
-        if isinstance(item, dict) and item.get("avg_logprob") is not None:
-            probabilities.append(math.exp(float(item["avg_logprob"])))
-    if probabilities:
-        return max(0.0, min(1.0, sum(probabilities) / len(probabilities)))
-    return sum(item.confidence for item in segments) / max(1, len(segments))
+    # Token log probabilities are not calibrated recognition confidence.
+    known = [item.confidence for item in segments if item.confidence is not None]
+    return min(known) if known else None
 
 
 def _extension(content_type: str) -> str:

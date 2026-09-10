@@ -322,7 +322,7 @@ class _CaptureMediaPlane:
         return {
             "egress_id": egress_id,
             "status": "EGRESS_COMPLETE",
-            "file_results": [{"size": 24}],
+            "file_results": [],
         }
 
 
@@ -451,7 +451,7 @@ class _Gateway:
 
 
 def _understanding_response(transcript: str) -> dict:
-    return {
+    return {"clarification_target": None,
         "intent": "answer",
         "answer_summary": transcript,
         "claims": [{"claim": "设计了恢复", "evidence_quote": transcript}],
@@ -3136,7 +3136,7 @@ def test_understanding_rejects_non_verbatim_evidence_without_creating_semantics(
 
 def test_understanding_reference_contract_retries_partition_without_rewriting_evidence(caplog) -> None:
     transcript = "嗯，Fast API 检查 Redis 依赖，readiness 返回 200。然后等待 10 秒，再退出旧 Pod。"
-    first = {
+    first = {"clarification_target": None,
         "intent": "answer", "answer_summary": "说明了就绪检查和滚动更新",
         "claims": [{"claim": "先检查依赖", "evidence_id": "E1"}],
         "evidence_ids": ["E1"], "covered_point_ids": ["P1"],
@@ -3149,7 +3149,7 @@ def test_understanding_reference_contract_retries_partition_without_rewriting_ev
         _utterance(transcript), _turn(), _interview(_turn()),
     ))
     assert result.problem is None
-    assert result.prompt_version == "interview_turn_understanding.v6"
+    assert result.prompt_version == "interview_turn_understanding.v8"
     assert result.evidence_quotes == ["嗯，Fast API 检查 Redis 依赖，readiness 返回 200。"]
     assert result.claims[0].evidence_quote == result.evidence_quotes[0]
     assert len(gateway.requests) == 2
@@ -3170,7 +3170,7 @@ def test_understanding_reference_contract_retries_partition_without_rewriting_ev
 ])
 def test_reference_contract_invalid_twice_never_creates_semantics(overrides, reason, caplog) -> None:
     transcript = "我检查依赖。然后验证就绪。"
-    data = {
+    data = {"clarification_target": None,
         "intent": "answer", "answer_summary": "说明检查流程",
         "claims": [{"claim": "检查依赖", "evidence_id": "E1"}],
         "evidence_ids": ["E1"], "covered_point_ids": ["P1"],
@@ -3354,7 +3354,8 @@ def test_agent_plays_materialized_s2s_followup_without_invoking_cascade_tts() ->
     asyncio.run(scenario())
 
 
-def test_root_question_falls_back_from_mock_avatar_to_managed_tts() -> None:
+def test_root_question_falls_back_from_mock_avatar_to_managed_tts(monkeypatch) -> None:
+    monkeypatch.setenv("INTERVIEWER_BUFFERED_TTS_ENABLED", "false")
     store = InMemoryStore()
     session = _runtime_session(store)
     runtime = InterviewAgentRuntime(store)

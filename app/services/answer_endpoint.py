@@ -166,6 +166,15 @@ class AnswerEndpoint:
         if self._last_voice is None:
             self._last_voice = self.clock() - self.min_silence_seconds
 
+    def continue_speaking(self) -> None:
+        """An explicit user action renews retries; microphone noise does not."""
+        retrying = self._prepare_failures > 0
+        self._reset_preparation_budget()
+        self.speech_started()
+        if self.confirmation is not None and not self.confirmation.speaking:
+            if not (retrying and self.confirmation.phase == "awaiting_reply"):
+                self.confirmation.phase = "listening"
+
     def assert_current(self) -> None:
         if (self._closed or not self.capture.is_open
                 or self._proposal_revision != self.revision):
@@ -349,6 +358,9 @@ class AnswerEndpoint:
                     return
                 if prepared.understanding.suggested_action == "continue_listening":
                     return
+            if self.confirmation is not None and prepared.understanding.suggested_action == "clarify":
+                await self.confirmation.clarify_answer(self, prepared.understanding, confirmed)
+                return
             stage = "commit"
             with measure_interview_agent_stage("decision_commit_ms"):
                 await self.commit(prepared, self.assert_current)
@@ -393,8 +405,9 @@ class AnswerEndpoint:
                     except Exception as exc:
                         await self._recover_capture(exc, "resume")
                     else:
-                        await self._notify(self._listening_notice())
-                elif preparing:
+                        if not (self.confirmation and self.confirmation.speaking):
+                            await self._notify(self._listening_notice())
+                elif preparing and not (self.confirmation and self.confirmation.speaking):
                     await self._notify(self._listening_notice())
 
     def _listening_notice(self) -> str:
