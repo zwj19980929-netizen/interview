@@ -1,5 +1,31 @@
 # 数据库与向量存储设计
 
+## 051：只读任务扫描与写事务分离
+
+`Persistence.transaction(organization_id, read_only=True)` 用于读取已提交的持久状态，不获得可写工作区；默认仍为原写事务。SQLite 以 `BEGIN` 和连接级 `query_only` 读取，避免周期 dispatcher 只查待执行工作却抢占 `BEGIN IMMEDIATE` 写锁。PostgreSQL 只读事务不为查询附加 `FOR UPDATE`；Memory 保持同一禁止写入合同。组织隔离仍由 transaction/repository 边界执行。
+
+Dispatcher 只发现可执行任务并发送其 ID，读到的结果不是领取授权；真正执行时仍通过原写事务的 claim/version/lease 规则保证并发与幂等。只读模式不能写文档、凭据、模型调用或 Outbox，退出后不影响后续写事务。未改变 SQLite 的默认锁等待时间，不以扩大超时替代减少无意义写锁。
+
+## 2026-09-10 · 组织级面试定制（044）
+
+新增通用文档集合interview_customizations，组织内唯一记录，id等于organization_id。字段含version、default_skill_id、sealed_company_profile、content_hash、has_company_profile、创建/更新操作者及时间。公司四字段经组织绑定JSON封装后加密，读取校验租户与内容hash；has_company_profile仅表示是否填写，使无资料的新面试不必解密空内容。GET编辑仍校验正文；审计只含模块名、版本、Skill标识等元数据。Skill revision与配置expected_version更新在同一事务，失败一起回滚。
+
+Memory/SQLite和PostgreSQL repository均注册该集合；`migrations/005_interview_customization.sql`在现有documents RLS下增加组织唯一索引和结构约束。部署PostgreSQL需按序应用003、004、005并验证真实数据库；本机SQLite不执行这些DDL，不把迁移静态检查当成生产通过。计划JSON增加customization_version及既有Skill/公司快照，历史数据不迁写。新增问答前缀、问题范围、评分派生转写按候选人原有保留期同步清理，组织级公司事实与Skill历史引用不因此删除。
+
+## 2026-09-10 · 自由Skill与可选公司文本（039）
+
+新Skill包保存为active版本，继续复用加密Skill文档集合、不可变内容revision、CAS和组织隔离；`migrations/004_optional_interview_skills.sql`扩展状态约束，003迁移历史不改写。旧approved/retired版本与已冻结快照仍可读取，compiler按实际schema/版本校验，不能因039升级而误撤销旧版本。
+
+计划与会话聚合JSON增加可选company_context文本；空白不存储，非空仅供本场权限范围读取并参与上下文指纹，候选人白名单投影不返回全文。Skill输入skill_id映射现有快照身份，不双写两套可漂移的内容真相。不迁改历史面试、评分或候选媒体，也不因可选项缺省引入新的外部基础设施前置要求。
+
+## 2026-09-10 · Skill与自适应会话持久化（038）
+
+新增interview_skills与interview_skill_revisions受保护文档集合；Memory/SQLite/PostgreSQL适配器登记允许集合，revision内容不可变，正文和资源为字段密文。PostgreSQL新增migrations/003_interview_skills.sql，配置索引与租户保护；部署先运行迁移。草稿生成即冻结精确批准Skill，后续批准复核同revision而不选择最新版本。列表/审计及计划快照只含身份、hash、编译版本、授权epoch等必要元数据，不包含正文。
+
+v3 assessment_contract及企业Skill精确快照继续存于计划/会话聚合JSON，实际选择才追加question_snapshot/QuestionSelection/turn，保存presented_unit_ids与assessed_rubric_point_ids。决策revision、输入结束原因、覆盖及安全回执与生命周期/Outbox同事务保存。记忆从权威证据派生，不建立另一套框架checkpointer或跨候选个人向量库；现有向量检索不成为实时规划的强依赖。
+
+Skill撤销按稳定会话锁序再锁Skill/revision，原子推进epoch、阻止旧授权并暂停绑定活动会话；并发绑定冲突失败关闭并返回409，通知/媒体清理在事务之后执行，失败可重试而不撤销已经提交的授权变更。规划最终提交复核同一事务内授权、owner和控制代次。具体字段与并发合同见[Skill API](interview-skills-api.md)和[自适应合同](adaptive-interview-contract.md)。本轮不改写历史候选回答、评分或媒体；真实PostgreSQL/RLS外部验收与本地适配器测试分开记录。
+
 ## 2026-09-10 · 诊断与完整语音来源（034）
 
 既有ModelInvocation JSON增加可选schema_reason/schema_path元数据，只记录校验规则代码和schema路径，不持久化被拒绝值/完整Prompt/响应。既有FileObject JSON的source_type增加tts_complete_pcm，沿用agent_expression_audio、组织/面试/题目归属、私有存储checksum与加密门禁。仅在验证完整final+EOF后写ready；取消或格式失败不写入资产。无DDL迁移，不修改历史回答、评分或冻结题库语音。

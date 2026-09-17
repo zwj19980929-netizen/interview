@@ -1,5 +1,49 @@
 # 领域模型
 
+## 2026-09-16：计划准备的临时进度（049）
+
+准备进度是一次请求的临时投影，不是新的计划状态或持久任务。复用数据来自已有不可变approved计划，经同组织与来源版本/内容/能力范围校验后复制到新计划，不修改旧计划，也不复用候选人的答案或评分。仍然只有最终事务成功后才产生新计划。没有新表、迁移或候选资料缓存；简历题复用受候选人及简历审查范围约束。
+
+## 2026-09-14：QuestionBankPreparation
+
+新工作台计划保存 `preparation_mode=question_bank`、`approval_source=automatic_preparation`、`role_requirement_id=null` 和 `assessment_basis`。basis 冻结 `kind=question_bank`、岗位 ID/version/name/description 及所选题库引用；不创建伪造的 RoleRequirement。相同 basis 纳入 assessment contract 哈希，入场冻结到会话。真实岗位/题库仍承担隔离边界；已有基于 RoleRequirement 的计划保持原语义。
+
+新计划能力权重只覆盖已生成短问题实际映射的能力；候选源和最终单元两次校验，自动预算适应实际单元数，每能力至少一个可评分考察点，问题数按时长/可用内容/覆盖需求自动计算。未问及或证据不足仍按原评分规则报告，不冒充已覆盖。计划通过生成、来源版本、语音及评分依据校验后直接不可变地保存为 approved；不要求额外人工启用。
+
+
+### 046：交流回应与答案的区别
+
+Conversation reception 是作用于当前服务端转写与当前交流阶段的临时语义判断，不是 CandidateAnswer。短回应使用非评分 `conversation_acknowledgement`，保留当前题、录音与此前技术内容；同一已回应转写只回应一次，后续新增请求可再次回应。等待不给候选人自动倒计时结束，不因静音提交或跳题。输出与后续动作继续由当前 capture/revision/owner fence 约束。 `pause_requested`仅为进程内播放后的待执行状态；真实暂停通过现有生命周期事务并携带EvidenceCommitFence复核，不新增数据库表或迁移。
+
+### 邀请入场状态投影（045）
+
+公开 readiness 的 `entry_blocker` 是即时准入结果的安全投影，不是新增持久状态。`device_readiness.ready` 与 `can_start` 含义不同：前者描述设备检查，后者还要求本次预约已登记、明确同意、有效时间窗及面试服务就绪。前端确认状态必须来源于当前邀请的 registered 投影或同一预约的 matched/registered 登记回执，不可继承其他邀请。HTTP 连接通过也不能推断实时音视频链路通过。
+
+## 2026-09-10 · InterviewCustomization（044）
+
+组织级可选面试定制，持久字段包括唯一组织身份、version、default_skill_id（可空）、sealed_company_profile、内容hash、has_company_profile及创建/更新时间与操作者。引用既有InterviewSkill及其不可变revision；自由正文为空时清空默认绑定，不删除历史Skill或面试快照。无记录的兼容读取可选择最近更新的active/approved Skill作为初始默认，读取不写入；保存后由明确配置确定默认值。
+
+企业资料四字段company_name/business_overview/products_services/additional_info均可留空，属于管理员提供、可用于向候选人介绍公司的事实来源。不是岗位能力、评分依据或模型权重。新计划按准备时版本冻结实际上下文；公司问答不形成能力证据。具体存储与错误规则见[接口设计](api-design.md)。
+
+内部turn.company_question_exchanges保存公司问题原文范围、转写前缀、媒体检查点、资料hash与引用/表达信息；CandidateAnswer可派生scoring_transcript和non_scoring_spans，原音频与转写不改。它们仍属于候选人数据，按既有保留期一并清理；公司反问不构成能力证据。详见[公司问答合同](company-question-runtime.md)。
+
+
+## 2026-09-10 · 可选用户Skill与企业上下文（039）
+
+InterviewSkill是用户自由编写的可选行为扩展，不是企业认证/审批对象。新interview_skill.v2保存后active，名称和instructions以外字段可选；编译不要求固定style/method或用关键词限制写作。内容版本和权限仍可校验，正文不能授予模型任意执行权限。旧v1版本继续使用其原hash和编译合同，不静默重解释历史快照。
+
+PlanAssemblyRequest新增可选skill_id、company_context。skill_id与旧enterprise_skill_id为同一选择的两个入口，冲突拒绝；已存enterprise_skill_id/snapshot仅保留兼容字段名，不代表企业依赖。company_context是本场独立可选文本，空白视为缺省；非空随计划冻结到会话，纳入上下文指纹。两项都缺省也能完成动态选择、语音回答和报告，候选投影不会包含Skill或企业全文。
+
+## 2026-09-10 · 自适应考察与Skill领域（038）
+
+v3 `InterviewAssessmentContract` 冻结能力权重、最低证据数量、题池/单元、评分标准和预算。`InquiryUnit` 对应一个原关键点、一个批准口头问题、标准答案逐字引用及同源能力子集；实际呈现范围保存在turn/question_snapshot，不能按原长题全部标签和标准评分。
+
+会话初始题目集合为空，SELECT_NEXT按(question_id,inquiry_unit_id)去重追加轮次和QuestionSelection；decision_id与decision_revision约束幂等。无当前题时 dialogue_state=awaiting_next_decision，仍为in_progress；只有END_CANDIDATE_INPUT记录候选输入结束。覆盖充分、真实预算耗尽、候选请求与预约截止的前置条件不同，评分完成和空队列均不代替结束命令。实际字段及状态转换见[自适应合同](adaptive-interview-contract.md)。
+
+议程和能力证据账本从已提交轮次、答案和理解派生，最近上下文有界，不新增独立的权威记忆库。准备指纹绑定考察契约、Skill、决策与对话事实、控制事件；最终事务额外校验owner租约和连接控制代次。已提交安全决策回执与生命周期事实保存，不将提案当作执行成功。
+
+EnterpriseInterviewSkill包含不可变正文revision、聚合CAS版本和授权epoch。draft→validated→approved，retired禁止新计划引用但原批准快照可继续；revoked使对应快照失去执行资格并暂停绑定会话。新版本不热替换已冻结会话；密文正文、资源、工具权限及快照字段见[Skill合同](interview-skills-api.md)。
+
 ## 2026-09-10 · 补充重试与完整动态音频（034）
 
 同一服务端回答的补充分类失败预算复用 AnswerEndpoint 的内容摘要与显式操作epoch；不会由声音revision单独刷新。失败不生成 Answer，成功恢复逐字证据后才进入原完成/继续/澄清状态迁移，显式继续重置预算但不代表已回答完毕。

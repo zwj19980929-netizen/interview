@@ -1,4 +1,4 @@
-const ADMIN_VIEWS = new Set(["overview", "questions", "workflow", "plans", "interviews", "models"]);
+const ADMIN_VIEWS = new Set(["overview", "questions", "workflow", "plans", "skills", "interviews", "models"]);
 
 export function parseRoute(hash, sessionStorage = window.sessionStorage) {
   const route = String(hash || "").replace(/^#\/?/, "") || "overview";
@@ -24,6 +24,8 @@ export function parseRoute(hash, sessionStorage = window.sessionStorage) {
     generationBatchId: child === "generation" ? childId || null : null,
   };
   if (view === "models" && id) return { view: "models", providerConnectionId: id };
+  if (view === "plans" && id === "new") return { view: "plans", planAction: "create" };
+  if (view === "plans" && id) return { view: "plans", selectedPlanId: id };
   if (ADMIN_VIEWS.has(view)) return { view, selectedInterviewId: null };
   return { view: "overview", selectedInterviewId: null };
 }
@@ -31,7 +33,7 @@ export function parseRoute(hash, sessionStorage = window.sessionStorage) {
 export function allowedViews(roles = []) {
   const roleSet = new Set(roles);
   if (roleSet.has("admin")) return new Set(ADMIN_VIEWS);
-  if (roleSet.has("interviewer")) return new Set(["overview", "questions", "workflow", "plans", "interviews"]);
+  if (roleSet.has("interviewer")) return new Set(["overview", "questions", "workflow", "plans", "skills", "interviews"]);
   if (roleSet.has("reviewer")) return new Set(["interviews"]);
   return new Set();
 }

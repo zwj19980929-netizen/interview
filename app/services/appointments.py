@@ -523,7 +523,10 @@ class AppointmentService:
                 )
             device = deepcopy(appointment.get("device_readiness"))
             can_start = False
+            entry_blocker = None
             try:
+                if appointment.get("status") == "invited":
+                    raise ApiError("INVITATION_REGISTRATION_REQUIRED", "Registration is required.", status_code=409)
                 self._validate_public_token(appointment, required_status="registered")
                 intake = next((item for item in transaction.candidate_intakes.list()
                                if item["appointment_id"] == appointment["id"]), None)
@@ -531,13 +534,20 @@ class AppointmentService:
                     raise ApiError("INTERVIEW_PLAN_NOT_APPROVED", "Appointment requires an approved plan.", status_code=409)
                 self.admission.validate_start(appointment, intake, readiness, now=self._now())
                 can_start = True
-            except ApiError:
-                # Display eligibility is the same fact checked by start, not
-                # merely a successful model probe and an old device boolean.
-                pass
+            except ApiError as error:
+                # Publish only stable admission codes, never exception messages
+                # or provider diagnostics. A healthy HTTP probe is not admission.
+                public_codes = {
+                    "INVITATION_REGISTRATION_REQUIRED", "INVITATION_UNAVAILABLE", "INVITATION_EXPIRED",
+                    "CONSENT_REQUIRED", "AUDIO_RECORDING_CONSENT_REQUIRED", "VIDEO_RECORDING_CONSENT_REQUIRED",
+                    "APPOINTMENT_TOO_EARLY", "APPOINTMENT_WINDOW_CLOSED", "APPOINTMENT_DEVICE_NOT_READY",
+                    "APPOINTMENT_NOT_READY", "INTERVIEW_PLAN_NOT_APPROVED",
+                }
+                entry_blocker = {"code": error.code if error.code in public_codes else "APPOINTMENT_NOT_READY"}
         result = deepcopy(readiness)
         result["device_readiness"] = device
         result["can_start"] = can_start
+        result["entry_blocker"] = entry_blocker
         return result
 
     async def readiness_with_refresh(

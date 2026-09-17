@@ -1,9 +1,12 @@
 from fastapi import APIRouter
 
 from app.api.routers import admin, catalog, interviews, plans, realtime, system, talent
+from app.api.routers import interview_customization, interview_skills
 
 
 router = APIRouter()
+router.include_router(interview_skills.router)
+router.include_router(interview_customization.router)
 router.include_router(system.router)
 router.include_router(admin.router)
 router.include_router(catalog.router)

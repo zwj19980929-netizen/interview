@@ -91,6 +91,7 @@ const CANDIDATE_SNAPSHOT_KEYS = Object.freeze([
   "capture_recovery",
   "supplement_confirmation",
   "answer_preparation",
+  "execution_schema_version", "dialogue_state", "planning_problem",
 ]);
 
 const ENTERPRISE_SNAPSHOT_KEYS = Object.freeze([
@@ -349,9 +350,19 @@ function validateSnapshot(payload, audience) {
     || !boundedString(payload.calibration_status, 1, 64)
     || !optionalBooleanFields(payload, ["calibration_retry_required"])
     || !nonNegativeInteger(payload.completed_answers)
-    || !nonNegativeInteger(payload.total_primary_questions)) {
+    || !(payload.execution_schema_version === 3 ? payload.total_primary_questions === null
+      : nonNegativeInteger(payload.total_primary_questions))
+    || (payload.execution_schema_version !== undefined && ![2, 3].includes(payload.execution_schema_version))
+    || (payload.dialogue_state != null && !["awaiting_next_decision", "asking", "candidate_input_completed"].includes(payload.dialogue_state))) {
     return invalidPayload("session.snapshot");
   }
+  if (payload.planning_problem != null && (
+    payload.execution_schema_version !== 3 || payload.dialogue_state !== "awaiting_next_decision"
+    || !isPlainObject(payload.planning_problem)
+    || !hasExactKeys(payload.planning_problem, ["code", "message", "recoverable", "action"])
+    || payload.planning_problem.recoverable !== true || payload.planning_problem.action !== "retry_planning"
+    || !validatePayload("problem", payload.planning_problem, audience).ok
+  )) return invalidPayload("session.snapshot");
   if (!validateRecording(payload.recording)
     || !validateCurrentQuestion(payload.current_question)
     || !validateTakeover(payload.takeover, audience)

@@ -204,6 +204,12 @@ class InterviewEvidenceChain:
         if self._stt is not None:
             await self._stt.resume_capture()
 
+    def assert_snapshot_current(self, prepared_decision: Any = None) -> None:
+        if self._stt is None or self._input_revoked:
+            raise ApiError("TURN_DECISION_STALE", "Capture is no longer active.", status_code=409)
+        self._stt._assert_commit_allowed()
+        self._stt.assert_snapshot_current(prepared_decision)
+
     @property
     def recovery_required(self) -> bool:
         return self._stt is not None and self._stt.recovery_required
@@ -223,12 +229,28 @@ class InterviewEvidenceChain:
     def checkpoint_incomplete(self) -> Any:
         return self._stt.checkpoint_incomplete() if self._stt is not None else None
 
+    async def classify_reception(self, text: str, *, phase: str, preceding_text: str = "") -> Any:
+        stream = self._stt
+        if stream is None or self._input_revoked:
+            raise ApiError("AGENT_EVIDENCE_NOT_OPEN", "Evidence is not open.", status_code=409)
+        stream._assert_commit_allowed()
+        session = stream.interviews.get_interview(self.interview_id, self.organization_id)
+        turn = next(item for item in session["turns"] if item["id"] == self.turn_id)
+        result = await stream.interviews.conversation.classify_reception(text, self.organization_id,
+            phase=phase, preceding_text=preceding_text,
+            question=turn.get("question_spoken_text") or turn.get("question_snapshot", {}).get("question_text", ""))
+        if stream is not self._stt or self._input_revoked:
+            raise ApiError("TURN_DECISION_STALE", "Capture changed.", status_code=409)
+        stream._assert_commit_allowed()
+        return result
+
     async def classify_supplement_reply(self, reply: str) -> Any:
         if self._stt is None or self._input_revoked:
             raise ApiError("AGENT_EVIDENCE_NOT_OPEN", "Evidence is not open.", status_code=409)
         return await self._stt.interviews.conversation.classify_supplement_reply(reply, self.organization_id)
 
-    async def prepare_decision(self, final: Any, *, completion_confirmed: bool = False) -> Any:
+    async def prepare_decision(self, final: Any, *, completion_confirmed: bool = False,
+                               semantic_first: bool = False) -> Any:
         if self._stt is None:
             raise ApiError("AGENT_EVIDENCE_NOT_OPEN", "Evidence is not open.", status_code=409)
         # Preview itself is cheap and read-only; seal a durable, incomplete
@@ -244,6 +266,7 @@ class InterviewEvidenceChain:
             self.interview_id, self._stt.turn_id, final, self.organization_id,
             snapshot_ref=snapshot_ref,
             completion_confirmed=completion_confirmed,
+            semantic_first=semantic_first,
         )
 
     async def finish(self, payload: Dict[str, Any], *, prepared_decision: Any = None,

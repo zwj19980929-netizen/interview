@@ -22,7 +22,7 @@ class InterviewPlanService:
         with self.persistence.transaction(organization_id) as transaction:
             plans = transaction.interview_plans.list()
         for plan in plans:
-            self.assembly.require_execution_v2(plan)
+            self.assembly.require_execution_plan(plan)
         return plans
 
     def get_plan(self, plan_id: str, organization_id: str = "org_default") -> Dict[str, Any]:
@@ -30,7 +30,7 @@ class InterviewPlanService:
             plan = transaction.interview_plans.get(plan_id)
         if plan is None:
             raise ApiError("INTERVIEW_PLAN_NOT_FOUND", "Interview plan does not exist.", status_code=404)
-        self.assembly.require_execution_v2(plan)
+        self.assembly.require_execution_plan(plan)
         return plan
 
     def patch_plan(

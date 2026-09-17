@@ -22,6 +22,8 @@ from app.core.interview_agent_metrics import (
     measure_interview_agent_stage,
 )
 from app.core.time import utc_now
+from app.domain.adaptive_interview import is_adaptive
+from app.core.prompt.interviewer_supervisor import transition_speech
 from app.domain.interview_agent import (
     ApprovedConversationAct,
     AgentEvent,
@@ -49,6 +51,7 @@ from app.services.interview_evidence import EvidenceFinishResult
 from app.services.livekit_evidence_ingress import (
     ManagedLiveKitEvidenceSession,
     livekit_evidence_supervisor,
+    stop_revoked_skill_evidence,
 )
 from app.services.livekit_room_binding import interview_room_name
 from app.services.media_capture import InterviewMediaCaptureService
@@ -163,7 +166,10 @@ class _AgentChannelHub:
         interview_id: str,
         organization_id: str,
         event: AgentEvent,
-    ) -> None:
+    ) -> Dict[str, Any]:
+        cleanup = []
+        delivered = 0
+        projection_ok = True
         for key, channels in list(self._channels.items()):
             _, channel_organization_id, channel_interview_id = key
             if (
@@ -181,8 +187,19 @@ class _AgentChannelHub:
                         interview_id=channel.interview_id,
                     )
                     channel._enqueue_event(projected)
+                    delivered += 1
+                    if event.type == "session.snapshot":
+                        current = channel.runtime.interviews.get_interview(interview_id, organization_id)
+                        if (current.get("skill_authorization_blocked") or {}).get("reason") == "enterprise_skill_revoked":
+                            cleanup.append(channel._stop_revoked_skill_output())
                 except Exception:
+                    projection_ok = False
                     channel._terminate_transport("remote_event_projection_failed")
+        if event.type == "session.snapshot":
+            cleanup.append(stop_revoked_skill_evidence(interview_id, organization_id))
+        outcomes = await asyncio.gather(*cleanup, return_exceptions=True)
+        return {"local_channels_notified": delivered,
+                "local_cleanup_complete": projection_ok and all(value is True for value in outcomes)}
 
 
 _AGENT_CHANNEL_HUB = _AgentChannelHub()
@@ -245,6 +262,7 @@ class AgentChannel:
         self._terminating = False
         self._termination_task: Optional[asyncio.Task[None]] = None
         self._endpoint_task: Optional[asyncio.Task[None]] = None
+        self._planning_task: Optional[asyncio.Task[None]] = None
         self._completion_task: Optional[asyncio.Task[None]] = None
         self._stt: Optional[StreamingInterviewSTT] = None
         self._warmup: Optional[WarmupCalibrationStream] = None
@@ -416,6 +434,7 @@ class AgentChannel:
             return
         self._closed = True
         self._terminating = True
+        self._cancel_planning()
         failure: Optional[BaseException] = None
         if self._speech_output is not None:
             try:
@@ -611,6 +630,9 @@ class AgentChannel:
                 calibration = (session.get("agent_runtime") or {}).get(
                     "calibration_status", "pending"
                 )
+                if calibration == "completed" and is_adaptive(session) and not session.get("current_turn_id") and not session.get("candidate_input_completed_at"):
+                    self._schedule_planning(signal.causation_id)
+                    return
                 if calibration == "pending":
                     self.runtime._set_calibration(
                         self.interview_id,
@@ -665,6 +687,14 @@ class AgentChannel:
             # recording. Egress starts only after warmup.confirm below.
             await self._emit_snapshot(signal.causation_id)
             return
+        if kind == "planning.retry":
+            self.runtime._require_candidate(self.principal)
+            session = self._require_active_interview()
+            session = self.runtime.interviews.get_interview(self.interview_id, self.organization_id)
+            if not is_adaptive(session) or (session.get("agent_runtime") or {}).get("calibration_status") != "completed" or session.get("current_turn_id") or session.get("candidate_input_completed_at"):
+                raise ApiError("INTERVIEW_DECISION_NOT_EXPECTED", "There is no pending interview decision.", status_code=409)
+            self._schedule_planning(signal.causation_id)
+            return
         if kind == "warmup.confirm":
             await self._confirm_warmup(signal)
             return
@@ -683,6 +713,7 @@ class AgentChannel:
                     "This principal cannot pause an interview.",
                     status_code=403,
                 )
+            self._cancel_planning()
             self.runtime.interviews.pause_interview(
                 self.interview_id,
                 reason="candidate_requested_pause",
@@ -1185,7 +1216,13 @@ class AgentChannel:
         stop_evidence_session: bool = True,
     ) -> None:
         causation_id = signal.causation_id if signal is not None else None
-        session = self.runtime.interviews.get_interview(self.interview_id, self.organization_id)
+        fence = self._planning_fence()
+        session = self.runtime.interviews.finish_on_candidate_intent(
+            self.interview_id, self.organization_id, evidence_fence=fence,
+        )
+        if is_adaptive(session) and session.get("status") == "in_progress" and not session.get("current_turn_id") and not session.get("candidate_input_completed_at"):
+            self._schedule_planning(causation_id)
+            return
         if session.get("status") in {"completed", "report_generating", "report_ready"} or session.get(
             "candidate_input_completed_at"
         ):
@@ -1427,6 +1464,9 @@ class AgentChannel:
             self.interview_id, self.organization_id
         )
         current = self.runtime._current_turn(session)
+        if current is None and is_adaptive(session):
+            self._schedule_planning(signal.causation_id)
+            return
         if current is None:
             await self._emit(
                 "problem",
@@ -1638,6 +1678,135 @@ class AgentChannel:
                 replayability=Replayability.REPLAYABLE,
             )
 
+    def _planning_fence(self):
+        if self._evidence_session is None:
+            return None
+        self._evidence_session.assert_controller(self)
+        ownership = self._evidence_session.ownership
+        if ownership is None:
+            raise ApiError("EVIDENCE_OWNER_FENCED", "The planning owner is no longer attached.", status_code=409)
+        return ownership.commit_fence()
+
+    def _cancel_planning(self) -> None:
+        task = self._planning_task
+        self._planning_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+
+    def _planning_guard(self, session: Dict[str, Any], transaction: Any, fence: Any,
+                        context_hash: str, control_generation: Optional[int], *, awaiting: bool = True) -> None:
+        from app.services.evidence_coordination import assert_current_evidence_fence
+        from app.services.interviewer_supervisor.context import context_fingerprint
+        if fence is not None:
+            assert_current_evidence_fence(transaction, fence)
+            owner = transaction.evidence_ownerships.get(fence.ownership_id)
+            if (owner.get("control_connection_id") != self.opened.connection_id
+                    or owner.get("control_generation") != control_generation):
+                raise ApiError("EVIDENCE_CONTROL_STALE", "The planning controller has been replaced.", status_code=409)
+        session = self.runtime._required(session)
+        state = session.get("agent_runtime") or {}
+        active_status = session.get("status") == "in_progress" or (
+            not awaiting and bool(session.get("candidate_input_completed_at"))
+            and session.get("status") in {"completed", "report_generating", "report_ready"}
+        )
+        if (self._closed or self._terminating or self._planning_task is not asyncio.current_task()
+                or not active_status
+                or context_fingerprint(session) != context_hash
+                or state.get("floor") == "human" or (state.get("takeover") or {}).get("status") == "active"
+                or (awaiting and (session.get("current_turn_id") or session.get("candidate_input_completed_at")
+                    or session.get("dialogue_state") != "awaiting_next_decision"))):
+            raise ApiError("AGENT_DECISION_STALE", "The planning observation is no longer current.", status_code=409)
+        self.runtime.interviews.assert_skill_authorized(transaction, session)
+
+    async def _planning_event(self, event_type: str, payload: Dict[str, Any], *, fence: Any,
+                              context_hash: str, control_generation: Optional[int], causation_id: Optional[str],
+                              awaiting: bool = True, mutation: Any = None) -> None:
+        def update(session, transaction):
+            self._planning_guard(session, transaction, fence, context_hash, control_generation, awaiting=awaiting)
+            if mutation is not None:
+                mutation(session)
+        # Status, owner/context checks, diagnostic updates and their event
+        # share one transaction. A queued task cannot overwrite its successor.
+        event = self.runtime._append_event(
+            self.interview_id, event_type, self.runtime._safe_replay_payload(event_type, payload),
+            turn_id=None, causation_id=causation_id,
+            replayability=Replayability.TRANSIENT if event_type == "session.snapshot" else Replayability.REPLAYABLE,
+            organization_id=self.organization_id, session_mutation=update,
+        )
+        # A committed event is historical truth. Recheck before fanout so an
+        # obsolete local owner does not announce an error after a handover.
+        with self.runtime.persistence.transaction(self.organization_id) as transaction:
+            session = transaction.interview_sessions.get(self.interview_id)
+            self._planning_guard(session, transaction, fence, context_hash, control_generation, awaiting=awaiting)
+        await _AGENT_CHANNEL_HUB.publish(self, event, live_payload=payload)
+        await _AGENT_CHANNEL_HUB.publish_cross_instance(self, event)
+
+    def _schedule_planning(self, causation_id: Optional[str]) -> None:
+        if self._closed or self._terminating or (self._planning_task is not None and not self._planning_task.done()):
+            return
+        from app.services.interviewer_supervisor.context import context_fingerprint
+        fence = self._planning_fence()
+        control_generation = None
+        with self.runtime.persistence.transaction(self.organization_id) as transaction:
+            source = self.runtime._required(transaction.interview_sessions.get(self.interview_id))
+            if fence is not None:
+                from app.services.evidence_coordination import assert_current_evidence_fence
+                assert_current_evidence_fence(transaction, fence)
+                owner = transaction.evidence_ownerships.get(fence.ownership_id)
+                if owner.get("control_connection_id") != self.opened.connection_id:
+                    raise ApiError("EVIDENCE_CONTROL_STALE", "The planning controller has been replaced.", status_code=409)
+                control_generation = owner["control_generation"]
+        self._planning_task = asyncio.create_task(self._plan_next(causation_id, fence, context_fingerprint(source), control_generation))
+
+    async def _plan_next(self, causation_id: Optional[str], fence: Any, context_hash: str,
+                         control_generation: Optional[int]) -> None:
+        try:
+            def preparing(session):
+                session.setdefault("agent_runtime", {}).update(floor="none", floor_reason="preparing_next_topic",
+                    floor_changed_at=utc_now(), planning_problem=None)
+            await self._planning_event("floor.changed", {"owner": "none", "reason": "preparing_next_topic"},
+                fence=fence, context_hash=context_hash, control_generation=control_generation, causation_id=causation_id, mutation=preparing)
+            await self._planning_event("session.snapshot", {}, fence=fence, context_hash=context_hash,
+                control_generation=control_generation, causation_id=causation_id)
+            result = await self.runtime.interviews.advance_adaptive_interview(
+                self.interview_id, self.organization_id, evidence_fence=fence,
+                planning_control=(self.opened.connection_id, control_generation) if fence is not None else None,
+            )
+            async with self._lock:
+                if self._closed or self._terminating:
+                    return
+                from app.services.interviewer_supervisor.context import context_fingerprint
+                # The successful decision intentionally changed the revision.
+                # Its own returned context fences the follow-on projection.
+                await self._planning_event("session.snapshot", {}, fence=fence,
+                    context_hash=context_fingerprint(result), control_generation=control_generation,
+                    causation_id=causation_id, awaiting=False)
+                await self._after_formal_evidence_finished(None, None,
+                    conversation_action_selected=False, stop_evidence_session=False)
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            problem = {"code": "INTERVIEW_DECISION_UNAVAILABLE", "message": "我暂时未能准备好后续交流，你可以重试或暂停面试。",
+                       "recoverable": True, "action": "retry_planning"}
+            def failed(session):
+                state = session.setdefault("agent_runtime", {})
+                state["planning_problem"] = deepcopy(problem)
+                state.setdefault("problems", []).append({**problem, "occurred_at": utc_now(),
+                    "cause_type": type(exc).__name__[:96]})
+                del state["problems"][:-100]
+            try:
+                await self._planning_event("problem", problem, fence=fence, context_hash=context_hash,
+                    control_generation=control_generation, causation_id=causation_id, mutation=failed)
+                await self._planning_event("session.snapshot", {}, fence=fence,
+                    context_hash=context_hash, control_generation=control_generation, causation_id=causation_id)
+            except ApiError:
+                # Ownership, pause/resume, Skill authorization or dialogue
+                # changes revoke permission to write or broadcast a failure.
+                return
+        finally:
+            if self._planning_task is asyncio.current_task():
+                self._planning_task = None
+
     async def _repeat_current(self, signal: ClientSignal) -> None:
         self.runtime._require_candidate(self.principal)
         session = self.runtime.interviews.get_interview(self.interview_id, self.organization_id)
@@ -1653,9 +1822,20 @@ class AgentChannel:
         *,
         act_type: str = "question",
     ) -> None:
+        text = str(turn.get("question_spoken_text") or "")
+        if act_type == "question":
+            session = self.runtime.interviews.get_interview(self.interview_id, self.organization_id)
+            key = (session.get("agent_runtime") or {}).get("next_transition_key", "none")
+            previous = next((item for item in reversed(session.get("turns", []))
+                             if item["id"] != turn["id"] and item.get("current_understanding")), None)
+            if (previous or {}).get("current_understanding", {}).get("intent") == "answer_declined":
+                key = "declined"
+            prefix = transition_speech(key)
+            if len(prefix + text) <= 1000:
+                text = prefix + text
         await self._select_act(
             act_type=act_type,
-            text=str(turn.get("question_spoken_text") or ""),
+            text=text,
             turn_id=turn["id"],
             causation_id=causation_id,
             evidence_refs=[],
@@ -1700,6 +1880,8 @@ class AgentChannel:
                 if owner_fence is not None:
                     assert_current_evidence_fence(transaction, owner_fence)
                 initial_session = transaction.interview_sessions.get(self.interview_id)
+                if initial_session:
+                    self.runtime.interviews.assert_skill_authorized(transaction, initial_session)
         except ApiError:
             return None
         if not initial_session:
@@ -1732,6 +1914,7 @@ class AgentChannel:
                     session = transaction.interview_sessions.get(self.interview_id)
                     if not session or session.get("status") not in allowed_statuses:
                         return False
+                    self.runtime.interviews.assert_skill_authorized(transaction, session)
                     state = session.get("agent_runtime") or {}
                     if act_type == "closing" and state.get("completion_emitted_at"):
                         return False
@@ -1930,6 +2113,31 @@ class AgentChannel:
         finally:
             if task is not None and task is not asyncio.current_task():
                 await asyncio.gather(task, return_exceptions=True)
+
+    async def _stop_revoked_skill_output(self) -> bool:
+        """Keep the paused control channel alive while stopping old AI media."""
+        self._cancel_planning()
+        endpoint = self._endpoint_task
+        self._endpoint_task = None
+        if endpoint is not None and endpoint is not asyncio.current_task():
+            endpoint.cancel()
+        pending = [self._cancel_speech_output()]
+        if self._stt is not None:
+            stt, self._stt = self._stt, None
+            pending.append(stt.close(repair_disconnect=False))
+        if self._warmup is not None:
+            warmup, self._warmup = self._warmup, None
+            pending.append(warmup.abort())
+        results = await asyncio.gather(
+            *(asyncio.wait_for(item, timeout=10.0) for item in pending), return_exceptions=True,
+        )
+        success = not any(isinstance(item, BaseException) for item in results)
+        if not success:
+            self.runtime._record_problem(self.interview_id, {
+                "code": "SKILL_REVOCATION_MEDIA_CLEANUP_FAILED", "message": "Skill revocation media cleanup requires recovery.",
+                "recoverable": True, "action": "retry_or_human_takeover",
+            }, self.organization_id)
+        return success
 
     async def _acquire_takeover(self, signal: ClientSignal) -> None:
         self.runtime._require_human(self.principal)
@@ -2266,6 +2474,51 @@ class InterviewAgentRuntime:
             {},
         )
 
+    async def publish_skill_revocation(
+        self, interview_id: str, organization_id: str = "org_default",
+    ) -> Dict[str, Any]:
+        """Publish committed revocation without conflating delivery and commit."""
+        with self.persistence.transaction(organization_id) as transaction:
+            session = self._required(transaction.interview_sessions.get(interview_id))
+            blocked = session.get("skill_authorization_blocked") or {}
+            if blocked.get("reason") != "enterprise_skill_revoked":
+                raise ApiError("SKILL_REVOCATION_NOT_COMMITTED", "No committed Skill revocation applies to this session.", status_code=409)
+        event = self._append_event(interview_id, "session.snapshot", {}, turn_id=None,
+            causation_id=None, replayability=Replayability.REPLAYABLE, organization_id=organization_id)
+        bus = realtime_event_bus()
+        async def publish_remote():
+            if not bus.enabled:
+                return "not_configured"
+            try:
+                await asyncio.wait_for(bus.publish(interview_id, {"transport": "interview_agent.v1",
+                    "organization_id": organization_id, "event": event.model_dump(mode="json")}), timeout=5.0)
+                return "published"
+            except Exception:
+                return "publication_failed"
+        # A slow local provider shutdown must not delay mute on other instances.
+        local, remote = await asyncio.gather(
+            _AGENT_CHANNEL_HUB.receive_cross_instance(interview_id, organization_id, event),
+            publish_remote(), return_exceptions=True,
+        )
+        if not isinstance(local, dict):
+            local = {"local_channels_notified": 0, "local_cleanup_complete": False}
+        result = {"interview_id": interview_id, **local,
+                  "cross_instance": remote if isinstance(remote, str) else "publication_failed"}
+        try:
+            with self.persistence.transaction(organization_id) as transaction:
+                transaction.audit_events.add({"id": new_id("audit"), "organization_id": organization_id,
+                    "actor_id": "system:skill-revocation", "action": "interview.skill.revocation_delivery",
+                    "resource_type": "interview_session", "resource_id": interview_id,
+                    "metadata": {"revision_id": blocked.get("revision_id"),
+                        "authorization_epoch": blocked.get("authorization_epoch"), **result}, "created_at": utc_now()})
+        except Exception:
+            # Delivery and the revocation are already effective. Preserve their
+            # actual outcomes if recording this separate diagnostic fails.
+            result["runtime_audit_status"] = "failed"
+        else:
+            result["runtime_audit_status"] = "recorded"
+        return result
+
     async def sweep_expired_takeovers(
         self, organization_id: str = "org_default"
     ) -> int:
@@ -2479,7 +2732,10 @@ class InterviewAgentRuntime:
             "completed_answers": len({answer.get("turn_id") for answer in session.get("answers", [])}
                                      & {turn["id"] for turn in session.get("turns", [])
                                         if not turn.get("is_followup")}),
-            "total_primary_questions": len([item for item in session.get("turns", []) if not item.get("is_followup")]),
+            "total_primary_questions": None if is_adaptive(session) else len([item for item in session.get("turns", []) if not item.get("is_followup")]),
+            "execution_schema_version": 3 if is_adaptive(session) else 2,
+            "dialogue_state": session.get("dialogue_state"),
+            "planning_problem": deepcopy((session.get("agent_runtime") or {}).get("planning_problem")),
         }
         if "candidate" in principal.roles:
             return candidate_view
@@ -2716,9 +2972,16 @@ class InterviewAgentRuntime:
         causation_id: Optional[str],
         replayability: Replayability,
         organization_id: str,
+        session_mutation: Any = None,
     ) -> AgentEvent:
         with self.persistence.transaction(organization_id) as transaction:
             session = self._required(transaction.interview_sessions.get(interview_id))
+            if session_mutation is not None:
+                session_mutation(session, transaction)
+            if (event_type == "avatar.performance.started"
+                    or (event_type == "conversation.act.selected" and payload.get("act_type") != "unscored_intervention")
+                    or (event_type == "floor.changed" and payload.get("owner") in {"agent", "candidate"})):
+                self.interviews.assert_skill_authorized(transaction, session)
             state = session.setdefault("agent_runtime", {})
             sequence = int(state.get("last_sequence", 0)) + 1
             state["last_sequence"] = sequence
@@ -2772,6 +3035,8 @@ class InterviewAgentRuntime:
     ) -> bool:
         with self.persistence.transaction(organization_id) as transaction:
             session = self._required(transaction.interview_sessions.get(interview_id))
+            if owner in {FloorOwner.AGENT, FloorOwner.CANDIDATE}:
+                self.interviews.assert_skill_authorized(transaction, session)
             state = session.setdefault("agent_runtime", {})
             if state.get("floor") == owner.value:
                 return False
@@ -2788,6 +3053,8 @@ class InterviewAgentRuntime:
     ) -> None:
         with self.persistence.transaction(organization_id) as transaction:
             session = self._required(transaction.interview_sessions.get(interview_id))
+            if performance_id is not None:
+                self.interviews.assert_skill_authorized(transaction, session)
             session.setdefault("agent_runtime", {})["active_performance_id"] = performance_id
             session["agent_runtime"]["active_output_id"] = output_id
             session["agent_runtime"]["active_expression_act_event_id"] = act_event_id
@@ -2980,6 +3247,8 @@ class InterviewAgentRuntime:
             session = self._required(
                 transaction.interview_sessions.get(interview_id)
             )
+            if act_type != "unscored_intervention":
+                self.interviews.assert_skill_authorized(transaction, session)
             turn = next(
                 (
                     item

@@ -208,6 +208,8 @@ def _principal_for_token(supplied: str) -> Optional[Principal]:
 
 
 def _required_roles(path: str, method: str = "GET") -> FrozenSet[str]:
+    if path == "/api/v1/interview-customization":
+        return frozenset({"admin", "interviewer"})
     if path == "/api/v1/auth/session":
         return frozenset({"admin", "interviewer", "reviewer"})
     if path.startswith("/api/v1/admin/"):

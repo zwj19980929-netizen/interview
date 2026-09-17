@@ -1,5 +1,71 @@
 # 接口设计
 
+## 2026-09-16：计划准备进度（049）
+
+`POST /api/v1/interview-plans/prepare` 默认保持原JSON响应。工作台可发送 `Accept: text/event-stream`，沿用相同认证、请求体和组织隔离；响应为SSE，`progress` data包含stage（reading/preparing/saving）、completed_points/total_points/reused_points（仅preparing阶段），数量只在校验通过后增加。`complete` data为保存成功的原计划；`error` data含status及error.code/message/details，HTTP头发送后错误通过此终止事件表达。连接中断/超时不能当作成功，客户端应提示先查看计划列表再重试。每10秒心跳保持连接，不模拟进度；断开取消未完成模型任务，事务已提交时不会撤销已保存计划。此接口不创建预约或启动面试。
+
+## 2026-09-14：计划生成超时诊断（048）
+
+批次边界：每批只含一个原题的最多6个评分点；响应Schema的题目ID、知识点ID、能力与参考片段枚举只来自该题，unit数量等于该批实际点数。
+
+失败处理：统一格式或单元内容校验失败时，仅对失败小批次使用集中修正指令再尝试一次，已通过批次保留。修正仍占用3并发/180秒总预算；超时、鉴权或服务错误不在装配层重复调用，第二次无效仍失败关闭。校验日志只记录固定原因枚举与题目/考察点/批次数量，不记录原文。
+
+prepare/generate 的短问题整理仍在同一计划装配内完成；不会创建预约或启动面试。模型按最多6个评分点分批、最多3批并行，单次60秒、整体180秒预算；失败取消剩余任务且不保存半成品。超时返回503 `INQUIRY_UNIT_GENERATION_TIMEOUT`，模型不可用返回503 `INQUIRY_UNIT_PROVIDER_UNAVAILABLE`，模型格式/来源引用不合格返回503 `INQUIRY_UNIT_RESPONSE_INVALID`，意外错误返回503 `INQUIRY_UNIT_GENERATION_FAILED`；中文提示区分原因，不以超时推断题库或简历缺失。仅返回安全原因，不暴露供应商响应、凭据或题目原文。
+
+## 2026-09-14：按题库直接准备面试
+
+`POST /api/v1/interview-plans/prepare` 是工作台新建计划入口。请求仅需 `job_position_id`、`candidate_profile_id`、`knowledge_base_ids`（1–10个不重复ID），可选 `duration_minutes`（5–120，默认45）。不接收岗位要求、技能覆盖、题数、深度或批准开关；服务端自动解析题库、生成短问题与评分依据，完成校验后返回 `status=approved` 的 execution v3 计划，可直接安排预约。`approval_source=automatic_preparation` 表示自动准备通过，不表示人工审阅或录用决策。
+
+考察能力来自所选题库实际可用的问题和经校验的单元映射；旧岗位要求中的额外标签不阻断此入口。未关联/不可用题库、越权候选人、无可用问题、生成失败、来源版本变化仍以结构化错误返回，失败不写入半成品计划。可用简历问题和已保存 Skill/企业资料自动带入，无则不要求补填。保留 `/generate` 和已有草稿的原合同，历史计划不会被自动批准或改写。
+
+
+### 046：交流回应事件
+
+沿用现有 `conversation.act.selected`、`avatar.performance.*` 和 `floor.changed`，新增非评分 `conversation_acknowledgement` act_type。接话判断只允许选择版本化短回应或重读当前冻结题目，不接受模型提交答案或任意调用工具；暂停在回应实际播放完成后沿用原 pause 命令，插话可撤销待执行暂停。取消回答准备后发布 `answer_listening`，避免前端长时间保留失效的准备状态。没有新增公开 REST 路由。
+
+### 公开邀请入场诊断（045）
+
+`GET/POST /api/v1/public/interview-invitations/{token}/readiness` 在原有响应上新增 `entry_blocker`：`can_start=true` 时为 `null`，否则为 `{ "code": "稳定错误码" }`。仅投影安全准入代码，不携带异常消息、Provider 诊断或凭据。未登记返回 `INVITATION_REGISTRATION_REQUIRED`；其余沿用 `CONSENT_REQUIRED`、录制同意缺失、`APPOINTMENT_TOO_EARLY`、`APPOINTMENT_WINDOW_CLOSED`、`APPOINTMENT_DEVICE_NOT_READY`、`APPOINTMENT_NOT_READY`、`INTERVIEW_PLAN_NOT_APPROVED`；未知错误使用 `APPOINTMENT_NOT_READY`。无效/过期/撤销 token 仍按原有 HTTP 错误响应处理。此字段只解释拒绝原因，不改变最终 start 的事务准入校验。
+
+客户端将每份邀请投影与发起 GET 的 token 原子绑定；当前路由尚未得到匹配投影时显示加载状态，不沿用其他邀请的登记状态。连接检测只测量 HTTP 服务可达性，不代表身份登记或实时媒体通道已就绪。
+
+## 2026-09-10 · 面试定制（044）
+
+新增组织级 `GET /api/v1/interview-customization` 与 `PATCH /api/v1/interview-customization`，仅admin/interviewer可读写。GET无保存记录也返回200与version=0、空企业资料和可选既有可用Skill；不会因为缺少资料阻止普通面试。响应为 `{version, skill:{skill_id,name,instructions,revision,status}|null, company_profile:{company_name,business_overview,products_services,additional_info}, updated_at}`。不返回密文、编译Prompt或其它组织内容。
+
+PATCH需expected_version（0首次创建），并至少含skill_instructions或company_profile之一；未传模块保持原值。skill_instructions为用户自由正文，最多6000字；非空沿既有v2 Skill生成不可变revision，空字符串清空默认绑定。company_profile四字段均可空，含栏目标题和分隔符的完整文本最多12000字；各次保存替换该模块内容，空资料表示新面试不使用企业资料。Skill和配置同事务保存，版本冲突409，不自动覆盖他人编辑；字段内容私有加密且审计仅元数据。所有字段按严格Schema拒绝额外键。
+
+计划generate增加use_customization_defaults:boolean，默认true。未提供非空skill_id/enterprise_skill_id或company_context时，分别继承该组织已保存的默认Skill和企业资料；提供的非空值逐项覆盖，false可明确禁止继承。Web新建计划正常不再重复填写这两项，显示面试定制保存状态及入口。计划冻结具体Skill revision与企业资料文本，配置更新适用于之后的新准备，不改写已存在计划或活动会话。
+
+企业资料是管理员填入的候选人可用信息来源，不授权任意事实补全。公司问答沿现有权威语音/对话seam处理，具体集中Prompt与响应合同在实现时同步登记，不借此扩大评分或其它工具权限。
+
+内部公司问答新增ask_company/respond_company和准确原文范围，使用既有语音、act及快照协议，不新增客户端答案入口；集中Prompt版本、超时、评分排除和恢复语义见[公司问答合同](company-question-runtime.md)。
+
+
+## 2026-09-10 · 计划能力覆盖诊断（043）
+
+`POST /api/v1/interview-plans/generate` 的v3请求在模型准备前校验可用原题能力覆盖。缺口返回422 `ASSESSMENT_SOURCE_COVERAGE_MISSING`，中文message说明补齐题库或调整对应要求；details含`missing_competency_ids`（排序后能力ID）、`missing_role_competency_ids`（来自岗位正权重能力）、`missing_requested_competency_ids`（来自本次coverage，可与岗位来源重叠）。只检查当前岗位/题库及计划可用范围，不以其它租户题目或不可用版本补足。失败不产生计划和单元生成模型调用，重复发送同一设置不会修复缺口。Skill和企业资料独立可选，与此错误无关。
+
+原有冻结合同完整性错误和单元级缺口校验继续保留；此诊断不改变岗位、题库标签、能力权重或自动略去必考维度。
+
+## 2026-09-10 · 面试计划工作区交互（042）
+
+前端新增可分享定位的`/#plans/new`创建页和`/#plans/{plan_id}`详情页，`/#plans`保持列表；仅改变前端导航，不新增REST接口。详情按现有GET读取最新计划，创建仍POST generate生成v3待审草稿，用户审阅实际问题后PATCH approved并提交所见expected_version；v2保持只读。创建页根据岗位要求筛选已关联题库，Skill和企业资料均独立可选。列表不直接展示私有评分依据或逐条兼容说明，详情中按需审阅；角色与原API鉴权保持。
+
+## 2026-09-10 · 可选用户Skill与企业资料（039，实施中）
+
+企业级约束属于Agent运行时；Skill由用户自由编写。`/api/v1/interview-skills`新包`interview_skill.v2`只要求名称和自由instructions文本，description/resources可选，保存/修改即可使用，不要求审核或选择固定交流方法。接口仍验证结构、大小和资源身份，不执行文本中的代码或自动访问链接；旧版本可继续读取。
+
+`POST /api/v1/interview-plans/generate`新增可选`skill_id`与`company_context`（最多12000字），均可省略/为null，空白公司资料视为未提供。旧enterprise_skill_id保留兼容，同时传不同ID返回422。企业资料独立于Skill：只有资料时也可使用；都没有时直接按岗位、题库、简历和实际对话面试，不要求补充公司信息。公司资料只进入本场私有上下文和受控读取工具，候选投影不返回全文；不得据缺失资料编造企业事实。
+
+## 2026-09-10 · 自适应面试与企业Skill接口（038）
+
+计划生成接口增加 `execution_schema_version:2|3`、`adaptive_policy`、`enterprise_skill_id`。工作台发送v3并生成草稿，查看具体单元后通过现有PATCH与expected_version批准；省略版本仍为v2。v3返回冻结 `assessment_contract` 和审核单元；具体字段、边界、覆盖不足错误与状态迁移见[自适应合同](adaptive-interview-contract.md)。新增企业管理 `/api/v1/interview-skills`，包含创建、版本、校验、批准、停用、撤销和通知重试；角色、请求与响应在[Skill API](interview-skills-api.md)完整定义。
+
+内部 `InterviewerSupervisor.propose_next(...) -> NextInterviewDecision` 提供选择问题/结束/调用工具的严格结构化提案，选择绑定question_id和inquiry_unit_id。合同、模型尝试预算及控制代次围栏见[总控合同](interviewer-supervisor-contract.md)。只有 `InterviewService` 可在重新校验后提交SELECT_NEXT或END_CANDIDATE_INPUT；工具不接受客户端提供的任意组织、URL或凭据。
+
+候选安全快照增加 execution_schema_version、dialogue_state、planning_problem；v3 total_primary_questions为null，不把预算上限假装固定题量。WebSocket `planning.retry` 仅在当前候选人控制连接、已完成开场及等待规划状态接受；不承认任何客户端文本为答案。企业复核/报告和JSON/CSV导出增加能力覆盖、未考察范围、结束原因及安全决策记录，不向候选人公开隐藏标准或Skill正文。
+
 ## 2026-09-10 · 补充确认合同与候选人提示（034）
 
 不新增 REST、事件类型或客户端文本答案。内部模型 wire 合同 supplement_reply.v3 必须且只含 intent（continue/finish/supplement/pause/unclear）、confidence（0–1真实数值，非bool）、evidence_id（本次服务端原文编号枚举）。网关校验后，ConversationUnderstandingService 恢复原有 intent/confidence/evidence_quote 领域输出并再次校验；v1/v2审计仍可读。350输出token、8秒调用预算、0次网关内部重试；完整回答内容决定三次端点失败预算，acoustic revision不清零。

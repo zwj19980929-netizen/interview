@@ -42,6 +42,10 @@ from app.services.conversation_understanding import ConversationUnderstandingSer
 from app.services.plan_assembly import InterviewPlanAssembly
 from app.services.reports import ReportService
 from app.services.livekit_room_binding import interview_room_name
+from app.services.interviewer_supervisor import InterviewerSupervisor, NextInterviewDecision
+from app.services.interviewer_supervisor.context import context_fingerprint as supervisor_fingerprint
+from app.services.interviewer_supervisor.context import conversation_memory
+from app.domain.adaptive_interview import is_adaptive, initialize_adaptive_snapshot, budget_summary
 
 
 @dataclass(frozen=True)
@@ -54,6 +58,8 @@ class PreparedTurnDecision:
     followup: Dict[str, Any]
     stt_fingerprint: str
     context_fingerprint: str
+    semantic_first: bool = False
+    completion_confirmed: bool = False
 
 
 class InterviewService:
@@ -75,6 +81,10 @@ class InterviewService:
         self.conversation = ConversationUnderstandingService(
             store, gateway=self.gateway, persistence=self.persistence
         )
+        self.supervisor = InterviewerSupervisor(gateway=self.gateway, conversation=self.conversation,
+                                               persistence=self.persistence)
+        from app.services.interview_skills import InterviewSkillService
+        self.skills = InterviewSkillService(store, persistence=self.persistence)
         self.reports = ReportService(store, persistence=self.persistence)
         self.plan_assembly = InterviewPlanAssembly(store, persistence=self.persistence)
 
@@ -129,20 +139,31 @@ class InterviewService:
                 if current < deadline:
                     continue
                 previous_status = str(source.get("status") or "")
+                adaptive = is_adaptive(source)
+                command = LifecycleCommand(LifecycleCommandType.CANCEL, {"reason": "appointment_window_expired"})
+                if adaptive:
+                    # Resolve legacy placement once, then bind the stop command
+                    # to the same trusted deadline used by the watchdog.
+                    source = deepcopy(source)
+                    source["scheduled_end_at"] = format_utc(deadline)
+                    command = LifecycleCommand(LifecycleCommandType.END_CANDIDATE_INPUT, {
+                        "decision_id": "appointment_deadline:%s:%s" % (source["id"], source["scheduled_end_at"]),
+                        "expected_decision_revision": int(source.get("decision_revision", 0)),
+                        "reason": "appointment_window_expired",
+                    })
                 decision = self.lifecycle.execute(
                     source,
-                    LifecycleCommand(
-                        LifecycleCommandType.CANCEL,
-                        {"reason": "appointment_window_expired"},
-                    ),
+                    command,
                     now=occurred_at,
                 )
-                if decision.effects:
+                if decision.effects and not adaptive:
                     raise RuntimeError(
                         "Deadline cancellation must not enqueue model or report work."
                     )
                 if not decision.changed:
                     continue
+                if adaptive:
+                    self._enqueue_effects(transaction, decision.effects, source["id"], organization_id)
                 decision.session = transaction.interview_sessions.update(
                     decision.session,
                     expected_version=source["version"],
@@ -236,8 +257,9 @@ class InterviewService:
                     "A formal interview can only be created from an approved plan.",
                     status_code=409,
                 )
-            role = transaction.role_requirements.get(plan["role_requirement_id"])
-            if role is None:
+            role = (transaction.role_requirements.get(plan["role_requirement_id"])
+                    if plan.get("role_requirement_id") else None)
+            if role is None and plan.get("preparation_mode") != "question_bank":
                 raise ApiError("ROLE_REQUIREMENT_NOT_FOUND", "Role requirement does not exist.", status_code=404)
 
             now_dt = ensure_utc(self.clock())
@@ -283,11 +305,12 @@ class InterviewService:
             }
 
             session_seed = payload.get("session_seed") or new_id("session_seed")
-            question_selections, turn_blueprints = self.plan_assembly.materialize_execution(
-                transaction,
-                plan,
-                session_seed,
-            )
+            if plan.get("execution_schema_version") == 3:
+                question_selections, turn_blueprints = [], []
+            else:
+                question_selections, turn_blueprints = self.plan_assembly.materialize_execution(
+                    transaction, plan, session_seed,
+                )
             interview_id = new_id("iv")
             now = format_utc(now_dt)
             candidate = {
@@ -389,6 +412,16 @@ class InterviewService:
                 "question_selections": deepcopy(question_selections),
                 "created_at": now,
             }
+            if plan.get("execution_schema_version") == 3:
+                plan_snapshot.update(initialize_adaptive_snapshot(plan))
+            if plan.get("preparation_mode") == "question_bank":
+                plan_snapshot["preparation_mode"] = "question_bank"
+                plan_snapshot["assessment_basis"] = deepcopy(plan["assessment_basis"])
+            if plan.get("company_context"):
+                plan_snapshot["company_context"] = plan["company_context"]
+            if plan.get("enterprise_skill_snapshot"):
+                self.skills.verify_current_authorization(transaction, plan["enterprise_skill_snapshot"])
+                plan_snapshot["enterprise_skill_snapshot"] = deepcopy(plan["enterprise_skill_snapshot"])
             session = {
                 "id": interview_id,
                 "organization_id": organization_id,
@@ -545,8 +578,11 @@ class InterviewService:
         interview_id: str,
         reason: str = "manual",
         organization_id: str = "org_default",
+        *,
+        evidence_fence: Optional[EvidenceCommitFence] = None,
     ) -> Dict[str, Any]:
-        return self._control(interview_id, LifecycleCommandType.PAUSE, reason, organization_id)
+        return self._control(interview_id, LifecycleCommandType.PAUSE, reason, organization_id,
+                             evidence_fence=evidence_fence)
 
     def report_candidate_runtime_problem(
         self,
@@ -691,11 +727,14 @@ class InterviewService:
         command_type: LifecycleCommandType,
         reason: str,
         organization_id: str,
+        *,
+        evidence_fence: Optional[EvidenceCommitFence] = None,
     ) -> Dict[str, Any]:
         session, work_items = self._apply_command(
             interview_id,
             LifecycleCommand(command_type, {"reason": reason}),
             organization_id,
+            evidence_fence=evidence_fence,
         )
         self._process_report_effects(work_items, organization_id)
         return self.get_interview(interview_id, organization_id) if work_items else session
@@ -897,7 +936,7 @@ class InterviewService:
                 utterance, source_turn, source_session
             )
         if understanding.intent not in {"answer", "answer_declined"} or understanding.suggested_action in {
-            "clarify", "repeat", "continue_listening", "pause"
+            "clarify", "repeat", "continue_listening", "pause", "respond_company"
         }:
             understanding_problem = (
                 understanding.problem.model_dump(mode="json")
@@ -911,6 +950,7 @@ class InterviewService:
                 turn = self.lifecycle.require_active_turn(
                     session, turn_id, allowed_statuses=("transcribing",)
                 )
+                self.assert_skill_authorized(transaction, session)
                 if prepared_decision is not None:
                     self._assert_prepared_decision(prepared_decision, session, turn, payload)
                 mutable = self._turn_by_id(session, turn["id"])
@@ -1022,11 +1062,19 @@ class InterviewService:
             turn = self.lifecycle.require_active_turn(
                 session, turn_id, allowed_statuses=("asking", "transcribing")
             )
+            self.assert_skill_authorized(transaction, session)
             if prepared_decision is not None:
                 self._assert_prepared_decision(prepared_decision, session, turn, payload)
             mutable = self._turn_by_id(session, turn["id"])
             mutable.setdefault("utterances", []).append(utterance.model_dump(mode="json"))
             mutable["current_understanding"] = understanding.model_dump(mode="json")
+            if mutable.get("company_question_exchanges"):
+                from app.services.company_questions import scoring_projection
+                scoring_text, excluded = scoring_projection(answer["final_transcript"], mutable,
+                    media_evidence=answer.get("media_evidence"))
+                if excluded:
+                    answer["scoring_transcript"] = scoring_text
+                    answer["non_scoring_spans"] = excluded
             decision, work_items = self._decide_and_persist(
                 transaction,
                 session,
@@ -1248,11 +1296,108 @@ class InterviewService:
             },
         }
 
+    def assert_skill_authorized(self, transaction: Any, session: Dict[str, Any]) -> None:
+        snapshot = (session.get("plan_snapshot") or {}).get("enterprise_skill_snapshot")
+        if snapshot:
+            self.skills.verify_current_authorization(transaction, snapshot)
+
+    def finish_on_candidate_intent(
+        self, interview_id: str, organization_id: str = "org_default", *,
+        evidence_fence: Optional[EvidenceCommitFence] = None,
+    ) -> Dict[str, Any]:
+        """Only a committed server understanding can request conversational closure."""
+        with self.persistence.transaction(organization_id) as transaction:
+            if evidence_fence is not None:
+                assert_current_evidence_fence(transaction, evidence_fence)
+            session = self._required(transaction.interview_sessions.get(interview_id))
+            if session.get("status") not in {"in_progress", "paused"} or session.get("candidate_input_completed_at"):
+                return session
+            answered = {answer["turn_id"] for answer in session.get("answers", [])}
+            previous = next((turn for turn in reversed(session.get("turns", [])) if turn["id"] in answered), None)
+            understanding = (previous or {}).get("current_understanding") or {}
+            if understanding.get("turn_intent") != "stop_interview":
+                return session
+            decision, _ = self._decide_and_persist(transaction, session, LifecycleCommand(
+                LifecycleCommandType.END_CANDIDATE_INPUT, {
+                    "decision_id": "candidate_stop_" + previous["id"],
+                    "expected_decision_revision": int(session.get("decision_revision", 0)),
+                    "reason": "candidate_requested",
+                }), organization_id)
+            return decision.session
+
+    @staticmethod
+    def _assert_planning_control(transaction: Any, evidence_fence: Optional[EvidenceCommitFence],
+                                 planning_control: Optional[Tuple[str, int]]) -> None:
+        if evidence_fence is not None:
+            assert_current_evidence_fence(transaction, evidence_fence)
+        if planning_control is not None:
+            if (evidence_fence is None or len(planning_control) != 2
+                    or not isinstance(planning_control[0], str) or not planning_control[0]
+                    or type(planning_control[1]) is not int or planning_control[1] < 1):
+                raise ApiError("EVIDENCE_CONTROL_STALE", "A valid planning controller is required.", status_code=409)
+            owner = transaction.evidence_ownerships.get(evidence_fence.ownership_id)
+            if (not owner or owner.get("control_connection_id") != planning_control[0]
+                    or owner.get("control_generation") != planning_control[1]):
+                raise ApiError("EVIDENCE_CONTROL_STALE", "The planning controller has been replaced.", status_code=409)
+
+    async def advance_adaptive_interview(
+        self, interview_id: str, organization_id: str = "org_default", *,
+        evidence_fence: Optional[EvidenceCommitFence] = None,
+        planning_control: Optional[Tuple[str, int]] = None,
+    ) -> Dict[str, Any]:
+        """Propose outside the transaction; commit one frozen decision with all fences."""
+        with self.persistence.transaction(organization_id) as transaction:
+            self._assert_planning_control(transaction, evidence_fence, planning_control)
+            source = self._required(transaction.interview_sessions.get(interview_id))
+        if not is_adaptive(source) or source.get("current_turn_id") or source.get("candidate_input_completed_at"):
+            return source
+        if source.get("status") != "in_progress":
+            raise ApiError("INTERVIEW_DECISION_NOT_EXPECTED", "The interview is not accepting new decisions.", status_code=409)
+        now = format_utc(ensure_utc(self.clock()))
+        budget = budget_summary(source, now)
+        fingerprint = supervisor_fingerprint(source)
+        revision = int(source.get("decision_revision", 0))
+        if budget["exhausted"]:
+            decision_id = "deadline_" + hashlib.sha256((interview_id + ":" + str(revision)).encode()).hexdigest()[:32]
+            proposal = NextInterviewDecision(interview_id, revision, fingerprint, decision_id,
+                "finish_interview", None, "budget_exhausted", "none", (), 0)
+        else:
+            proposal = await self.supervisor.propose_next(source)
+        with self.persistence.transaction(organization_id) as transaction:
+            self._assert_planning_control(transaction, evidence_fence, planning_control)
+            session = self._required(transaction.interview_sessions.get(interview_id))
+            self.assert_skill_authorized(transaction, session)
+            if (session.get("status") != "in_progress"
+                    or not hmac.compare_digest(proposal.context_fingerprint, supervisor_fingerprint(session))):
+                raise ApiError("AGENT_DECISION_STALE", "The interview changed while planning; discard the old proposal.", status_code=409)
+            session = deepcopy(session)
+            payload = {"decision_id": proposal.decision_id, "expected_decision_revision": proposal.revision,
+                       "reason": proposal.reason_code}
+            if proposal.action == "select_question":
+                payload["question_id"] = proposal.question_id
+                if proposal.inquiry_unit_id is not None:
+                    payload["inquiry_unit_id"] = proposal.inquiry_unit_id
+                command = LifecycleCommand(LifecycleCommandType.SELECT_NEXT, payload)
+            else:
+                payload["reason"] = "evidence_sufficient" if proposal.reason_code == "coverage_complete" else proposal.reason_code
+                command = LifecycleCommand(LifecycleCommandType.END_CANDIDATE_INPUT, payload)
+            session.setdefault("agent_runtime", {})["planning_problem"] = None
+            session["agent_runtime"]["next_transition_key"] = proposal.transition_key
+            # Safe metadata only; raw model output and candidate speech are not duplicated here.
+            session["agent_runtime"]["last_planning"] = {
+                "decision_id": proposal.decision_id, "reason_code": proposal.reason_code,
+                "tools_used": list(proposal.tools_used), "model_calls": proposal.model_calls,
+                "prompt_version": "interviewer_supervisor.v2", "context_hash": proposal.context_fingerprint,
+            }
+            decision, _ = self._decide_and_persist(transaction, session, command, organization_id)
+            return decision.session
+
     async def prepare_streaming_decision(
         self, interview_id: str, turn_id: str,
         final: Union[StreamingSTTEvent, StableTranscriptPreview],
         organization_id: str = "org_default", *, snapshot_ref: str,
         completion_confirmed: bool = False,
+        semantic_first: bool = False,
     ) -> PreparedTurnDecision:
         """Prepare from a stable server prefix or final; neither commits an answer."""
         is_preview = isinstance(final, StableTranscriptPreview)
@@ -1282,8 +1427,10 @@ class InterviewService:
         context_fingerprint = self._prepared_context_fingerprint(session, turn)
         if completion_confirmed:
             session = {**session, "_answer_completion_confirmed": True}
+        if semantic_first:
+            session = {**session, "_semantic_first": True}
         if is_preview:
-            understanding, followup = await self.conversation.prepare_preview(
+            understanding, followup = await self.supervisor.prepare_preview(
                 final, turn, session, snapshot_ref=snapshot_ref,
             )
         else:
@@ -1292,10 +1439,12 @@ class InterviewService:
                 text=final.text.strip(), is_final=True, authoritative=True, audio_uri=snapshot_ref,
                 stt_confidence=final.confidence, source="server_streaming", created_at=utc_now(),
             )
-            understanding, followup = await self.conversation.prepare_decision(utterance, turn, session)
+            understanding, followup = await self.supervisor.prepare_turn(utterance, turn, session)
         return PreparedTurnDecision(
             interview_id, turn_id, final.text.strip(), understanding, followup,
             stt_fingerprint=stt_fingerprint, context_fingerprint=context_fingerprint,
+            semantic_first=semantic_first,
+            completion_confirmed=completion_confirmed,
         )
 
     @staticmethod
@@ -1369,6 +1518,15 @@ class InterviewService:
             "language": settings.get("language", "zh-CN"),
             "started_at": session.get("started_at"),
             "estimated_minutes": (session.get("plan_snapshot") or {}).get("estimated_minutes", 0),
+            "supervisor_context": {
+                "decision_revision": session.get("decision_revision", 0),
+                "control_events": [event.get("id") for event in session.get("lifecycle_events", [])
+                                   if event.get("type") in {"interview.paused", "interview.resumed", "interview.recovered", "interview.timed_out"}],
+                "memory": conversation_memory(session),
+                "skill_snapshot": (session.get("plan_snapshot") or {}).get("enterprise_skill_snapshot"),
+                "company_context": (session.get("plan_snapshot") or {}).get("company_context"),
+                "contract_hash": ((session.get("plan_snapshot") or {}).get("assessment_contract") or {}).get("contract_hash"),
+            },
         }
         return hashlib.sha256(json.dumps(
             context, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False,
@@ -1394,6 +1552,11 @@ class InterviewService:
                 matches = self.conversation._within_time_budget(
                     session, int(policy["min_remaining_seconds"]), now=self.clock(),
                 )
+            if (matches and prepared.semantic_first and not prepared.completion_confirmed
+                    and prepared.understanding.intent in {"answer", "answer_declined"}
+                    and prepared.understanding.suggested_action not in {"clarify", "repeat", "continue_listening", "pause", "respond_company"}):
+                matches = self.conversation.can_complete_without_confirmation(
+                    prepared.understanding, str(payload["final_transcript"]).strip())
         except (ValueError, TypeError, KeyError, AttributeError):
             matches = False
         if not matches:
@@ -1846,6 +2009,8 @@ class InterviewService:
             if evidence_fence is not None:
                 assert_current_evidence_fence(transaction, evidence_fence)
             session = self._required(transaction.interview_sessions.get(interview_id))
+            if command.type in {LifecycleCommandType.START, LifecycleCommandType.RESUME, LifecycleCommandType.RECOVER}:
+                self.assert_skill_authorized(transaction, session)
             if evidence_fence is not None and media_evidence:
                 DurableEvidenceMedia.assert_complete_capture(
                     transaction,
@@ -2026,7 +2191,7 @@ class InterviewService:
         primary_count = len(plan.get("bank_slots", [])) + len(
             plan.get("experience_question_snapshots", [])
         )
-        return {
+        policy = {
             "max_depth": 2,
             "max_total": min(4, max(0, primary_count)),
             "max_per_root": 2,
@@ -2036,6 +2201,11 @@ class InterviewService:
             "max_probe_chars": min(300, max(40, int(source.get("followup_max_probe_chars", 180)))),
             "low_confidence_threshold": 0.65,
         }
+        if plan.get("execution_schema_version") == 3:
+            budget = plan["assessment_contract"]["budget"]
+            policy.update(max_total=budget["max_total_followups"], max_per_root=budget["max_followups_per_root"],
+                          max_depth=budget["max_followups_per_root"])
+        return policy
 
     def _merged_authoritative_answer(
         self,

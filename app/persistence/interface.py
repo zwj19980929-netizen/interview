@@ -170,6 +170,45 @@ class QuestionRepository(VersionedDocumentRepository):
         return result
 
 
+class InterviewSkillRevisionRepository(VersionedDocumentRepository):
+    """Content identity cannot change during authorization lifecycle updates."""
+
+    _CONTENT_FIELDS = (
+        "skill_id", "revision", "sealed_package", "content_hash", "name",
+        "description", "language", "style", "interview_method", "allowed_tools", "compiler_version", "schema_version",
+    )
+
+    def __init__(self, backend: TransactionBackend, organization_id: str) -> None:
+        super().__init__(backend, organization_id, collection="interview_skill_revisions",
+                         entity_name="InterviewSkillRevision")
+
+    def add(self, document: Document) -> Document:
+        self._require_tenant(document)
+        if any(item.get("skill_id") == document.get("skill_id")
+               and item.get("revision") == document.get("revision") for item in self.list()):
+            raise RecordAlreadyExists("Skill content revision already exists.")
+        return super().add(document)
+
+    def update(self, document: Document, *, expected_version: int) -> Document:
+        current = self.get(document["id"])
+        if current and any(current.get(key) != document.get(key) for key in self._CONTENT_FIELDS):
+            raise ConcurrencyConflict("Skill content revisions are immutable; create a new revision.")
+        return super().update(document, expected_version=expected_version)
+
+
+class InterviewCustomizationRepository(VersionedDocumentRepository):
+    """One versioned default configuration per tenant."""
+
+    def __init__(self, backend: TransactionBackend, organization_id: str) -> None:
+        super().__init__(backend, organization_id, collection="interview_customizations",
+                         entity_name="InterviewCustomization")
+
+    def _require_tenant(self, item: Document) -> None:
+        super()._require_tenant(item)
+        if item.get("id") != self._organization_id:
+            raise ValueError("Interview customization identity must equal its organization.")
+
+
 class OutboxRepository:
     def __init__(self, backend: TransactionBackend, organization_id: str) -> None:
         self._backend = backend
@@ -419,6 +458,11 @@ class PersistenceTransaction:
         self.interview_plans = VersionedDocumentRepository(
             backend, organization_id, collection="interview_plans", entity_name="InterviewPlan"
         )
+        self.interview_skills = VersionedDocumentRepository(
+            backend, organization_id, collection="interview_skills", entity_name="EnterpriseInterviewSkill"
+        )
+        self.interview_skill_revisions = InterviewSkillRevisionRepository(backend, organization_id)
+        self.interview_customizations = InterviewCustomizationRepository(backend, organization_id)
         self.candidate_profiles = VersionedDocumentRepository(
             backend, organization_id, collection="candidate_profiles", entity_name="CandidateProfile"
         )
@@ -511,7 +555,11 @@ class PersistenceTransaction:
 
 
 class Persistence(Protocol):
-    def transaction(self, organization_id: str) -> AbstractContextManager[PersistenceTransaction]: ...
+    def transaction(
+        self, organization_id: str, *, read_only: bool = False,
+    ) -> AbstractContextManager[PersistenceTransaction]:
+        """Read-only discovery never claims work; mutations retain write transactions."""
+        ...
 
 
 def new_work_item(

@@ -25,7 +25,8 @@ def run_node(source: str) -> None:
 
 def test_router_and_http_modules_preserve_auth_and_role_interfaces() -> None:
     router = _data_module(ROOT / "app/web/core/router.js")
-    http = _data_module(ROOT / "app/web/core/http.js")
+    # Load the real module graph, including the progress-stream transport.
+    http = (ROOT / "app/web/core/http.js").as_uri()
     run_node(
         f"""
         import assert from 'node:assert/strict';

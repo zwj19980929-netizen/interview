@@ -54,7 +54,9 @@ def test_invalid_optional_probe_advances_valid_answer_without_repeating_inferenc
             understanding = current["turns"][0]["current_understanding"]
             assert understanding["intent"] == "answer" and understanding["problem"] is None
             assert understanding["evidence_quotes"] == [_TECHNICAL]
-            assert len([call for call in calls if call[0] == "understanding"]) == 1
+            assert [call[2] for call in calls if call[0] == "understanding"] == [
+                "interview_turn_decision.v17", "interview_turn_decision.v18",
+            ], "One semantic preparation per distinct final, no rejected-probe retries"
             assert not any(turn.get("is_followup") for turn in current["turns"])
             acts = [event["payload"]["act_type"] for event in current["agent_events"]
                     if event["type"] == "conversation.act.selected"]

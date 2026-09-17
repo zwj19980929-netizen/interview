@@ -22,6 +22,7 @@ const newestFirst = (items = []) => [...items].sort((a, b) => String(b.created_a
 const routeLoadKey = (route) => JSON.stringify([
   route.view, route.selectedInterviewId, route.candidateToken, route.invitationToken,
   route.knowledgeBaseId, route.generation, route.generationBatchId, route.providerConnectionId,
+  route.selectedPlanId, route.planAction,
 ]);
 
 export function WorkbenchProvider({ children }) {
@@ -77,7 +78,7 @@ export function WorkbenchProvider({ children }) {
       if (activeRoute.view === "invite") {
         const invitation = await request(`${API}/public/interview-invitations/${encodeURIComponent(activeRoute.invitationToken || "")}`);
         if (!isCurrent()) return;
-        dataRef.current.invitation = invitation;
+        dataRef.current.invitation = { ...invitation, token: activeRoute.invitationToken };
         touch();
         return;
       }
@@ -130,7 +131,7 @@ export function WorkbenchProvider({ children }) {
     }
   }, [auth, navigate, query, request, route, touch]);
 
-  useEffect(() => { load(route); }, [route.view, route.knowledgeBaseId, route.generation, route.generationBatchId, route.providerConnectionId, route.selectedInterviewId, route.invitationToken, route.candidateToken]);
+  useEffect(() => { load(route); }, [route.view, route.knowledgeBaseId, route.generation, route.generationBatchId, route.providerConnectionId, route.selectedInterviewId, route.invitationToken, route.candidateToken, route.selectedPlanId, route.planAction]);
 
   const login = useCallback(async (token) => {
     http.setAccessToken(token);

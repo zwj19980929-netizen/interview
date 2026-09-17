@@ -226,10 +226,14 @@ class EvaluationService:
                 "rubric": question_snapshot.get("rubric", {}),
                 "role_requirement": (role_requirement or {}).get("description", ""),
                 "answer_text": scoring_answer["final_transcript"],
+                "company_questions_excluded": bool(scoring_answer.get("company_questions_excluded")),
                 "key_points": question_snapshot["key_points"],
                 "question_type": question_snapshot.get("source_type", "position_bank"),
                 "recognition_quality": recognition_context(quality_answers),
                 "recognition_terms": recognition_terms({"question_snapshot": question_snapshot}),
+                "inquiry_scope": ({"inquiry_unit_id": question_snapshot["inquiry_unit_id"],
+                                   "assessed_rubric_point_ids": question_snapshot["assessed_rubric_point_ids"]}
+                                  if question_snapshot.get("inquiry_unit_id") else None),
             },
         )
         request = ChatJSONRequest(
@@ -311,16 +315,24 @@ class EvaluationService:
         if answer.get("final_transcript") != expected_text:
             return answer, []
         declined, retained = [], []
+        company_excluded = False
         for index, item in enumerate(evidence):
             turn = turns.get(item.get("turn_id"), {})
             raw = turn.get("current_understanding") or {}
+            scoring_item = item
+            if turn.get("company_question_exchanges"):
+                from app.services.company_questions import scoring_projection
+                text, excluded = scoring_projection(item["final_transcript"], turn, media_evidence=item.get("media_evidence"))
+                if excluded:
+                    company_excluded = True
+                    scoring_item = {**item, "final_transcript": text}
             if raw.get("intent") != "answer_declined":
-                retained.append((index, item))
+                retained.append((index, scoring_item))
                 continue
             try:
                 understanding = TurnUnderstanding.model_validate(raw)
             except (ValueError, TypeError):
-                retained.append((index, item))
+                retained.append((index, scoring_item))
                 continue
             utterance = next((value for value in turn.get("utterances", [])
                               if value.get("utterance_id") == item.get("utterance_id")), {})
@@ -348,10 +360,11 @@ class EvaluationService:
                                  "understanding_prompt_version": understanding.prompt_version,
                                  "confidence": understanding.confidence})
             else:
-                retained.append((index, item))
-        if not declined:
+                retained.append((index, scoring_item))
+        if not declined and not company_excluded:
             return answer, []
         scoring_answer = deepcopy(answer)
+        scoring_answer["company_questions_excluded"] = company_excluded
         if len(retained) == 1 and retained[0][0] == 0:
             # Keep the root's original scoring input byte-for-byte when its
             # follow-ups add no technical evidence.
@@ -401,6 +414,9 @@ class EvaluationService:
             "answer_id": answer["id"],
             "question_id": question_snapshot.get("source_question_id", question_snapshot["id"]),
             "question_snapshot_id": question_snapshot["id"],
+            "inquiry_unit_id": question_snapshot.get("inquiry_unit_id"),
+            "assessed_rubric_point_ids": deepcopy(question_snapshot.get("assessed_rubric_point_ids", [])),
+            "not_assessed_rubric_point_ids": deepcopy(question_snapshot.get("not_assessed_rubric_point_ids", [])),
             "score": data["score"],
             "confidence": data["confidence"],
             "dimension_scores": data["dimension_scores"],

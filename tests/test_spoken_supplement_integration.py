@@ -164,7 +164,7 @@ def test_five_second_check_then_spoken_no_submits_original_answer_with_no_button
             await _wait_until(lambda: all(c["status"] == "completed" for c in store.evidence_commands.values()))
             _assert_one_automatic_answer(store, runtime, _PREFIX + "没有补充了。", voice_frames=5, continuation_frames=5)
             assert _current(runtime)["turns"][0]["current_understanding"]["prompt_version"] in {
-                "interview_turn_understanding.v9", "interview_turn_decision.v8",
+                "interview_turn_understanding.v19", "interview_turn_decision.v18",
             }
     asyncio.run(scenario())
 
@@ -187,6 +187,8 @@ def test_repeated_no_with_continuous_pcm_and_slow_preparation_commits_once_witho
             release = asyncio.Event()
             original_prepare = managed.chain.prepare_decision
             async def slow_prepare(final, **kwargs):
+                if kwargs.get("semantic_first") and not kwargs.get("completion_confirmed"):
+                    return await original_prepare(final, **kwargs)
                 prepares.append(final.text)
                 await release.wait()
                 return await original_prepare(final, **kwargs)
@@ -299,6 +301,8 @@ def test_nonzero_microphone_frames_and_single_impulse_during_preparation_keep_sp
     entered = release = None
     original = ConversationUnderstandingService.prepare_decision
     async def slow_prepare(self, *args, **kwargs):
+        if args[2].get("_semantic_first") and not args[2].get("_answer_completion_confirmed"):
+            return await original(self, *args, **kwargs)
         entered.set()
         await release.wait()
         return await original(self, *args, **kwargs)

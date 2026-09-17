@@ -389,3 +389,19 @@ async def test_current_speech_prompt_versions_are_auditable(version):
     payload.metadata['prompt_version'] = version
     await gateway.invoke(cap.LLM_CHAT_JSON, payload, route=route(retry_count=0, fallback=False))
     assert store.model_invocations[-1]['prompt_version'] == version
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("limit,retry_count", [(1, 3), (2, 3), (1, 0)])
+async def test_workflow_attempt_budget_caps_retries_and_fallbacks(limit, retry_count):
+    from app.model_gateway.schemas import InvocationExecutionBudget
+    store = configured_store()
+    adapter = ScriptedAdapter([ProviderError("provider_timeout", "synthetic timeout", retryable=True)])
+    gateway = ModelGateway(store, provider_clients={"openai_compatible": adapter})
+    bounded = request().model_copy(update={"execution_budget": InvocationExecutionBudget(
+        timeout_s=1, max_provider_retries=3, max_provider_attempts=limit)})
+    with pytest.raises(ProviderError):
+        await gateway.invoke(cap.LLM_CHAT_JSON, bounded, route=route(retry_count=retry_count))
+    assert adapter.calls == limit
+    assert len(store.model_invocations) == limit
+    assert all(item["provider_id"] == "openai_compatible" for item in store.model_invocations)

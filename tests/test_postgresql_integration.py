@@ -3,7 +3,7 @@ from uuid import uuid4
 
 import pytest
 
-from app.persistence.errors import ConcurrencyConflict, RecordAlreadyExists
+from app.persistence.errors import ConcurrencyConflict, ReadOnlyViolation, RecordAlreadyExists
 from app.persistence.interface import new_work_item
 from app.persistence.postgresql import PostgreSQLPersistence
 from app.repositories.postgresql import PostgreSQLStore
@@ -56,6 +56,12 @@ def test_real_postgresql_runtime_role_is_transactional_and_tenant_scoped() -> No
         current["title"] = "updated"
         updated = transaction.questions.update(current, expected_version=1)
     assert updated["version"] == 2
+    with persistence.transaction("org_pg_a", read_only=True) as transaction:
+        assert transaction.questions.get(question_id) == updated
+        with pytest.raises(ReadOnlyViolation):
+            transaction.questions.update({**updated, "title": "forbidden"}, expected_version=2)
+    with persistence.transaction("org_pg_b", read_only=True) as transaction:
+        assert transaction.questions.get(question_id) is None
     with pytest.raises(ConcurrencyConflict):
         with persistence.transaction("org_pg_a") as transaction:
             transaction.questions.update({**saved, "title": "stale"}, expected_version=1)

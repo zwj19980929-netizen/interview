@@ -203,7 +203,10 @@ class AnswerEndpoint:
                     try:
                         await self.confirmation.step(self, quiet)
                     except ApiError as exc:
-                        if exc.code != "TURN_DECISION_STALE":
+                        if exc.code == "TURN_DECISION_STALE":
+                            if not self._closed and not self.confirmation.speaking:
+                                await self._notify(self._listening_notice())
+                        else:
                             await self._recover_capture(exc, "snapshot")
                     except asyncio.CancelledError:
                         raise
@@ -262,7 +265,7 @@ class AnswerEndpoint:
         finally:
             await self._close_preparations()
 
-    async def _propose(self, *, final_snapshot: Any = None) -> None:
+    async def _propose(self, *, final_snapshot: Any = None, prepared_decision: Any = None) -> None:
         stage = "snapshot"
         recovery_handled = False
         nonclosing = bool(getattr(self.capture, "supports_stable_preview", False))
@@ -309,13 +312,13 @@ class AnswerEndpoint:
                 await self._understanding_failed(record_failure=False)
                 return
             preparing = True
-            if self._completed_confirmed_preparation(final) is None:
+            if prepared_decision is None and self._completed_confirmed_preparation(final) is None:
                 await self._notify("answer_preparing")
                 self.assert_current()
             stage = "understanding"
             if nonclosing and not already_finalized:
                 observe_interview_agent_metric("stt_preview_prepared", 1)
-            prepared = await self._prepare_transcript(final)
+            prepared = prepared_decision if prepared_decision is not None else await self._prepare_transcript(final)
             self.assert_current()
             if prepared.understanding.problem is not None:
                 await self._understanding_failed(record_failure=False)
@@ -358,6 +361,9 @@ class AnswerEndpoint:
                     return
                 if prepared.understanding.suggested_action == "continue_listening":
                     return
+            if self.confirmation is not None and prepared.understanding.suggested_action == "respond_company":
+                await self.confirmation.company_answer(self, prepared, confirmed)
+                return
             if self.confirmation is not None and prepared.understanding.suggested_action == "clarify":
                 await self.confirmation.clarify_answer(self, prepared.understanding, confirmed)
                 return
@@ -414,14 +420,15 @@ class AnswerEndpoint:
         return ("supplement_awaiting_reply" if self.confirmation and
                 self.confirmation.phase in {"awaiting_reply", "classifying"} else "answer_listening")
 
-    async def _prepare_transcript(self, transcript: Any) -> Any:
+    async def _prepare_transcript(self, transcript: Any, *, semantic_first: bool = False) -> Any:
         with measure_interview_agent_stage("understanding_prepare_ms"):
             self._use_preparation_budget(transcript.text)
             if self._prepare_failures >= 3:
                 raise ApiError("UNDERSTANDING_RETRY_EXHAUSTED", "New server words or an explicit retry are required.",
                                status_code=503)
-            kwargs = {"completion_confirmed": True} if self.confirmation and self.confirmation.confirmed else {}
-            if not kwargs or (getattr(transcript, "type", None) != "transcript.final"
+            kwargs = ({"semantic_first": True} if semantic_first else
+                      {"completion_confirmed": True} if self.confirmation and self.confirmation.confirmed else {})
+            if semantic_first or not kwargs or (getattr(transcript, "type", None) != "transcript.final"
                               or not getattr(transcript, "is_final", False)):
                 self._discard_confirmed_preparation()
                 attempt = _PreparationAttempt(self._preparation_budget_epoch, self._preparation_budget_key)
@@ -482,8 +489,11 @@ class AnswerEndpoint:
         return task
 
     async def _bounded_confirmed_preparation(self, transcript: Any) -> Any:
+        kwargs = {"completion_confirmed": True}
+        if getattr(self.confirmation, "semantic_first", False):
+            kwargs["semantic_first"] = True
         return await asyncio.wait_for(
-            self.capture.prepare_decision(transcript, completion_confirmed=True),
+            self.capture.prepare_decision(transcript, **kwargs),
             timeout=_CONFIRMED_PREPARATION_TIMEOUT,
         )
 

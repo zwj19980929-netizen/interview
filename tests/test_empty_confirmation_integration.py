@@ -38,6 +38,8 @@ def test_no_word_noise_after_finish_does_not_reask_or_recompute_or_duplicate_rec
             prepared, release = [], asyncio.Event()
             original_prepare = managed.chain.prepare_decision
             async def slow(final, **kwargs):
+                if kwargs.get("semantic_first") and not kwargs.get("completion_confirmed"):
+                    return await original_prepare(final, **kwargs)
                 prepared.append(final.text)
                 await release.wait()
                 return await original_prepare(final, **kwargs)

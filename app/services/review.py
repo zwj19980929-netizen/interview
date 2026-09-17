@@ -71,6 +71,10 @@ class EnterpriseReviewService:
                     "answer": answer_projection,
                     "evaluation": deepcopy(evaluation),
                     "is_followup": bool(turn.get("is_followup")),
+                    "competency_ids": deepcopy(turn.get("competency_ids", [])),
+                    "assessed_rubric_point_ids": deepcopy(turn.get("assessed_rubric_point_ids", [])),
+                    "presented_unit_ids": deepcopy(turn.get("presented_unit_ids", [])),
+                    "inquiry_unit_id": turn.get("inquiry_unit_id"),
                     "order": turn.get("order"),
                     "playback": self._turn_playback(turn, answer, capture),
                 }
@@ -87,6 +91,17 @@ class EnterpriseReviewService:
             "candidate": deepcopy(interview["candidate"]),
             "position_id": interview.get("plan_snapshot", {}).get("job_position_id"),
             "status": interview["status"],
+            "execution_schema_version": interview.get("execution_schema_version") or interview.get("plan_snapshot", {}).get("execution_schema_version", 2),
+            "candidate_input_completion_reason": interview.get("candidate_input_completion_reason"),
+            "planning": {
+                "last_decision": {key: deepcopy(value) for key, value in
+                    (interview.get("agent_runtime", {}).get("last_planning") or {}).items()
+                    if key in {"decision_id", "reason_code", "tools_used", "model_calls", "prompt_version", "context_hash"}},
+                "decisions": [{key: deepcopy(value) for key, value in item.items()
+                    if key in {"decision_id", "kind", "revision", "committed_at", "question_id", "inquiry_unit_id",
+                               "reason", "reason_code", "tools_used", "model_calls", "prompt_version", "context_hash", "request_hash"}}
+                    for item in interview.get("adaptive_decision_receipts", [])[-100:]],
+            },
             "turns": turns,
             "report": deepcopy(report),
             "review_completion": deepcopy(interview.get("review_completion")),

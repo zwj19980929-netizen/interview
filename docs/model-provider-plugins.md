@@ -1,5 +1,44 @@
 # 模型供应商插件化设计
 
+## 2026-09-14：短问题生成预算（048）
+
+批次边界：每批只含一个原题的最多6个评分点；响应Schema的题目ID、知识点ID、能力与参考片段枚举只来自该题，unit数量等于该批实际点数。
+
+失败处理：统一格式或单元内容校验失败时，仅对失败小批次使用集中修正指令再尝试一次，已通过批次保留。修正仍占用3并发/180秒总预算；超时、鉴权或服务错误不在装配层重复调用，第二次无效仍失败关闭。校验日志只记录固定原因枚举与题目/考察点/批次数量，不记录原文。
+
+新调用使用集中合同 `interview_inquiry_units.v2`：输入原标准答案的连续编号片段，模型仅选择参考范围首尾编号，不重复输出整段答案。统一Schema及引用seam校验合法编号、同源顺序、逐点评分范围与非空内容，再从原文还原标准答案引用；冻结单元结构不变，历史v1计划不重写。每批最多6个知识点（原题可跨批）、并发3、输出3500tokens、每次60秒，整体180秒；不重试相同大批次，不通过mock或长题回退掩盖失败。审计保留v1并登记v2。
+
+## 047：计划准备使用真实语言模型
+
+`InterviewPlanAssembly.prepare` 复用 `llm.chat_json / question_generation`，执行版本化 `interview_inquiry_units.v2`；准备不是仅靠题目标签或模板拼接。部署时此用途必须绑定可用语言模型，不能把开发环境缺路由的 mock 回退当成真实模型验收。047本机排查发现这条路由缺失，先使用合成题库在内存复用已有语言模型验证，再通过模型管理接口补齐本机路由；具体结果记录在操作日志。供应商协议、统一结构校验与调用预算均沿用既有 ModelGateway，不在业务模块绑定特定厂商。
+
+
+## 2026-09-14 · 交流接话模型合同（046）
+
+新增`conversation_reception.v1`，通过既有`interview_turn_understanding`路由返回且仅返回`kind/confidence/evidence_id`；180输出token、4秒provider预算、0次内部重试，整体5秒可撤销等待。类型/枚举/边界/额外字段与服务端证据引用先统一校验，再进行高置信度控制分发；预览不得提交或直接播放。候选新话语和先前上下文作为数据，普通答案、公司问题和明确结束留给完整语义链。
+
+短表达集中为`conversation_reception_speech.v1`，等待/继续/确认在线/重说/题意澄清请求/转写投诉/收听问题/暂停/不明请求/理解失败均复用批准act与TTS。语义理解升级v16/v17（无可选上下文）和v18/v19（可选上下文），decision升级v15/v16、v17/v18；分别对应未确认/已确认结束。`semantic_turn.v3/v4`明确thinking与pause及completion_basis互斥，原严格校验不放宽；旧版本继续可读，版本进入领域与网关审计。
+
+没有变更实际模型路由、密钥或开启实时PCM播放开关。默认仍收齐完整PCM并发布受管音频；一条固定合成等待回应在真实路由首PCM466ms、完整收齐1048ms，独立于1–2秒的合成接话识别，均非用户端到端承诺。失败/取消保持当前回答，不把识别服务故障伪装为候选人没有补充。
+
+## 2026-09-10 · 公司问答模型合同（044）
+
+公司反问沿既有interview_turn_understanding路由，新增company_question_reply.v1只返回受限引用，无自由事实回答；抽取一次调用、8秒、供应商内部0次重试。带公司反问的理解v14/v15、decision v13/v14、supplement_reply.v4及带排除的answer_evaluation.v7均集中注册并进入统一校验/审计。Provider adapter不增加业务Prompt，TTS继续走原网关和私有音频链路。详细语义、失败回退和范围见[公司问答合同](company-question-runtime.md)。
+
+## 2026-09-10 · 可选上下文Prompt（039）
+
+interviewer_supervisor.v2明确Skill由用户自由编写、可选加载，企业资料独立可选。模型只在资料真实存在时调用受控读取工具；缺省直接按岗位面试，不猜测企业事实或把Skill资源当成企业身份。真实语义入口携带独立skill/company_context后，集中Prompt seam使用understanding.v12/v13与decision.v11/v12；旧无该上下文的审计Prompt保持原版本。新自由包使用interview_skill_compiler.v2；历史v1hash与编译结果保持可读，不把旧快照套入新Prompt。
+
+运行时仍统一模型网关、结构化输出校验、调用预算和取消；Skill文字包含代码或链接只是文字，不执行代码或自动访问网络。没有新增供应商或生产模型配置要求。
+
+## 2026-09-10 · 总控、语义与Skill统一模型合同（038）
+
+所有新Prompt、工具定义、条件Schema与语义引用验证集中在app/core/prompt，不新增厂商SDK或要求厂商原生tool calling。新合同包括interviewer_supervisor.v1、interviewer_evidence_expert.v1、interviewer_transition.v1、interview_inquiry_units.v1、首次语义理解v10/决策v9、真实补充确认后理解v11/决策v10与单元评分answer_evaluation.v6；版本加入网关审计白名单并有合同测试。企业正文通过受控编译seam加载，不能直接替换平台指令。
+
+总控沿用interview_turn_understanding路由，每次规划共享15秒与最多3次实际供应商尝试，specialists.consult至多一次并占用同一预算；InvocationExecutionBudget增加可选max_provider_attempts，实时规划每次调用设为1，同时max_provider_retries=0，避免fallback隐式突破预算。普通旧调用省略新字段保持原路由策略。超时/取消不记录完整Prompt或响应，只暴露安全错误码；候选人明确重试恢复规划。
+
+离线单元生成继续question_generation，评分继续既有answer_evaluation工作链；语义输入分离answer_content、turn_intent及真实CompletionBasis。语音生成和数字人继续通过既有批准act与供应商插件执行。未更换生产模型路由、密钥或声明实际供应商延迟达标；接口参数和运行限制见[总控合同](interviewer-supervisor-contract.md)及[自适应合同](adaptive-interview-contract.md)。
+
 ## 2026-09-10 · 补充分类与完整音频直取（034）
 
 supplement_reply.v3集中定义Prompt和严格Schema，只返回intent/confidence/evidence_id。长回答不要求模型复写最多300字的quote；服务端按编号恢复精确证据。调用预算8秒、350输出token、0次provider内重试；端点按原文最多三次失败。网关记录白名单schema_reason/schema_path用于区分枚举、类型、长度、字段等错误，保留历史版本。

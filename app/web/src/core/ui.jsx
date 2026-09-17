@@ -7,6 +7,7 @@ export const formatDate = (value) => value ? new Intl.DateTimeFormat("zh-CN", { 
 
 const statusLabels = {
   active: "启用",
+  approved: "已批准",
   archived: "已归档",
   building: "语音生成中",
   completed: "已完成",

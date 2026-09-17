@@ -4,6 +4,7 @@ import { act } from "react";
 import { describe, expect, it, vi } from "vitest";
 
 import App from "./App.jsx";
+import { WorkbenchProvider, useWorkbench } from "./core/WorkbenchProvider.jsx";
 import { publicFeatures, workspaceFeatures } from "./features/registry.js";
 
 describe("React workbench shell", () => {
@@ -18,9 +19,9 @@ describe("React workbench shell", () => {
     document.body.append(host);
     const root = createRoot(host);
     await act(async () => root.render(<App />));
-    for (let attempt = 0; attempt < 30 && host.querySelectorAll("[data-view]").length < 6; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
+    for (let attempt = 0; attempt < 30 && host.querySelectorAll("[data-view]").length < 7; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
     expect([...host.querySelectorAll("[data-view]")].map((node) => node.dataset.view)).toEqual([
-      "overview", "questions", "workflow", "plans", "interviews", "models",
+      "overview", "questions", "workflow", "plans", "skills", "interviews", "models",
     ]);
     expect(host.querySelector(".content")).not.toBeNull();
     await act(async () => root.unmount());
@@ -57,40 +58,92 @@ describe("React workbench shell", () => {
     await act(async () => root.unmount());
   });
 
-  it("generates and enables a plan in one confirmation without self-approval", async () => {
+  it("prepares a usable plan in one page and reads its saved content without a second approval", async () => {
     window.history.replaceState(null, "", "#plans");
-    const calls = [];
+    const creates = [], approvals = [], reads = [];
     const position = { id: "position_1", name: "后端工程师", knowledge_base_ids: ["kb_1"] };
-    const role = { id: "role_1", title: "后端岗位要求", job_position_id: "position_1", must_have_skills: ["python"] };
+    const role = { id: "role_1", title: "后端岗位要求", job_position_id: "position_1", must_have_skills: ["python"], interview_duration_minutes: 30 };
     const candidate = { id: "candidate_1", name: "候选人甲", job_position_id: "position_1" };
-    const bank = { id: "kb_1", name: "后端题库", job_position_id: "position_1" };
+    const bank = { id: "kb_1", name: "后端题库", status: "ready", job_position_id: "position_1" };
     const question = { id: "question_1", knowledge_base_id: "kb_1", status: "active" };
+    const plan = { id: "plan_1", version: 2, status: "approved", execution_schema_version: 3,
+      candidate_profile_id: candidate.id, role_requirement_id: role.id, job_position_id: position.id,
+      assessment_contract: { contract_hash: "frozen_contract", competencies: [{ id: "python", weight: 1, min_evidence_roots: 2 }],
+        budget: { min_root_questions: 3, max_root_questions: 6, max_duration_seconds: 1800 },
+        candidate_questions: [{ question_id: question.id, frozen_question: { title: "任务处理", key_points: [{ id: "point_1", text: "幂等" }] },
+          inquiry_units: [{ id: "unit_1", question_text: "重新读取后展示的口头问题？", competency_ids: ["python"], assessed_rubric_point_ids: ["point_1"], standard_answer_quote: "使用幂等键。" }] }] } };
     globalThis.fetch = async (path, options = {}) => {
       const url = String(path);
       if (url.endsWith("/auth/session")) return new Response(JSON.stringify({ actor_id: "admin_1", organization_id: "org_1", roles: ["admin"], authenticated: true }));
       if (url.endsWith("/workspace/question-catalog")) return new Response(JSON.stringify({ positions: [position], knowledge_bases: [bank], questions: [question] }));
+      if (url.endsWith("/job-positions")) return new Response(JSON.stringify({ items: [position] }));
+      if (url.endsWith("/knowledge-bases")) return new Response(JSON.stringify({ items: [bank] }));
       if (url.endsWith("/role-requirements")) return new Response(JSON.stringify({ items: [role] }));
+      if (url.endsWith("/interview-customization")) return new Response(JSON.stringify({ version: 0, skill: null, company_profile: { company_name: "", business_overview: "", products_services: "", additional_info: "" }, updated_at: null }));
       if (url.endsWith("/candidate-profiles")) return new Response(JSON.stringify({ items: [candidate] }));
-      if (url.endsWith("/interview-plans/generate") && options.method === "POST") {
-        calls.push(JSON.parse(options.body));
-        return new Response(JSON.stringify({ id: "plan_1", status: "approved", execution: { stages: [{ slots: [{ id: "slot_1" }] }] } }));
+      if (url.endsWith("/interview-plans/prepare") && options.method === "POST") {
+        creates.push(JSON.parse(options.body));
+        return new Response(JSON.stringify({ ...plan, version: 1 }));
       }
-      if (url.endsWith("/interview-plans")) return new Response(JSON.stringify({ items: [] }));
+      if (url.endsWith("/interview-plans/plan_1")) {
+        if (options.method === "PATCH") { approvals.push(JSON.parse(options.body)); return new Response(JSON.stringify({ ...plan, version: 3, status: "approved" })); }
+        reads.push(url); return new Response(JSON.stringify(plan));
+      }
       return new Response(JSON.stringify({ items: [] }));
     };
     const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
-    await act(async () => root.render(<App />));
-    let generate;
-    for (let attempt = 0; attempt < 30 && !generate; attempt += 1) { await new Promise((resolve) => setTimeout(resolve, 10)); generate = [...host.querySelectorAll("button")].find((node) => node.textContent === "生成计划"); }
-    await act(async () => generate.click());
-    const dialog = document.querySelector('[role="dialog"][aria-label="生成面试计划"]');
-    expect(dialog.textContent).toContain("无需再次审批");
-    expect([...dialog.querySelectorAll("button")].some((node) => node.textContent === "生成并启用计划")).toBe(true);
-    await act(async () => dialog.querySelector("form").dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
-    for (let attempt = 0; attempt < 30 && !calls.length; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));
-    expect(calls[0]).toMatchObject({ approve: true, role_requirement_id: "role_1", candidate_profile_id: "candidate_1", knowledge_base_ids: ["kb_1"] });
-    expect(host.textContent).not.toContain("审批计划");
-    await act(async () => root.unmount());
+    const button = (label) => [...host.querySelectorAll("button")].find((node) => node.textContent.trim() === label);
+    try {
+      await act(async () => root.render(<App />));
+      await act(async () => button("新建计划").click());
+      expect(window.location.hash).toBe("#plans/new");
+      expect(host.querySelector('[role="dialog"]')).toBeNull();
+      expect(host.querySelector('[aria-current="step"]')).toBeNull();
+      expect(host.textContent).toContain("候选人甲");
+      expect(creates).toHaveLength(0);
+      await act(async () => button("创建面试计划 →").click());
+      expect(creates[0]).toEqual({ job_position_id: "position_1", candidate_profile_id: "candidate_1", knowledge_base_ids: ["kb_1"], duration_minutes: 45 });
+      expect(creates[0]).not.toHaveProperty("skill_id");
+      expect(creates[0]).not.toHaveProperty("company_context");
+      expect(window.location.hash).toBe("#plans/plan_1");
+      expect(reads.length).toBeGreaterThan(0);
+      expect(host.textContent).toContain("重新读取后展示的口头问题？");
+      expect(approvals).toHaveLength(0);
+      expect(button("确认并启用计划")).toBeUndefined();
+      expect(host.querySelector('a[href="#interviews"]')).not.toBeNull();
+      expect(host.textContent).toContain("计划已启用");
+    } finally { await act(async () => root.unmount()); host.remove(); }
+  });
+
+  it.each([["#plans/new", "plan_2"], ["#plans/plan_1", "plan_2"], ["#plans", "new"]])("keeps late workspace errors out of plan navigation from %s to %s", async (initial, target) => {
+    window.history.replaceState(null, "", initial);
+    let rejectOld;
+    const oldPlans = new Promise((resolve, reject) => { rejectOld = reject; });
+    let planLoads = 0;
+    globalThis.fetch = async (path) => {
+      const url = String(path);
+      if (url.endsWith("/auth/session")) return new Response(JSON.stringify({ actor_id: "admin_1", organization_id: "org_1", roles: ["admin"], authenticated: true }));
+      if (url.endsWith("/interview-plans") && ++planLoads === 1) return oldPlans;
+      if (url.endsWith("/workspace/question-catalog")) return new Response(JSON.stringify({ positions: [], knowledge_bases: [], questions: [] }));
+      return new Response(JSON.stringify({ items: [] }));
+    };
+    let workspace;
+    function Probe() {
+      workspace = useWorkbench();
+      return <p data-loading={String(workspace.loading)} data-plan={workspace.route.selectedPlanId || ""} data-action={workspace.route.planAction || ""}>{workspace.fatalError}</p>;
+    }
+    const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+    try {
+      await act(async () => root.render(<WorkbenchProvider><Probe /></WorkbenchProvider>));
+      expect(host.querySelector("p").dataset.loading).toBe("true");
+      await act(async () => workspace.navigate("plans", target));
+      expect(host.querySelector("p").dataset.plan).toBe(target === "new" ? "" : target);
+      expect(host.querySelector("p").dataset.action).toBe(target === "new" ? "create" : "");
+      expect(host.querySelector("p").dataset.loading).toBe("false");
+      await act(async () => rejectOld(new Error("旧新建页面的加载失败")));
+      expect(host.textContent).not.toContain("旧新建页面的加载失败");
+      expect(host.querySelector("p").dataset.loading).toBe("false");
+    } finally { await act(async () => root.unmount()); host.remove(); }
   });
 
   it("copies the one-time candidate invitation link with one click", async () => {
@@ -142,6 +195,7 @@ describe("React workbench shell", () => {
     const getUserMedia = vi.fn();
     Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: { getUserMedia } });
     const invitation = {
+      appointment_id: "appointment_confirm",
       position_name: "后端工程师",
       status: "invited",
       scheduled_start_at: "2099-09-02T01:00:00.000Z",
@@ -157,7 +211,7 @@ describe("React workbench shell", () => {
     globalThis.fetch = async (path, options = {}) => {
       const url = String(path);
       if (url.endsWith("/public/interview-invitations/token_confirm") && options.method === "GET") return new Response(JSON.stringify(invitation));
-      if (url.endsWith("/public/interview-invitations/token_confirm/intake") && options.method === "POST") { requests.push(JSON.parse(options.body)); return new Response(JSON.stringify({ status: "registered", email_reminder: { status: "scheduled" } })); }
+      if (url.endsWith("/public/interview-invitations/token_confirm/intake") && options.method === "POST") { requests.push(JSON.parse(options.body)); return new Response(JSON.stringify({ appointment_id: "appointment_confirm", matched: true, status: "registered", email_reminder: { status: "scheduled" } })); }
       throw new Error(`Unexpected request: ${url}`);
     };
     const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
@@ -182,6 +236,33 @@ describe("React workbench shell", () => {
     expect(getUserMedia).not.toHaveBeenCalled();
     expect([...host.querySelectorAll("button")].find((node) => node.textContent === "尚未到面试时间")?.disabled).toBe(true);
     await act(async () => root.unmount());
+  });
+
+  it("binds a loaded invitation to its route before showing identity confirmation", async () => {
+    window.history.replaceState(null, "", "#invite/token_old");
+    let resolveNew;
+    const pending = new Promise((resolve) => { resolveNew = resolve; });
+    const invitation = { appointment_id: "appointment_old", status: "registered", position_name: "合成岗位",
+      scheduled_start_at: "2099-01-01T00:00:00Z", scheduled_end_at: "2099-01-01T01:00:00Z", consent: {} };
+    globalThis.fetch = async (path) => {
+      if (String(path).endsWith("/token_old")) return new Response(JSON.stringify(invitation));
+      if (String(path).endsWith("/token_new")) return pending;
+      throw new Error("Unexpected synthetic request");
+    };
+    const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+    try {
+      await act(async () => root.render(<App />));
+      expect(host.textContent).toContain("身份核验通过");
+      await act(async () => {
+        window.history.replaceState(null, "", "#invite/token_new");
+        window.dispatchEvent(new HashChangeEvent("hashchange"));
+      });
+      expect(host.textContent).toContain("正在读取本次邀请");
+      expect(host.textContent).not.toContain("身份核验通过");
+      await act(async () => resolveNew(new Response(JSON.stringify({ ...invitation, appointment_id: "appointment_new", status: "invited" }))));
+      expect(host.querySelector("form")).toBeTruthy();
+      expect(host.textContent).not.toContain("预约已确认");
+    } finally { await act(async () => root.unmount()); host.remove(); }
   });
 
   it("starts with knowledge bases and keeps the first-bank path available in an empty workspace", async () => {

@@ -4,6 +4,9 @@ import { Status, formatDate } from "../../core/ui.jsx";
 
 const recordingLabels = { completed: "录像已保存", hash_pending: "录像正在封存校验", stopping: "录像正在收尾", recording: "正在录制", failed: "录像处理失败", unavailable: "暂无全场录像", cancelled: "未开始录制", retention_purged: "录像已按留存策略清除" };
 const fitLabels = { strong_match: "高度匹配", match: "匹配", partial_match: "部分匹配", insufficient_evidence: "证据不足", manual_review: "建议人工复核" };
+const completionLabels = { evidence_sufficient: "已取得约定范围的考察证据", budget_exhausted: "考察时间或题数预算已用完", candidate_requested: "候选人主动结束", appointment_window_expired: "预约时间已结束", media_failure: "音视频故障导致结束" };
+const decisionLabels = { ...completionLabels, coverage_gap: "补充能力证据", relevant_experience: "了解相关经历", topic_change: "转换考察方向", coverage_complete: "已取得约定范围的考察证据" };
+const toolLabels = { "questions.search": "检索批准题池", "questions.read": "读取批准问题", "resume.read_evidence": "读取简历证据", "interview.read_context": "读取考察上下文", "company.read_reference": "读取企业资料", "specialists.consult": "咨询专业证据专家" };
 
 export function useInterviewReview(interviewId) {
   const { API, request } = useWorkbench();
@@ -49,6 +52,9 @@ export default function InterviewReview({ interviewId, review, error, reload, ca
   const turns = review.turns || [];
   const selected = turns.find((turn) => turn.turn_id === selectedId) || turns[0];
   const report = review.report;
+  const adaptive = review.execution_schema_version === 3 || report?.execution_schema_version === 3;
+  const completionReason = review.candidate_input_completion_reason || report?.candidate_input_completion_reason;
+  const planningDecisions = review.planning?.decisions?.length ? review.planning.decisions : review.planning?.last_decision?.decision_id ? [review.planning.last_decision] : [];
   const status = { ready: "报告已生成", pending_verification: "报告已生成", failed: "报告待处理：后台评分或报告生成失败", processing: "正在后台评分，完成后自动生成报告", awaiting_submission: "面试进行中" }[processing.report_status] || "正在同步处理状态";
   const select = (id) => { generation.current += 1; setSelectedId(id); setMedia(null); setMediaError(""); };
   const play = async (kind, turn = null) => {
@@ -89,7 +95,8 @@ export default function InterviewReview({ interviewId, review, error, reload, ca
     <section className="report-panel">
       <h2>面试报告与回放</h2>
       <p role="status"><strong>{status}</strong></p>
-      {processing.submitted_at && <p>回答已收齐 · {formatDate(processing.submitted_at)}</p>}
+      {processing.submitted_at && <p>{completionReason ? "候选人作答已结束" : "回答已收齐"} · {formatDate(processing.submitted_at)}</p>}
+      {completionReason && <p>结束原因：{completionLabels[completionReason] || "本场考察已结束"}</p>}
       <p>已评分 {processing.completed || 0} / {processing.total || 0} 题 · 待处理 {processing.pending || 0} 题 · 失败 {processing.failed || 0} 题</p>
       {processing.failed > 0 && <p role="alert">评分失败不会丢失回答和录音。修复模型问题后可重试，评分完成后会自动生成报告。</p>}
       {error && <p role="alert">状态刷新失败：{error}</p>}
@@ -100,11 +107,25 @@ export default function InterviewReview({ interviewId, review, error, reload, ca
         {canManage && (processing.can_retry || ["hash_pending", "stopping"].includes(recording.status)) && <button className="button button-primary" disabled={busy} onClick={retry}>{busy ? "正在排队…" : "重试未完成处理"}</button>}
       </div>
       {report && <div className="review-report-summary">
-        {report.overall_score == null ? <p role="status"><strong>{report.score_status === "processing" ? "正在重新评分" : "正在等待有效评分"}</strong></p> : <strong className="score-value">{report.overall_score}<small> / 100</small></strong>}
+        {report.overall_score == null ? <p role="status"><strong>{report.score_status === "processing" ? "正在重新评分" : report.coverage_status === "insufficient_evidence" ? "考察覆盖不足，暂不形成总分" : "正在等待有效评分"}</strong></p> : <strong className="score-value">{report.overall_score}<small> / 100</small></strong>}
+        {report.coverage_status === "insufficient_evidence" && <p>已考察题目的有效分数仍可查看。未考察的范围不计零分，也不分摊到其他能力。</p>}
         {report.recognition_notice && <p className="form-hint">{report.recognition_notice}</p>}
+        {report.scope_notice && <p className="form-hint">{report.scope_notice}</p>}
         <h3>{fitLabels[report.job_fit_level] || "待人工复核"}</h3>
         {report.summary && <p>{report.summary}</p>}
         <p>最终决定由企业人员完成。</p>
+        {adaptive && report.dimension_scores?.length > 0 && <section aria-label="能力维度评分">
+          <h4>能力维度评分</h4>
+          <p className="form-hint">能力权重按企业批准的考察要求固定；追问计入主问题的证据，不重复计权。</p>
+          <table className="data-table"><thead><tr><th scope="col">能力</th><th scope="col">固定权重</th><th scope="col">评分</th><th scope="col">考察证据</th></tr></thead>
+            <tbody>{report.dimension_scores.map((dimension) => <tr key={dimension.dimension}>
+              <th scope="row">{dimension.dimension}</th>
+              <td>{typeof dimension.weight === "number" ? `${Number((dimension.weight * 100).toFixed(1))}%` : "—"}</td>
+              <td>{dimension.score == null ? "未形成评分" : `${dimension.score} 分`}</td>
+              <td>{dimension.evidence_root_count ? `${dimension.evidence_root_count} 道主问题 · ${dimension.evidence_status === "sufficient" ? "达到证据要求" : "证据不足"}` : "未考察"}</td>
+            </tr>)}</tbody>
+          </table>
+        </section>}
         {[["优势", report.strengths], ["风险与待核验项", report.risks], ["建议", report.followup_suggestions]].map(([title, items]) => items?.length > 0 && <div key={title}><h4>{title}</h4><ul>{items.map((item, index) => <li key={index}>{typeof item === "string" ? item : item.text || item.description || item.reason || JSON.stringify(item)}</li>)}</ul></div>)}
       </div>}
     </section>
@@ -112,12 +133,16 @@ export default function InterviewReview({ interviewId, review, error, reload, ca
       <h3>逐题复核</h3>
       <div className="review-question-tabs" role="group" aria-label="选择回答题目">
         {turns.map((turn) => <button key={turn.turn_id} className={`button ${turn.turn_id === selected?.turn_id ? "button-primary" : "button-secondary"}`} aria-pressed={turn.turn_id === selected?.turn_id} onClick={() => select(turn.turn_id)}>
-          第 {turn.order} 题{turn.is_followup ? " · 追问" : ""} · {turn.skip_reason === "resume_speech_not_ready" ? "语音未就绪，已跳过" : turn.answer?.evaluation_status === "failed" ? "评分失败" : turn.answer?.evaluation_status === "pending" ? "正在评分" : turn.evaluation?.score != null ? `${turn.evaluation.score}分` : turn.answer ? "待评分" : "未作答"}
+          第 {turn.order} 题{turn.is_followup ? " · 追问" : ""} · {turn.skip_reason === "resume_speech_not_ready" ? "语音未就绪，已跳过" : turn.status === "skipped" && completionLabels[turn.skip_reason] ? "面试结束，未考察" : turn.answer?.evaluation_status === "failed" ? "评分失败" : turn.answer?.evaluation_status === "pending" ? "正在评分" : turn.evaluation?.score != null ? `${turn.evaluation.score}分` : turn.answer ? "待评分" : "未作答"}
         </button>)}
       </div>
       {selected && <article className="review-answer">
         <h3>{selected.question?.question_text}</h3>
         {selected.skip_reason === "resume_speech_not_ready" && <p role="status">本题读题语音在提问时尚未就绪，系统已跳过，不计入评分。</p>}
+        {selected.status === "skipped" && completionLabels[selected.skip_reason] && <p role="status">{completionLabels[selected.skip_reason]}，本题没有形成完整回答证据，不计零分。</p>}
+        {adaptive && !selected.is_followup && selected.presented_unit_ids?.includes("complete_question") && <p className="form-hint">本题评分范围：完整呈现的题目与全部 {selected.assessed_rubric_point_ids?.length || 0} 项关键点。</p>}
+        {selected.inquiry_unit_id && !selected.is_followup && <p className="form-hint">本题仅考察当前问题对应的 {selected.assessed_rubric_point_ids?.length || 0} 项关键点。{selected.question?.not_assessed_rubric_point_ids?.length ? `原题另外 ${selected.question.not_assessed_rubric_point_ids.length} 项不在本次提问的评分范围内。` : ""}</p>}
+        {adaptive && selected.is_followup && <p className="form-hint">此追问作为主问题的补充证据，在总分中不重复计权。</p>}
         <div className="page-actions">
           <button className="button button-secondary" disabled={!selected.playback?.audio_available} onClick={() => play("audio", selected)}>播放本题音频</button>
           <button className="button button-secondary" disabled={!selected.playback?.video_available} onClick={() => play("video", selected)}>播放本题视频</button>
@@ -137,6 +162,19 @@ export default function InterviewReview({ interviewId, review, error, reload, ca
         </>}
         {canManage && selected.answer && selected.evaluation && <TranscriptVerification key={`${selected.answer.id}:${selected.evaluation.id}:${selected.answer.current_transcript_revision || 1}`} interviewId={interviewId} turn={selected} reload={reload} />}
       </article>}
+    </section>}
+    {planningDecisions.length > 0 && <section className="report-panel" aria-label="面试官决策记录">
+      <h3>面试官决策记录</h3>
+      <p className="form-hint">记录已提交的选题与结束原因，供复核考察过程。</p>
+      <details><summary>查看 {planningDecisions.length} 条决策记录</summary>
+        <ol>{planningDecisions.map((decision) => <li key={decision.decision_id}>
+          <strong>{decisionLabels[decision.reason_code || decision.reason] || "已提交考察决策"}</strong>
+          {decision.committed_at && <span> · {formatDate(decision.committed_at)}</span>}
+          {decision.tools_used?.length > 0 && <p>调用能力：{decision.tools_used.map((name) => toolLabels[name] || "受控工具").join("、")}</p>}
+          {Number.isInteger(decision.model_calls) && <p>模型调用 {decision.model_calls} 次{decision.prompt_version ? ` · 策略版本 ${decision.prompt_version}` : ""}</p>}
+          <small>决策编号：{decision.decision_id}</small>
+        </li>)}</ol>
+      </details>
     </section>}
     {(media || mediaError) && <section className="report-panel review-player-panel">
       <h3>{media?.label || "音视频回放"}</h3>

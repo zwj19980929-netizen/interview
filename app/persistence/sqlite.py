@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 from app.persistence.interface import Document, PersistenceTransaction, Predicate, TransactionBackend
+from app.persistence.read_only import ReadOnlyTransactionBackend
 from app.repositories.sqlite import SQLiteStore
 
 
@@ -229,19 +230,28 @@ class SQLitePersistence:
         self.store = store
 
     @contextmanager
-    def transaction(self, organization_id: str) -> Iterator[PersistenceTransaction]:
+    def transaction(
+        self, organization_id: str, *, read_only: bool = False,
+    ) -> Iterator[PersistenceTransaction]:
         connection = self.store._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            if read_only:
+                # Every transaction owns and closes its connection. This pragma
+                # cannot leak into a later writer's connection.
+                connection.execute("PRAGMA query_only = ON")
+            connection.execute("BEGIN" if read_only else "BEGIN IMMEDIATE")
             backend = _SQLiteTransactionBackend(connection)
-            yield PersistenceTransaction(backend, organization_id)
+            yield PersistenceTransaction(
+                ReadOnlyTransactionBackend(backend) if read_only else backend, organization_id,
+            )
             connection.commit()
         except Exception:
             connection.rollback()
             raise
         finally:
             connection.close()
-        backend.sync_store_cache(self.store)
+        if not read_only:
+            backend.sync_store_cache(self.store)
 
 
 def _item_time(item: Document) -> Optional[str]:

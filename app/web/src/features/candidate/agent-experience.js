@@ -18,6 +18,7 @@ const WINDOWED_AVATAR_METRICS = new Set([
   "avatar_freeze_ms",
 ]);
 const AVATAR_METRIC_WINDOW_MS = 1_000;
+const MICROPHONE_LEVEL_INTERVAL_MS = 100;
 const ANSWER_PREPARATION_WARNING_CODES = new Set([
   "UNDERSTANDING_UNAVAILABLE", "UNDERSTANDING_RETRY_EXHAUSTED", "TRANSCRIPT_UNAVAILABLE", "ENDPOINT_UNCERTAIN",
 ]);
@@ -196,6 +197,7 @@ class CandidateExperienceRun {
     this.evidenceOpenCausationId = null;
     this.speechStartSignaled = false;
     this.pendingSpeechStop = false;
+    this.lastMicrophoneLevelAt = -Infinity;
     this.warmupRetryRequested = false;
     this.warmupRetryCausationId = null;
     this.acknowledgedWarmupRetryCausationIds = new Set();
@@ -252,6 +254,7 @@ class CandidateExperienceRun {
       calibration: { status: "pending", transcript: "", confidence: null, retryRequired: false },
       avatar: { ...EMPTY_AVATAR },
       problem: null,
+      planningRetryPending: false,
       completion: null,
       recovery: { retainedFrames: 0, unacknowledgedFrames: 0, encryptedBytes: 0, retentionMs: 30_000 },
     };
@@ -358,6 +361,15 @@ class CandidateExperienceRun {
     let causationId = null;
     let warmupConfirmRollback = null;
     let finishRollback = null;
+    if (type === "planning.retry") {
+      if (this.isSafetyStopped() || this.state.phase !== "planning"
+        || this.state.problem?.action !== "retry_planning" || this.state.planningRetryPending) return false;
+      causationId = uniqueId("candidate");
+      this.planningRetryCausationId = causationId;
+      this.patch({ planningRetryPending: true });
+      turnId = null;
+      payload = {};
+    }
     if (type === "continue_speaking") {
       const recovery = this.state.captureRecovery;
       if (recovery?.status === "retry_required") {
@@ -443,6 +455,10 @@ class CandidateExperienceRun {
         causationId,
       });
     } catch (error) {
+      if (type === "planning.retry") {
+        this.planningRetryCausationId = null;
+        this.patch({ planningRetryPending: false });
+      }
       if (type === "continue_speaking" && causationId === this.captureRetryCausationId) {
         this.captureRetryCausationId = null;
         if (this.state.captureRecovery) this.patch({ captureRecovery: { ...this.state.captureRecovery, retryPending: false } });
@@ -718,6 +734,8 @@ class CandidateExperienceRun {
           this.warmupRetryRequested = false;
           this.warmupRetryCausationId = null;
           this.captureRetryCausationId = null;
+          this.planningRetryCausationId = null;
+          this.patch({ planningRetryPending: false });
           if (this.state.captureRecovery) this.patch({ captureRecovery: { ...this.state.captureRecovery, retryPending: false } });
           if (
             !this.intentionalClose
@@ -1077,6 +1095,15 @@ class CandidateExperienceRun {
     if (event.type === "problem") {
       // A queued VAD error must never replace the actionable safety pause.
       if (this.state.problem?.recoverable === false && payload.recoverable) return;
+      if (payload.recoverable === true && payload.action === "retry_planning") {
+        if (this.state.session?.execution_schema_version !== 3 || this.state.currentQuestion
+          || this.state.session?.status !== "in_progress") return;
+        const retryResolved = !this.planningRetryCausationId || event.causation_id === this.planningRetryCausationId;
+        if (retryResolved) this.planningRetryCausationId = null;
+        this.patch({ problem: payload, phase: "planning", floor: "none",
+          ...(retryResolved ? { planningRetryPending: false } : {}) });
+        return;
+      }
       if (CAPTURE_RECOVERY_CODES.has(payload.code)) {
         if (!this.isSafetyStopped() && this.matchesCapture(event)) {
           // An unchanged snapshot is not an ACK. Only the scoped failure for
@@ -1309,6 +1336,12 @@ class CandidateExperienceRun {
 
   applySnapshot(payload) {
     const sessionStatus = payload.status;
+    const calibrationStatus = payload.calibration_status || this.state.calibration.status;
+    // Adaptive sessions have no formal turn during calibration too. Planning
+    // must not clear the warm-up capture or suppress its VAD start/stop signals.
+    const planning = sessionStatus === "in_progress" && payload.execution_schema_version === 3
+      && calibrationStatus === "completed"
+      && payload.dialogue_state === "awaiting_next_decision" && !payload.current_question && !payload.current_turn_id;
     const nextTranscriptTurnId = payload.current_question?.turn_id || payload.current_turn_id || null;
     this.answerPreparation = sessionStatus === "in_progress" && payload.floor === "candidate"
       && !payload.capture_recovery && payload.answer_preparation?.turn_id === nextTranscriptTurnId
@@ -1336,7 +1369,6 @@ class CandidateExperienceRun {
       this.liveSpeech.reset();
     }
     const calibrationRetryRequired = Boolean(payload.calibration_retry_required);
-    const calibrationStatus = payload.calibration_status || this.state.calibration.status;
     const warmupJustCompleted = calibrationStatus === "completed"
       && this.state.calibration.status !== "completed";
     if (transcriptTurnChanged || warmupJustCompleted) window.clearTimeout(this.captionFreshnessTimer);
@@ -1363,7 +1395,7 @@ class CandidateExperienceRun {
         this.warmupRetryCausationId = null;
       }
     }
-    if (["paused", "completed", "cancelled", "expired", "report_ready"].includes(sessionStatus)) {
+    if (planning || ["paused", "completed", "cancelled", "expired", "report_ready"].includes(sessionStatus)) {
       this.captureRetryCausationId = null;
       this.answerFinishRequested = false;
       window.clearTimeout(this.endpointTimer);
@@ -1377,11 +1409,22 @@ class CandidateExperienceRun {
       this.warmupRetryRequested = false;
       this.warmupRetryCausationId = null;
       this.evidenceReassertPending = false;
+      if (planning) {
+        this.answerSubmissionPending = false;
+        this.evidenceTurnId = null;
+        this.evidenceCaptureId = null;
+      }
     }
+    if (!planning) this.planningRetryCausationId = null;
+    const planningProblem = planning && payload.planning_problem
+      ? { ...payload.planning_problem, recoverable: true, action: "retry_planning" } : null;
     this.patch({
       session: payload,
       floor: payload.floor || this.state.floor,
       currentQuestion: payload.current_question || null,
+      planningRetryPending: planning ? this.state.planningRetryPending : false,
+      ...(this.state.problem?.recoverable !== false && (planningProblem || this.state.problem?.action === "retry_planning")
+        ? { problem: planningProblem } : {}),
       mediaPolicy: { ...(this.state.mediaPolicy || {}), recording: payload.recording },
       calibration: {
         ...this.state.calibration,
@@ -1397,7 +1440,7 @@ class CandidateExperienceRun {
         evidence: { requested: false, ready: false },
         recovery: this.ring?.snapshot?.() || this.state.recovery,
       } : {}),
-      ...(["paused", "completed", "cancelled", "expired", "report_ready"].includes(sessionStatus) ? {
+      ...(planning || ["paused", "completed", "cancelled", "expired", "report_ready"].includes(sessionStatus) ? {
         captureRecovery: null,
         endpoint: { active: false, deadlineAt: null },
         microphone: { ...this.state.microphone, localDetected: false },
@@ -1407,6 +1450,8 @@ class CandidateExperienceRun {
         ? "paused"
         : sessionStatus === "completed"
           ? "completed"
+          : planning
+            ? "planning"
           : payload.floor === "candidate" && this.isPreparingAnswer(nextTranscriptTurnId)
             ? "answer_preparing"
           : this.answerSubmissionPending
@@ -1436,6 +1481,7 @@ class CandidateExperienceRun {
       && !this.evidenceReady;
     if (
       sessionStatus === "in_progress"
+      && !planning
       && this.state.captureRecovery?.status !== "retry_required"
       && !this.answerSubmissionPending
       && payload.floor === "candidate"
@@ -1520,13 +1566,21 @@ class CandidateExperienceRun {
   }
 
   onLevel(rms) {
-    this.patch({ microphone: { ...this.state.microphone, level: Math.min(1, rms / 0.12) } }, false);
+    if (this.closed || !this.state.microphone.enabled || !Number.isFinite(rms)) return;
+    const now = this.clock();
+    if (now >= this.lastMicrophoneLevelAt && now - this.lastMicrophoneLevelAt < MICROPHONE_LEVEL_INTERVAL_MS) return;
+    const level = Math.max(0, Math.min(1, rms / 0.12));
+    if (level === this.state.microphone.level) return;
+    // Worklet levels arrive every audio quantum. Publish the latest level at
+    // most 10 Hz; speech detection runs independently at full audio cadence.
+    this.lastMicrophoneLevelAt = now;
+    this.patch({ microphone: { ...this.state.microphone, level } });
   }
 
   async onLocalSpeechStarted(details = {}) {
     if (this.state.captureRecovery?.status === "retry_required") return;
     if (this.answerSubmissionPending || (this.state.phase === "understanding" && this.state.calibration.status === "completed")) return;
-    if (this.closed || ["paused", "completed"].includes(this.state.phase) || this.state.completion) {
+    if (this.closed || ["paused", "completed", "planning"].includes(this.state.phase) || this.state.completion) {
       return;
     }
     const cancelsPreparation = this.answerFinishRequested || this.state.phase === "answer_preparing";
@@ -1568,7 +1622,7 @@ class CandidateExperienceRun {
   onLocalSpeechStopped() {
     if (this.state.captureRecovery?.status === "retry_required") return;
     if (this.answerSubmissionPending) return;
-    if (this.closed || ["paused", "completed"].includes(this.state.phase) || this.state.completion) {
+    if (this.closed || ["paused", "completed", "planning"].includes(this.state.phase) || this.state.completion) {
       return;
     }
     this.localSpeechStoppedAt = this.clock();

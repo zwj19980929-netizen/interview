@@ -67,6 +67,25 @@ async def _prepared(service, final):
 
 
 @pytest.mark.anyio
+@pytest.mark.parametrize("confirmed", [False, True])
+async def test_semantic_schema_does_not_fabricate_the_separate_completion_permission(confirmed):
+    service, final = _setup()
+    prepared = await service.prepare_streaming_decision("iv_binding", "turn_binding", final,
+        snapshot_ref="private-file://synthetic_prefix", semantic_first=True, completion_confirmed=confirmed)
+    assert prepared.semantic_first and prepared.completion_confirmed is confirmed
+    assert prepared.understanding.completion_basis is None
+    assert prepared.understanding.prompt_version == ("interview_turn_understanding.v19" if confirmed else "interview_turn_understanding.v18")
+    if confirmed:
+        service.assert_prepared_streaming_decision(prepared, final, "org_default")
+        with pytest.raises(ApiError, match="no longer matches"):
+            service.assert_prepared_streaming_decision(prepared, final.model_copy(update={"confidence": .4}), "org_default")
+    else:
+        with pytest.raises(ApiError, match="no longer matches"):
+            service.assert_prepared_streaming_decision(prepared, final, "org_default")
+    assert service.get_interview("iv_binding")["answers"] == []
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("mutate", [
     lambda p: p.update(confidence=0.1),
     lambda p: p.update(language="en-US"),

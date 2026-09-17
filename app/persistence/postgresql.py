@@ -9,18 +9,23 @@ from psycopg.types.json import Jsonb
 
 from app.persistence.errors import ConcurrencyConflict, RecordAlreadyExists
 from app.persistence.interface import Document, PersistenceTransaction, Predicate, TransactionBackend
+from app.persistence.read_only import ReadOnlyTransactionBackend
 from app.repositories.postgresql import PostgreSQLStore
 
 
 MIGRATIONS = [
     Path(__file__).resolve().parents[2] / "migrations" / "001_postgresql_persistence.sql",
     Path(__file__).resolve().parents[2] / "migrations" / "002_model_configuration_v2.sql",
+    Path(__file__).resolve().parents[2] / "migrations" / "003_interview_skills.sql",
+    Path(__file__).resolve().parents[2] / "migrations" / "004_optional_interview_skills.sql",
+    Path(__file__).resolve().parents[2] / "migrations" / "005_interview_customization.sql",
 ]
 
 
 class _PostgreSQLTransactionBackend(TransactionBackend):
-    def __init__(self, connection: psycopg.Connection) -> None:
+    def __init__(self, connection: psycopg.Connection, *, read_only: bool = False) -> None:
         self.connection = connection
+        self.read_only = read_only
 
     def database_now(self) -> datetime:
         row = self.connection.execute(
@@ -33,7 +38,8 @@ class _PostgreSQLTransactionBackend(TransactionBackend):
 
     def get_document(self, collection: str, item_id: str) -> Optional[Document]:
         row = self.connection.execute(
-            "SELECT data FROM documents WHERE collection = %s AND id = %s FOR UPDATE",
+            "SELECT data FROM documents WHERE collection = %s AND id = %s"
+            + ("" if self.read_only else " FOR UPDATE"),
             (collection, item_id),
         ).fetchone()
         return dict(row["data"]) if row else None
@@ -106,7 +112,8 @@ class _PostgreSQLTransactionBackend(TransactionBackend):
 
     def get_work_item(self, item_id: str) -> Optional[Document]:
         row = self.connection.execute(
-            "SELECT data FROM outbox_work_items WHERE id = %s FOR UPDATE", (item_id,)
+            "SELECT data FROM outbox_work_items WHERE id = %s"
+            + ("" if self.read_only else " FOR UPDATE"), (item_id,)
         ).fetchone()
         return dict(row["data"]) if row else None
 
@@ -190,7 +197,15 @@ class PostgreSQLPersistence:
                     to_regclass('public.documents') AS documents,
                     to_regclass('public.outbox_work_items') AS outbox_work_items,
                     to_regclass('public.provider_secrets') AS provider_secrets,
-                    to_regclass('public.model_invocations') AS model_invocations
+                    to_regclass('public.model_invocations') AS model_invocations,
+                    to_regclass('public.uq_interview_skill_revision') AS interview_skill_revision_index,
+                    (SELECT oid FROM pg_constraint
+                     WHERE conrelid = to_regclass('public.documents')
+                       AND conname = 'ck_interview_skill_active_version') AS interview_skill_active_state,
+                    to_regclass('public.uq_interview_customization_organization') AS interview_customization_index,
+                    (SELECT oid FROM pg_constraint
+                     WHERE conrelid = to_regclass('public.documents')
+                       AND conname = 'ck_interview_customization') AS interview_customization_contract
                 """
             ).fetchone()
             missing = [name for name, value in dict(row).items() if value is None]
@@ -202,14 +217,21 @@ class PostgreSQLPersistence:
                 )
 
     @contextmanager
-    def transaction(self, organization_id: str) -> Iterator[PersistenceTransaction]:
+    def transaction(
+        self, organization_id: str, *, read_only: bool = False,
+    ) -> Iterator[PersistenceTransaction]:
         try:
             with self._connect() as connection:
+                if read_only:
+                    connection.execute("SET TRANSACTION READ ONLY")
                 connection.execute("SELECT set_config('app.organization_id', %s, true)", (organization_id,))
-                yield PersistenceTransaction(_PostgreSQLTransactionBackend(connection), organization_id)
+                backend = _PostgreSQLTransactionBackend(connection, read_only=read_only)
+                yield PersistenceTransaction(
+                    ReadOnlyTransactionBackend(backend) if read_only else backend, organization_id,
+                )
         except psycopg.errors.UniqueViolation as exc:
             raise RecordAlreadyExists("PostgreSQL unique constraint rejected the transaction.") from exc
-        except psycopg.errors.SerializationFailure as exc:
+        except (psycopg.errors.SerializationFailure, psycopg.errors.DeadlockDetected) as exc:
             raise ConcurrencyConflict("PostgreSQL serialization conflict.") from exc
 
 

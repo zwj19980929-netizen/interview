@@ -8,7 +8,7 @@ import {
   useState,
 } from "react";
 
-import { candidateNotice, candidateEntryMessage } from "./presentation.js";
+import { candidateNotice, candidateEntryMessage, candidateEntryFailure } from "./presentation.js";
 
 import { useWorkbench } from "../../core/WorkbenchProvider.jsx";
 import { Empty, Field, Status } from "../../core/ui.jsx";
@@ -19,9 +19,11 @@ import {
 } from "./agent-experience.js";
 import {
   peekPreparedCandidateMedia,
+  discardPreparedCandidateMedia,
   prepareCandidateMedia,
   recordPreparedAvatarFps,
   runCandidatePreflight,
+  runCandidateNetworkCheck,
   verifySpeaker,
 } from "./preflight.js";
 
@@ -64,11 +66,18 @@ const EMPTY_EXPERIENCE = {
 
 export default function CandidateFeaturePage() {
   const { route, data, fatalError } = useWorkbench();
-  if (route.view === "invite") return <InvitationPage key={route.invitationToken} />;
+  if (route.view === "invite") {
+    if (fatalError || !route.invitationToken || data.invitation?.token !== route.invitationToken) {
+      return <PublicShell><div className="candidate-loading" role={fatalError ? "alert" : "status"}>
+        {fatalError ? "暂时无法读取本次邀请，请重新打开邀请链接；若仍不可用，请联系面试安排人。" : "正在读取本次邀请…"}
+      </div></PublicShell>;
+    }
+    return <InvitationPage key={route.invitationToken} />;
+  }
   const binding = data.candidateSession;
   if (!binding || binding.interview?.id !== route.selectedInterviewId || binding.token !== route.candidateToken) {
     return <div className="candidate-room"><PublicHeader /><div className="candidate-loading" role={fatalError ? "alert" : "status"}>
-      {fatalError ? candidateEntryMessage() : "正在进入面试…"}
+      {fatalError ? "暂时无法进入面试，请重新打开邀请链接；若仍不可用，请联系面试安排人。" : "正在进入面试…"}
     </div></div>;
   }
   return <CandidateRoom key={`${binding.interview.id}:${binding.token}`} interview={binding.interview} token={binding.token} />;
@@ -81,24 +90,47 @@ function InvitationPage() {
   const [entering, setEntering] = useState(false);
   const enteringRef = useRef(false);
   const [entryStage, setEntryStage] = useState(null);
+  const [entryFailure, setEntryFailure] = useState(null);
   const [confirmed, setConfirmed] = useState(invitation?.status === "registered");
   const [now, setNow] = useState(Date.now());
   const [preflight, setPreflight] = useState(null);
   const [speakerPlayed, setSpeakerPlayed] = useState(false);
+  const speakerPlayedRef = useRef(false);
+  const [networkState, setNetworkState] = useState({ status: "idle" });
+  const networkBusyRef = useRef(false);
+  const activeRef = useRef(true);
+  const operationRef = useRef(0);
+  const probeControllerRef = useRef(null);
   const previewRef = useRef(null);
+  const mediaHandedOff = useRef(false);
+  const entryFailureRef = useRef(null);
 
+  useEffect(() => {
+    activeRef.current = true;
+    return () => {
+      activeRef.current = false;
+      operationRef.current += 1;
+      probeControllerRef.current?.abort();
+      if (!mediaHandedOff.current) discardPreparedCandidateMedia();
+    };
+  }, []);
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 30_000);
     return () => window.clearInterval(timer);
   }, []);
   useEffect(() => {
-    if (invitation?.status === "registered") setConfirmed(true);
+    setConfirmed(invitation?.status === "registered");
   }, [invitation?.status]);
   useEffect(() => {
     if (previewRef.current && preflight?.stream) {
       previewRef.current.srcObject = preflight.stream;
     }
   }, [preflight]);
+  useEffect(() => {
+    if (!entryFailure) return;
+    entryFailureRef.current?.focus({ preventScroll: true });
+    entryFailureRef.current?.scrollIntoView?.({ block: "center" });
+  }, [entryFailure]);
 
   if (!invitation) {
     return <PublicShell><Empty title="邀请链接不可用" copy="链接可能已过期、已使用或被撤销" /></PublicShell>;
@@ -112,13 +144,25 @@ function InvitationPage() {
     invitation.consent?.required_scopes
     || (invitation.consent?.recording_required ? ["audio_recording"] : []),
   );
+  const isCurrentOperation = (operation) => activeRef.current && operationRef.current === operation;
+  const networkReady = networkState.status === "checked" && networkReportReady(preflight?.report);
+  const networkChecking = networkState.status === "checking";
+  const browserReady = preflight?.report.browser_supported && preflight?.report.webrtc_supported
+    && preflight?.report.audio_worklet_supported && preflight?.report.media_recorder_supported
+    && preflight?.report.audio_content_type?.startsWith("audio/")
+    && (!requiredScopes.has("video_recording") || preflight?.report.video_content_type?.startsWith("video/"));
+  const displayReady = preflight?.report.webgl_supported && preflight?.report.avatar_fps >= 30;
+  const devicesReady = browserReady && displayReady && preflight?.report.microphone_granted && preflight?.report.camera_granted;
 
   const confirm = async (event) => {
     event.preventDefault();
+    if (enteringRef.current) return;
+    enteringRef.current = true;
+    const operation = ++operationRef.current;
     setBusy(true);
     try {
       const form = new FormData(event.currentTarget);
-      await request(`${API}/public/interview-invitations/${encodeURIComponent(token)}/intake`, {
+      const receipt = await request(`${API}/public/interview-invitations/${encodeURIComponent(token)}/intake`, {
         method: "POST",
         body: {
           name: form.get("name"),
@@ -132,44 +176,105 @@ function InvitationPage() {
           },
         },
       });
+      if (!isCurrentOperation(operation)) return;
+      if (!invitation.appointment_id || receipt?.appointment_id !== invitation.appointment_id
+        || receipt.matched !== true || receipt.status !== "registered") {
+        throw new Error("Invalid registration receipt");
+      }
       setConfirmed(true);
+      setEntryFailure(null);
       toast("预约确认成功", "系统正在准备本次面试语音，并已安排面试前 30 分钟邮件提醒");
     } catch (error) {
+      if (!isCurrentOperation(operation)) return;
       toast("暂时无法确认预约", "请检查填写的信息，稍后再试。", "error");
     } finally {
-      setBusy(false);
+      if (isCurrentOperation(operation)) {
+        setBusy(false);
+        enteringRef.current = false;
+      }
     }
   };
 
   const beginPreflight = async () => {
-    if (enteringRef.current) return;
+    if (enteringRef.current || networkBusyRef.current) return;
     enteringRef.current = true;
+    const operation = ++operationRef.current;
+    const controller = new AbortController();
+    probeControllerRef.current = controller;
     setEntering(true);
+    setEntryFailure(null);
+    discardPreparedCandidateMedia();
+    setPreflight(null);
+    speakerPlayedRef.current = false;
+    setSpeakerPlayed(false);
+    setNetworkState({ status: "idle" });
     try {
-      const result = await runCandidatePreflight({ probeUrl: "/healthz" });
+      const result = await runCandidatePreflight({ probeUrl: "/healthz", signal: controller.signal });
+      if (!isCurrentOperation(operation)) return;
       setPreflight(result);
+      setNetworkState({ status: "checked" });
     } catch (error) {
-      toast("请检查设备", candidateEntryMessage(error), "error");
+      if (!isCurrentOperation(operation)) return;
+      const networkMessage = networkCheckErrorMessage(error?.code);
+      toast(networkMessage ? "网络检测未通过" : "请检查设备", networkMessage || candidateEntryMessage(error), "error");
     } finally {
-      enteringRef.current = false;
-      setEntering(false);
+      if (isCurrentOperation(operation)) {
+        enteringRef.current = false;
+        setEntering(false);
+      }
+    }
+  };
+
+  const recheckNetwork = async () => {
+    if (!preflight?.stream || enteringRef.current || networkBusyRef.current) return;
+    networkBusyRef.current = true;
+    const operation = ++operationRef.current;
+    const controller = new AbortController();
+    probeControllerRef.current = controller;
+    const invalidReport = { ...preflight.report, network_rtt_ms: null, network_jitter_ms: null };
+    setPreflight({ ...preflight, report: invalidReport });
+    prepareCandidateMedia(preflight.stream, invalidReport);
+    setNetworkState({ status: "checking" });
+    try {
+      const network = await runCandidateNetworkCheck({ probeUrl: "/healthz", signal: controller.signal });
+      if (!isCurrentOperation(operation)) return;
+      const report = {
+        ...invalidReport,
+        network_rtt_ms: network.rttMs,
+        network_jitter_ms: network.jitterMs,
+        speaker_verified: speakerPlayedRef.current,
+      };
+      prepareCandidateMedia(preflight.stream, report);
+      setPreflight({ ...preflight, report });
+      setNetworkState({ status: "checked" });
+      if (networkReportReady(report)) setEntryFailure((failure) => failure?.invalidateNetwork ? null : failure);
+    } catch (error) {
+      if (!isCurrentOperation(operation)) return;
+      setNetworkState({ status: "failed", reason: error?.code === "NETWORK_CHECK_TIMEOUT" ? "timeout" : "unavailable" });
+    } finally {
+      if (isCurrentOperation(operation)) networkBusyRef.current = false;
     }
   };
 
   const playSpeakerTest = async () => {
     try {
       await verifySpeaker();
+      if (!activeRef.current) return;
+      speakerPlayedRef.current = true;
       setSpeakerPlayed(true);
     } catch (error) {
+      if (!activeRef.current) return;
       toast("扬声器检测失败", candidateEntryMessage(error), "error");
     }
   };
 
   const finishPreflightAndEnter = async () => {
-    if (!preflight?.stream || !speakerPlayed || enteringRef.current) return;
+    if (!confirmed || !preflight?.stream || !speakerPlayed || !networkReady || !devicesReady || enteringRef.current || networkBusyRef.current) return;
     enteringRef.current = true;
+    const operation = ++operationRef.current;
     setEntering(true);
     setEntryStage("model_services");
+    setEntryFailure(null);
     try {
       const report = { ...preflight.report, speaker_verified: true };
       prepareCandidateMedia(preflight.stream, report);
@@ -178,17 +283,37 @@ function InvitationPage() {
         `${API}/public/interview-invitations/${encodeURIComponent(token)}/readiness`,
         { method: "POST", body: report, timeoutMs: 40000 },
       );
-      if (!readiness.can_start) {
-        throw new Error("摄像头、扬声器、网络、WebRTC、AudioWorklet、WebGL 或模型服务尚未达到正式面试门槛");
+      if (!isCurrentOperation(operation)) return;
+      if (readiness?.can_start !== true) {
+        throw Object.assign(new Error("Admission blocked"), { code: readiness?.entry_blocker?.code });
       }
       setEntryStage("starting");
       const result = await request(
         `${API}/public/interview-invitations/${encodeURIComponent(token)}/start`,
         { method: "POST", timeoutMs: 40000 },
       );
+      if (!isCurrentOperation(operation)) return;
+      mediaHandedOff.current = true;
       location.href = result.candidate_join_url;
     } catch (error) {
-      toast("暂时无法进入面试", candidateEntryMessage(error), "error");
+      if (!isCurrentOperation(operation)) return;
+      const failure = candidateEntryFailure(error);
+      setEntryFailure(failure);
+      if (failure.registrationRequired) {
+        setConfirmed(false);
+        discardPreparedCandidateMedia();
+        setPreflight(null);
+        speakerPlayedRef.current = false;
+        setSpeakerPlayed(false);
+        setNetworkState({ status: "idle" });
+      }
+      if (failure.invalidateNetwork) {
+        const invalidReport = { ...preflight.report, network_rtt_ms: null, network_jitter_ms: null };
+        setPreflight({ ...preflight, report: invalidReport });
+        prepareCandidateMedia(preflight.stream, invalidReport);
+        rememberPreflightReport(invalidReport);
+        setNetworkState({ status: "failed", reason: error.code === "REQUEST_TIMEOUT" ? "entry_timeout" : "unavailable" });
+      }
       enteringRef.current = false;
       setEntering(false);
       setEntryStage(null);
@@ -203,6 +328,11 @@ function InvitationPage() {
         <span>预约时间</span>
         <strong>{formatAppointmentTime(startAt)} — {formatAppointmentTime(endAt)}</strong>
       </div>
+      {entryFailure && <div className="candidate-entry-failure" role="alert" tabIndex={-1} ref={entryFailureRef}>
+        <strong>{entryFailure.title}</strong>
+        <p>{entryFailure.detail}</p>
+        {entryFailure.recheckDevices && <button className="button button-secondary" type="button" disabled={entering || networkChecking} onClick={beginPreflight}>重新检查设备</button>}
+      </div>}
       {confirmed ? <div className="appointment-confirmed">
         <Status value="预约已确认" />
         <h2>身份核验通过</h2>
@@ -222,14 +352,17 @@ function InvitationPage() {
           <div className="candidate-preflight-checks">
             <h3>设备检查</h3>
             <DeviceCheck label="麦克风与摄像头" ready={preflight.report.microphone_granted && preflight.report.camera_granted} />
-            <DeviceCheck label="浏览器支持" ready={preflight.report.webrtc_supported && preflight.report.audio_worklet_supported} />
-            <DeviceCheck label="画面显示" ready={preflight.report.webgl_supported && Math.round(preflight.report.avatar_fps) >= 30} />
-            <DeviceCheck label="网络连接" ready={preflight.report.network_rtt_ms <= 500 && preflight.report.network_jitter_ms <= 100} />
+            <DeviceCheck label="浏览器支持" ready={browserReady} />
+            <DeviceCheck label="画面显示" ready={displayReady} />
+            <DeviceCheck label="服务连接" ready={networkReady} detail={networkCheckDetail(preflight.report, networkState)} />
+            <button className="button button-secondary" type="button" disabled={entering || networkChecking} onClick={recheckNetwork}>
+              {networkChecking ? "正在检测网络…" : "重新检测网络"}
+            </button>
             <p className="form-hint">请播放测试音，确认能听清后进入面试。</p>
-            <button className="button button-secondary" type="button" onClick={playSpeakerTest}>
+            <button className="button button-secondary" type="button" disabled={entering || networkChecking} onClick={playSpeakerTest}>
               {speakerPlayed ? "重新播放测试音" : "播放扬声器测试音"}
             </button>
-            <button className="button button-primary" type="button" disabled={!speakerPlayed || entering} onClick={finishPreflightAndEnter}>
+            <button className="button button-primary" type="button" disabled={!speakerPlayed || !networkReady || !devicesReady || entering || networkChecking} onClick={finishPreflightAndEnter}>
               {entering ? entryStage === "model_services" ? "正在准备面试…" : "正在进入面试…" : "我听到了测试音，进入面试"}
             </button>
             {entering && <p className="form-hint" role="status">{entryStage === "model_services"
@@ -415,8 +548,10 @@ function CandidateRoom({ interview, token }) {
   const completion = experience.completion;
   const calibration = experience.calibration || EMPTY_EXPERIENCE.calibration;
   const currentQuestion = experience.currentQuestion;
-  const totalQuestions = Number(session.total_primary_questions || interview?.turns?.filter((item) => !item.is_followup).length || 0);
-  const answered = Number(session.completed_answers || interview?.answers?.length || 0);
+  const adaptive = session.execution_schema_version === 3;
+  const planning = experience.phase === "planning";
+  const totalQuestions = adaptive ? null : Number(session.total_primary_questions ?? interview?.turns?.filter((item) => !item.is_followup).length ?? 0);
+  const answered = Number(session.completed_answers ?? interview?.answers?.length ?? 0);
   const pauseConfirmed = problem?.pauseConfirmed === true || session.status === "paused";
   const notice = candidateNotice(problem, pauseConfirmed);
   const visibleExperience = problem?.recoverable === false ? {
@@ -490,19 +625,18 @@ function CandidateRoom({ interview, token }) {
       <section className="candidate-question-band">
         {notice && <div className={notice.urgent ? "candidate-problem is-fatal" : "candidate-waiting-row"} role={notice.urgent ? "alert" : "status"}>
           <span><strong>{notice.title}</strong><small>{notice.detail}</small></span>
-          {notice.retry && <button className="button button-secondary" type="button" onClick={() => act("continue_speaking")}>重试</button>}
+          {notice.retry && <button className="button button-secondary" type="button" disabled={experience.planningRetryPending}
+            onClick={() => act(notice.action || "continue_speaking")}>{experience.planningRetryPending ? "正在重试…" : "重试"}</button>}
         </div>}
 
         <SpeechPlaybackState playback={problem?.recoverable === false ? null : experience.speechPlayback} act={act} />
         {!experience.session ? <CandidateSessionGate problem={problem} /> : calibration.status !== "completed" ? <WarmupPanel calibration={calibration} experience={visibleExperience} act={act} /> : <>
           <div className="candidate-question-head">
             <div>
-              <p className="eyebrow">{currentQuestion?.is_followup ? "基于你刚才回答的追问" : `正式问题 ${currentQuestion?.order || answered + 1}`}</p>
-              <h1>{currentQuestion?.question_text || "面试官正在组织下一句话…"}</h1>
+              <p className="eyebrow">{planning ? "稍作停顿" : currentQuestion?.is_followup ? "基于你刚才回答的追问" : adaptive ? `交流话题 ${currentQuestion?.order || answered + 1}` : `正式问题 ${currentQuestion?.order || answered + 1}`}</p>
+              <h1>{planning ? "面试官正在准备下一话题…" : currentQuestion?.question_text || "面试官正在组织下一句话…"}</h1>
             </div>
-            <div className="candidate-progress" aria-label={`已完成 ${answered}，共 ${totalQuestions} 个主问题`}>
-              {answered}/{totalQuestions || "—"}
-            </div>
+            <CandidateProgress answered={answered} totalQuestions={totalQuestions} adaptive={adaptive} />
           </div>
           <ConversationState phase={visibleExperience.phase} endpoint={experience.endpoint} formal
             speechDetected={experience.microphone.localDetected || experience.captions.forming} />
@@ -518,7 +652,7 @@ function CandidateRoom({ interview, token }) {
               <button className="button button-secondary" type="button" onClick={() => act("finish_answer")} disabled={!experience.evidence?.ready || !["listening", "answer_preparing", "awaiting_supplement"].includes(visibleExperience.phase)}>
                 提前结束回答
               </button>
-              <button className="button button-secondary" type="button" onClick={() => act("request_repeat")} disabled={visibleExperience.phase === "understanding" || visibleExperience.phase === "paused" || Boolean(experience.captureRecovery)}>
+              <button className="button button-secondary" type="button" onClick={() => act("request_repeat")} disabled={planning || visibleExperience.phase === "understanding" || visibleExperience.phase === "paused" || Boolean(experience.captureRecovery)}>
                 请再说一遍
               </button>
               <button className="button button-secondary" type="button" onClick={() => act("continue_speaking")} disabled={problem?.recoverable === false || (!experience.endpoint.active && !["answer_preparing", "awaiting_supplement"].includes(experience.phase)) || !experience.evidence?.ready}>
@@ -592,12 +726,19 @@ export function SpeechPlaybackState({ playback, act }) {
   </div>;
 }
 
+export function CandidateProgress({ answered, totalQuestions, adaptive = false }) {
+  return <div className={`candidate-progress${adaptive ? " is-adaptive" : ""}`}
+    aria-label={adaptive ? `已完成 ${answered} 个话题` : `已完成 ${answered}，共 ${totalQuestions} 个主问题`}>
+    {adaptive ? `已完成 ${answered} 个话题` : `${answered}/${totalQuestions || "—"}`}
+  </div>;
+}
+
 export function ConversationState({ phase, endpoint, formal = false, speechDetected }) {
   return <div className="candidate-waiting-row" role="status" aria-live="polite">
     <span>
       <strong>{phase === "listening" && speechDetected === false ? "正在聆听，等待你开口" : phaseText(phase)}</strong>
       <small>{["listening", "preparing"].includes(phase) && endpoint.active ? endpoint.deadlineAt == null
-        ? "停顿5秒后，面试官会询问是否补充。直接口头回答即可，无需提交。"
+        ? "自然表达即可。需要思考、想换个话题或已经讲完，都可以直接告诉面试官。"
         : "说完后稍等片刻，就能查看试音字幕。"
         : phaseDetail(phase, formal)}</small>
     </span>
@@ -623,10 +764,17 @@ export function AnswerRecoveryAction({ recovery, act, disabled = false }) {
 }
 
 export function CandidateSignalList({ experience, blocked = false }) {
-  const stopped = blocked || ["paused", "completed", "answer_retry_required", "understanding"].includes(experience.phase);
+  const stopped = blocked || ["paused", "completed", "answer_retry_required", "understanding", "planning"].includes(experience.phase);
   const recovering = experience.captureRecovery?.status === "recovering" && !stopped;
   const local = !stopped && experience.microphone.localDetected;
-  const stoppedDetail = experience.phase === "answer_retry_required" ? "本题收音已停止，请重试本题" : "暂未收音";
+  const stoppedDetail = blocked ? "收音已停止，请查看页面提示"
+    : experience.phase === "paused" ? "面试已暂停"
+    : experience.phase === "completed" ? "面试已结束"
+    : experience.phase === "answer_retry_required" ? "本题收音已停止，请重试本题"
+    : experience.calibration?.status === "awaiting_confirmation" ? "试音已收好，请确认下方字幕"
+    : experience.calibration?.status === "confirming" ? "正在进入正式面试"
+    : experience.phase === "planning" ? "面试官正在准备下一话题"
+    : "这段回答已收好，面试官正在整理";
   return <div className="candidate-signal-list">
     <SignalState label={recovering ? "连接有些慢，正在恢复" : "麦克风"} active={local && !recovering}
       detail={stopped ? stoppedDetail : recovering ? "请稍等，已收到的回答会保留" : local ? "正在收到你的声音" : "等待你开口"}>
@@ -640,6 +788,35 @@ function SignalState({ label, active, detail, children }) {
     <span className="signal-state-dot" />
     <span><strong>{label}</strong><small>{detail}</small>{children}</span>
   </div>;
+}
+
+function networkReportReady(report) {
+  return Number.isFinite(report?.network_rtt_ms) && report.network_rtt_ms >= 0 && report.network_rtt_ms <= 500
+    && Number.isFinite(report?.network_jitter_ms) && report.network_jitter_ms >= 0 && report.network_jitter_ms <= 100;
+}
+
+function networkCheckErrorMessage(code) {
+  if (code === "NETWORK_CHECK_TIMEOUT") return "连接检测超时，请确认面试服务可访问后重新检测。";
+  if (code === "NETWORK_CHECK_FAILED") return "未能连接面试服务，请检查连接后重新检测。";
+  if (code === "NETWORK_CHECK_UNAVAILABLE") return "当前无法执行网络检测，请重新打开页面后再试。";
+  return null;
+}
+
+function networkCheckDetail(report, state) {
+  if (state.status === "checking") return "正在检测本机到面试服务的连接，请稍候。";
+  if (state.status === "failed" && state.reason === "entry_timeout") return "入场请求超时，之前的检测结果已失效，请重新检测。";
+  if (state.status === "failed") return state.reason === "timeout"
+    ? "连接检测超时，请确认面试服务可访问后重新检测。"
+    : "未能连接面试服务，请检查连接后重新检测。";
+  if (!Number.isFinite(report?.network_rtt_ms) || !Number.isFinite(report?.network_jitter_ms)) {
+    return "尚未取得有效检测结果，请重新检测。";
+  }
+  const metrics = `响应 ${report.network_rtt_ms} ms · 波动 ${report.network_jitter_ms} ms`;
+  if (networkReportReady(report)) return `${metrics}。页面服务连接检测通过，入场条件将在下一步核验。`;
+  const reasons = [];
+  if (report.network_rtt_ms > 500) reasons.push("服务响应较慢（需 ≤ 500 ms）");
+  if (report.network_jitter_ms > 100) reasons.push("响应波动较大（需 ≤ 100 ms）");
+  return `${metrics}。${reasons.join("；") || "检测结果无效"}，请重新检测。`;
 }
 
 function DeviceCheck({ label, ready, detail }) {
@@ -674,6 +851,7 @@ function phaseText(phase) {
     answer_recovering: "连接有些慢，正在恢复",
     answer_retry_required: "这段回答需要重试",
     understanding: "正在整理你的回答",
+    planning: "正在准备下一话题",
     responding: "面试官正在回应，可随时开口打断",
     paused: "面试已暂停",
     completed: "面试已完成",
@@ -684,12 +862,13 @@ function phaseDetail(phase, formal) {
   return ({
     connecting: "请稍等片刻。",
     preparing: "准备好后就可以开口了。",
-    listening: formal ? "停顿5秒后会询问是否补充。自然表达即可，系统会理解你想继续还是结束。" : "正在识别试音，停止说话后将自动形成试音字幕。",
+    listening: formal ? "自然表达即可。需要思考、想换个话题或已经讲完，都可以直接告诉面试官。" : "正在识别试音，停止说话后将自动形成试音字幕。",
     awaiting_supplement: "还有想说的可以直接补充，已经讲完也请告诉我；没听清可以让我再问一遍。",
     answer_preparing: "不需要重复确认。若想补充，仍可直接开口，面试官会重新整理后再回应。",
     answer_recovering: "请稍等，已收到的回答会保留。",
     answer_retry_required: "点击“重试本题”后，再回答一次。",
     understanding: "这段回答已收好，请等面试官回应后再说。",
+    planning: "这段回答已保留，请稍等面试官继续。",
     responding: "如果想补充，可以直接开口。",
     paused: "请联系面试安排人协助恢复。",
   }[phase] || "请稍等片刻。");

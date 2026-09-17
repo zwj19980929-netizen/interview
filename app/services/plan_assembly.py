@@ -1,11 +1,21 @@
 from dataclasses import dataclass, field, replace
 from copy import deepcopy
-from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple
+import asyncio
+import logging
+from typing import Any, Callable, Dict, FrozenSet, List, Optional, Sequence, Tuple
 
 from app.core.errors import ApiError
 from app.core.ids import new_id
 from app.core.time import utc_now
+from app.core.prompt.inquiry_units import VERSION as INQUIRY_PROMPT_VERSION, InquiryUnitValidationError, inquiry_units_contract, validate_inquiry_units
+from app.model_gateway import capabilities as cap
+from app.model_gateway.errors import ProviderError
+from app.model_gateway.schemas import ChatJSONRequest, InvocationExecutionBudget
 from app.domain.candidate_screening import effective_screening_outcome
+from app.domain.adaptive_interview import (
+    AdaptiveInterviewPolicy, freeze_assessment_contract, frozen_candidate,
+    validate_assessment_contract,
+)
 from app.domain.question_selection import QuestionSelection, QuestionSelectionRequest
 from app.domain.speech_profile import freeze_interview_speech_profile, speech_profile_fingerprint
 from app.persistence.errors import ConcurrencyConflict
@@ -14,9 +24,13 @@ from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
 from app.services.catalog import CatalogService
 from app.services.text import normalize_skill, tokenize
+from app.services.interview_skills import InterviewSkillService
 
 
 DIFFICULTY_RANK = {"junior": 1, "mid": 2, "senior": 3, "expert": 4}
+logger = logging.getLogger(__name__)
+INQUIRY_BATCH_POINT_LIMIT = 6
+INQUIRY_TOTAL_TIMEOUT_SECONDS = 180
 
 
 @dataclass(frozen=True)
@@ -30,7 +44,7 @@ class PlanAssemblyPolicy:
 
 @dataclass(frozen=True)
 class PlanAssemblyRequest:
-    role_requirement_id: str
+    role_requirement_id: Optional[str]
     knowledge_base_ids: Tuple[str, ...] = ()
     question_count: int = 8
     policy: PlanAssemblyPolicy = field(default_factory=PlanAssemblyPolicy)
@@ -38,6 +52,14 @@ class PlanAssemblyRequest:
     candidate_profile_id: Optional[str] = None
     resume_review_id: Optional[str] = None
     approve: bool = False
+    execution_schema_version: int = 2
+    adaptive_policy: Optional[Dict[str, Any]] = None
+    enterprise_skill_id: Optional[str] = None
+    skill_id: Optional[str] = None
+    company_context: Optional[str] = None
+    use_customization_defaults: bool = True
+    preparation_mode: Optional[str] = None
+    duration_minutes: int = 45
 
 
 @dataclass(frozen=True)
@@ -72,15 +94,50 @@ class InterviewPlanAssembly:
     ) -> None:
         self.persistence = persistence or persistence_for(store)
         self.catalog = catalog or CatalogService(store, persistence=self.persistence)
+        self.skills = InterviewSkillService(store, persistence=self.persistence)
+
+    async def prepare(self, *, job_position_id: str, candidate_profile_id: str,
+                      knowledge_base_ids: Sequence[str], duration_minutes: int = 45,
+                      organization_id: str = "org_default",
+                      on_progress: Optional[Callable[[Dict[str, Any]], None]] = None) -> Dict[str, Any]:
+        """Prepare one usable interview from existing materials, without a role draft."""
+        if (not job_position_id or not candidate_profile_id or not knowledge_base_ids
+                or len(knowledge_base_ids) > 10 or len(set(knowledge_base_ids)) != len(knowledge_base_ids)
+                or any(not isinstance(item, str) or not item.strip() for item in knowledge_base_ids)
+                or type(duration_minutes) is not int or not 5 <= duration_minutes <= 120):
+            raise ApiError("INTERVIEW_PREPARATION_INVALID", "请选择岗位、候选人与题库，面试时长为5至120分钟。", status_code=422)
+        return await self.assemble(PlanAssemblyRequest(
+            role_requirement_id=None, job_position_id=job_position_id, candidate_profile_id=candidate_profile_id,
+            knowledge_base_ids=tuple(knowledge_base_ids), duration_minutes=duration_minutes,
+            question_count=min(12, max(1, duration_minutes // 5)), approve=True,
+            execution_schema_version=3, preparation_mode="question_bank",
+            adaptive_policy={"min_root_questions": 1, "min_evidence_units_per_competency": 1},
+        ), organization_id, on_progress=on_progress)
 
     async def assemble(
         self,
         request: PlanAssemblyRequest,
         organization_id: str = "org_default",
+        *, on_progress: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         self._validate_request(request)
+        self._notify_progress(on_progress, {"stage": "reading"})
+        bank_preparation = request.preparation_mode == "question_bank"
+        basis = None
         with self.persistence.transaction(organization_id) as transaction:
-            role = transaction.role_requirements.get(request.role_requirement_id)
+            if bank_preparation:
+                position = transaction.job_positions.get(request.job_position_id)
+                if position is None or position.get("status") in {"archived", "deleting"}:
+                    raise ApiError("JOB_POSITION_NOT_FOUND", "请选择有效的招聘岗位。", status_code=404)
+                basis = {"kind": "question_bank", "job_position_id": position["id"],
+                         "position_version": position["version"], "position_name": position["name"],
+                         "position_description": position.get("description", ""),
+                         "knowledge_base_ids": list(request.knowledge_base_ids)}
+                # An assembly context, not a persisted or invented RoleRequirement.
+                role = {"id": None, "version": None, "job_position_id": position["id"],
+                        "interview_duration_minutes": request.duration_minutes}
+            else:
+                role = transaction.role_requirements.get(request.role_requirement_id)
         if role is None:
             raise ApiError(
                 "ROLE_REQUIREMENT_NOT_FOUND",
@@ -89,6 +146,23 @@ class InterviewPlanAssembly:
             )
         request = self._resolve_resume_review(request, organization_id)
         self._validate_target_scope(request, role, organization_id)
+        default_skill_snapshot = None
+        customization_version = None
+        if request.use_customization_defaults:
+            from app.services.interview_customization import InterviewCustomizationService
+
+            supplied_skill = request.skill_id or request.enterprise_skill_id
+            supplied_company = isinstance(request.company_context, str) and request.company_context.strip()
+            if not supplied_skill or not supplied_company:
+                defaults = InterviewCustomizationService(None, persistence=self.persistence).resolve_defaults(
+                    organization_id, include_skill=not supplied_skill, include_company=not supplied_company,
+                )
+                customization_version = defaults["customization_version"]
+                if not supplied_skill:
+                    request = replace(request, skill_id=defaults["skill_id"])
+                    default_skill_snapshot = defaults["skill_snapshot"]
+                if not supplied_company and (request.company_context is None or isinstance(request.company_context, str)):
+                    request = replace(request, company_context=defaults["company_context"])
         interview_duration = int(role.get("interview_duration_minutes", 45))
         if request.question_count > interview_duration:
             raise ApiError(
@@ -108,8 +182,15 @@ class InterviewPlanAssembly:
         if not candidates:
             raise ApiError(
                 "NO_QUESTIONS_MATCHED",
-                "No indexed questions matched this role requirement and plan policy.",
+                "所选题库没有可用问题，请先完成题目入库与语音准备。",
             )
+
+        if bank_preparation:
+            skills = self._unique_skills([skill for candidate in candidates for skill in candidate.skills]) or ["general"]
+            role["parsed_profile"] = {"skill_weights": {skill: 1.0 for skill in skills}}
+            dimensions, targets, dimension_weights = self._coverage_targets(role, request)
+            candidates = [replace(item, dimension=self._candidate_dimension(item.skills, dimensions, dimension_weights))
+                          for item in candidates]
 
         selections, warnings = self._select(
             candidates,
@@ -149,7 +230,7 @@ class InterviewPlanAssembly:
         )
         summary["experience_question_count"] = len(experience_question_snapshots)
         summary["experience_question_target"] = 3
-        if len(experience_question_snapshots) < 2:
+        if len(experience_question_snapshots) < 2 and not bank_preparation:
             summary.setdefault("warnings", []).append(
                 "简历题不足2道：请确认该候选人在此岗位的合格简历审核中已有批准的问题。"
             )
@@ -178,14 +259,64 @@ class InterviewPlanAssembly:
             "bank_slots": bank_slots,
             "experience_question_ids": [item["id"] for item in experience_question_snapshots],
             "experience_question_snapshots": experience_question_snapshots,
-            "execution_schema_version": 2,
+            "execution_schema_version": request.execution_schema_version,
             "created_at": now,
             "updated_at": now,
         }
+        if bank_preparation:
+            plan.update(preparation_mode="question_bank", assessment_basis=basis)
+            # Selection relaxations are internal decisions, not missing user inputs.
+            summary["selection_notes"] = summary.pop("warnings", [])
+            summary["warnings"] = []
+        if request.skill_id and request.enterprise_skill_id and request.skill_id != request.enterprise_skill_id:
+            raise ApiError("INTERVIEW_SKILL_REFERENCE_CONFLICT", "Only one optional Skill can be selected.", status_code=422)
+        selected_skill_id = request.skill_id or request.enterprise_skill_id
+        if selected_skill_id:
+            # Existing snapshots retain their storage identity for compatibility.
+            plan["enterprise_skill_id"] = selected_skill_id
+            if default_skill_snapshot:
+                plan["enterprise_skill_snapshot"] = deepcopy(default_skill_snapshot)
+        if customization_version is not None:
+            plan["customization_version"] = customization_version
+        if request.company_context is not None:
+            if not isinstance(request.company_context, str) or len(request.company_context) > 12000:
+                raise ApiError("COMPANY_CONTEXT_INVALID", "Optional company context must be text within 12000 characters.", status_code=422)
+            if request.company_context.strip():
+                plan["company_context"] = request.company_context.strip()
+        if request.execution_schema_version == 3:
+            plan["adaptive_policy"] = AdaptiveInterviewPolicy.model_validate(request.adaptive_policy or {}).model_dump()
+            self._bound_adaptive_pool(plan, request.question_count)
+            source_plan = deepcopy(plan)
+            # Before units exist, the original-question count cannot be used
+            # to reject a valid unit budget. Final freezing below validates it.
+            source_plan["adaptive_policy"] = {}
+            with self.persistence.transaction(organization_id) as transaction:
+                self._freeze_adaptive_contract(transaction, source_plan, role, dimension_weights, request.question_count)
+            reusable = self._reusable_inquiry_units(source_plan, organization_id) if bank_preparation else {}
+            plan["inquiry_unit_snapshots"] = await self._prepare_inquiry_units(
+                source_plan["assessment_contract"]["candidate_questions"], organization_id,
+                reusable=reusable, on_progress=on_progress)
+        self._notify_progress(on_progress, {"stage": "saving"})
+        # Give request cancellation a checkpoint before the atomic save, even
+        # when every question was reused and no model call yielded control.
+        await asyncio.sleep(0)
         with self.persistence.transaction(organization_id) as transaction:
-            current_role = transaction.role_requirements.get(role["id"])
-            if current_role is None or current_role["version"] != role["version"]:
-                raise ConcurrencyConflict("RoleRequirement changed while the plan was assembled.")
+            if bank_preparation:
+                self._validate_preparation_basis(transaction, plan)
+            else:
+                current_role = transaction.role_requirements.get(role["id"])
+                if current_role is None or current_role["version"] != role["version"]:
+                    raise ConcurrencyConflict("RoleRequirement changed while the plan was assembled.")
+            if request.execution_schema_version == 3:
+                self._freeze_adaptive_contract(transaction, plan, role, dimension_weights, request.question_count)
+                contract = plan["assessment_contract"]
+                plan["assembly_summary"]["inquiry_unit_count"] = sum(len(item["inquiry_units"]) for item in contract["candidate_questions"])
+                plan["assembly_summary"]["minimum_required_root_questions"] = contract["budget"]["min_root_questions"]
+                if bank_preparation:
+                    summary["coverage_dimensions"] = [item["id"] for item in contract["competencies"]]
+                    summary["uncovered_dimensions"] = []
+                plan["assembly_summary"]["warnings"] = [warning for warning in plan["assembly_summary"].get("warnings", [])
+                    if not (warning.startswith("请求 ") and "候选池只有" in warning)]
             if request.resume_review_id:
                 review = transaction.resume_reviews.get(request.resume_review_id)
                 if not review or effective_screening_outcome(review) != "qualified":
@@ -194,11 +325,34 @@ class InterviewPlanAssembly:
                     current = transaction.experience_questions.get(snapshot["id"])
                     if not current or current["version"] != snapshot["version"] or current.get("status") != "approved":
                         raise ConcurrencyConflict("Experience question changed while the plan was assembled.")
+            # Freeze the exact approved Skill on the reviewable draft. Approval
+            # revalidates this revision instead of silently selecting a newer one.
+            self._freeze_enterprise_skill(transaction, plan)
             if request.approve:
                 self._validate_canonical_plan(transaction, plan)
                 plan["status"] = "approved"
                 plan["approved_at"] = utc_now()
+                if bank_preparation:
+                    plan["approval_source"] = "automatic_preparation"
             return transaction.interview_plans.add(plan)
+
+    @staticmethod
+    def _validate_preparation_basis(transaction: Any, plan: Dict[str, Any]) -> None:
+        basis = plan["assessment_basis"]
+        position = transaction.job_positions.get(basis["job_position_id"])
+        if (not position or position["version"] != basis["position_version"]
+                or position.get("status") in {"archived", "deleting"}):
+            raise ConcurrencyConflict("岗位资料发生变化，请重新准备面试。")
+        candidate = transaction.candidate_profiles.get(plan["candidate_profile_id"])
+        if (not candidate or candidate.get("status") in {"archived", "deleted", "purged"}
+                or candidate.get("job_position_id") not in {None, position["id"]}):
+            raise ConcurrencyConflict("候选人资料或所属岗位发生变化，请重新准备面试。")
+        for snapshot in plan["knowledge_base_snapshots"]:
+            bank = transaction.knowledge_bases.get(snapshot["knowledge_base_id"])
+            if (not bank or bank["version"] != snapshot["knowledge_base_version"] or bank["status"] != "ready"
+                    or not (bank.get("job_position_id") == position["id"]
+                            or bank["id"] in position.get("knowledge_base_ids", []))):
+                raise ConcurrencyConflict("题库内容或关联发生变化，请重新准备面试。")
 
     def _resolve_resume_review(self, request: PlanAssemblyRequest, organization_id: str) -> PlanAssemblyRequest:
         if request.resume_review_id:
@@ -242,6 +396,11 @@ class InterviewPlanAssembly:
                 raise ApiError("KNOWLEDGE_BASE_NOT_READY", "Every selected knowledge base must be ready.", status_code=409)
             if request.candidate_profile_id and transaction.candidate_profiles.get(request.candidate_profile_id) is None:
                 raise ApiError("CANDIDATE_PROFILE_NOT_FOUND", "Candidate profile does not exist.", status_code=404)
+            if request.preparation_mode == "question_bank":
+                candidate = transaction.candidate_profiles.get(request.candidate_profile_id)
+                if (not candidate or candidate.get("job_position_id") not in {None, request.job_position_id}
+                        or candidate.get("status") in {"archived", "deleted", "purged"}):
+                    raise ApiError("CANDIDATE_POSITION_MISMATCH", "请选择该岗位的有效候选人。", status_code=409)
             if request.resume_review_id:
                 review = transaction.resume_reviews.get(request.resume_review_id)
                 if review is None:
@@ -320,7 +479,7 @@ class InterviewPlanAssembly:
                     "InterviewPlan %s expected version %s, found %s"
                     % (plan_id, expected_version, plan["version"])
                 )
-            self.require_execution_v2(plan)
+            self.require_execution_plan(plan)
 
             editable_fields = {"bank_slots", "experience_question_ids", "selection_policy", "assembly_policy"}
             editing = any(field in payload and payload[field] is not None for field in editable_fields)
@@ -362,6 +521,11 @@ class InterviewPlanAssembly:
                 warnings = summary.setdefault("warnings", [])
                 if warning not in warnings:
                     warnings.append(warning)
+                if plan.get("execution_schema_version") == 3:
+                    contract = plan["assessment_contract"]
+                    self._freeze_adaptive_contract(transaction, plan, transaction.role_requirements.get(plan["role_requirement_id"]),
+                        {item["id"]: item["weight"] for item in contract["competencies"]},
+                        contract["budget"]["max_root_questions"])
 
             new_status = payload.get("status")
             if new_status is not None:
@@ -378,12 +542,21 @@ class InterviewPlanAssembly:
                     )
                 if new_status == "approved":
                     self._validate_canonical_plan(transaction, plan)
+                    self._freeze_enterprise_skill(transaction, plan)
                     if not plan.get("approved_at"):
                         plan["approved_at"] = utc_now()
                 plan["status"] = new_status
 
             plan["updated_at"] = utc_now()
             return transaction.interview_plans.update(plan, expected_version=expected_version)
+
+    def _freeze_enterprise_skill(self, transaction: Any, plan: Dict[str, Any]) -> None:
+        if not plan.get("enterprise_skill_id"):
+            return
+        if plan.get("enterprise_skill_snapshot"):
+            self.skills.verify_current_authorization(transaction, plan["enterprise_skill_snapshot"], for_new_plan=True)
+        else:
+            plan["enterprise_skill_snapshot"] = self.skills.freeze_snapshot(transaction, plan["enterprise_skill_id"])
 
     def materialize_execution(
         self,
@@ -558,6 +731,23 @@ class InterviewPlanAssembly:
             blueprint["weight"] = round(value / 10_000, 4)
 
     def _validate_canonical_plan(self, transaction: Any, plan: Dict[str, Any]) -> None:
+        if plan.get("execution_schema_version") == 3:
+            contract = plan.get("assessment_contract") or {}
+            validate_assessment_contract(contract)
+            if plan.get("preparation_mode") == "question_bank":
+                if contract.get("assessment_basis") != plan.get("assessment_basis"):
+                    raise ConcurrencyConflict("The frozen preparation basis changed before approval.")
+                self._validate_preparation_basis(transaction, plan)
+            else:
+                role = transaction.role_requirements.get(contract["role_requirement_id"])
+                if role is None or role["version"] != contract["role_requirement_version"]:
+                    raise ConcurrencyConflict("The frozen role requirement changed before plan approval.")
+            for candidate in contract["candidate_questions"]:
+                if candidate["source_type"] != "position_bank":
+                    continue
+                current = transaction.questions.get(candidate["question_id"])
+                if current is None or current["version"] != candidate["question_version"]:
+                    raise ConcurrencyConflict("A frozen candidate question changed before plan approval.")
         self._validate_speech_profile_snapshot(transaction, plan)
         slots = plan.get("bank_slots", [])
         experiences = plan.get("experience_question_snapshots", [])
@@ -590,10 +780,259 @@ class InterviewPlanAssembly:
                 status_code=409,
             )
 
+    def require_execution_plan(self, plan: Dict[str, Any]) -> None:
+        if plan.get("execution_schema_version") == 3 and "items" not in plan:
+            validate_assessment_contract(plan.get("assessment_contract") or {})
+            return
+        self.require_execution_v2(plan)
+
+    def _freeze_adaptive_contract(self, transaction: Any, plan: Dict[str, Any], role: Dict[str, Any],
+                                  dimension_weights: Dict[str, float], question_count: int) -> None:
+        weights = dict(dimension_weights)
+        experiences = plan.get("experience_question_snapshots", [])
+        if experiences and "resume_experience" not in weights:
+            weights["resume_experience"] = 0.2
+        candidates: Dict[str, Dict[str, Any]] = {}
+        for slot in plan["bank_slots"]:
+            for reference in slot["candidate_pool"]:
+                question = transaction.questions.get(reference["question_id"])
+                if question is None:
+                    raise ApiError("QUESTION_NOT_FOUND", "An approved candidate question does not exist.", status_code=404)
+                self._validate_question_scope(plan, question)
+                if question["version"] != reference["question_version"]:
+                    raise ConcurrencyConflict("An approved candidate question changed during plan assembly.")
+                mapped = [name for name in weights if name in self._unique_skills(question.get("skills", []))]
+                if not mapped and "general" in weights:
+                    mapped = ["general"]
+                if not mapped:
+                    continue
+                candidates[question["id"]] = frozen_candidate(question, competency_ids=mapped,
+                    source_type="position_bank", expected_minutes=slot["expected_minutes"],
+                    allow_followup=slot.get("allow_followup", True))
+        for question in experiences:
+            candidates[question["id"]] = frozen_candidate(question, competency_ids=["resume_experience"],
+                source_type="resume_experience", expected_minutes=question.get("expected_minutes", 3),
+                allow_followup=question.get("allow_followup", True))
+        bank_preparation = plan.get("preparation_mode") == "question_bank"
+        if bank_preparation:
+            supported = {name for candidate in candidates.values() for name in candidate["competency_ids"]}
+            weights = {name: 1.0 for name in weights if name in supported}
+        if "inquiry_unit_snapshots" not in plan and not bank_preparation:
+            self._check_adaptive_source_coverage(plan, role, weights, list(candidates.values()))
+        if "inquiry_unit_snapshots" in plan:
+            for candidate in candidates.values():
+                units = plan["inquiry_unit_snapshots"].get(candidate["question_id"])
+                if not units:
+                    raise ApiError("INQUIRY_UNITS_REQUIRED", "新增题目需要重新生成并审核该自主考察计划。", status_code=409)
+                candidate["inquiry_units"] = deepcopy(units)
+            if bank_preparation:
+                supported = set()
+                for candidate in candidates.values():
+                    mapped = {name for unit in candidate["inquiry_units"] for name in unit["competency_ids"]}
+                    candidate["competency_ids"] = sorted(mapped)
+                    supported.update(mapped)
+                weights = {name: 1.0 for name in weights if name in supported}
+        plan["assessment_contract"] = freeze_assessment_contract(
+            role=role, candidates=list(candidates.values()), dimension_weights=weights,
+            question_count=question_count, duration_minutes=int(plan["estimated_minutes"]),
+            policy=plan.get("adaptive_policy"),
+            assessment_basis=plan.get("assessment_basis"),
+            allow_followups=bool(plan.get("selection_policy", {}).get("allow_followups", True)))
+
+    def _check_adaptive_source_coverage(self, plan: Dict[str, Any], role: Dict[str, Any],
+                                      weights: Dict[str, float], candidates: Sequence[Dict[str, Any]]) -> None:
+        """Explain shortlist gaps before building a contract or generating units.
+
+        This is the actual scoped, ready shortlist, not every question in a
+        knowledge base. Inquiry units can only narrow their source mappings.
+        """
+        required = {name for name, weight in weights.items() if weight > 0}
+        available = {name for candidate in candidates for name in candidate["competency_ids"]}
+        missing = required - available
+        if not missing:
+            return
+        role_required = {normalize_skill(str(name)) for name, weight in
+                         (role.get("parsed_profile", {}).get("skill_weights") or {}).items() if float(weight) > 0}
+        requested = set(self._unique_skills(plan.get("selection_policy", {}).get("coverage", [])))
+        raise ApiError("ASSESSMENT_SOURCE_COVERAGE_MISSING",
+            "当前可用题池尚未覆盖以下能力：%s。请补齐题库中可用题目，或调整对应岗位要求及本次考察重点后重新生成。"
+            % "、".join(sorted(missing)), status_code=422,
+            details={"missing_competency_ids": sorted(missing),
+                     "missing_role_competency_ids": sorted(missing & role_required),
+                     "missing_requested_competency_ids": sorted(missing & requested)})
+
+    @staticmethod
+    def _bound_adaptive_pool(plan: Dict[str, Any], question_count: int) -> None:
+        """Freeze an explicit, reviewable shortlist before paid adaptation."""
+        slots = plan["bank_slots"]
+        limit = min(60, max(12, question_count * 2, len({slot["dimension"] for slot in slots})))
+        chosen = set()
+        # Start with one approved representative per slot/dimension, then fill
+        # in fair rounds so large skill pools do not crowd out smaller ones.
+        for slot in slots:
+            if slot["candidate_pool"]:
+                chosen.add(slot["candidate_pool"][0]["question_id"])
+        maximum = max((len(slot["candidate_pool"]) for slot in slots), default=0)
+        for index in range(maximum):
+            for slot in slots:
+                if len(chosen) >= limit:
+                    break
+                if index < len(slot["candidate_pool"]):
+                    chosen.add(slot["candidate_pool"][index]["question_id"])
+        for slot in slots:
+            slot["candidate_pool"] = [item for item in slot["candidate_pool"] if item["question_id"] in chosen]
+            slot["candidate_pool_count"] = len(slot["candidate_pool"])
+            slot["candidate_pool_hash"] = QuestionSelection().pool_hash(slot["candidate_pool"])
+        plan["assembly_summary"]["adaptive_source_question_count"] = len(chosen)
+
+    @staticmethod
+    def _notify_progress(callback, progress):
+        if callback is not None:
+            try:
+                callback(progress)
+            except Exception:
+                # Observability must not change the assembly outcome.
+                logger.warning("inquiry_progress_observer_failed")
+
+    def _reusable_inquiry_units(self, source_plan: Dict[str, Any], organization_id: str) -> Dict[str, Any]:
+        """Reuse validated immutable sources; never another candidate's evidence."""
+        wanted = {row["question_id"]: row for row in source_plan["assessment_contract"]["candidate_questions"]}
+        result = {}
+        with self.persistence.transaction(organization_id) as transaction:
+            plans = transaction.interview_plans.list()
+        for previous in sorted(plans, key=lambda row: row.get("created_at", ""), reverse=True):
+            if previous.get("status") != "approved" or previous.get("preparation_mode") != "question_bank":
+                continue
+            contract = previous.get("assessment_contract") or {}
+            if contract.get("presentation_policy") != "approved_inquiry_units.v1":
+                continue
+            try:
+                validate_assessment_contract(contract)
+            except (ApiError, ValueError, TypeError, KeyError, AttributeError):
+                continue
+            for cached in contract["candidate_questions"]:
+                current = wanted.get(cached["question_id"])
+                if not current or current["question_id"] in result:
+                    continue
+                if (cached["question_hash"] != current["question_hash"]
+                        or cached["question_version"] != current["question_version"]
+                        or cached["source_type"] != current["source_type"]):
+                    continue
+                if current["source_type"] == "resume_experience":
+                    if any(previous.get(key) != source_plan.get(key) for key in ("candidate_profile_id", "resume_review_id")):
+                        continue
+                    original_scope = ["resume_experience"]
+                else:
+                    # Bank preparation originally offered all source labels to
+                    # the model, then narrowed the final contract to actual units.
+                    original_scope = self._unique_skills(cached["frozen_question"].get("skills", [])) or ["general"]
+                units = cached.get("inquiry_units") or []
+                if (set(original_scope) != set(current["competency_ids"]) or not units
+                        or any(unit.get("prompt_version") != INQUIRY_PROMPT_VERSION for unit in units)
+                        or any(not set(unit["competency_ids"]).issubset(current["competency_ids"]) for unit in units)):
+                    continue
+                result[current["question_id"]] = deepcopy(units)
+            if len(result) == len(wanted):
+                break
+        return result
+
+    async def _prepare_inquiry_units(self, candidates: List[Dict[str, Any]], organization_id: str,
+                                     *, reusable=None, on_progress=None) -> Dict[str, Any]:
+        reusable = reusable or {}
+        sources = []
+        for candidate in candidates:
+            question = candidate["frozen_question"]
+            points = [{"id": point["id"], "text": point["text"]} if isinstance(point, dict)
+                      else {"id": str(point), "text": str(point)} for point in question["key_points"]]
+            if len(points) > 20:
+                raise ApiError("INQUIRY_SOURCE_TOO_COMPLEX", "单道原题最多支持20个关键点，请先在题库拆分并审核。", status_code=422)
+            sources.append({"id": question["id"], "question_text": question["question_text"],
+                            "standard_answer": question["standard_answer"], "key_points": points,
+                            "competency_ids": deepcopy(candidate["competency_ids"])})
+        total_points = sum(len(source["key_points"]) for source in sources)
+        reused_points = sum(len(units) for units in reusable.values())
+        completed_points = reused_points
+
+        def report():
+            self._notify_progress(on_progress, {"stage": "preparing", "completed_points": completed_points,
+                "total_points": total_points, "reused_points": reused_points})
+
+        report()
+        semaphore = asyncio.Semaphore(3)
+        # Cost is determined by the number of generated units, not source count.
+        # One source per call makes the Schema's IDs and exact unit count local
+        # to that source. Retain its full approved answer when splitting points.
+        batches = [[{**source, "key_points": source["key_points"][index:index + INQUIRY_BATCH_POINT_LIMIT]}]
+                   for source in sources if source["id"] not in reusable
+                   for index in range(0, len(source["key_points"]), INQUIRY_BATCH_POINT_LIMIT)]
+
+        async def generate(batch):
+            nonlocal completed_points
+            for attempt in range(2):
+                try:
+                    async with semaphore:
+                        contract = inquiry_units_contract(batch, repair=bool(attempt))
+                        response = await self.catalog.gateway.invoke(cap.LLM_CHAT_JSON, ChatJSONRequest(
+                            organization_id=organization_id, purpose="question_generation", messages=contract.messages,
+                            json_schema=contract.response_schema, max_output_tokens=3500, temperature=0,
+                            execution_budget=InvocationExecutionBudget(timeout_s=60, max_provider_retries=0),
+                            metadata={"prompt_version": contract.version}))
+                        validated = validate_inquiry_units(response.data, batch)
+                        completed_points += sum(len(units) for units in validated.values())
+                        report()
+                        return validated
+                except (InquiryUnitValidationError, ProviderError) as exc:
+                    invalid = isinstance(exc, InquiryUnitValidationError) or exc.code == "provider_schema_invalid"
+                    if attempt or not invalid:
+                        raise
+                    # Repair only this invalid small batch. Successful batches
+                    # remain intact; retries share the same total deadline.
+                    logger.warning("inquiry_preparation_repair points=%d", sum(len(source["key_points"]) for source in batch))
+
+        tasks = [asyncio.create_task(generate(batch)) for batch in batches]
+        try:
+            groups = await asyncio.wait_for(asyncio.gather(*tasks), timeout=INQUIRY_TOTAL_TIMEOUT_SECONDS)
+            merged = {source["id"]: deepcopy(reusable.get(source["id"], [])) for source in sources}
+            for group in groups:
+                for source_id, units in group.items():
+                    merged[source_id].extend(units)
+            for source in sources:
+                points = [unit["assessed_rubric_point_ids"][0] for unit in merged[source["id"]]]
+                if points != [point["id"] for point in source["key_points"]]:
+                    # Batch completion and model row order must not affect scope.
+                    if len(points) != len(set(points)) or set(points) != {point["id"] for point in source["key_points"]}:
+                        raise InquiryUnitValidationError("Inquiry batches must cover every source point exactly once.", "point_partition")
+                    order = {point["id"]: index for index, point in enumerate(source["key_points"])}
+                    merged[source["id"]].sort(key=lambda unit: order[unit["assessed_rubric_point_ids"][0]])
+            return merged
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if isinstance(exc, asyncio.TimeoutError) or (isinstance(exc, ProviderError) and exc.code == "provider_timeout"):
+                code, message, reason = "INQUIRY_UNIT_GENERATION_TIMEOUT", "模型整理问题超时，计划尚未创建。已保留你的选择，请稍后重试。", "timeout"
+            elif isinstance(exc, ValueError) or (isinstance(exc, ProviderError) and exc.code == "provider_schema_invalid"):
+                code, message, reason = "INQUIRY_UNIT_RESPONSE_INVALID", "模型返回的问题未通过内容校验，计划尚未创建。请重试，无需重新生成简历问题。", "invalid_response"
+            elif isinstance(exc, ProviderError):
+                code, message, reason = "INQUIRY_UNIT_PROVIDER_UNAVAILABLE", "问题整理服务暂时不可用，计划尚未创建。请检查模型服务后重试。", "provider_unavailable"
+            else:
+                code, message, reason = "INQUIRY_UNIT_GENERATION_FAILED", "创建计划时发生异常，计划尚未创建。已保留你的选择，请稍后重试。", "unexpected"
+            detail = getattr(exc, "reason_code", None)
+            if detail not in {"source_partition", "point_partition", "spoken_question", "reference_range", "reference_content", "competency_scope"}:
+                detail = "unspecified"
+            logger.warning("inquiry_preparation_failed reason=%s detail=%s sources=%d points=%d batches=%d", reason, detail,
+                           len(sources), sum(len(source["key_points"]) for source in sources), len(batches))
+            raise ApiError(code, message, status_code=503) from None
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
     def _validate_question_scope(self, plan: Dict[str, Any], question: Dict[str, Any]) -> None:
         if question.get("status") != "active":
             raise ApiError("INTERVIEW_PLAN_QUESTION_INACTIVE", "Plan questions must be active.", status_code=409)
-        if plan.get("job_position_id") and question.get("job_position_id") != plan.get("job_position_id"):
+        if (plan.get("preparation_mode") != "question_bank" and plan.get("job_position_id")
+                and question.get("job_position_id") != plan.get("job_position_id")):
             raise ApiError("INTERVIEW_PLAN_QUESTION_SCOPE_MISMATCH", "Plan question belongs to another position.", status_code=409)
         knowledge_base_ids = set(plan.get("knowledge_base_ids", []))
         if knowledge_base_ids and question.get("knowledge_base_id") not in knowledge_base_ids:
@@ -747,6 +1186,26 @@ class InterviewPlanAssembly:
         )
 
     def _validate_request(self, request: PlanAssemblyRequest) -> None:
+        if request.preparation_mode is not None and (
+                request.preparation_mode != "question_bank" or request.role_requirement_id is not None
+                or request.execution_schema_version != 3 or not request.approve
+                or not request.job_position_id or not request.candidate_profile_id or not request.knowledge_base_ids):
+            raise ApiError("INTERVIEW_PREPARATION_INVALID", "Bank preparation requires a complete scoped v3 request.", status_code=422)
+        if not isinstance(request.use_customization_defaults, bool):
+            raise ApiError(
+                "INTERVIEW_CUSTOMIZATION_POLICY_INVALID",
+                "use_customization_defaults must be a boolean.",
+                status_code=422,
+            )
+        if request.execution_schema_version not in {2, 3}:
+            raise ApiError("INTERVIEW_PLAN_VERSION_INVALID", "execution_schema_version must be 2 or 3.", status_code=422)
+        if request.adaptive_policy is not None:
+            if request.execution_schema_version != 3:
+                raise ApiError("INTERVIEW_PLAN_POLICY_INVALID", "adaptive_policy requires execution schema version 3.", status_code=422)
+            try:
+                AdaptiveInterviewPolicy.model_validate(request.adaptive_policy)
+            except ValueError as error:
+                raise ApiError("ASSESSMENT_POLICY_INVALID", "Adaptive interview budget is invalid.", status_code=422) from error
         if not request.job_position_id or not request.candidate_profile_id or not request.knowledge_base_ids:
             raise ApiError(
                 "INTERVIEW_PLAN_SCOPE_REQUIRED",

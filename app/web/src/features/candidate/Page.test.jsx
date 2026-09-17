@@ -2,7 +2,7 @@ import React, { act } from "react";
 import { createRoot } from "react-dom/client";
 import { describe, expect, it, vi } from "vitest";
 
-import { AnswerRecoveryAction, CandidateSignalList, ConversationState, SpeechPlaybackState, WarmupPanel } from "./Page.jsx";
+import { AnswerRecoveryAction, CandidateProgress, CandidateSignalList, ConversationState, SpeechPlaybackState, WarmupPanel } from "./Page.jsx";
 
 describe("candidate automatic answer completion", () => {
   it("offers replay of only the current blocked speech and distinguishes listening from detected speech", async () => {
@@ -34,7 +34,8 @@ describe("candidate automatic answer completion", () => {
     await act(async () => root.render(<ConversationState
       phase="listening" endpoint={{ active: true, deadlineAt: null }} formal
     />));
-    expect(host.textContent).toContain("停顿5秒后，面试官会询问是否补充");
+    expect(host.textContent).toContain("需要思考、想换个话题或已经讲完");
+    expect(host.textContent).not.toContain("5秒");
     expect(host.textContent).not.toContain("请点击");
     expect(host.textContent).not.toContain("回答完毕");
 
@@ -62,6 +63,31 @@ describe("candidate automatic answer completion", () => {
 });
 
 describe("candidate capture recovery presentation", () => {
+  it("shows live warm-up input and explains why capture is waiting after the trial", async () => {
+    const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+    const experience = { phase: "listening", calibration: { status: "listening" }, microphone: { localDetected: true, level: 0.5 } };
+    try {
+      await act(async () => root.render(<CandidateSignalList experience={experience} />));
+      expect(host.textContent).toContain("正在收到你的声音");
+      expect(host.querySelectorAll(".is-active")).toHaveLength(1);
+      expect(host.querySelector(".microphone-level i").style.width).toBe("50%");
+      for (const [phase, status, detail] of [
+        ["understanding", "awaiting_confirmation", "试音已收好，请确认下方字幕"],
+        ["understanding", "confirming", "正在进入正式面试"],
+        ["understanding", "completed", "这段回答已收好，面试官正在整理"],
+        ["planning", "completed", "面试官正在准备下一话题"],
+        ["paused", "listening", "面试已暂停"],
+        ["completed", "completed", "面试已结束"],
+      ]) {
+        await act(async () => root.render(<CandidateSignalList experience={{ ...experience, phase, calibration: { status } }} />));
+        expect(host.textContent).toContain(detail);
+        expect(host.textContent).not.toContain("暂未收音");
+        expect(host.querySelectorAll(".is-active")).toHaveLength(0);
+        expect(host.querySelector(".microphone-level i").style.width).toBe("0%");
+      }
+    } finally { await act(async () => root.unmount()); host.remove(); }
+  });
+
   it("separates automatic repair and same-question retry from a human safety pause", async () => {
     const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
     try {
@@ -86,7 +112,7 @@ describe("candidate capture recovery presentation", () => {
     const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
     const staleSignals = { microphone: { localDetected: true, level: 0.8 }, serverAudio: { received: true }, captions: { forming: true } };
     try {
-      for (const phase of ["paused", "answer_retry_required", "completed", "understanding"]) {
+      for (const phase of ["paused", "answer_retry_required", "completed", "understanding", "planning"]) {
         await act(async () => root.render(<CandidateSignalList experience={{ ...staleSignals, phase }} />));
         expect(host.querySelectorAll(".is-active")).toHaveLength(0);
         expect(host.textContent).not.toContain("服务端正在转写");
@@ -202,5 +228,23 @@ describe("candidate warm-up recovery", () => {
 
     await act(async () => root.unmount());
     host.remove();
+  });
+});
+
+describe("adaptive interview progress", () => {
+  it("shows completed topics without inventing a total and keeps legacy progress", async () => {
+    const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+    try {
+      await act(async () => root.render(<CandidateProgress answered={3} totalQuestions={null} adaptive />));
+      expect(host.textContent).toBe("已完成 3 个话题");
+      expect(host.textContent).not.toContain("/");
+      expect(host.querySelector("[aria-label]").getAttribute("aria-label")).toBe("已完成 3 个话题");
+      await act(async () => root.render(<CandidateProgress answered={3} totalQuestions={6} />));
+      expect(host.textContent).toBe("3/6");
+      await act(async () => root.render(<ConversationState phase="planning" endpoint={{ active: false }} formal />));
+      expect(host.textContent).toContain("正在准备下一话题");
+      expect(host.textContent).toContain("这段回答已保留");
+      expect(host.textContent).not.toContain("已完成");
+    } finally { await act(async () => root.unmount()); host.remove(); }
   });
 });

@@ -216,6 +216,25 @@ def test_automatic_audio_endpoint_commits_one_durable_server_answer(tmp_path, mo
 
 
 def test_new_voice_cancels_held_preparation_without_closing_capture_or_losing_tail(tmp_path, monkeypatch):
+    from test_answer_endpoint import _Clock
+    from app.providers.mock.provider import MockSTTStream
+
+    original_send = MockSTTStream.send_audio
+
+    async def audio_aligned_partial(stream, chunk):
+        # Ordinal finals are synthetic. Only voiced input can announce their
+        # text; otherwise the next stream "hears" the continuation in silence
+        # and revokes preparation before the candidate has actually resumed.
+        original_request = stream.request
+        if not any(chunk):
+            stream.request = original_request.model_copy(update={"enable_partial": False})
+        try:
+            return await original_send(stream, chunk)
+        finally:
+            stream.request = original_request
+
+    monkeypatch.setattr(MockSTTStream, "send_audio", audio_aligned_partial)
+
     async def scenario():
         entered, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
         prepared_texts = []
@@ -237,13 +256,23 @@ def test_new_voice_cancels_held_preparation_without_closing_capture_or_losing_ta
         monkeypatch.setattr(InterviewEvidenceChain, "prepare_decision", held_prepare)
         try:
             async with _automatic_session(tmp_path, monkeypatch, [_PREFIX, _SUFFIX]) as (store, runtime, channel, managed):
+                # Audio activity is the scenario's clock. Host scheduling or
+                # a slow provider must not invent a 300ms candidate pause in
+                # the middle of a burst and consume the ordinal STT fixture.
+                clock = _Clock()
+                managed._answer_endpoint.clock = clock
                 capture_id = managed._capture_id
                 await _feed(managed._ingress, _VOICE, 10)
+                clock.value = 1
                 await _silence_until(managed._ingress, entered.is_set)
                 assert managed.evidence_open and managed.chain.is_open
                 assert _current(runtime)["agent_runtime"]["floor"] == "candidate"
                 assert _current(runtime)["answers"] == []
 
+                # Silence during the held inference is not the continuation.
+                # The provider fixture must not invent the next stream's words.
+                await _feed(managed._ingress, _SILENCE, 5)
+                assert not cancelled.is_set()
                 await _feed(managed._ingress, _CONTINUATION, 10)
                 await _wait_until(cancelled.is_set)
                 assert managed._capture_id == capture_id
@@ -253,6 +282,7 @@ def test_new_voice_cancels_held_preparation_without_closing_capture_or_losing_ta
                 assert not [item for item in store.evidence_commands.values()
                             if item["command_type"] == "evidence.seal"]
 
+                clock.value = 2
                 await _silence_until(managed._ingress, lambda: len(_current(runtime)["answers"]) == 1)
                 await _wait_until(lambda: all(item["status"] == "completed"
                                              for item in store.evidence_commands.values()))

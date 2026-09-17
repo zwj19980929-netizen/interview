@@ -1,0 +1,23 @@
+# 候选人公司问答合同（044）
+
+公司资料是可选的候选人交流上下文。没有Skill、没有企业资料时，基础面试仍可运行；不能猜测企业背景。
+
+## 意图与来源
+
+权威STT final在首次端点判断或补充确认阶段可识别公司反问。内部TurnUnderstanding增加turn_intent=ask_company、suggested_action=respond_company及company_question；模型只返回服务端E编号与逐字问题quote，统一seam还原并校验start/end。纯问题的intent=company_question、answer_content=none，不产生能力claims；同句技术回答仍属于技术证据。同一E编号含技术陈述与反问时，技术claim须逐字摘取问题以外的原句，校验可证明排除后仍保留技术依据。缺少合法原文依据、范围过宽或与完成依据冲突时不能授权公司答复或完成本题。
+
+公司答复只读取session.plan_snapshot.company_context。Skill正文、Skill资源、岗位评分依据、候选人的猜测和模型常识均不作为公司事实。无资料直接使用集中管理的无法确认答复；有资料时一次模型调用，8秒、无内部重试，最多返回3条company:context逐字引用，每段最多240字。严格Schema拒绝自由answer字段、额外字段、未知引用、空白或非原文引文；status=supported必须有引文，not_found必须为空。无对应事实说明无法确认，模型故障使用暂时无法核实的固定答复。
+
+## 会话与评分
+
+company_questions模块负责有依据的公司答复和准确原文排除。候选人控制连接、owner/evidence fence、当前turn、输入和上下文指纹、未结束音频capture及资料hash均须复验；模型请求不持有事务或通道锁。答复沿ApprovedConversationAct.company_answer及既有Floor、TTS、私有音频和数字人链路表达，后续回到当前题的同一采集。
+
+turn.company_question_exchanges保留准确问题范围、服务端转写前缀、采集检查点、资料hash和答复引用，以便验证与恢复。delivery_status区分pending/playing/delivered，并绑定performance_id；只有匹配的播放完成才标已答复。表达失败、超时或中断保留已校验答复供恢复，已有记录不等于语音交付。外层操作上限45秒，覆盖8秒引用提取及原TTS准备预算。纯问答不触发ANSWER_SUBMITTED、评分或换题；只有后续真实结束依据才可提交完整回答。
+
+原音频、raw/final转写保持原文；派生scoring_transcript与non_scoring_spans只排除已经绑定到真实采集与原文的问题范围，保留相邻技术回答。评分从持久会话和真实媒体再核验，不信任客户端或未绑定的派生字段。若原始前缀被修改而范围失效，拒绝猜测偏移。候选人安全投影不返回完整Skill、企业资料、问答原文前缀或评分标准。候选人保留期清理同时去除这些新增的转写派生与问答记录。
+
+## 版本与验证范围
+
+新增company_question_reply.v1；带公司上下文的理解使用interview_turn_understanding.v14/v15，复合理解/追问使用interview_turn_decision.v13/v14，补充分类使用supplement_reply.v4，带公司问题排除的评分使用answer_evaluation.v7。所有Prompt、输出Schema和固定表达均集中在app/core/prompt/，网关统一结构校验与调用审计登记版本；旧合同审计仍可读取。
+
+此功能不新增客户端文本答案接口，不扩大题库、评分或Skill工具权限。最终回归、故障恢复、本机加载与真实服务验证边界见[操作日志044](change-log.md)。

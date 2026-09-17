@@ -22,7 +22,7 @@ class Capture(_Capture):
             return await self.classify_impl(reply)
         return {"intent": self.intent, "confidence": self.confidence, "evidence_quote": reply}
 
-    async def prepare_decision(self, final, *, completion_confirmed=False):
+    async def prepare_decision(self, final, *, completion_confirmed=False, semantic_first=False):
         assert completion_confirmed
         return await super().prepare_decision(final)
 
@@ -37,7 +37,9 @@ def setup():
         spoken.append(kind)
         return True
 
-    endpoint.confirmation = SpokenSupplementConfirmation(speak=speak)
+    # These fixtures isolate the retained uncertain-reply handshake. Semantic
+    # first-turn behavior has real-entry regression coverage separately.
+    endpoint.confirmation = SpokenSupplementConfirmation(speak=speak, semantic_first=False)
     return endpoint, clock, notices, commits, spoken
 
 

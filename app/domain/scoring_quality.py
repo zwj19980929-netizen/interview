@@ -3,6 +3,7 @@ from copy import deepcopy
 from math import isfinite
 
 from app.domain.speech_quality import minimum_reported_confidence, transcript_is_verified, transcript_identity
+from app.domain.adaptive_interview import adaptive_score_summary, interrupted_fixed_plan_summary, is_adaptive
 
 DISPUTE_FLAGS = {"transcription_ambiguity", "low_stt_confidence"}
 RECOGNITION_NOTICE = "部分转写存在识别不确定性，已按可理解的回答内容评分；可按需回听或修正，不影响报告生成。"
@@ -100,7 +101,13 @@ def project_report(report, session):
     result["recognition_notice"] = RECOGNITION_NOTICE if warning_ids else None
     # 026 may have stored a null total. Rebuild only from actual retained scores
     # and the frozen plan's weights; never drop a missing question or assume 0.
-    if not unavailable and (result.get("overall_score") is None or restored):
+    if not unavailable and is_adaptive(session):
+        result.update(adaptive_score_summary(session, result.get("question_evaluations", [])))
+        if result["coverage_status"] != "sufficient":
+            result.update(job_fit_level="insufficient_evidence", recommendation="insufficient_evidence")
+    elif not unavailable and session.get("candidate_input_completion_reason") == "candidate_requested":
+        result.update(interrupted_fixed_plan_summary(session, result.get("question_evaluations", [])))
+    elif not unavailable and (result.get("overall_score") is None or restored):
         plan = {item["question_snapshot_id"]: item for item in session.get("plan_snapshot", {}).get("question_snapshots", [])}
         totals = {}
         weighted = weight_sum = 0.0

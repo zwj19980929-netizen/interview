@@ -81,6 +81,23 @@ def test_clarification_focus_is_original_speech_and_cannot_invent_a_term():
         resolve_understanding_references(wire, refs)
 
 
+def test_identical_evidence_text_keeps_occurrence_offsets_for_company_exclusion():
+    text = "这家公司做什么？我用幂等键。这家公司做什么？"
+    refs = understanding_references(text, ["幂等键"])
+    question = "这家公司做什么？"
+    assert refs["evidence"]["E1"] == refs["evidence"]["E3"] == question
+    wire = {"company_question": {"evidence_id": "E3", "quote": question},
+            "evidence_ids": ["E3", "E2", "E1"], "claims": [],
+            "covered_point_ids": [], "missing_point_ids": []}
+    before = deepcopy(wire)
+    resolved = resolve_understanding_references(wire, refs)
+    assert resolved["evidence_quotes"] == [question, "我用幂等键。"]
+    assert resolved["company_question"] == {
+        "start": text.rindex(question), "end": len(text), "quote": question,
+    }
+    assert wire == before and refs["offsets"]["E1"] == 0
+
+
 @pytest.mark.anyio
 async def test_targeted_clarification_keeps_capture_and_complete_answer_until_correction():
     capture = Capture()

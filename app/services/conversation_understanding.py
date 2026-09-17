@@ -10,8 +10,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from app.domain.speech_quality import limit_semantic_confidence
+from app.domain.adaptive_interview import is_adaptive, assessment_contract
 from app.core.ids import new_id
 from app.core.prompt.contracts import prompt_contract, understanding_canonical_schema, supplement_reply_canonical_schema
+from app.core.prompt.semantic_turn import with_semantic_turn_schema, validate_semantic_turn
 from app.core.prompt.understanding_references import (
     understanding_references,
     resolve_understanding_references,
@@ -143,13 +145,16 @@ class ConversationUnderstandingService:
         """Shared inference for validated final evidence or a private preview."""
         capability_points = self._capability_points(turn)
         completion_confirmed = interview.get("_answer_completion_confirmed") is True
-        deterministic = None if completion_confirmed else self.meta_intents.detect(utterance.text)
+        semantic_first = interview.get("_semantic_first") is True
+        deterministic = None if completion_confirmed or semantic_first else self.meta_intents.detect(utterance.text)
         context = {
             "question_text": turn.get("question_spoken_text")
             or turn.get("question_snapshot", {}).get("question_text", ""),
             "capability_points": capability_points,
             "transcript": utterance.text,
             "completion_confirmed": completion_confirmed,
+            "semantic_first": semantic_first,
+            "interviewer_context": interview.get("_interviewer_context") or {},
         }
         contract = prompt_contract("interview_turn_understanding", context)
         references = understanding_references(utterance.text, capability_points)
@@ -187,6 +192,8 @@ class ConversationUnderstandingService:
                                 json_schema=contract.response_schema,
                                 temperature=0.0,
                                 max_output_tokens=1800,
+                                execution_budget=(InvocationExecutionBudget(timeout_s=12, max_provider_retries=0)
+                                                  if semantic_first else None),
                                 metadata={
                                     "prompt_version": contract.version,
                                     "interview_id": interview["id"],
@@ -204,7 +211,7 @@ class ConversationUnderstandingService:
                     stage = "understanding_references"
                     data = resolve_understanding_references(response.data, references)
                     stage = "understanding_canonical"
-                    validate_structured_response(data, understanding_canonical_schema())
+                    validate_structured_response(data, self._canonical_schema(semantic_first))
                     stage = "understanding_content"
                     self._validate_understanding_content(data, utterance.text, capability_points)
                     provider = response.provider.model_dump()
@@ -277,7 +284,33 @@ class ConversationUnderstandingService:
         """
 
         self._require_authoritative_final(utterance)
+        if interview.get("_semantic_first") is True:
+            # The correction attempt shares the initial decision's deadline;
+            # two individually bounded invocations must not double latency.
+            return await asyncio.wait_for(self._prepare_decision(utterance, turn, interview), timeout=15.0)
         return await self._prepare_decision(utterance, turn, interview)
+
+    async def classify_reception(self, text: str, organization_id: str, *, phase: str = "listening",
+                                 question: str = "", preceding_text: str = "") -> Dict[str, Any]:
+        """Route a server utterance's social request without preparing an answer."""
+        if not isinstance(text, str) or not text.strip() or len(text) > 100000:
+            raise ValueError("A bounded nonempty server utterance is required")
+        if phase not in {"listening", "awaiting_reply"}:
+            raise ValueError("Unknown conversational phase")
+        contract = prompt_contract("conversation_reception", {
+            "text": text, "phase": phase, "question": question[:2000], "preceding_text": preceding_text[-1000:],
+        })
+        response = await asyncio.wait_for(self.gateway.invoke(cap.LLM_CHAT_JSON, ChatJSONRequest(
+            organization_id=organization_id, purpose="interview_turn_understanding",
+            messages=contract.messages, json_schema=contract.response_schema,
+            temperature=0, max_output_tokens=180,
+            execution_budget=InvocationExecutionBudget(timeout_s=4, max_provider_retries=0),
+            metadata={"prompt_version": contract.version},
+        )), timeout=5)
+        validate_structured_response(response.data, contract.response_schema)
+        data = response.data
+        return {"kind": data["kind"], "confidence": data["confidence"],
+                "evidence_quote": understanding_references(text, [])["evidence"][data["evidence_id"]]}
 
     async def classify_supplement_reply(self, reply: str, organization_id: str) -> Dict[str, Any]:
         if not isinstance(reply, str) or not reply.strip() or len(reply) > 100000:
@@ -335,7 +368,8 @@ class ConversationUnderstandingService:
         interview: Dict[str, Any],
     ) -> tuple[TurnUnderstanding, Dict[str, Any]]:
         scope = self._followup_scope(interview, turn, utterance)
-        if (not interview.get("_answer_completion_confirmed") and self.meta_intents.detect(utterance.text)) or scope.get("selected") is False:
+        if (not interview.get("_answer_completion_confirmed") and not interview.get("_semantic_first")
+                and self.meta_intents.detect(utterance.text)) or scope.get("selected") is False:
             understanding = await self._understand(utterance, turn, interview)
             # No second invocation when the budget or acoustic confidence
             # already rules out a probe. Deterministic controls invoke none.
@@ -353,6 +387,8 @@ class ConversationUnderstandingService:
             "capability_points": capability_points,
             "transcript": utterance.text,
             "completion_confirmed": interview.get("_answer_completion_confirmed") is True,
+            "semantic_first": interview.get("_semantic_first") is True,
+            "interviewer_context": interview.get("_interviewer_context") or {},
             "difficulty": scope["difficulty"],
             "max_probe_chars": int(scope["policy"]["max_probe_chars"]),
             "low_confidence_threshold": float(scope["policy"]["low_confidence_threshold"]),
@@ -376,6 +412,8 @@ class ConversationUnderstandingService:
                             json_schema=contract.response_schema,
                             temperature=0.0,
                             max_output_tokens=2000,
+                            execution_budget=(InvocationExecutionBudget(timeout_s=12, max_provider_retries=0)
+                                              if context["semantic_first"] else None),
                             metadata={
                                 "prompt_version": contract.version,
                                 "interview_id": interview["id"],
@@ -397,7 +435,7 @@ class ConversationUnderstandingService:
                 stage = "understanding_references"
                 data = resolve_understanding_references(response.data["understanding"], references)
                 stage = "understanding_canonical"
-                validate_structured_response(data, understanding_canonical_schema())
+                validate_structured_response(data, self._canonical_schema(context["semantic_first"]))
                 stage = "understanding_content"
                 self._validate_understanding_content(data, utterance.text, capability_points)
                 confidence = limit_semantic_confidence(float(data["confidence"]), utterance.stt_confidence)
@@ -576,24 +614,33 @@ class ConversationUnderstandingService:
         """
 
         policy = {**self.DEFAULT_POLICY, **(interview.get("followup_policy") or {})}
-        primary_count = len([item for item in interview.get("turns", []) if not item.get("is_followup")])
-        policy["max_total"] = min(4, primary_count)
+        if is_adaptive(interview):
+            budget = assessment_contract(interview)["budget"]
+            policy.update(max_depth=budget["max_followups_per_root"],
+                          max_per_root=budget["max_followups_per_root"],
+                          max_total=budget["max_total_followups"])
+        else:
+            primary_count = len([item for item in interview.get("turns", []) if not item.get("is_followup")])
+            policy.update(max_total=min(4, primary_count), max_depth=min(2, int(policy["max_depth"])),
+                          max_per_root=min(2, int(policy["max_per_root"])))
         depth = int(turn.get("followup_depth", 0))
         root_turn_id = str(turn.get("root_turn_id") or turn["id"])
         followups = [item for item in interview.get("turns", []) if item.get("is_followup")]
         root_followups = [item for item in followups if item.get("root_turn_id") == root_turn_id]
         if understanding is not None and understanding.intent != "answer":
             return self._no_followup("meta_or_non_answer", policy)
+        if understanding is not None and not understanding.followup_allowed:
+            return self._no_followup("candidate_topic_boundary", policy)
         confidence = understanding.confidence if understanding is not None else utterance.stt_confidence
         if confidence is not None and confidence < float(policy["low_confidence_threshold"]):
             return self._no_followup("low_confidence_clarification_required", policy)
         if not bool(turn.get("allow_followup", False)):
             return self._no_followup("followup_disabled", policy)
-        if depth >= min(2, int(policy["max_depth"])):
+        if depth >= int(policy["max_depth"]):
             return self._no_followup("depth_budget_exhausted", policy)
         if len(followups) >= int(policy["max_total"]):
             return self._no_followup("session_budget_exhausted", policy)
-        if len(root_followups) >= min(2, int(policy["max_per_root"])):
+        if len(root_followups) >= int(policy["max_per_root"]):
             return self._no_followup("root_budget_exhausted", policy)
         if not self._within_time_budget(interview, int(policy["min_remaining_seconds"]), now=now):
             return self._no_followup("time_budget_exhausted", policy)
@@ -778,6 +825,7 @@ class ConversationUnderstandingService:
     def _validate_understanding_content(
         data: Dict[str, Any], transcript: str, capability_points: Sequence[str]
     ) -> None:
+        validate_semantic_turn(data, transcript)
         allowed = set(capability_points)
         covered_values = list(data["covered_capability_points"])
         missing_values = list(data["missing_capability_points"])
@@ -830,6 +878,14 @@ class ConversationUnderstandingService:
         # The model identifies the meaning/ambiguity; the server enforces its
         # consequence even if the proposed action contradicts that finding.
         # Explicit pause/repeat controls retain precedence.
+        if data.get("completion_basis") and confidence < .75:
+            data["completion_basis"] = None
+            data["turn_intent"] = "clarify"
+            data["followup_allowed"] = False
+            data["suggested_action"] = "clarify"
+        if data.get("turn_intent") == "ask_company" and confidence < .75:
+            data.update(company_question=None, turn_intent="clarify", intent="clarification_request",
+                        suggested_action="clarify", followup_allowed=False)
         if data["intent"] == "answer_declined" and confidence < .75:
             # A clear lack of technical knowledge can be understood with high
             # confidence. Unreliable speech evidence is a separate limitation;
@@ -841,6 +897,20 @@ class ConversationUnderstandingService:
             data["suggested_action"] = "clarify"
             return min(confidence, 0.64)
         return confidence
+
+    @staticmethod
+    def _canonical_schema(semantic_first: bool) -> Dict[str, Any]:
+        schema = understanding_canonical_schema()
+        return with_semantic_turn_schema(schema, company_questions=True) if semantic_first else schema
+
+    @staticmethod
+    def can_complete_without_confirmation(understanding: TurnUnderstanding, transcript: str) -> bool:
+        """Recheck semantic authorization at the current final/commit fence."""
+        if understanding.problem is not None or understanding.completion_basis is None:
+            return False
+        data = understanding.model_dump(mode="json")
+        validate_semantic_turn(data, transcript)
+        return understanding.confidence >= .75 and understanding.suggested_action == "next"
 
     @staticmethod
     def _capability_points(turn: Dict[str, Any]) -> List[str]:

@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 from app.core.errors import ApiError
 from app.core.ids import new_id
 from app.domain.scoring_quality import DISPUTE_FLAGS, evaluation_answers, project_evaluation, project_report
+from app.domain.adaptive_interview import adaptive_score_summary, interrupted_fixed_plan_summary, is_adaptive
 from app.core.time import utc_now
 from app.persistence.interface import Persistence
 from app.persistence.provider import persistence_for
@@ -112,7 +113,7 @@ class ReportService:
             }
             for dimension, value in sorted(dimension_totals.items())
         ]
-        return project_report({
+        document = {
             "id": new_id("report"),
             "organization_id": interview["organization_id"],
             "interview_id": interview["id"],
@@ -136,7 +137,48 @@ class ReportService:
             "decision_notice": "本报告只提供岗位匹配证据，不自动作出录用或淘汰决定。",
             "generated_by": "system",
             "generated_at": utc_now(),
-        }, interview)
+        }
+        if is_adaptive(interview):
+            document.update(adaptive_score_summary(interview, question_evaluations))
+            document["execution_schema_version"] = 3
+            document["candidate_input_completion_reason"] = interview.get("candidate_input_completion_reason")
+            document["skipped_questions"] = [
+                {"turn_id": turn["id"], "question_id": turn.get("question_id"),
+                 "reason": turn.get("skip_reason", "not_assessed"), "counts_toward_score": False}
+                for turn in interview.get("turns", []) if turn.get("status") == "skipped"
+            ]
+            for entry in question_evaluations:
+                setting = item_by_snapshot.get(entry["question_snapshot_id"], {})
+                entry["competency_ids"] = deepcopy(setting.get("competency_ids", []))
+                entry["assessed_rubric_point_ids"] = deepcopy(setting.get("assessed_rubric_point_ids", []))
+                entry["presented_unit_ids"] = deepcopy(setting.get("presented_unit_ids", []))
+                entry["inquiry_unit_id"] = setting.get("inquiry_unit_id")
+                entry["not_assessed_rubric_point_ids"] = deepcopy(setting.get("not_assessed_rubric_point_ids", []))
+            if any(scope["scope_status"] != "complete" for scope in document.get("source_question_scopes", [])):
+                document["scope_notice"] = "本报告只评价实际呈现的考察单元；原题未问到的关键点标记为未考察，不作为扣分项。"
+            if document["coverage_status"] != "sufficient":
+                document.update(job_fit_level="insufficient_evidence", recommendation="insufficient_evidence", strengths=[],
+                                risks=["考察覆盖或证据不足；未考察能力不计零分，需结合已取得证据人工复核。"],
+                                followup_suggestions=["针对报告标示的未覆盖能力补充人工访谈。"])
+            else:
+                score = document["overall_score"]
+                fit = self._job_fit_level(score, requires_manual_review=requires_manual_review, has_evidence=bool(question_evaluations))
+                document.update(job_fit_level=fit, recommendation=fit,
+                                strengths=["关键点覆盖较好"] if score >= 75 else [],
+                                risks=["存在未覆盖关键点，建议人工复核"] if score < 75 else [],
+                                followup_suggestions=["针对缺失关键点安排人工追问"] if score < 75 else [])
+        elif interview.get("candidate_input_completion_reason") == "candidate_requested":
+            document.update(interrupted_fixed_plan_summary(interview, question_evaluations))
+            document["candidate_input_completion_reason"] = "candidate_requested"
+            document["skipped_questions"] = [
+                {"turn_id": turn["id"], "question_id": turn.get("question_id"),
+                 "reason": turn.get("skip_reason", "not_assessed"), "counts_toward_score": False}
+                for turn in interview.get("turns", []) if turn.get("status") == "skipped"
+            ]
+            if document["coverage_status"] != "sufficient":
+                document.update(strengths=[], risks=["候选人主动结束，计划中部分题目未考察；保留已取得的评分证据。"],
+                                followup_suggestions=["结合未考察范围与已有证据人工复核。"])
+        return project_report(document, interview)
 
     def get_report(self, interview_id: str, organization_id: str = "org_default") -> Dict[str, Any]:
         interview = self._get_interview(interview_id, organization_id)

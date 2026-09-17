@@ -59,13 +59,26 @@ class MockProvider:
         if capability == cap.LLM_CHAT_JSON and isinstance(request, ChatJSONRequest):
             if request.purpose == "answer_evaluation":
                 data = evaluate_answer(request.metadata)
-            elif request.purpose == "interview_turn_understanding" and request.metadata.get("prompt_version") in {"supplement_reply.v1", "supplement_reply.v2", "supplement_reply.v3"}:
+            elif request.metadata.get("prompt_version") == "interview_inquiry_units.v2":
+                from app.core.prompt.inquiry_units import mock_inquiry_units_result
+                data = mock_inquiry_units_result(request)
+            elif request.metadata.get("prompt_version") == "conversation_reception.v1":
+                data = {"kind": "other", "confidence": 0.0,
+                        "evidence_id": next(iter(json.loads(request.messages[-1].content)["evidence"]))}
+            elif request.purpose == "interview_turn_understanding" and request.metadata.get("prompt_version") in {"supplement_reply.v1", "supplement_reply.v2", "supplement_reply.v3", "supplement_reply.v4"}:
                 reply = json.loads(request.messages[-1].content)["reply"]
                 # Offline mock never fabricates permission to finish.
                 data = {"intent": "unclear", "confidence": 0.0, "evidence_quote": reply[:300]}
-                if request.metadata.get("prompt_version") == "supplement_reply.v3":
+                if request.metadata.get("prompt_version") in {"supplement_reply.v3", "supplement_reply.v4"}:
                     data = {"intent": "unclear", "confidence": 0.0,
                             "evidence_id": next(iter(json.loads(request.messages[-1].content)["evidence"]))}
+            elif request.metadata.get("prompt_version") == "company_question_reply.v1":
+                data = {"status": "not_found", "citations": []}
+            elif request.purpose == "interview_turn_understanding" and request.metadata.get("prompt_version") in {
+                "interviewer_supervisor.v1", "interviewer_supervisor.v2", "interviewer_evidence_expert.v1",
+            }:
+                from app.core.prompt.interviewer_supervisor import mock_supervisor_result
+                data = mock_supervisor_result(request)
             elif request.purpose == "interview_turn_understanding":
                 from app.core.prompt.understanding_references import understanding_references
 
@@ -96,6 +109,11 @@ class MockProvider:
                     "interview_turn_understanding.v3", "interview_turn_decision.v2",
                     "interview_turn_understanding.v4", "interview_turn_understanding.v5",
                     "interview_turn_understanding.v6", "interview_turn_understanding.v7", "interview_turn_understanding.v8", "interview_turn_understanding.v9",
+                    "interview_turn_understanding.v10", "interview_turn_decision.v9",
+                    "interview_turn_understanding.v11", "interview_turn_decision.v10",
+                    "interview_turn_understanding.v12", "interview_turn_understanding.v13",
+                    "interview_turn_decision.v11", "interview_turn_decision.v12",
+                "interview_turn_understanding.v14", "interview_turn_understanding.v15", "interview_turn_decision.v13", "interview_turn_decision.v14", "interview_turn_understanding.v16", "interview_turn_understanding.v17", "interview_turn_understanding.v18", "interview_turn_understanding.v19", "interview_turn_decision.v15", "interview_turn_decision.v16", "interview_turn_decision.v17", "interview_turn_decision.v18",
                     "interview_turn_decision.v3", "interview_turn_decision.v4",
                     "interview_turn_decision.v5", "interview_turn_decision.v6", "interview_turn_decision.v7", "interview_turn_decision.v8",
                 }:
@@ -107,7 +125,12 @@ class MockProvider:
                     data["claims"] = [{"claim": transcript[:600], "evidence_id": evidence_ids[0]}] if evidence_ids else []
                     data["covered_point_ids"] = [point_ids[point] for point in data.pop("covered_capability_points")]
                     data["missing_point_ids"] = [point_ids[point] for point in data.pop("missing_capability_points")]
-                    if request.metadata.get("prompt_version") in {"interview_turn_decision.v1", "interview_turn_decision.v2", "interview_turn_decision.v3", "interview_turn_decision.v4", "interview_turn_decision.v5", "interview_turn_decision.v6", "interview_turn_decision.v7", "interview_turn_decision.v8"}:
+                    if request.metadata.get("prompt_version") in {"interview_turn_understanding.v10", "interview_turn_decision.v9", "interview_turn_understanding.v11", "interview_turn_decision.v10", "interview_turn_understanding.v12", "interview_turn_understanding.v13", "interview_turn_decision.v11", "interview_turn_decision.v12", "interview_turn_understanding.v14", "interview_turn_understanding.v15", "interview_turn_decision.v13", "interview_turn_decision.v14", "interview_turn_understanding.v16", "interview_turn_understanding.v17", "interview_turn_understanding.v18", "interview_turn_understanding.v19", "interview_turn_decision.v15", "interview_turn_decision.v16", "interview_turn_decision.v17", "interview_turn_decision.v18"}:
+                        # A deterministic development mock cannot decide a
+                        # candidate's completion intent. Keep it unconfirmed.
+                        data.update(answer_content="technical", turn_intent="answering",
+                                    completion_basis=None, followup_allowed=True)
+                    if str(request.metadata.get("prompt_version") or "").startswith("interview_turn_decision."):
                         probed = set(request.metadata.get("previously_probed_ids") or [])
                         targets = [key for key in data["missing_point_ids"] if key not in probed][:1]
                         selected = bool(targets and evidence_ids)

@@ -229,6 +229,7 @@ class ModelGateway:
         execution_budget = getattr(request, "execution_budget", None)
         if execution_budget is not None:
             retry_count = min(retry_count, execution_budget.max_provider_retries)
+        attempt_limit = execution_budget.max_provider_attempts if execution_budget is not None else None
         backoff_ms = min(1000, max(0, int(policy.get("retry_backoff_ms", 0))))
         circuit_threshold = max(0, int(policy.get("circuit_failure_threshold", 3)))
         circuit_recovery_seconds = max(0.0, float(policy.get("circuit_recovery_seconds", 30)))
@@ -365,7 +366,8 @@ class ModelGateway:
                         error_details=exc.details,
                         prompt_version=request.metadata.get("prompt_version"),
                     )
-                    can_retry = exc.retryable and exc.code != "provider_circuit_open" and attempt <= retry_count
+                    can_retry = (exc.retryable and exc.code != "provider_circuit_open" and attempt <= retry_count
+                                 and (attempt_limit is None or total_attempts < attempt_limit))
                     if can_retry:
                         if backoff_ms:
                             await asyncio.sleep((backoff_ms * attempt) / 1000.0)
@@ -377,7 +379,8 @@ class ModelGateway:
             if last_error is None:
                 break
             has_fallback = fallback_index + 1 < len(targets)
-            if not has_fallback or not self._allows_fallback(last_error, policy):
+            if (not has_fallback or not self._allows_fallback(last_error, policy)
+                    or (attempt_limit is not None and total_attempts >= attempt_limit)):
                 self._annotate_error(last_error, invocation_id, resolved_route, total_attempts)
                 raise last_error
 
@@ -1027,10 +1030,17 @@ class ModelGateway:
             "estimated_cost_usd": estimated_cost_usd,
             "error_code": error_code,
             "prompt_version": prompt_version if prompt_version in {
+                "company_question_reply.v1", "answer_evaluation.v7", "supplement_reply.v4", "conversation_reception.v1", "conversation_reception_speech.v1", "interviewer_supervisor.v1", "interviewer_supervisor.v2", "interviewer_evidence_expert.v1", "interviewer_transition.v1",
+                "interview_turn_understanding.v10", "interview_turn_decision.v9",
+                "interview_turn_understanding.v11", "interview_turn_decision.v10",
+                "interview_turn_understanding.v12", "interview_turn_understanding.v13",
+                "interview_turn_decision.v11", "interview_turn_decision.v12",
+                "interview_turn_understanding.v14", "interview_turn_understanding.v15", "interview_turn_decision.v13", "interview_turn_decision.v14", "interview_turn_understanding.v16", "interview_turn_understanding.v17", "interview_turn_understanding.v18", "interview_turn_understanding.v19", "interview_turn_decision.v15", "interview_turn_decision.v16", "interview_turn_decision.v17", "interview_turn_decision.v18",
                 "interview_turn_understanding.v1", "interview_turn_understanding.v2", "interview_turn_understanding.v3",
                 "interview_turn_understanding.v4", "interview_turn_understanding.v5",
                 "interview_turn_understanding.v6", "interview_turn_understanding.v7",
                 "interview_turn_understanding.v8", "interview_turn_understanding.v9",
+                "interview_inquiry_units.v1", "interview_inquiry_units.v2", "answer_evaluation.v6",
                 "interview_turn_decision.v3", "interview_turn_decision.v4", "answer_evaluation.v2",
                 "answer_evaluation.v3", "answer_evaluation.v4", "answer_evaluation.v5",
                 "interview_turn_decision.v5", "interview_turn_decision.v6",

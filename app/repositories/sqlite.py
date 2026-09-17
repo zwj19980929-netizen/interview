@@ -15,6 +15,9 @@ DOCUMENT_COLLECTIONS = [
     "question_speech_assets",
     "role_requirements",
     "interview_plans",
+    "interview_skills",
+    "interview_skill_revisions",
+    "interview_customizations",
     "candidate_profiles",
     "resume_documents",
     "file_objects",
@@ -108,6 +111,12 @@ class SQLiteStore(InMemoryStore):
                 """
             )
             connection.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS uq_interview_skill_revision
+                ON documents (json_extract(data, '$.organization_id'),
+                              json_extract(data, '$.skill_id'), json_extract(data, '$.revision'))
+                WHERE collection = 'interview_skill_revisions'"""
+            )
+            connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS provider_secrets (
                     provider_connection_id TEXT PRIMARY KEY,
@@ -115,6 +124,11 @@ class SQLiteStore(InMemoryStore):
                     updated_at TEXT
                 )
                 """
+            )
+            connection.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS uq_interview_customization_organization
+                ON documents (json_extract(data, '$.organization_id'))
+                WHERE collection = 'interview_customizations'"""
             )
             connection.execute(
                 """

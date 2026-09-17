@@ -4,6 +4,7 @@ import { modelsFeature } from "./models/index.js";
 import { plansFeature } from "./plans/index.js";
 import { questionsFeature } from "./questions/index.js";
 import { workflowFeature } from "./workflow/index.js";
+import { skillsFeature } from "./skills/index.js";
 
 export const overviewFeature = Object.freeze({
   id: "overview",
@@ -17,6 +18,7 @@ export const workspaceFeatures = Object.freeze([
   questionsFeature,
   workflowFeature,
   plansFeature,
+  skillsFeature,
   interviewsFeature,
   modelsFeature,
 ]);

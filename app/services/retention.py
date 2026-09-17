@@ -685,6 +685,8 @@ class RetentionService:
                     "transcript_revisions": [],
                 }
             )
+            item.pop("scoring_transcript", None)
+            item.pop("non_scoring_spans", None)
             answers.append(item)
         sanitized["answers"] = answers
         turns = []
@@ -693,6 +695,9 @@ class RetentionService:
             item["utterances"] = []
             item["current_understanding"] = None
             item["conversation_acts"] = []
+            # Includes the original candidate prefix and question ranges, so
+            # it follows the same retention boundary as utterances/answers.
+            item.pop("company_question_exchanges", None)
             turns.append(item)
         sanitized["turns"] = turns
         runtime = dict(sanitized.get("agent_runtime") or {})

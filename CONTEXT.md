@@ -1,5 +1,53 @@
 # Interviewer Domain
 
+## 当前补充：面试定制（044）
+
+**InterviewCustomization**：组织保存的可选面试偏好与公司介绍，含相互独立的Skill正文和CompanyProfile。保存后新生成的计划默认使用已填写部分；空项略过，不要求用户再次选用，也不要求两项同时存在。
+
+**CompanyProfile**：管理员提供、可以向候选人介绍的公司名称、业务、产品服务与补充信息。它是公司问答的事实来源，不是评分材料；Skill中的行为说明或个人资源不等同公司事实。未提供的信息不能由模型自行补全。
+
+默认解析结果在准备开始时冻结，配置更新与已审阅计划是不同事实；清空默认绑定不会删除历史Skill或会话证据。
+
+## 当前领域语言：面试官自主决策与可选上下文（039）
+
+**InterviewerSupervisor**:
+面试中根据考察目标、候选人话语和已有证据选择下一步交流动作的面试官总控；专家向它提供建议，对外表达保持一个面试官身份。
+_Avoid_: FixedQuestionRunner、AgentChain、IndependentSpeakers
+
+**InterviewAssessmentContract**:
+企业在面试前批准的能力目标、评价标准、证据要求、允许问题范围和考察预算；它约束面试官自主选择问题和结束考察。
+_Avoid_: FixedQuestionList、PromptOnlyPlan、UnlimitedInterview
+
+**InterviewAgenda**:
+一场面试当前的考察议程，包含正在了解的目标、待补证据、已考察和明确不再继续的话题；它可随真实对话修订。
+_Avoid_: PendingQuestionQueue、StaticExamPaper
+
+**CompetencyEvidenceLedger**:
+从本场已提交轮次、答案与理解派生的能力证据及覆盖缺口；当前实现为有界投影，不是独立知识库或最终能力得分。
+_Avoid_: LiveScore、CandidateRanking、ModelBelief
+
+**CompletionBasis**:
+将候选人话题结束判断与其真实发言、补充答复或明确操作相联系的依据；它区分停止继续交流的意愿与回答内容是否充分。
+_Avoid_: SilenceEqualsFinish、NoKnowledgeEqualsNoSpeech
+
+**InterviewSkill**:
+用户自由编写、可选加载的面试方法或行为说明；没有Skill也可以正常面试，不代表企业身份，不要求企业审批，也不等同于模型权重微调。
+_Avoid_: ModelFineTuning、UnrestrictedScript、CandidateInstruction
+
+**AgentDecisionReceipt**:
+已提交面试决策的安全元数据与真实效果记录；被拒绝提案只留下受控错误信息，不能当作已经执行。
+_Avoid_: PrivateThoughts、RawModelResponse、ProposedActionAsFact
+
+**InquiryUnit**:
+企业批准的单点提问单元，绑定一个原关键点、原标准答案引用及自身能力子集。实际单元是v3根题与评分范围，原题其他标签和未问点不能自动计入。
+_Avoid_: FullQuestionAsOneTurn、UnaskedPointPenalty
+
+**AwaitingNextDecision**:
+已保存本题、当前无下一题但候选输入仍未结束的对话状态；可重试规划。只有明确的END_CANDIDATE_INPUT结束候选输入，评分完成或空队列不代替它。
+_Avoid_: EmptyQueueMeansCompleted
+
+当前实现与版本边界见[面试官架构](docs/interviewer-agent-architecture.md)。下列带日期章节保留历史词义，038语义优先与v3合同优先适用。
+
 ## 2026-09-10 · 补充确认与候选人提示（034）
 
 “补充确认”使用当前服务端回复的意图分类；v3通过证据编号恢复原文，同一原文的失败预算不由声学活动刷新。“完整音频直取”只优化服务端收集与私有存储，浏览器仍播放完整文件，不等同实验性的实时PCM播放。候选人提示描述当前状态和可采取动作，内部错误代码、供应商故障和技术指标只用于诊断；必须如实区分正在暂停、已确认暂停与连接中断。
@@ -64,7 +112,7 @@ _Avoid_: EmptyStreamReconfirmation、EnergyEqualsSpeech、VadEqualsTranscript
 
 ## SpokenSupplementConfirmation
 
-**SpokenSupplementConfirmation**：候选人回答后静音5秒触发的补充确认。肯定或实质补充继续同题收听，明确否定才授权准备完整答案，未知/无答复不会自动跳题。它是当前owner/turn/capture内的会话控制状态，不是评分或答案事实。
+**SpokenSupplementConfirmation**：语义判断仍未取得明确完成依据时使用的补充确认；038已在首次静音边界先理解服务端发言。肯定或实质补充继续同题收听，明确否定才授权准备完整答案，未知/无答复不会自动跳题。它是当前owner/turn/capture内的会话控制状态，不是评分或答案事实。
 _Avoid_: SilenceEqualsAnswer、ButtonRequired、BrowserTranscript
 
 本领域描述从岗位题库与候选人简历形成计划和预约，执行语音面试并形成可复核岗位评价的核心概念。
@@ -226,6 +274,9 @@ _Avoid_: PersonalKnowledgeBase、CandidateKnowledgeBase、CopiedQuestionBank
 **ExperienceQuestion**:
 绑定 CandidateProfile，由符合资格后的独立生成工作或面试官基于该候选人简历证据创建，经批准后用于核验过往经历的问题；批准表示可入计划，不提前产生全局读题语音。没有证据快照或题干未点名证据标签的题不得展示或组卷。
 _Avoid_: FollowUp、ResumeGuess、AutoApprovedQuestion、PersonalQuestion
+
+**QuestionBankPreparation**:
+基于岗位、候选人与已关联题库直接准备可预约面试计划的过程；实际考察内容和评分依据来自题库，自动确定问题预算，可选上下文有则使用，不要求另填岗位要求或重复批准。
 
 **InterviewPlanAssembly**:
 依据岗位要求、岗位题库候选池和 ResumeReview 形成候选人专属 InterviewPlan 草稿的结果，包含抽题槽位、冻结候选池、经历问题、覆盖、权重、时长与告警。

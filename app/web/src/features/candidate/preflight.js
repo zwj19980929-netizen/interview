@@ -21,22 +21,30 @@ export async function runCandidatePreflight({
   now = () => performance.now(),
   frame = (callback) => requestAnimationFrame(callback),
   durationMs = 650,
+  signal,
 } = {}) {
+  assertNotAborted(signal);
   if (!mediaDevices?.getUserMedia) throw new Error("当前浏览器无法访问麦克风和摄像头");
   const stream = await mediaDevices.getUserMedia({
     audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user" },
   });
+  if (signal?.aborted) {
+    stream.getTracks().forEach((track) => track.stop());
+    assertNotAborted(signal);
+  }
   if (!stream.getAudioTracks().length || !stream.getVideoTracks().length) {
     stream.getTracks().forEach((track) => track.stop());
     throw new Error("设备预检必须同时取得麦克风和摄像头；摄像头只会按同意范围决定是否上行");
   }
 
   try {
-    const [network, avatarFps] = await Promise.all([
-      measureNetwork(probeUrl, fetchImpl, now),
-      measureWebglFps({ now, frame, durationMs }),
-    ]);
+    // WebGL context creation can block the main thread. Finish that work before
+    // starting the HTTP clocks so it cannot inflate the first network sample.
+    const avatarFps = await measureWebglFps({ now, frame, durationMs });
+    assertNotAborted(signal);
+    const network = await runCandidateNetworkCheck({ probeUrl, fetchImpl, now, signal });
+    assertNotAborted(signal);
     const report = {
       browser_supported: Boolean(globalThis.MediaRecorder && globalThis.RTCPeerConnection),
       microphone_granted: true,
@@ -136,22 +144,72 @@ export function supportsAudioWorklet() {
   return Boolean(Context && globalThis.AudioWorkletNode && "audioWorklet" in Context.prototype);
 }
 
-async function measureNetwork(probeUrl, fetchImpl, now) {
-  if (!probeUrl || !fetchImpl) return { rttMs: 0, jitterMs: 0 };
+export async function runCandidateNetworkCheck({
+  probeUrl,
+  fetchImpl = globalThis.fetch,
+  now = () => performance.now(),
+  timeoutMs = 3000,
+  signal,
+} = {}) {
+  if (!probeUrl || typeof fetchImpl !== "function") throw networkError("NETWORK_CHECK_UNAVAILABLE");
+  const timeout = Number.isFinite(timeoutMs) ? Math.min(10_000, Math.max(1, timeoutMs)) : 3000;
   const samples = [];
   for (let index = 0; index < 4; index += 1) {
+    assertNotAborted(signal);
     const started = now();
     const separator = probeUrl.includes("?") ? "&" : "?";
-    const response = await fetchImpl(`${probeUrl}${separator}preflight_probe=${index}`, {
-      cache: "no-store",
-      credentials: "same-origin",
+    const response = await fetchNetworkSample(`${probeUrl}${separator}preflight_probe=${index}`, {
+      fetchImpl, timeout, signal,
     });
-    if (!response.ok) throw new Error("网络预检请求失败");
+    assertNotAborted(signal);
+    if (!response?.ok) throw networkError("NETWORK_CHECK_FAILED");
     samples.push(Math.max(0, now() - started));
   }
   const rttMs = samples.reduce((sum, value) => sum + value, 0) / samples.length;
   const jitterMs = samples.slice(1).reduce((sum, value, index) => sum + Math.abs(value - samples[index]), 0) / Math.max(1, samples.length - 1);
   return { rttMs: roundMetric(rttMs), jitterMs: roundMetric(jitterMs) };
+}
+
+async function fetchNetworkSample(url, { fetchImpl, timeout, signal }) {
+  const controller = new AbortController();
+  let timer;
+  let onAbort;
+  try {
+    return await Promise.race([
+      new Promise((resolve, reject) => {
+        onAbort = () => {
+          reject(networkError("NETWORK_CHECK_ABORTED"));
+          controller.abort();
+        };
+        signal?.addEventListener("abort", onAbort, { once: true });
+        timer = setTimeout(() => {
+          reject(networkError("NETWORK_CHECK_TIMEOUT"));
+          controller.abort();
+        }, timeout);
+        if (signal?.aborted) onAbort();
+      }),
+      Promise.resolve().then(() => {
+        assertNotAborted(signal);
+        return fetchImpl(url, { cache: "no-store", credentials: "same-origin", signal: controller.signal });
+      }),
+    ]);
+  } catch (error) {
+    if (["NETWORK_CHECK_ABORTED", "NETWORK_CHECK_TIMEOUT"].includes(error?.code)) throw error;
+    throw networkError("NETWORK_CHECK_FAILED");
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener("abort", onAbort);
+  }
+}
+
+function assertNotAborted(signal) {
+  if (signal?.aborted) throw networkError("NETWORK_CHECK_ABORTED");
+}
+
+function networkError(code) {
+  const error = new Error("网络检测未完成，请重新检测。");
+  error.code = code;
+  return error;
 }
 
 async function measureWebglFps({ now, frame, durationMs }) {

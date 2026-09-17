@@ -9,9 +9,10 @@ import OverviewPage from "./features/overview/Page.jsx";
 import PlansPage from "./features/plans/Page.jsx";
 import QuestionsPage from "./features/questions/Page.jsx";
 import WorkflowPage from "./features/workflow/Page.jsx";
+import SkillsPage from "./features/skills/Page.jsx";
 import { workspaceFeatures } from "./features/registry.js";
 
-const pages = { overview: OverviewPage, questions: QuestionsPage, workflow: WorkflowPage, plans: PlansPage, interviews: InterviewsPage, live: InterviewsPage, models: ModelsPage };
+const pages = { overview: OverviewPage, questions: QuestionsPage, workflow: WorkflowPage, plans: PlansPage, skills: SkillsPage, interviews: InterviewsPage, live: InterviewsPage, models: ModelsPage };
 
 export function Shell({ children }) {
   const { auth, route, logout, navigate } = useWorkbench();

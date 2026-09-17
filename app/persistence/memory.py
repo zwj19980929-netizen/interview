@@ -5,6 +5,7 @@ from threading import RLock
 from typing import Dict, Iterator, List, Optional
 
 from app.persistence.interface import Document, PersistenceTransaction, Predicate, TransactionBackend
+from app.persistence.read_only import ReadOnlyTransactionBackend
 from app.repositories.memory import InMemoryStore
 
 
@@ -16,6 +17,9 @@ DOCUMENT_COLLECTIONS = (
     "question_speech_assets",
     "role_requirements",
     "interview_plans",
+    "interview_skills",
+    "interview_skill_revisions",
+    "interview_customizations",
     "candidate_profiles",
     "resume_documents",
     "file_objects",
@@ -133,15 +137,21 @@ class MemoryPersistence:
         self._lock = RLock()
 
     @contextmanager
-    def transaction(self, organization_id: str) -> Iterator[PersistenceTransaction]:
+    def transaction(
+        self, organization_id: str, *, read_only: bool = False,
+    ) -> Iterator[PersistenceTransaction]:
         with self._lock:
             backend = _MemoryTransactionBackend(self.store)
-            transaction = PersistenceTransaction(backend, organization_id)
+            transaction = PersistenceTransaction(
+                ReadOnlyTransactionBackend(backend) if read_only else backend, organization_id,
+            )
             try:
                 yield transaction
             except Exception:
                 raise
             else:
+                if read_only:
+                    return
                 for collection in DOCUMENT_COLLECTIONS:
                     target = getattr(self.store, collection)
                     target.clear()

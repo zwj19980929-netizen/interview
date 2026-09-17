@@ -707,6 +707,43 @@ svg {
   gap: 34px;
 }
 
+.two-column > section {
+  min-width: 0;
+}
+
+.plan-review {
+  margin-top: 16px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.plan-review .data-table {
+  min-width: 0;
+}
+
+.plan-review .question-card {
+  margin: 16px 0;
+}
+
+.plan-review .question-card p {
+  min-height: 0;
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.plan-review ol {
+  padding-left: 22px;
+}
+
+.plan-review li + li,
+.plan-review details {
+  margin-top: 12px;
+}
+
+.plan-review .page-actions {
+  flex-wrap: wrap;
+}
+
 .data-table-wrap {
   overflow: hidden;
   border: 1px solid var(--line);
@@ -2966,6 +3003,16 @@ body.candidate-mode .content {
   font-weight: 800;
 }
 
+.candidate-progress.is-adaptive {
+  width: auto;
+  height: auto;
+  min-height: 40px;
+  flex: 0 0 auto;
+  padding: 10px 14px;
+  border-radius: 20px;
+  white-space: nowrap;
+}
+
 .candidate-waiting-row,
 .candidate-answer-actions,
 .candidate-score-strip,
@@ -3149,6 +3196,24 @@ body.candidate-mode .content {
   font-size: 11px;
 }
 
+.candidate-entry-failure {
+  margin: 20px 0;
+  padding: 16px 18px;
+  border: 1px solid #e3c59a;
+  border-radius: 12px;
+  background: #fff8ed;
+  color: #704b21;
+}
+
+.candidate-entry-failure p {
+  margin: 8px 0 0;
+  line-height: 1.6;
+}
+
+.candidate-entry-failure .button {
+  margin-top: 12px;
+}
+
 .candidate-preflight-checks {
   display: grid;
   align-content: start;
@@ -3161,7 +3226,7 @@ body.candidate-mode .content {
 
 .preflight-check {
   display: grid;
-  grid-template-columns: 24px minmax(0, 1fr) auto;
+  grid-template-columns: 24px minmax(0, 1fr);
   gap: 8px;
   align-items: center;
   min-height: 42px;
@@ -3187,8 +3252,10 @@ body.candidate-mode .content {
 }
 
 .preflight-check small {
+  grid-column: 2;
   color: var(--ink-muted);
-  font-size: 10px;
+  font-size: 12px;
+  line-height: 1.5;
 }
 
 .candidate-loading {

@@ -1,0 +1,41 @@
+.customization-page { max-width: 1180px; margin: 0 auto; color: #213b31; }
+.customization-heading { margin-bottom: 22px; }
+.customization-heading h1 { margin: 4px 0 12px; font-size: clamp(26px, 3vw, 34px); letter-spacing: -1px; line-height: 1.25; }
+.customization-heading > p:last-child { margin: 0; color: #718073; font-size: 15px; line-height: 1.8; }
+.customization-eyebrow { margin: 0; color: #568068; font-size: 12px; font-weight: 600; }
+.customization-intro { margin-bottom: 28px; padding: 14px 18px; border: 1px solid #e1e8dd; border-radius: 10px; background: #f1f5ed; color: #657460; font-size: 13px; line-height: 1.8; }
+.customization-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 24px; align-items: start; }
+.customization-section-nav { display: none; }
+.customization-card { scroll-margin-top: 88px; }
+.customization-card { min-width: 0; padding: 28px; border: 1px solid #dfe6dd; border-radius: 14px; background: #fff; box-shadow: 0 2px 3px #273b2203; }
+.customization-card-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; margin-bottom: 24px; }
+.customization-card-heading h2 { margin: 0 0 9px; font-size: 20px; line-height: 1.4; }
+.customization-card-heading p { margin: 0; color: #7a8778; font-size: 13px; line-height: 1.8; }
+.customization-state { flex: 0 0 auto; margin-top: 3px; padding: 3px 9px; border-radius: 20px; background: #f1f3ee; color: #83917d; font-size: 11px; white-space: nowrap; }
+.customization-state.is-set { background: #e9f4eb; color: #41865a; }
+.customization-state.is-dirty { background: #fff5df; color: #9a7a35; }
+.customization-field { display: flex; min-width: 0; flex-direction: column; gap: 9px; color: #3c513f; font-size: 13px; font-weight: 600; }
+.customization-field small { color: #87927f; font-size: 12px; font-weight: 400; line-height: 1.7; }
+.customization-page .form-textarea { display: block; width: 100%; min-width: 0; min-height: 92px; resize: vertical; line-height: 1.85; font-size: 13px; border-color: #dce4d8; border-radius: 8px; }
+.customization-page .form-input { width: 100%; min-width: 0; font-size: 13px; border-color: #dce4d8; border-radius: 8px; }
+.customization-page .customization-skill-editor { min-height: 440px; font-family: inherit; }
+.customization-counter { margin-top: 9px; color: #939c8c; font-size: 11px; text-align: right; }
+.customization-company-hint { margin: -9px 0 20px; color: #788871; font-size: 12px; line-height: 1.8; }
+.customization-company-fields { display: grid; gap: 19px; }
+.customization-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 14px; margin-top: 24px; padding-top: 20px; border-top: 1px solid #edf0e9; }
+.customization-actions > span { color: #8b9782; font-size: 12px; }
+.customization-actions > .button { min-height: 41px; }
+.customization-feedback { margin: 18px 0 0; color: #3e7e51; font-size: 13px; line-height: 1.8; overflow-wrap: anywhere; }
+.customization-feedback.is-error { color: #a56735; }
+.customization-notice { margin: 0 0 20px; padding: 14px 18px; border: 1px solid #dfe6d8; border-radius: 9px; background: #f4f7f0; color: #697e5e; font-size: 13px; line-height: 1.8; }
+.customization-notice p { margin: 0 0 12px; }
+.customization-notice.is-warning { color: #8b6b34; background: #fffbf1; border-color: #eadfbd; }
+.customization-latest { margin-top: 20px; padding: 14px; border: 1px solid #e2e8dd; border-radius: 8px; background: #f9faf7; font-size: 12px; line-height: 1.8; }
+.customization-latest summary { cursor: pointer; font-weight: 600; }
+.customization-latest dl { margin: 14px 0 0; }
+.customization-latest dl > div + div { margin-top: 12px; }
+.customization-latest dt { color: #87917c; }
+.customization-latest dd { margin: 3px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.skill-prose { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; line-height: 1.8; background: #f7f9f7; padding: 18px; border-radius: 8px; }
+@media (max-width: 1080px) { .customization-grid { grid-template-columns: 1fr; } .customization-page .customization-skill-editor { min-height: 320px; } }
+@media (max-width: 600px) { .customization-section-nav { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 22px; } .customization-card { padding: 21px 18px; } .customization-grid { gap: 20px; } .customization-heading { margin-bottom: 19px; } .customization-intro { margin-bottom: 22px; padding: 13px 15px; } .customization-actions { align-items: stretch; flex-direction: column; gap: 10px; } .customization-actions > .button { width: 100%; } .customization-card-heading { gap: 9px; } .customization-card-heading h2 { font-size: 18px; } }

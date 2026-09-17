@@ -297,13 +297,41 @@ class ClarificationTarget(BaseModel):
         return self
 
 
+class CompletionBasis(BaseModel):
+    """Semantic permission bound to exact server speech, never to silence."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    source: Literal["explicit_server_intent"]
+    evidence_quotes: List[str] = Field(min_length=1, max_length=4)
+
+    @field_validator("evidence_quotes")
+    @classmethod
+    def bounded_unique_quotes(cls, value):
+        if len(value) != len(set(value)) or any(not item.strip() or len(item) > 300 for item in value):
+            raise ValueError("Completion evidence must be bounded, unique and nonempty")
+        return value
+
+
+class CompanyQuestionSpan(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    start: int = Field(ge=0)
+    end: int = Field(ge=1)
+    quote: str = Field(min_length=1, max_length=240)
+
+    @model_validator(mode="after")
+    def exact_range(self):
+        if self.end - self.start != len(self.quote) or not self.quote.strip():
+            raise ValueError("company question span invalid")
+        return self
+
+
 class TurnUnderstanding(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     understanding_id: str = Field(min_length=1, max_length=128)
     revision: int = Field(ge=1)
     # v1 remains readable for immutable historical understandings only.
-    prompt_version: Literal["interview_turn_understanding.v1", "interview_turn_understanding.v2", "interview_turn_understanding.v3", "interview_turn_understanding.v4", "interview_turn_understanding.v5", "interview_turn_understanding.v6", "interview_turn_understanding.v7", "interview_turn_understanding.v8", "interview_turn_understanding.v9", "interview_turn_decision.v1", "interview_turn_decision.v2", "interview_turn_decision.v3", "interview_turn_decision.v4", "interview_turn_decision.v5", "interview_turn_decision.v6", "interview_turn_decision.v7", "interview_turn_decision.v8"]
+    prompt_version: Literal["interview_turn_understanding.v1", "interview_turn_understanding.v2", "interview_turn_understanding.v3", "interview_turn_understanding.v4", "interview_turn_understanding.v5", "interview_turn_understanding.v6", "interview_turn_understanding.v7", "interview_turn_understanding.v8", "interview_turn_understanding.v9", "interview_turn_understanding.v10", "interview_turn_decision.v1", "interview_turn_decision.v2", "interview_turn_decision.v3", "interview_turn_decision.v4", "interview_turn_decision.v5", "interview_turn_decision.v6", "interview_turn_decision.v7", "interview_turn_decision.v8", "interview_turn_decision.v9", "interview_turn_understanding.v11", "interview_turn_decision.v10", "interview_turn_understanding.v12", "interview_turn_understanding.v13", "interview_turn_decision.v11", "interview_turn_decision.v12", "interview_turn_understanding.v14", "interview_turn_understanding.v15", "interview_turn_decision.v13", "interview_turn_decision.v14", "interview_turn_understanding.v16", "interview_turn_understanding.v17", "interview_turn_understanding.v18", "interview_turn_understanding.v19", "interview_turn_decision.v15", "interview_turn_decision.v16", "interview_turn_decision.v17", "interview_turn_decision.v18"]
     utterance_id: str = Field(min_length=1, max_length=128)
     intent: Literal[
         "answer",
@@ -313,7 +341,15 @@ class TurnUnderstanding(BaseModel):
         "pause",
         "clarification_request",
         "off_topic",
+        "company_question",
     ]
+    # Optional solely for immutable historical understandings. The semantic
+    # wire contract requires all four fields on every newly prepared result.
+    answer_content: Optional[Literal["technical", "partial", "none"]] = None
+    turn_intent: Optional[Literal["answering", "thinking", "finish_topic", "decline_topic", "stop_interview", "repeat", "clarify", "correction", "pause", "ask_company"]] = None
+    company_question: Optional[CompanyQuestionSpan] = None
+    completion_basis: Optional["CompletionBasis"] = None
+    followup_allowed: bool = True
     answer_summary: str = Field(max_length=800)
     claims: List[ClaimEvidence] = Field(default_factory=list, max_length=12)
     evidence_quotes: List[str] = Field(default_factory=list, max_length=12)
@@ -324,7 +360,7 @@ class TurnUnderstanding(BaseModel):
     clarification_target: Optional[ClarificationTarget] = None
     confidence: float = Field(ge=0, le=1)
     suggested_action: Literal[
-        "accept", "clarify", "repeat", "continue_listening", "pause", "followup", "next"
+        "accept", "clarify", "repeat", "continue_listening", "pause", "followup", "next", "respond_company"
     ]
     provider: Dict[str, Any]
     problem: Optional[UnderstandingProblem] = None
@@ -348,6 +384,8 @@ class ApprovedConversationAct(BaseModel):
         "supplement_check",
         "supplement_continue",
         "supplement_clarify",
+        "company_answer",
+        "conversation_acknowledgement",
     ]
     text: str = Field(min_length=1, max_length=1000)
     turn_id: Optional[str] = Field(default=None, max_length=128)
