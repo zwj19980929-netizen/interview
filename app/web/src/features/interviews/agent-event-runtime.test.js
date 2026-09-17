@@ -3,6 +3,13 @@ import { describe, expect, it } from "vitest";
 import { OrderedAgentEventStream, validateAgentEvent } from "./agent-event-runtime.js";
 
 describe("ordered AgentEvent runtime", () => {
+  it("accepts only fixed runtime diagnostic codes in a paused snapshot", () => {
+    const snapshot = { ...candidateSnapshot(), status: "paused", runtime_problem_code: "AUDIO_TRACK_LOST" };
+    expect(validateAgentEvent(event(1, "session.snapshot", snapshot), { audience: "candidate" }).ok).toBe(true);
+    for (const bad of [{ ...snapshot, runtime_problem_code: "secret provider error" }, { ...snapshot, status: "in_progress" }]) {
+      expect(validateAgentEvent(event(1, "session.snapshot", bad), { audience: "candidate" }).ok).toBe(false);
+    }
+  });
   it("accepts unknown transcript confidence without converting it into certainty or a protocol failure", () => {
     const stream = new OrderedAgentEventStream({ audience: "candidate" });
     const received = event(1, "transcript.final", { text: "合成术语回答。", confidence: null, authoritative: true, persisted_audio: true });

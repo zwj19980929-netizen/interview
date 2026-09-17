@@ -7,19 +7,21 @@ from app.core.prompt.contracts import prompt_contract
 from app.core.prompt.validation import StructuredResponseValidationError
 from app.services.spoken_supplement import SpokenSupplementConfirmation
 from test_answer_endpoint import _Capture, _endpoint, _final, _until
+from test_semantic_turn_endpoint import SemanticCapture
+from test_stable_preview_preparation import _preview
 from test_prepared_turn_decision import Gateway, _service
 
 
 @pytest.mark.anyio
 async def test_reception_uses_small_grounded_schema_and_no_answer_preparation():
-    gateway = Gateway({'kind': 'wait', 'confidence': .95, 'evidence_id': 'E1'})
+    gateway = Gateway({'kind': 'wait', 'confidence': .95, 'evidence_id': 'E1', 'reply_text': '没关系，慢慢想，我在听。'})
     result = await _service(gateway).classify_reception('稍等。', 'org_default', question='请介绍一个项目。')
-    assert result == {'kind': 'wait', 'confidence': .95, 'evidence_quote': '稍等。'}
+    assert result == {'kind': 'wait', 'confidence': .95, 'evidence_quote': '稍等。', 'reply_text': '没关系，慢慢想，我在听。'}
     request = gateway.requests[0]
-    assert request.max_output_tokens == 180
+    assert request.max_output_tokens == 320
     assert request.execution_budget.timeout_s == 4
     assert request.execution_budget.max_provider_retries == 0
-    assert request.metadata == {'prompt_version': 'conversation_reception.v1'}
+    assert request.metadata == {'prompt_version': 'conversation_reception.v2'}
     assert 'standard_answer' not in str(request.messages)
 
 
@@ -34,10 +36,10 @@ async def test_reception_uses_small_grounded_schema_and_no_answer_preparation():
 ])
 async def test_reception_rejects_invalid_model_results_before_routing(data):
     with pytest.raises(StructuredResponseValidationError):
-        await _service(Gateway(data)).classify_reception('稍等。', 'org_default')
+        await _service(Gateway({'reply_text': '我在听。', **data})).classify_reception('稍等。', 'org_default')
 
 
-class ReceptionCapture(_Capture):
+class ReceptionCapture(SemanticCapture):
     supports_stable_preview = True
 
     def __init__(self, kind='wait'):
@@ -50,7 +52,7 @@ class ReceptionCapture(_Capture):
         self.preview_override = None
 
     async def transcript_preview(self):
-        return self.preview_override or SimpleNamespace(text=self.current_final.text, confidence=.95, has_unstable_tail=False)
+        return self.preview_override or _preview(self.current_final)
 
     async def classify_reception(self, text, **kwargs):
         self.requests.append((text, kwargs))
@@ -66,6 +68,7 @@ def setup(kind='wait'):
     spoken = []
     async def speak(kind, guard):
         guard()
+        endpoint.confirmation.playback_selected(endpoint)
         spoken.append(kind)
         if kind == 'pause':
             capture.is_open = False
@@ -86,7 +89,7 @@ def test_social_requests_speak_after_current_final_before_full_answer_analysis(k
             await _until(lambda: spoken)
             assert spoken == ['reception_' + kind]
             assert endpoint.capture.snapshots == [False], 'Preview alone cannot speak'
-            assert not endpoint.capture.prepares and not commits
+            assert len(endpoint.capture.prepares) <= 1 and not commits, 'Parallel preparation never authorizes submission'
             assert len(endpoint.capture.requests) == 1, 'Reuse the validated result for identical final words'
             endpoint.confirmation.floor_returned(endpoint)
             clock.value = 60
@@ -119,7 +122,7 @@ def test_new_input_revokes_pending_reception_and_clears_preparing(change):
         endpoint, clock, notices, commits, spoken = setup()
         endpoint.capture.release = asyncio.Event()
         try:
-            await endpoint.capture.entered.wait()
+            await asyncio.wait_for(endpoint.capture.entered.wait(), 1)
             if change == 'voice':
                 endpoint.speech_started()
             elif change == 'transcript':
@@ -139,7 +142,7 @@ def test_new_input_revokes_pending_reception_and_clears_preparing(change):
 def test_changed_final_cannot_reuse_preview_reception():
     async def scenario():
         endpoint, clock, notices, commits, spoken = setup()
-        endpoint.capture.preview_override = SimpleNamespace(text='稍等。', confidence=.95, has_unstable_tail=False)
+        endpoint.capture.preview_override = _preview(_final('稍等。'))
         endpoint.capture.current_final = _final('不用等了，我继续回答。')
         calls = 0
         async def classify(text, **kwargs):
@@ -149,7 +152,7 @@ def test_changed_final_cannot_reuse_preview_reception():
         endpoint.capture.classify_reception = classify
         try:
             await _until(lambda: calls == 2)
-            assert not spoken and not commits and not endpoint.capture.prepares
+            assert not spoken and not commits
         finally:
             await endpoint.close()
     asyncio.run(scenario())

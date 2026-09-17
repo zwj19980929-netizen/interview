@@ -326,7 +326,7 @@ def test_nonzero_microphone_frames_and_single_impulse_during_preparation_keep_sp
             await _feed(managed._ingress, _SILENCE, 8)
             clock.value += 1
             await asyncio.wait_for(entered.wait(), 3)
-            assert managed.chain._stt.stream.paused
+            assert not managed.chain._stt.stream.paused, "Recognition continues during answer preparation"
             revision = endpoint.revision
             noise = array("h", [(i % 7) - 3 for i in range(320)]).tobytes()
             impulse = array("h", [2000] * 160 + [-2000] * 160).tobytes()

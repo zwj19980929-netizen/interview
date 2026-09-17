@@ -1,5 +1,19 @@
 # 模型供应商插件化设计
 
+## 053：有界连续播放
+
+不改变TTS供应商路由或PCM/final合同。服务器每帧并行提交录制音轨与浏览器可靠PCM，共享一次有界授权监视；任一分支异常撤销另一分支，最多一帧在途。浏览器240ms缓冲吸收包抖动并统计欠载；持续慢供给需消除发送瓶颈，不能增加无限缓冲或伪造完成。完整消费者已失败时也回收异常，避免监视器同时撤销造成后台Task异常。详见[053说明](warmup-playback-053.md)。
+
+## 052：自然接话与连续识别、流式输出
+
+集中合同 `conversation_reception.v2` 返回且仅返回 `kind/confidence/evidence_id/reply_text`。11 类 kind 保留控制边界并加入 `interview_dialogue`；`reply_text` 最多 180 字符，非空口语、不含链接、代码块或控制字符。`other` 与 `repeat` 必须空回复：普通技术回答、公司反问和结束意图归后续专门路径；重读沿冻结原题。统一结构、跨字段及原文编号校验通过后才进入批准表达。现有理解路由、4 秒供应商预算和 0 次内部重试保持，输出上限为 320 tokens。
+
+接话上下文仅含当前题、当前及此前原话、最近最多 4 条候选人可见话语、安全的流程事实和可选 Skill；不传标准答案、评分依据、企业全文或任意会话对象。Skill 不能提升工具或结束权限；公司事实只能走已有资料引用问答，没有资料不能编造。预览理解在稳定短停顿时提前启动，与接话调用并行；最多一个受控任务，失败不提供完成许可，新增输入或关闭撤销。final 与预览的全部证据指纹匹配才可复用。
+
+STT 供应商 final 仍只结束识别片段；服务端取得 final 并投影字幕后立即重开识别，较慢理解期间继续接收 partial。完整答案最终仍需权威 final、录音与输入代次校验。没有修改供应商路由、模型密钥或评分模型合同。
+
+批准 TTS 默认 `INTERVIEWER_STREAMING_TTS_ENABLED=true`，继续通过 `ModelGateway.open_tts_stream` 严格验证 PCM 和唯一 final。LiveKit RTC 音轨保留录制，同源 PCM 经可靠数据通道送往有界 AudioWorklet；源样本消费与设备输出时钟共同确认排空，PCM 不经事件/Redis。供应商不支持流式传输时仅首 PCM 前可用原完整资产路径；首 PCM 后失败或取消不自动重播。已有完整题目音频仍优先，动态承接语与问题可能重新合成。052 本机 Chromium / LiveKit 断供实验通过，真实口音、长会话、其他浏览器和生产 p50/p95 仍需独立验收，见[052 改造说明](continuous-conversation-052.md)。
+
 ## 2026-09-14：短问题生成预算（048）
 
 批次边界：每批只含一个原题的最多6个评分点；响应Schema的题目ID、知识点ID、能力与参考片段枚举只来自该题，unit数量等于该批实际点数。
@@ -19,7 +33,7 @@
 
 短表达集中为`conversation_reception_speech.v1`，等待/继续/确认在线/重说/题意澄清请求/转写投诉/收听问题/暂停/不明请求/理解失败均复用批准act与TTS。语义理解升级v16/v17（无可选上下文）和v18/v19（可选上下文），decision升级v15/v16、v17/v18；分别对应未确认/已确认结束。`semantic_turn.v3/v4`明确thinking与pause及completion_basis互斥，原严格校验不放宽；旧版本继续可读，版本进入领域与网关审计。
 
-没有变更实际模型路由、密钥或开启实时PCM播放开关。默认仍收齐完整PCM并发布受管音频；一条固定合成等待回应在真实路由首PCM466ms、完整收齐1048ms，独立于1–2秒的合成接话识别，均非用户端到端承诺。失败/取消保持当前回答，不把识别服务故障伪装为候选人没有补充。
+046 当时没有变更模型路由、密钥或开启实时 PCM 播放；052 的自然接话和默认流式输出取代这部分旧行为。046 当时仍收齐完整 PCM 并发布受管音频；一条固定合成等待回应在真实路由首PCM466ms、完整收齐1048ms，独立于1–2秒的合成接话识别，均非用户端到端承诺。失败/取消保持当前回答，不把识别服务故障伪装为候选人没有补充。
 
 ## 2026-09-10 · 公司问答模型合同（044）
 
@@ -43,7 +57,7 @@ interviewer_supervisor.v2明确Skill由用户自由编写、可选加载，企�
 
 supplement_reply.v3集中定义Prompt和严格Schema，只返回intent/confidence/evidence_id。长回答不要求模型复写最多300字的quote；服务端按编号恢复精确证据。调用预算8秒、350输出token、0次provider内重试；端点按原文最多三次失败。网关记录白名单schema_reason/schema_path用于区分枚举、类型、长度、字段等错误，保留历史版本。
 
-AgentExpressionAudioService通过既有open_tts_stream收齐完整PCM并私有存储，默认INTERVIEWER_BUFFERED_TTS_ENABLED=true；不支持此传输时使用原batch URL导入。已开始的流失败、超时、取消不自动重播，Mock拒绝；浏览器仍是完整文件播放，INTERVIEWER_STREAMING_TTS_ENABLED=false不变。20秒总准备预算，字节/音频时长与输出终态校验继续由既有网关承担。
+AgentExpressionAudioService通过既有open_tts_stream收齐完整PCM并私有存储，默认INTERVIEWER_BUFFERED_TTS_ENABLED=true；不支持此传输时使用原batch URL导入。已开始的流失败、超时、取消不自动重播，Mock拒绝；034 当时使用完整文件播放且 INTERVIEWER_STREAMING_TTS_ENABLED=false；052 已默认开启可计数 PCM 播放，完整文件保留作适用回退。20秒总准备预算，字节/音频时长与输出终态校验继续由既有网关承担。
 
 合成真实调用发现DashScope Qwen HTTP SSE三项旧适配遗漏：中间finish_reason为字符串“null”，首片带精确PCM16/24k/mono的44字节流式WAVE头，stop前还有一条空audio.data的usage通知。Adapter仅兼容已观察到的固定头（signed-limit占位对），未知头/格式拒绝；空usage通知只允许一次且必须已有PCM，不能视为final，之后仅允许有效stop和EOF。统一网关看到的始终是无容器PCM，不能把文件头当声音或时长。供应商状态/终片规范参照[官方Qwen-TTS接口](https://help.aliyun.com/en/model-studio/qwen-tts-api)；usage空通知和精确首片头依据本次新合成文本的只读字段/容器探针，不声称文档保证所有模型都相同。
 
@@ -110,7 +124,7 @@ DashScope正常finish在拿到有效final后复用独立共享清理任务，优
 
 邀请、企业显式 readiness refresh 和已通过前置准入的候选人 readiness/start 复用统一路由探测模块：健康且未过期复用；未测/过期按需探测；失败有 30 秒冷却。每批至多 3 条并行、每条探测至多 15 秒、自动刷新总预算 30 秒，同租户同路由通过持久化租约去重；配置变化或旧探针完成不得覆盖新配置证据。手动 route test 使用同一所有权和配置检查，不以模型 test 冒充路由健康。
 
-探针继续只使用 `app/core/prompt/` 的既有版本化合成输入；流式 STT/实时语音只验证 ready 握手并关闭，不拿静音要求 final，也不评价 WER。TTS 检测既有完整合成能力，不启用 012 的实验流式输出。错误仅持久化安全分类，不写原始异常/响应/凭据；取消或超时须回收已经打开的流连接。成功仍不等于正式业务质量/端到端验收。
+探针继续只使用 `app/core/prompt/` 的既有版本化合成输入；流式 STT/实时语音只验证 ready 握手并关闭，不拿静音要求 final，也不评价 WER。TTS 探针只检测既有完整合成能力，不创建候选流式输出；052 的实际表达播放验收独立记录。错误仅持久化安全分类，不写原始异常/响应/凭据；取消或超时须回收已经打开的流连接。成功仍不等于正式业务质量/端到端验收。
 
 手动路由测试可显式重试冷却中的失败，但仍与自动刷新共享租约和配置检查。STT 探针独立回收预算2秒，仍受每条15秒总预算约束，不能确认回收时返回安全分类 `provider_probe_cleanup_failed`。DashScope abort 以共享独立任务保证重复调用能等到同一次清理，优雅关闭至多0.5秒，取消/超时先强制回收底层 transport 再取消等待；不能仅凭 closed 标志跳过未完成清理。正常正式 finish 与尾音 final 不变。批次网络等待预算30秒，取消任务另有最多0.1秒收尾等待；前端邀请/候选检查和开场40秒、手动路由测试35秒局部超时与此预算匹配。
 
@@ -124,8 +138,7 @@ DashScope正常finish在拿到有效final后复用独立共享清理任务，优
 
 ### 已批准文本的 TTS streaming transport
 
-默认关闭，开关 `INTERVIEWER_STREAMING_TTS_ENABLED=false`；网关/供应商 PCM 合同已验证，但 Chrome 接收端时钟尚不具备可靠内容样本映射，
-不得把已实现供应商 SSE 等同于正式链路已启用边生成边播放。自动轮次、合并理解和原完整私有 TTS 路径正常运行。
+052 已用可计数的客户端 PCM 播放器替代 012 的 MediaStream 墙钟适配器，默认 `INTERVIEWER_STREAMING_TTS_ENABLED=true`。本机 Chromium / LiveKit 停供实验验证源样本位置不随静音增长；供应商 SSE、发送结束和客户端实际排空仍是独立事实，不能把此实验等同于生产延迟达标。原完整私有 TTS 路径保持。
 
 `ModelGateway.open_tts_stream(TTSSynthesizeRequest, route=...)` 是已有 `tts.synthesize` 能力的可选传输，非新业务能力。
 统一 `ValidatedTTSStream` 严格校验 ready→顺序 PCM16 mono chunks→唯一 final，provider/model/请求身份、采样率和字节水位不可换代，

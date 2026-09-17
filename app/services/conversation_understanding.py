@@ -291,26 +291,36 @@ class ConversationUnderstandingService:
         return await self._prepare_decision(utterance, turn, interview)
 
     async def classify_reception(self, text: str, organization_id: str, *, phase: str = "listening",
-                                 question: str = "", preceding_text: str = "") -> Dict[str, Any]:
-        """Route a server utterance's social request without preparing an answer."""
+                                 question: str = "", preceding_text: str = "",
+                                 history: Optional[List[Dict[str, Any]]] = None,
+                                 process_facts: Optional[Dict[str, Any]] = None,
+                                 skill_instructions: str = "") -> Dict[str, Any]:
+        """Understand and answer a bounded social request in a single invocation.
+
+        No lifecycle/answer authority is returned. Callers must fence the current
+        server utterance and ownership again before speaking the validated reply.
+        """
         if not isinstance(text, str) or not text.strip() or len(text) > 100000:
             raise ValueError("A bounded nonempty server utterance is required")
         if phase not in {"listening", "awaiting_reply"}:
             raise ValueError("Unknown conversational phase")
         contract = prompt_contract("conversation_reception", {
             "text": text, "phase": phase, "question": question[:2000], "preceding_text": preceding_text[-1000:],
+            "history": history, "process_facts": process_facts, "skill_instructions": skill_instructions,
         })
         response = await asyncio.wait_for(self.gateway.invoke(cap.LLM_CHAT_JSON, ChatJSONRequest(
             organization_id=organization_id, purpose="interview_turn_understanding",
             messages=contract.messages, json_schema=contract.response_schema,
-            temperature=0, max_output_tokens=180,
+            temperature=0, max_output_tokens=320,
             execution_budget=InvocationExecutionBudget(timeout_s=4, max_provider_retries=0),
             metadata={"prompt_version": contract.version},
         )), timeout=5)
-        validate_structured_response(response.data, contract.response_schema)
+        from app.core.prompt.conversation_reception import validate_reception_response
+        validate_reception_response(response.data, contract.response_schema)
         data = response.data
         return {"kind": data["kind"], "confidence": data["confidence"],
-                "evidence_quote": understanding_references(text, [])["evidence"][data["evidence_id"]]}
+                "evidence_quote": understanding_references(text, [])["evidence"][data["evidence_id"]],
+                "reply_text": data["reply_text"].strip()}
 
     async def classify_supplement_reply(self, reply: str, organization_id: str) -> Dict[str, Any]:
         if not isinstance(reply, str) or not reply.strip() or len(reply) > 100000:

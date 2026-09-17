@@ -8,7 +8,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from app.persistence.errors import ConcurrencyConflict, RecordAlreadyExists
-from app.persistence.interface import Document, PersistenceTransaction, Predicate, TransactionBackend
+from app.persistence.interface import Document, InterviewWatchdogKind, PersistenceTransaction, Predicate, TransactionBackend
 from app.persistence.read_only import ReadOnlyTransactionBackend
 from app.repositories.postgresql import PostgreSQLStore
 
@@ -19,7 +19,25 @@ MIGRATIONS = [
     Path(__file__).resolve().parents[2] / "migrations" / "003_interview_skills.sql",
     Path(__file__).resolve().parents[2] / "migrations" / "004_optional_interview_skills.sql",
     Path(__file__).resolve().parents[2] / "migrations" / "005_interview_customization.sql",
+    Path(__file__).resolve().parents[2] / "migrations" / "006_evidence_command_poll.sql",
+    Path(__file__).resolve().parents[2] / "migrations" / "007_interview_watchdog_candidates.sql",
 ]
+
+
+def _json_falsy(field: str) -> str:
+    # Match existing Python truthiness, including legacy empty containers, but
+    # not nonempty strings that happen to spell "false", "0" or "{}".
+    return "COALESCE(data->'%s', 'null'::jsonb) IN " % field + (
+        "('null'::jsonb, 'false'::jsonb, '0'::jsonb, '\"\"'::jsonb, '[]'::jsonb, '{}'::jsonb)"
+    )
+
+
+_INTERVIEW_WATCHDOG_PREDICATES = {
+    "takeover": "jsonb_typeof(data#>'{agent_runtime,takeover}') = 'object' "
+                "AND data#>'{agent_runtime,takeover}' <> '{}'::jsonb AND " + _json_falsy("list_removed_at"),
+    "deadline": "data->>'status' IN ('scheduled', 'waiting', 'in_progress', 'paused') AND "
+                + _json_falsy("candidate_input_completed_at"),
+}
 
 
 class _PostgreSQLTransactionBackend(TransactionBackend):
@@ -47,6 +65,31 @@ class _PostgreSQLTransactionBackend(TransactionBackend):
     def list_documents(self, collection: str) -> List[Document]:
         rows = self.connection.execute(
             "SELECT data FROM documents WHERE collection = %s ORDER BY id", (collection,)
+        ).fetchall()
+        return [dict(row["data"]) for row in rows]
+
+    def list_unsettled_evidence_commands(
+        self, *, organization_id: str, interview_id: str,
+    ) -> List[Document]:
+        # Candidate discovery takes no additional row locks. claim_next has
+        # already locked ownership, then re-gets each command FOR UPDATE.
+        rows = self.connection.execute(
+            "SELECT data FROM documents WHERE collection = 'evidence_commands' "
+            "AND organization_id = %s AND data->>'interview_id' = %s "
+            "AND data->>'status' IN ('pending', 'running')",
+            (organization_id, interview_id),
+        ).fetchall()
+        return [dict(row["data"]) for row in rows]
+
+    def list_interview_watchdog_candidates(
+        self, *, organization_id: str, kind: InterviewWatchdogKind,
+    ) -> List[Document]:
+        if kind not in ("takeover", "deadline"):
+            raise ValueError("Unknown interview watchdog kind.")
+        rows = self.connection.execute(
+            "SELECT data FROM documents WHERE collection = 'interviews' "
+            "AND organization_id = %s AND " + _INTERVIEW_WATCHDOG_PREDICATES[kind],
+            (organization_id,),
         ).fetchall()
         return [dict(row["data"]) for row in rows]
 
@@ -203,6 +246,9 @@ class PostgreSQLPersistence:
                      WHERE conrelid = to_regclass('public.documents')
                        AND conname = 'ck_interview_skill_active_version') AS interview_skill_active_state,
                     to_regclass('public.uq_interview_customization_organization') AS interview_customization_index,
+                    to_regclass('public.idx_evidence_commands_unsettled') AS evidence_command_poll_index,
+                    to_regclass('public.idx_interviews_watchdog_takeover') AS interview_takeover_watchdog_index,
+                    to_regclass('public.idx_interviews_watchdog_deadline') AS interview_deadline_watchdog_index,
                     (SELECT oid FROM pg_constraint
                      WHERE conrelid = to_regclass('public.documents')
                        AND conname = 'ck_interview_customization') AS interview_customization_contract

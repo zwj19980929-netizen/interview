@@ -4,7 +4,10 @@ from datetime import datetime, timezone
 from threading import RLock
 from typing import Dict, Iterator, List, Optional
 
-from app.persistence.interface import Document, PersistenceTransaction, Predicate, TransactionBackend
+from app.persistence.interface import (
+    Document, InterviewWatchdogKind, PersistenceTransaction, Predicate, TransactionBackend,
+    is_interview_watchdog_candidate,
+)
 from app.persistence.read_only import ReadOnlyTransactionBackend
 from app.repositories.memory import InMemoryStore
 
@@ -64,6 +67,23 @@ class _MemoryTransactionBackend(TransactionBackend):
 
     def list_documents(self, collection: str) -> List[Document]:
         return [deepcopy(item) for item in self.documents[collection].values()]
+
+    def list_unsettled_evidence_commands(
+        self, *, organization_id: str, interview_id: str,
+    ) -> List[Document]:
+        return [deepcopy(item) for item in self.documents["evidence_commands"].values()
+                if item.get("organization_id") == organization_id
+                and item.get("interview_id") == interview_id
+                and item.get("status") in {"pending", "running"}]
+
+    def list_interview_watchdog_candidates(
+        self, *, organization_id: str, kind: InterviewWatchdogKind,
+    ) -> List[Document]:
+        if kind not in ("takeover", "deadline"):
+            raise ValueError("Unknown interview watchdog kind.")
+        return [deepcopy(item) for item in self.documents["interviews"].values()
+                if item.get("organization_id") == organization_id
+                and is_interview_watchdog_candidate(item, kind)]
 
     def insert_document(self, collection: str, item: Document) -> None:
         self.documents[collection][item["id"]] = deepcopy(item)

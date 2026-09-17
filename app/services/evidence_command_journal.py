@@ -227,12 +227,8 @@ class EvidenceCommandJournal:
     def has_unsettled(self, interview_id: str, organization_id: str) -> bool:
         """Tell a failover worker whether terminal-effect receipts remain."""
 
-        with self.persistence.transaction(organization_id) as transaction:
-            return any(
-                item.get("interview_id") == interview_id
-                and item.get("status") in {"pending", "running"}
-                for item in transaction.evidence_commands.list()
-            )
+        with self.persistence.transaction(organization_id, read_only=True) as transaction:
+            return bool(transaction.evidence_commands.list_unsettled(interview_id))
 
     def claim_next(
         self,
@@ -241,6 +237,20 @@ class EvidenceCommandJournal:
     ) -> Optional[ClaimedEvidenceCommand]:
         """Claim one due command; an expired claim is safe to deliver again."""
 
+        # Idle audio owners poll frequently. Discover whether there is work
+        # without taking SQLite's writer lock (or PostgreSQL row locks), but
+        # still fail closed when this owner has expired or been replaced.
+        with self.persistence.transaction(organization_id, read_only=True) as transaction:
+            now = transaction.database_now()
+            assert_current_evidence_fence(transaction, fence, now=now)
+            ownership = transaction.evidence_ownerships.get(fence.ownership_id)
+            assert ownership is not None
+            if not transaction.evidence_commands.list_unsettled(ownership["interview_id"]):
+                return None
+
+        # Discovery grants no authority and its records are not reused here.
+        # Re-read time, ownership and commands under the original write locks
+        # so expiry, takeover and concurrent delivery retain their CAS rules.
         with self.persistence.transaction(organization_id) as transaction:
             now = transaction.database_now()
             assert_current_evidence_fence(transaction, fence, now=now)
@@ -248,13 +258,7 @@ class EvidenceCommandJournal:
             assert ownership is not None
             current_generation = int(ownership.get("control_generation", 0))
             summaries = sorted(
-                (
-                    item
-                    for item in transaction.evidence_commands.list()
-                    if item.get("interview_id") == ownership.get("interview_id")
-                    and item.get("status")
-                    in {"pending", "running"}
-                ),
+                transaction.evidence_commands.list_unsettled(ownership["interview_id"]),
                 key=lambda item: (
                     str(item.get("available_at") or ""),
                     str(item.get("created_at") or ""),

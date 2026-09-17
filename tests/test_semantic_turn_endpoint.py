@@ -58,7 +58,7 @@ def test_clear_decline_submits_first_final_without_confirmed_flag_or_second_infe
         assert len(commits) == 1 and not spoken
         assert endpoint.capture.flags == [(True, False)]
         assert not endpoint.confirmation.confirmed
-        assert endpoint.capture.snapshots == [False]
+        assert endpoint.capture.snapshots == [False, False], "Resume during reasoning, then fence a new final before committing"
         assert commits[0].understanding.completion_basis.evidence_quotes == ["下一题吧。"]
         await endpoint.close()
     asyncio.run(scenario())
@@ -105,18 +105,37 @@ def test_semantic_failures_use_one_shared_budget_and_noise_does_not_reset_it():
     async def scenario():
         endpoint, clock, notices, commits, spoken = setup()
         endpoint.capture.failure = True
-        for attempt in range(3):
-            clock.value += 5
-            await _until(lambda: endpoint._prepare_failures == attempt + 1)
-            if endpoint.confirmation.speaking:
-                endpoint.confirmation.floor_returned(endpoint)
-        assert len(endpoint.capture.prepares) == 3
-        for _ in range(3):
-            endpoint.speech_started()
-            clock.value += 10
-            await asyncio.sleep(.06)
-        assert len(endpoint.capture.prepares) == 3
-        assert "understanding_retry_exhausted" in notices
-        assert not commits and spoken == ["reception_unavailable"] and endpoint.capture.is_open
-        await endpoint.close()
+        original_notify = endpoint.notify
+        failure_notice_started, release_failure_notice = asyncio.Event(), asyncio.Event()
+
+        async def notify(reason):
+            if reason == "understanding_unavailable" and not failure_notice_started.is_set():
+                failure_notice_started.set()
+                await release_failure_notice.wait()
+            await original_notify(reason)
+
+        endpoint.notify = notify
+        try:
+            for attempt in range(3):
+                clock.value += 5
+                await _until(lambda: endpoint._prepare_failures == attempt + 1)
+                if attempt == 0:
+                    # The model callback records the failure before async
+                    # notification and recovery playback have completed.
+                    await asyncio.wait_for(failure_notice_started.wait(), 1)
+                    assert not endpoint.confirmation.speaking and not spoken
+                    release_failure_notice.set()
+                    await _until(lambda: endpoint.confirmation.speaking)
+                    endpoint.confirmation.floor_returned(endpoint)
+            assert len(endpoint.capture.prepares) == 3
+            for _ in range(3):
+                endpoint.speech_started()
+                clock.value += 10
+                await asyncio.sleep(.06)
+            assert len(endpoint.capture.prepares) == 3
+            assert "understanding_retry_exhausted" in notices
+            assert not commits and spoken == ["reception_unavailable"] and endpoint.capture.is_open
+        finally:
+            release_failure_notice.set()
+            await endpoint.close()
     asyncio.run(scenario())

@@ -11,6 +11,7 @@ import asyncio
 import inspect
 import math
 import re
+import struct
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -74,6 +75,8 @@ class LiveKitApprovedAudioPublisher:
         self.track_name = "approved-expression:%s" % performance_id
         self.sample_rate_hz = sample_rate_hz
         self.total_samples = 0
+        self._output_id: Optional[str] = None
+        self._sequence = 0
         self._fence = assert_current
         self._rtc = rtc if rtc_module is None else rtc_module
         self._room_factory = room_factory or self._rtc.Room
@@ -85,6 +88,14 @@ class LiveKitApprovedAudioPublisher:
         self._operation_lock = asyncio.Lock()
         self._cleanup_lock = asyncio.Lock()
         self._pending_operations: set[asyncio.Task] = set()
+
+    def bind_output(self, output_id: str) -> None:
+        """Bind the counted PCM transport before either output path opens."""
+        if self._state != "new" or self._output_id is not None:
+            raise ValueError("An output can only be bound once before publication")
+        if not isinstance(output_id, str) or not re.fullmatch(r"speech_output_[A-Za-z0-9_]{1,100}", output_id):
+            raise ValueError("An exact server-issued output identifier is required")
+        self._output_id = output_id
 
     @property
     def publication(self) -> Optional[LiveKitApprovedAudioPublication]:
@@ -188,14 +199,50 @@ class LiveKitApprovedAudioPublisher:
             try:
                 frame_bytes = self.sample_rate_hz // 50 * 2
                 for offset in range(0, len(pcm_s16le), frame_bytes):
-                    self._assert_current()
                     data = pcm_s16le[offset:offset + frame_bytes]
                     frame = self._rtc.AudioFrame(data, self.sample_rate_hz, 1, len(data) // 2)
-                    await self._current_operation(self._source.capture_frame(frame))
+                    packet = None
+                    if self._output_id is not None:
+                        # Reliable data carries the same source PCM to the browser's
+                        # counted worklet. The RTC track remains for room recording;
+                        # it is never also attached for candidate playback.
+                        packet = struct.pack("!4sIII", b"IAS1", self._sequence + 1,
+                                             self.total_samples, self.sample_rate_hz) + data
+                    # Both independent sinks receive the same authorized frame
+                    # concurrently. The next frame still waits for both sinks;
+                    # one shared operation bounds both waits. Each sink also
+                    # checks authority when its queued task actually starts.
+                    await self._current_operation(self._publish_frame(frame, packet))
+                    if packet is not None:
+                        self._sequence += 1
                     self.total_samples += len(data) // 2
             except BaseException as exc:
                 await self.abort()
                 self._raise_safe(exc)
+
+    async def _publish_frame(self, frame: Any, packet: Optional[bytes]) -> None:
+        async def send_current(operation: Callable[[], Any]) -> None:
+            # Revocation can run after the outer fence but before this queued
+            # child starts. Validate at each actual SDK send, without yielding
+            # between authorization and creating/entering its operation.
+            self._assert_current()
+            await operation()
+
+        tasks = [asyncio.create_task(send_current(lambda: self._source.capture_frame(frame)))]
+        if packet is not None:
+            tasks.append(asyncio.create_task(send_current(lambda: self._room.local_participant.publish_data(
+                packet, reliable=True, topic="interviewer.approved-pcm." + self._output_id,
+            ))))
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            # gather does not cancel siblings on a native exception. Reap both
+            # before returning so no late packet escapes a failed frame.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            for task in tasks:
+                await self._reap(task)
 
     async def finish(self) -> LiveKitApprovedAudioPublication:
         async with self._operation_lock:

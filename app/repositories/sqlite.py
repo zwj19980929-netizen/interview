@@ -45,6 +45,27 @@ DOCUMENT_COLLECTIONS = [
 ]
 
 
+def _json_falsy(path: str) -> str:
+    # JSON null/missing, false, zero and empty containers/string match Python
+    # truthiness. Nonempty strings such as "0" or "{}" must stay truthy.
+    value = "json_extract(data, '%s')" % path
+    kind = "json_type(data, '%s')" % path
+    return "(%s IS NULL OR %s IN (0, '') OR (%s IN ('array', 'object') AND %s IN ('[]', '{}')))" % (
+        value, value, kind, value,
+    )
+
+
+# Reused verbatim by queries and partial indexes so indexed discovery does not
+# deserialize inactive history. These paths and kinds are never caller input.
+INTERVIEW_WATCHDOG_PREDICATES = {
+    "takeover": "json_type(data, '$.agent_runtime.takeover') = 'object' "
+                "AND json_extract(data, '$.agent_runtime.takeover') <> '{}' AND "
+                + _json_falsy("$.list_removed_at"),
+    "deadline": "json_extract(data, '$.status') IN ('scheduled', 'waiting', 'in_progress', 'paused') AND "
+                + _json_falsy("$.candidate_input_completed_at"),
+}
+
+
 class SQLiteStore(InMemoryStore):
     """SQLite-backed store for local development.
 
@@ -150,6 +171,19 @@ class SQLiteStore(InMemoryStore):
                 ON documents(collection)
                 """
             )
+            connection.execute(
+                """CREATE INDEX IF NOT EXISTS idx_evidence_commands_unsettled
+                ON documents (json_extract(data, '$.organization_id'),
+                              json_extract(data, '$.interview_id'))
+                WHERE collection = 'evidence_commands'
+                  AND json_extract(data, '$.status') IN ('pending', 'running')"""
+            )
+            for kind, predicate in INTERVIEW_WATCHDOG_PREDICATES.items():
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_interviews_watchdog_%s "
+                    "ON documents (json_extract(data, '$.organization_id')) "
+                    "WHERE collection = 'interviews' AND %s" % (kind, predicate)
+                )
 
     def _load_from_db(self) -> None:
         for collection in DOCUMENT_COLLECTIONS:

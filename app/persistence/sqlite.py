@@ -5,9 +5,9 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
-from app.persistence.interface import Document, PersistenceTransaction, Predicate, TransactionBackend
+from app.persistence.interface import Document, InterviewWatchdogKind, PersistenceTransaction, Predicate, TransactionBackend
 from app.persistence.read_only import ReadOnlyTransactionBackend
-from app.repositories.sqlite import SQLiteStore
+from app.repositories.sqlite import INTERVIEW_WATCHDOG_PREDICATES, SQLiteStore
 
 
 class _SQLiteTransactionBackend(TransactionBackend):
@@ -43,6 +43,30 @@ class _SQLiteTransactionBackend(TransactionBackend):
         rows = self.connection.execute(
             "SELECT data FROM documents WHERE collection = ? ORDER BY id",
             (collection,),
+        ).fetchall()
+        return [json.loads(row["data"]) for row in rows]
+
+    def list_unsettled_evidence_commands(
+        self, *, organization_id: str, interview_id: str,
+    ) -> List[Document]:
+        rows = self.connection.execute(
+            "SELECT data FROM documents WHERE collection = 'evidence_commands' "
+            "AND json_extract(data, '$.organization_id') = ? "
+            "AND json_extract(data, '$.interview_id') = ? "
+            "AND json_extract(data, '$.status') IN ('pending', 'running')",
+            (organization_id, interview_id),
+        ).fetchall()
+        return [json.loads(row["data"]) for row in rows]
+
+    def list_interview_watchdog_candidates(
+        self, *, organization_id: str, kind: InterviewWatchdogKind,
+    ) -> List[Document]:
+        if kind not in ("takeover", "deadline"):
+            raise ValueError("Unknown interview watchdog kind.")
+        rows = self.connection.execute(
+            "SELECT data FROM documents WHERE collection = 'interviews' "
+            "AND json_extract(data, '$.organization_id') = ? AND " + INTERVIEW_WATCHDOG_PREDICATES[kind],
+            (organization_id,),
         ).fetchall()
         return [json.loads(row["data"]) for row in rows]
 

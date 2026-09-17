@@ -62,9 +62,11 @@ class MockProvider:
             elif request.metadata.get("prompt_version") == "interview_inquiry_units.v2":
                 from app.core.prompt.inquiry_units import mock_inquiry_units_result
                 data = mock_inquiry_units_result(request)
-            elif request.metadata.get("prompt_version") == "conversation_reception.v1":
+            elif request.metadata.get("prompt_version") in {"conversation_reception.v1", "conversation_reception.v2"}:
                 data = {"kind": "other", "confidence": 0.0,
                         "evidence_id": next(iter(json.loads(request.messages[-1].content)["evidence"]))}
+                if request.metadata.get("prompt_version") == "conversation_reception.v2":
+                    data["reply_text"] = ""
             elif request.purpose == "interview_turn_understanding" and request.metadata.get("prompt_version") in {"supplement_reply.v1", "supplement_reply.v2", "supplement_reply.v3", "supplement_reply.v4"}:
                 reply = json.loads(request.messages[-1].content)["reply"]
                 # Offline mock never fabricates permission to finish.

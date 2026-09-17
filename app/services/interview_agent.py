@@ -57,6 +57,8 @@ from app.services.livekit_room_binding import interview_room_name
 from app.services.media_capture import InterviewMediaCaptureService
 from app.services.streaming_stt import StreamingInterviewSTT
 from app.services.warmup_calibration import WarmupCalibrationStream
+from app.domain.candidate_runtime import CANDIDATE_RUNTIME_PROBLEM_REASONS, runtime_pause_epoch
+from app.services.speech_output_interruption import revoke_active_performance
 
 
 _CLOSE = object()
@@ -714,11 +716,19 @@ class AgentChannel:
                     status_code=403,
                 )
             self._cancel_planning()
-            self.runtime.interviews.pause_interview(
-                self.interview_id,
-                reason="candidate_requested_pause",
-                organization_id=self.organization_id,
-            )
+            runtime_code = signal.payload.get("reason")
+            if isinstance(runtime_code, str) and runtime_code in CANDIDATE_RUNTIME_PROBLEM_REASONS:
+                self.runtime._require_candidate(self.principal)
+                self.runtime.interviews.pause_for_candidate_runtime_problem(
+                    self.interview_id, runtime_code, self.organization_id,
+                )
+            else:
+                self.runtime.interviews.pause_interview(
+                    self.interview_id,
+                    reason="candidate_requested_pause",
+                    organization_id=self.organization_id,
+                )
+            await self._emit_snapshot(signal.causation_id)
             if self._evidence_session is not None:
                 await self._evidence_session.pause_capture()
             await self._cancel_speech_output()
@@ -918,7 +928,6 @@ class AgentChannel:
         if self._evidence_session is not None:
             await self._evidence_session.dispatch(self, signal)
             return
-        await self._cancel_speech_output()
         if self._endpoint_task:
             self._endpoint_task.cancel()
             self._endpoint_task = None
@@ -931,22 +940,11 @@ class AgentChannel:
                 self.interview_id, "listening", self.organization_id
             )
         if runtime_state.get("floor") == FloorOwner.AGENT.value:
-            await self._emit(
-                "avatar.performance.interrupted",
-                {
-                    "reason": "barge_in",
-                    "deadline_ms": 200,
-                    "performance_id": runtime_state.get("active_performance_id"),
-                },
+            await revoke_active_performance(self, runtime_state.get("active_performance_id"), reason="barge_in",
                 turn_id=signal.turn_id or session.get("current_turn_id"),
                 causation_id=signal.causation_id,
-                replayability=Replayability.TRANSIENT,
             )
-            self.runtime._clear_active_performance(
-                self.interview_id,
-                runtime_state.get("active_performance_id"),
-                self.organization_id,
-            )
+        await self._cancel_speech_output(expected_performance_id=runtime_state.get("active_performance_id"))
         await self._set_floor(FloorOwner.CANDIDATE, "barge_in", signal.causation_id)
         await self._emit(
             "speech.started",
@@ -1854,6 +1852,7 @@ class AgentChannel:
         expression: Optional[Dict[str, Any]] = None,
         approval_guard: Any = None,
         prompt_version: Optional[str] = None,
+        on_playback_selected: Any = None,
     ) -> Optional[AvatarPerformance]:
         if not text.strip():
             raise ApiError("CONVERSATION_ACT_EMPTY", "Approved conversation act is empty.", status_code=409)
@@ -1876,7 +1875,7 @@ class AgentChannel:
             except ApiError:
                 return None
         try:
-            with self.runtime.persistence.transaction(self.organization_id) as transaction:
+            with self.runtime.persistence.transaction(self.organization_id, read_only=True) as transaction:
                 if owner_fence is not None:
                     assert_current_evidence_fence(transaction, owner_fence)
                 initial_session = transaction.interview_sessions.get(self.interview_id)
@@ -1895,7 +1894,11 @@ class AgentChannel:
         if (initial_session.get("status") not in allowed_statuses
                 or (turn_id is not None and turn_id != expected_turn_id)):
             return None
-        await self._cancel_speech_output()
+        previous_output = self._speech_output
+        if previous_output is not None:
+            await revoke_active_performance(self, previous_output.performance_id, reason="replaced",
+                                            turn_id=expected_turn_id, causation_id=causation_id)
+        await self._cancel_speech_output(expected_performance_id=previous_output.performance_id if previous_output else None)
         expected_performance_id = None
         if approval_guard is not None:
             approval_guard()
@@ -1908,7 +1911,7 @@ class AgentChannel:
             try:
                 if approval_guard is not None:
                     approval_guard()
-                with self.runtime.persistence.transaction(self.organization_id) as transaction:
+                with self.runtime.persistence.transaction(self.organization_id, read_only=True) as transaction:
                     if owner_fence is not None:
                         assert_current_evidence_fence(transaction, owner_fence)
                     session = transaction.interview_sessions.get(self.interview_id)
@@ -1998,6 +2001,8 @@ class AgentChannel:
                             output_id=output.output_id, act_event_id=selected_event.event_id,
                         )
                         expected_performance_id = performance.performance_id
+                        if on_playback_selected is not None:
+                            on_playback_selected()
                         await self._emit(
                             "avatar.performance.started", performance.model_dump(mode="json"),
                             turn_id=turn_id, causation_id=causation_id,
@@ -2066,6 +2071,8 @@ class AgentChannel:
         self.runtime._set_active_performance(
             self.interview_id, performance.performance_id, self.organization_id
         )
+        if on_playback_selected is not None:
+            on_playback_selected()
         await self._emit(
             "avatar.performance.started",
             performance.model_dump(mode="json"),
@@ -2102,8 +2109,10 @@ class AgentChannel:
                 self._speech_output = None
                 self._speech_output_task = None
 
-    async def _cancel_speech_output(self) -> None:
+    async def _cancel_speech_output(self, *, expected_performance_id: Optional[str] = None) -> None:
         output, task = self._speech_output, self._speech_output_task
+        if expected_performance_id is not None and output is not None and output.performance_id != expected_performance_id:
+            return
         self._speech_output = self._speech_output_task = None
         if task is not None and task is not asyncio.current_task():
             task.cancel()
@@ -2157,20 +2166,13 @@ class AgentChannel:
             reason=reason,
             organization_id=self.organization_id,
         )
+        await revoke_active_performance(self, (session.get("agent_runtime") or {}).get("active_performance_id"),
+                                        reason="human_takeover", turn_id=session.get("current_turn_id"), causation_id=signal.causation_id)
         await self._cancel_speech_output()
         if replaced:
             await self.runtime._disconnect_takeover_media(
                 self.interview_id, replaced, self.organization_id
             )
-        self.runtime._clear_active_performance(
-            self.interview_id, None, self.organization_id
-        )
-        await self._emit(
-            "avatar.performance.interrupted",
-            {"reason": "human_takeover", "deadline_ms": 200},
-            causation_id=signal.causation_id,
-            replayability=Replayability.TRANSIENT,
-        )
         await self._set_floor(FloorOwner.HUMAN, "takeover_acquired", signal.causation_id)
         await self._emit(
             "takeover.changed",
@@ -2525,7 +2527,11 @@ class InterviewAgentRuntime:
         """Recover persisted lease expiry after disconnect or process restart."""
 
         expired_count = 0
-        for summary in self.interviews.list_interviews(organization_id):
+        with self.persistence.transaction(organization_id, read_only=True) as transaction:
+            candidates = transaction.interview_sessions.watchdog_candidates("takeover")
+        for summary in candidates:
+            # Do not monopolize audio transport while reconciling several leases.
+            await asyncio.sleep(0)
             interview_id = str(summary.get("id") or "")
             if not interview_id:
                 continue
@@ -2736,6 +2742,12 @@ class InterviewAgentRuntime:
             "execution_schema_version": 3 if is_adaptive(session) else 2,
             "dialogue_state": session.get("dialogue_state"),
             "planning_problem": deepcopy((session.get("agent_runtime") or {}).get("planning_problem")),
+            "runtime_problem_code": next((
+                problem["code"] for problem in reversed(runtime_state.get("problems", []))
+                if session.get("status") == "paused"
+                and problem.get("code") in CANDIDATE_RUNTIME_PROBLEM_REASONS
+                and problem.get("pause_epoch") == runtime_pause_epoch(session)
+            ), None),
         }
         if "candidate" in principal.roles:
             return candidate_view
@@ -3547,6 +3559,14 @@ class InterviewAgentRuntime:
     ) -> Optional[Dict[str, Any]]:
         """Atomically consume one expired lease so duplicate watchdogs are safe."""
 
+        # Most signals have no takeover to expire. A read-only preflight must
+        # not wait behind unrelated writers; any mutation rechecks the lease
+        # with a fresh database clock in the original write transaction.
+        with self.persistence.transaction(organization_id, read_only=True) as transaction:
+            session = self._required(transaction.interview_sessions.get(interview_id))
+            lease = (session.get("agent_runtime") or {}).get("takeover")
+            if not lease or self._lease_active(lease, now=transaction.database_now()):
+                return None
         with self.persistence.transaction(organization_id) as transaction:
             session = self._required(
                 transaction.interview_sessions.get(interview_id)
@@ -3592,7 +3612,7 @@ class InterviewAgentRuntime:
     ) -> Optional[float]:
         """Read watchdog delay from the same database clock as lease mutation."""
 
-        with self.persistence.transaction(organization_id) as transaction:
+        with self.persistence.transaction(organization_id, read_only=True) as transaction:
             session = self._required(
                 transaction.interview_sessions.get(interview_id)
             )
@@ -3694,10 +3714,9 @@ class InterviewAgentRuntime:
         self, interview_id: str, turn_id: Optional[str], text: str,
         organization_id: str, *, performance_id: str, assert_current,
     ) -> Optional[ApprovedSpeechOutput]:
-        # Chrome MediaStream.currentTime includes sender underflow silence. The
-        # real browser probe disproved sample-clock equivalence; keep this
-        # transport opt-in until a content/sample playout mapping is validated.
-        if os.getenv("INTERVIEWER_STREAMING_TTS_ENABLED", "false").lower() != "true":
+        # The counted PCM worklet excludes underflow silence and checks the
+        # device output clock before acknowledging the final source sample.
+        if os.getenv("INTERVIEWER_STREAMING_TTS_ENABLED", "true").lower() != "true":
             return None
         session = self.interviews.get_interview(interview_id, organization_id)
         current = self._current_turn(session)

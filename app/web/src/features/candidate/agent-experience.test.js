@@ -622,6 +622,7 @@ describe("candidate real-time experience contracts", () => {
       "/api/v1/public/interviews/iv_test/runtime-problems",
       {
         method: "POST",
+        timeoutMs: 5000,
         headers: { "X-Candidate-Session-Token": "candidate-token" },
         body: { code: "AVATAR_RENDERER_FAILED" },
       },
@@ -883,96 +884,136 @@ describe("candidate real-time experience contracts", () => {
     await run.close();
   });
 
-  it.each([true, false])("plays approved streaming TTS in either event order without a ready/play deadlock (%s)", async (trackFirst) => {
-    const audio = new CandidateFakeAudio({ emitPlay: false, playResult: new Promise(() => {}) });
-    const { run, socket, mediaCallbacks, request, audioFactory } = await openPlaybackHarness({ liveAudio: audio });
-    const performance = livePerformance();
-    const track = liveTrack(performance);
+  it.each([true, false])("plays counted streaming PCM in either binding order (%s)", async (trackFirst) => {
+    const { run, socket, mediaCallbacks, request, audioFactory, liveSink } = await openPlaybackHarness();
+    const performance = livePerformance(); const track = liveTrack(performance);
+    const participant = { identity: performance.live_audio.publisher_identity, metadata: '{"role":"approved_expression"}' };
     const subscribe = () => mediaCallbacks.onRemoteAudioTrack(track,
-      { trackSid: track.sid, trackName: performance.live_audio.track_name },
-      { identity: performance.live_audio.publisher_identity });
+      { trackSid: track.sid, trackName: performance.live_audio.track_name }, participant);
     try {
       socket.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", { ...candidateSnapshot(), floor: "agent" })) });
       if (trackFirst) subscribe();
-      expect(audio.play).not.toHaveBeenCalled();
       socket.emit("message", { data: JSON.stringify({ ...candidateEvent(2, "avatar.performance.started", performance), replayability: "transient" }) });
-      if (!trackFirst) subscribe();
-      await flushPlaybackEvents();
-      expect(audioFactory).not.toHaveBeenCalled();
-      expect(audio.play).toHaveBeenCalledOnce();
-      expect(socket.sent.filter((item) => item.type === "avatar.performance.ready")).toEqual([
+      if (!trackFirst) subscribe(); await flushPlaybackEvents();
+      expect(audioFactory).not.toHaveBeenCalled(); expect(track.attach).not.toHaveBeenCalled();
+      expect(socket.sent.filter(item => item.type === "avatar.performance.ready")).toEqual([
         expect.objectContaining({ payload: { performance_id: performance.performance_id, output_id: performance.live_audio.output_id } }),
       ]);
       expect(run.getSnapshot().avatar.status).toBe("idle");
-      audio.emit("play");
-      expect(run.getSnapshot().avatar.status).toBe("idle");
-      audio.currentTime = 15;
-      audio.emit("playing");
+      const packet = new Uint8Array(976); const view = new DataView(packet.buffer);
+      view.setUint32(0, 0x49415331); view.setUint32(4, 1); view.setUint32(8, 0); view.setUint32(12, 24000);
+      mediaCallbacks.onApprovedAudioData(packet, participant, `interviewer.approved-pcm.${performance.live_audio.output_id}`);
+      liveSink.progress({ consumed: 480, renderedUntil: 1, firstRenderStart: 0, producing: true, drained: false });
       expect(run.getSnapshot().avatar.status).toBe("speaking");
       socket.emit("message", { data: JSON.stringify({ ...candidateEvent(3, "avatar.performance.producer_finished", {
         performance_id: performance.performance_id, output_id: performance.live_audio.output_id,
-        total_samples: 24_000, sample_rate_hz: 24_000,
+        total_samples: 480, sample_rate_hz: 24000,
       }), replayability: "transient" }) });
-      await flushPlaybackEvents();
-      expect(run.getSnapshot().floor).toBe("agent");
-      expect(socket.sent.filter((item) => item.type === "avatar.performance.stopped")).toHaveLength(0);
-      audio.currentTime = 16;
-      await new Promise((resolve) => window.setTimeout(resolve, 60));
-      expect(socket.sent.filter((item) => item.type === "avatar.performance.stopped")).toEqual([
+      await flushPlaybackEvents(); expect(liveSink.finish).toHaveBeenCalledWith(480);
+      expect(socket.sent.filter(item => item.type === "avatar.performance.stopped")).toHaveLength(0);
+      liveSink.progress({ consumed: 480, renderedUntil: 1, firstRenderStart: 0, producing: false, drained: true });
+      expect(socket.sent.filter(item => item.type === "avatar.performance.stopped")).toEqual([
         expect.objectContaining({ payload: { performance_id: performance.performance_id, output_id: performance.live_audio.output_id, reason: "drained" } }),
       ]);
-      expect(track.detach).toHaveBeenCalledWith(audio);
-      expect(runtimeProblemCalls(request)).toHaveLength(0);
+      expect(liveSink.close).toHaveBeenCalledOnce(); expect(runtimeProblemCalls(request)).toHaveLength(0);
     } finally { await run.close(); }
   });
 
-  it.each(["paused", "completed", "replacement"])("stops a live output immediately from a %s snapshot without acknowledging drainage", async (state) => {
-    const audio = new CandidateFakeAudio();
-    const { run, socket, mediaCallbacks, request } = await openPlaybackHarness({ liveAudio: audio });
-    const performance = livePerformance();
-    const track = liveTrack(performance);
+  it.each(["paused", "completed", "replacement"])("stops counted output on %s and rejects stale consumption", async state => {
+    const { run, socket, mediaCallbacks, request, liveSink } = await openPlaybackHarness();
+    const performance = livePerformance(); const track = liveTrack(performance);
     try {
       socket.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", candidateSnapshot())) });
       socket.emit("message", { data: JSON.stringify({ ...candidateEvent(2, "avatar.performance.started", performance), replayability: "transient" }) });
       mediaCallbacks.onRemoteAudioTrack(track, { trackSid: track.sid, trackName: performance.live_audio.track_name },
         { identity: performance.live_audio.publisher_identity });
-      const staleEnded = audio.listener("ended");
-      const staleError = audio.listener("error");
+      await flushPlaybackEvents();
       socket.emit("message", { data: JSON.stringify(candidateEvent(3, "session.snapshot", {
         ...candidateSnapshot(), status: state === "replacement" ? "in_progress" : state,
         active_performance_id: state === "replacement" ? "new_output" : null,
       })) });
-      staleEnded(); staleError();
-      expect(audio.pause).toHaveBeenCalledOnce();
-      expect(track.detach).toHaveBeenCalledOnce();
+      liveSink.progress({ consumed: 480, renderedUntil: 1, firstRenderStart: 0, producing: true, drained: true });
+      expect(liveSink.close).toHaveBeenCalledOnce(); expect(track.attach).not.toHaveBeenCalled();
       expect(run.getSnapshot().avatar.status).toBe("idle");
-      expect(socket.sent.filter((item) => item.type === "avatar.performance.stopped")).toHaveLength(0);
+      expect(socket.sent.filter(item => item.type === "avatar.performance.stopped")).toHaveLength(0);
       expect(runtimeProblemCalls(request)).toHaveLength(0);
     } finally { await run.close(); }
   });
 
-  it("does not replay the old live output after a control resync and fresh snapshot", async () => {
-    const audio = new CandidateFakeAudio();
-    const { run, socket, mediaCallbacks } = await openPlaybackHarness({ liveAudio: audio });
-    const performance = livePerformance();
-    const track = liveTrack(performance);
+  it.each(["interrupt", "snapshot"])("does not pause when media unpublication precedes the authoritative %s", async control => {
+    const { run, socket, mediaCallbacks, request, liveSink } = await openPlaybackHarness();
+    const performance = livePerformance(); const track = liveTrack(performance);
+    try {
+      socket.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", { ...candidateSnapshot(), floor: "agent" })) });
+      socket.emit("message", { data: JSON.stringify({ ...candidateEvent(2, "avatar.performance.started", performance), replayability: "transient" }) });
+      mediaCallbacks.onRemoteAudioTrack(track, { trackSid: track.sid, trackName: performance.live_audio.track_name },
+        { identity: performance.live_audio.publisher_identity });
+      await flushPlaybackEvents(); vi.useFakeTimers();
+      mediaCallbacks.onRemoteAudioTrackRemoved(track);
+      expect(liveSink.close).toHaveBeenCalledOnce(); expect(runtimeProblemCalls(request)).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(300);
+      socket.emit("message", { data: JSON.stringify(control === "interrupt"
+        ? { ...candidateEvent(3, "avatar.performance.interrupted", { performance_id: performance.performance_id, reason: "barge_in", deadline_ms: 200 }), replayability: "transient" }
+        : candidateEvent(3, "session.snapshot", { ...candidateSnapshot(), active_performance_id: null })) });
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(runtimeProblemCalls(request)).toHaveLength(0);
+      expect(socket.sent.filter(item => item.type === "pause" || item.type === "avatar.performance.stopped")).toHaveLength(0);
+    } finally { await run.close(); vi.useRealTimers(); }
+  });
+
+  it.each([false, true])("reports an actual vanished stream with its diagnostic, HTTP failure=%s", async httpFails => {
+    const { run, socket, mediaCallbacks, request } = await openPlaybackHarness({
+      runtimeReport: async () => { if (httpFails) throw new Error("secret network error"); return { status: "paused" }; },
+    });
+    const performance = livePerformance(); const track = liveTrack(performance);
+    try {
+      socket.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", candidateSnapshot())) });
+      socket.emit("message", { data: JSON.stringify({ ...candidateEvent(2, "avatar.performance.started", performance), replayability: "transient" }) });
+      mediaCallbacks.onRemoteAudioTrack(track, { trackSid: track.sid, trackName: performance.live_audio.track_name },
+        { identity: performance.live_audio.publisher_identity });
+      await flushPlaybackEvents(); vi.useFakeTimers(); mediaCallbacks.onRemoteAudioTrackRemoved(track);
+      await vi.advanceTimersByTimeAsync(350);
+      expect(runtimeProblemCalls(request).map(([, options]) => options.body)).toEqual([{ code: "AUDIO_TRACK_LOST" }]);
+      const pauses = socket.sent.filter(item => item.type === "pause");
+      expect(pauses).toHaveLength(httpFails ? 1 : 0);
+      if (httpFails) expect(pauses[0].payload).toEqual({ reason: "AUDIO_TRACK_LOST" });
+      expect(run.getSnapshot().problem).toMatchObject({ code: "AUDIO_TRACK_LOST", pauseConfirmed: !httpFails, recoverable: false });
+      expect(socket.sent.filter(item => item.type === "avatar.performance.stopped")).toHaveLength(0);
+    } finally { await run.close(); vi.useRealTimers(); }
+  });
+
+  it("restores only the current safe playback diagnostic after reconnecting to a paused session", async () => {
+    const { run, socket, request } = await openPlaybackHarness();
+    try {
+      socket.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", {
+        ...candidateSnapshot(), status: "paused", runtime_problem_code: "AUDIO_PLAYBACK_TIMEOUT",
+      })) });
+      expect(run.getSnapshot().problem).toMatchObject({ code: "AUDIO_PLAYBACK_TIMEOUT", pauseConfirmed: true, recoverable: false });
+      for (const type of ["warmup.confirm", "warmup.retry"]) expect(await run.act({ type })).toBe(false);
+      expect(socket.sent.filter(item => ["warmup.confirm", "warmup.retry"].includes(item.type))).toHaveLength(0);
+      expect(runtimeProblemCalls(request)).toHaveLength(0);
+    } finally { await run.close(); }
+  });
+
+  it("does not replay counted output after a control resync and fresh snapshot", async () => {
+    const { run, socket, mediaCallbacks, liveSink } = await openPlaybackHarness();
+    const performance = livePerformance(); const track = liveTrack(performance);
     const subscribe = () => mediaCallbacks.onRemoteAudioTrack(track,
       { trackSid: track.sid, trackName: performance.live_audio.track_name },
       { identity: performance.live_audio.publisher_identity });
     try {
       socket.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", candidateSnapshot())) });
       socket.emit("message", { data: JSON.stringify({ ...candidateEvent(2, "avatar.performance.started", performance), replayability: "transient" }) });
-      subscribe();
+      subscribe(); await flushPlaybackEvents();
       socket.emit("message", { data: JSON.stringify(candidateEvent(4, "floor.changed", { owner: "agent" })) });
-      expect(audio.pause).toHaveBeenCalledOnce();
+      expect(liveSink.close).toHaveBeenCalledOnce();
       socket.emit("message", { data: JSON.stringify(candidateEvent(5, "session.snapshot", {
         ...candidateSnapshot(), floor: "agent", active_performance_id: performance.performance_id,
       })) });
       subscribe();
       socket.emit("message", { data: JSON.stringify({ ...candidateEvent(6, "avatar.performance.started", performance), replayability: "transient" }) });
-      expect(audio.play).toHaveBeenCalledOnce();
-      expect(socket.sent.filter((item) => item.type === "avatar.performance.ready")).toHaveLength(1);
-      expect(socket.sent.filter((item) => item.type === "avatar.performance.stopped")).toHaveLength(0);
+      expect(socket.sent.filter(item => item.type === "avatar.performance.ready")).toHaveLength(1);
+      expect(socket.sent.filter(item => item.type === "avatar.performance.stopped")).toHaveLength(0);
     } finally { await run.close(); }
   });
 
@@ -2576,7 +2617,8 @@ class CandidateFakeAudio {
   }
 }
 
-async function openPlaybackHarness({ audios = [], sockets = null, liveAudio = null, clock } = {}) {
+async function openPlaybackHarness({ audios = [], sockets = null, clock, runtimeReport } = {}) {
+  const liveSink = { append: vi.fn(), finish: vi.fn(), close: vi.fn(), outputTime: () => 100 };
   const socket = sockets?.[0] || new CandidateFakeSocket();
   let socketIndex = 0;
   const stream = {
@@ -2596,6 +2638,7 @@ async function openPlaybackHarness({ audios = [], sockets = null, liveAudio = nu
   });
   const request = vi.fn(async (path) => {
     if (path.endsWith("/runtime-problems")) {
+      if (runtimeReport) return runtimeReport();
       return { accepted: true, status: "paused" };
     }
     return {
@@ -2640,11 +2683,11 @@ async function openPlaybackHarness({ audios = [], sockets = null, liveAudio = nu
     ringFactory: () => ring,
     verifyAvatar: async () => ({ ready: true }),
     audioFactory,
-    liveAudioFactory: () => liveAudio || new CandidateFakeAudio(),
+    livePcmPlayerFactory: async ({ onProgress }) => { liveSink.progress = onProgress; return liveSink; },
     clock,
   });
   const run = await experience.open({ interviewId: "iv_test", ticket: "candidate-token" });
-  return { run, socket, capture, request, audioFactory, mediaCallbacks, media, ring };
+  return { run, socket, capture, request, audioFactory, mediaCallbacks, media, ring, liveSink };
 }
 
 function runtimeProblemCalls(request) {

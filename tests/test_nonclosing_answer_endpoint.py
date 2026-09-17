@@ -1,4 +1,4 @@
-"""Stable sentence preparation must not rotate a healthy recognition stream."""
+"""Preview reasoning stays open; corrected finals resume ASR before reasoning."""
 import asyncio
 
 import pytest
@@ -126,7 +126,7 @@ def test_late_provider_evidence_invalidates_preparation_before_cut(change):
 
 
 @pytest.mark.parametrize("change", ["text", "confidence", "timestamps", "provider"])
-def test_final_correction_reprepares_without_an_empty_reopen_and_second_finish(change):
+def test_final_correction_resumes_recognition_during_reasoning_then_revalidates_final(change):
     async def scenario():
         capture = PreviewCapture()
         corrected = _final()
@@ -139,12 +139,26 @@ def test_final_correction_reprepares_without_an_empty_reopen_and_second_finish(c
         else:
             corrected.provider.latency_ms = 5
         capture.current_final = corrected
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def prepare(final):
+            if getattr(final, "is_final", False):
+                entered.set()
+                await release.wait()
+            return capture.prepared(final)
+
+        capture.prepare_impl = prepare
         endpoint, clock, _, commits = _endpoint(capture=capture)
         _voice_then_pause(endpoint, clock)
         endpoint.start()
+        await asyncio.wait_for(entered.wait(), 1)
+        assert capture.snapshots == [False] and capture.resumes == 1
+        assert capture.is_open and not commits
+        release.set()
         await _until(lambda: commits)
-        assert capture.snapshots == [False] and capture.resumes == 0
+        assert capture.snapshots == [False, False] and capture.resumes == 1
         assert len(capture.prepares) == 2
+        assert len(commits) == 1
         assert commits[0].final.model_dump() == corrected.model_dump()
         await endpoint.close()
     asyncio.run(scenario())
@@ -166,17 +180,87 @@ def test_voice_during_final_confirmation_resumes_once_and_never_commits_old_prev
 
 
 @pytest.mark.parametrize("unavailable", [None, _preview(tail=True)])
-def test_explicit_early_finish_remains_a_single_final_fallback_when_no_stable_preview(unavailable):
+def test_explicit_early_finish_without_preview_keeps_recognition_open_during_reasoning(unavailable):
     async def scenario():
         capture = PreviewCapture()
         capture.preview = unavailable
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def prepare(final):
+            entered.set()
+            await release.wait()
+            return capture.prepared(final)
+
+        capture.prepare_impl = prepare
         endpoint, clock, _, commits = _endpoint(capture=capture)
         _voice_then_pause(endpoint, clock)
         endpoint.request_finish()
         endpoint.start()
+        await asyncio.wait_for(entered.wait(), 1)
+        assert capture.snapshots == [False] and capture.resumes == 1
+        assert capture.is_open and not commits
+        release.set()
         await _until(lambda: commits)
-        assert capture.snapshots == [False] and len(capture.prepares) == 1
+        assert capture.snapshots == [False, False] and len(capture.prepares) == 1
         assert capture.prepares[0].is_final
-        assert capture.resumes == 0
+        assert capture.resumes == 1 and len(commits) == 1
+        assert commits[0].final.model_dump() == capture.current_final.model_dump()
+        await endpoint.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("start", ["corrected_final", "explicit_finish"])
+def test_late_final_change_while_reasoning_cannot_commit_the_prepared_prefix(start):
+    async def scenario():
+        capture = PreviewCapture()
+        corrected = _final("合成回答还有最后一句。")
+        capture.current_final = corrected
+        if start == "explicit_finish":
+            capture.preview = None
+        entered, release = asyncio.Event(), asyncio.Event()
+        latest_entered, latest_release = asyncio.Event(), asyncio.Event()
+
+        async def prepare(final):
+            prepared = capture.prepared(final)
+            if getattr(final, "is_final", False):
+                if final.text == corrected.text:
+                    entered.set()
+                    await release.wait()
+                else:
+                    latest_entered.set()
+                    await latest_release.wait()
+            return prepared
+
+        capture.prepare_impl = prepare
+        endpoint, clock, _, commits = _endpoint(capture=capture)
+        _voice_then_pause(endpoint, clock)
+        if start == "explicit_finish":
+            endpoint.request_finish()
+        endpoint.start()
+        await asyncio.wait_for(entered.wait(), 1)
+        assert capture.resumes == 1 and capture.snapshots == [False]
+        assert not commits
+        # This final-only addition deliberately has no VAD/partial signal.
+        # A fresh authoritative cut must still revoke the prepared prefix.
+        latest = _final(corrected.text + "刚才还漏了一点。")
+        capture.current_final = latest
+        capture.preview = None
+        release.set()
+        if start == "explicit_finish":
+            await asyncio.wait_for(latest_entered.wait(), 1)
+        else:
+            await _until(lambda: capture.resumes == 2)
+        assert not commits and capture.is_open
+        assert capture.snapshots == [False, False]
+        assert capture.current_final.model_dump() == latest.model_dump()
+        assert any(item.text == corrected.text for item in capture.prepares)
+        if start == "explicit_finish":
+            # Explicit finish can re-understand the new final in this proposal,
+            # but it must obtain a matching fresh cut before committing it.
+            latest_release.set()
+            await _until(lambda: commits)
+            assert len(commits) == 1
+            assert commits[0].final.model_dump() == latest.model_dump()
+            assert capture.snapshots == [False, False, False]
         await endpoint.close()
     asyncio.run(scenario())

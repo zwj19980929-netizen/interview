@@ -23,6 +23,7 @@ from app.domain.interview_lifecycle import (
 )
 from app.domain.interview_agent import ConversationUtterance, TurnUnderstanding
 from app.domain.evidence_coordination import EvidenceCommitFence
+from app.domain.candidate_runtime import CANDIDATE_RUNTIME_PROBLEM_REASONS
 from app.model_gateway import capabilities as cap
 from app.model_gateway.gateway import ModelGateway
 from app.model_gateway.schemas import (
@@ -111,33 +112,22 @@ class InterviewService:
         current = ensure_utc(self.clock())
         occurred_at = format_utc(current)
         expired: List[Dict[str, Any]] = []
-        with self.persistence.transaction(organization_id) as transaction:
-            for source in transaction.interview_sessions.list():
-                if source.get("status") not in {
-                    "scheduled",
-                    "waiting",
-                    "in_progress",
-                    "paused",
-                }:
+        # Discovery never takes a writer lock or scans completed history.
+        # It grants no authority: each candidate is read again below before
+        # changing its lifecycle, so concurrent completion/extension is safe.
+        with self.persistence.transaction(organization_id, read_only=True) as transaction:
+            due_ids = [
+                source["id"]
+                for source in transaction.interview_sessions.watchdog_candidates("deadline")
+                if self._overdue_deadline(transaction, source, current) is not None
+            ]
+        for interview_id in due_ids:
+            with self.persistence.transaction(organization_id) as transaction:
+                source = transaction.interview_sessions.get(interview_id)
+                resolved = self._overdue_deadline(transaction, source, current)
+                if resolved is None:
                     continue
-                if source.get("candidate_input_completed_at"):
-                    continue
-                scheduled_end_at = source.get("scheduled_end_at") or (
-                    source.get("settings") or {}
-                ).get("scheduled_end_at")
-                if not scheduled_end_at and source.get("appointment_id"):
-                    appointment = transaction.interview_appointments.get(
-                        source["appointment_id"]
-                    )
-                    scheduled_end_at = (appointment or {}).get("scheduled_end_at")
-                if not scheduled_end_at:
-                    continue
-                try:
-                    deadline = parse_utc(str(scheduled_end_at))
-                except (TypeError, ValueError):
-                    continue
-                if current < deadline:
-                    continue
+                deadline, scheduled_end_at = resolved
                 previous_status = str(source.get("status") or "")
                 adaptive = is_adaptive(source)
                 command = LifecycleCommand(LifecycleCommandType.CANCEL, {"reason": "appointment_window_expired"})
@@ -186,6 +176,27 @@ class InterviewService:
                 )
                 expired.append(deepcopy(decision.session))
         return expired
+
+    @staticmethod
+    def _overdue_deadline(transaction: Any, source: Optional[Dict[str, Any]],
+                          current: datetime) -> Optional[Tuple[datetime, str]]:
+        if not source or source.get("status") not in {
+            "scheduled", "waiting", "in_progress", "paused",
+        } or source.get("candidate_input_completed_at"):
+            return None
+        scheduled_end_at = source.get("scheduled_end_at") or (
+            source.get("settings") or {}
+        ).get("scheduled_end_at")
+        if not scheduled_end_at and source.get("appointment_id"):
+            appointment = transaction.interview_appointments.get(source["appointment_id"])
+            scheduled_end_at = (appointment or {}).get("scheduled_end_at")
+        if not scheduled_end_at:
+            return None
+        try:
+            deadline = parse_utc(str(scheduled_end_at))
+        except (TypeError, ValueError):
+            return None
+        return (deadline, str(scheduled_end_at)) if current >= deadline else None
 
     def remove_from_list(
         self,
@@ -597,23 +608,8 @@ class InterviewService:
         messages are deliberately excluded from lifecycle facts and logs.
         """
 
-        reasons = {
-            "AVATAR_ASSET_UNAVAILABLE": "candidate_avatar_asset_unavailable",
-            "AVATAR_MODEL_LOAD_FAILED": "candidate_avatar_model_load_failed",
-            "AVATAR_RENDERER_FAILED": "candidate_avatar_renderer_failed",
-            "CANDIDATE_RUNTIME_FAILED": "candidate_runtime_failed",
-        }
-        reason = reasons.get(str(code or ""))
-        if reason is None:
-            raise ApiError(
-                "CANDIDATE_RUNTIME_PROBLEM_INVALID",
-                "Candidate runtime problem code is not supported.",
-                status_code=422,
-            )
         self.validate_candidate_token(interview_id, token, organization_id)
-        session = self.pause_interview(
-            interview_id, reason=reason, organization_id=organization_id
-        )
+        session = self.pause_for_candidate_runtime_problem(interview_id, code, organization_id)
         interruption = session.get("interruption") or {}
         return {
             "interview_id": interview_id,
@@ -623,6 +619,24 @@ class InterviewService:
             "action": "await_human_takeover",
             "paused_at": interruption.get("occurred_at"),
         }
+
+    def pause_for_candidate_runtime_problem(
+        self, interview_id: str, code: str, organization_id: str = "org_default",
+    ) -> Dict[str, Any]:
+        """Shared by the token-verified HTTP report and authenticated channel."""
+        if code not in CANDIDATE_RUNTIME_PROBLEM_REASONS:
+            raise ApiError(
+                "CANDIDATE_RUNTIME_PROBLEM_INVALID",
+                "Candidate runtime problem code is not supported.",
+                status_code=422,
+            )
+        session, work_items = self._apply_command(
+            interview_id,
+            LifecycleCommand(LifecycleCommandType.PAUSE, {"runtime_problem_code": code}),
+            organization_id,
+        )
+        self._process_report_effects(work_items, organization_id)
+        return session
 
     def record_agent_problem(
         self,
@@ -744,7 +758,7 @@ class InterviewService:
         interview_id: str,
         organization_id: str = "org_default",
     ) -> Dict[str, Any]:
-        with self.persistence.transaction(organization_id) as transaction:
+        with self.persistence.transaction(organization_id, read_only=True) as transaction:
             return self._required(transaction.interview_sessions.get(interview_id))
 
     def get_candidate_interview(

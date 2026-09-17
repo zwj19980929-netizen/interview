@@ -1,215 +1,160 @@
-/** A single approved LiveKit output. Unknown tracks never attach or autoplay.
- *
- * Producer EOF is not playback completion. Only a progressing media clock
- * reaching the declared sample length may acknowledge a drained output.
- * This is a browser media clock, not a claim of sample-accurate RTP alignment.
+import { createApprovedPcmPlayer } from "./approved-pcm-player.js";
+
+/** Exact approved publisher binding plus a counted, bounded PCM consumer.
+ * RTC stays subscribed for recording but never attaches to another audio sink.
+ * Underflow produces silence without advancing the source-sample clock.
  */
 export class LiveSpeechPlayback {
-  constructor({
-    audioFactory = () => document.createElement("audio"),
-    now = () => performance.now(),
-    setTimer = (fn, ms) => window.setTimeout(fn, ms),
-    clearTimer = (id) => window.clearTimeout(id),
-    timeoutMs = 10_000,
-  } = {}) {
-    Object.assign(this, { audioFactory, now, setTimer, clearTimer, timeoutMs });
-    this.pending = new Map();
-    this.seen = new Set();
-    this.active = null;
-    this.closed = false;
+  constructor({ pcmPlayerFactory = createApprovedPcmPlayer, now = () => performance.now(),
+    setTimer = (fn, ms) => window.setTimeout(fn, ms), clearTimer = (id) => window.clearTimeout(id),
+    timeoutMs = 10_000, interruptionGraceMs = 350 } = {}) {
+    Object.assign(this, { pcmPlayerFactory, now, setTimer, clearTimer, timeoutMs, interruptionGraceMs });
+    this.pending = new Map(); this.seen = new Set(); this.active = null; this.closed = false;
   }
-
-  hasSeen(performanceId) { return this.seen.has(performanceId); }
-
+  hasSeen(id) { return this.seen.has(id); }
   trackSubscribed(track, publication, participant) {
     if (this.closed || track?.kind !== "audio") return;
     const sid = publication?.trackSid || track.sid;
     if (!sid || this.pending.has(sid) || this.active?.track?.sid === sid) return;
     const entry = { track, sid, name: publication?.trackName, identity: participant?.identity, timer: null };
-    if (this.matches(this.active, entry)) {
-      this.attach(this.active, entry);
-      return;
-    }
+    if (this.matches(this.active, entry)) { this.attach(this.active, entry); return; }
     while (this.pending.size >= 4) this.dropPending(this.pending.keys().next().value);
     entry.timer = this.setTimer(() => this.dropPending(sid), 10_000);
     this.pending.set(sid, entry);
   }
-
   trackUnsubscribed(track) {
     this.dropPending(track?.sid);
-    if (this.active?.track === track) this.fail(this.active, "数字人音轨在播放完成前断开");
+    const state = this.active;
+    if (!state || state.track !== track || state.detached) return;
+    // Media unpublication and the authoritative interrupt use separate
+    // transports. Silence immediately, then allow the bounded control race to
+    // resolve. A lost track never counts as a completed utterance.
+    state.detached = true; state.playing = false;
+    this.clearTimer(state.timer); state.abort.abort(); state.player?.close(); state.player = null;
+    state.timer = this.setTimer(() => this.fail(state, "面试官音轨在播放完成前断开", "AUDIO_TRACK_LOST"), this.interruptionGraceMs);
   }
-
   begin(performance, callbacks) {
     if (this.closed || this.hasSeen(performance.performance_id)) return null;
-    // A session has a bounded number of outputs; never evict a tombstone and
-    // accidentally allow a late/replayed output to become audible again.
-    if (this.seen.size >= 512) throw new Error("数字人播放身份数量超限");
-    this.cancel();
-    this.seen.add(performance.performance_id);
-    const state = {
-      performance, callbacks, track: null, audio: null, handlers: null,
-      origin: null, lastPosition: 0, playing: false, waitingAt: null,
-      finalSamples: null, timer: null, lastProgressAt: this.now(),
-    };
+    if (this.seen.size >= 512) throw new Error("面试官播放身份数量超限");
+    this.cancel(); this.seen.add(performance.performance_id);
+    const state = { performance, callbacks, track: null, player: null, opening: false,
+      ready: false, detached: false, received: 0, consumed: 0, sequence: 0, final: null, finalSent: false,
+      progress: null, playing: false, firstPlayed: false, timer: null, abort: new AbortController(), lastProgressAt: this.now() };
     this.active = state;
     const entry = this.pending.get(performance.live_audio.track_sid);
-    if (this.matches(state, entry)) {
-      this.dropPending(entry.sid);
-      this.attach(state, entry);
-    }
+    if (this.matches(state, entry)) { this.dropPending(entry.sid); this.attach(state, entry); }
     this.poll(state);
-    return Object.freeze({
-      positionMs: () => this.position(state),
+    return Object.freeze({ positionMs: () => state.consumed / 24,
       isPlaying: () => this.active === state && state.playing,
-      cancel: () => { if (this.active === state) this.cancel(); },
-    });
+      cancel: () => { if (this.active === state) this.cancel(); } });
   }
-
-  producerFinished(payload) {
-    const state = this.active;
-    if (!state || payload.performance_id !== state.performance.performance_id
-      || payload.output_id !== state.performance.live_audio.output_id) return;
-    if (!Number.isSafeInteger(payload.total_samples) || payload.total_samples <= 0
-      || payload.sample_rate_hz !== state.performance.live_audio.sample_rate_hz
-      || payload.total_samples > payload.sample_rate_hz * 600
-      || (state.finalSamples !== null && state.finalSamples !== payload.total_samples)) {
-      this.fail(state, "数字人流式音频结束位置无效");
-      return;
-    }
-    state.finalSamples = payload.total_samples;
-    this.checkDrained(state);
-  }
-
   matches(state, entry) {
     const binding = state?.performance.live_audio;
     return Boolean(binding && entry && binding.track_sid === entry.sid
       && binding.publisher_identity === entry.identity && binding.track_name === entry.name);
   }
-
-  attach(state, entry) {
-    if (this.active !== state || state.audio || !this.matches(state, entry)) return;
+  async attach(state, entry) {
+    if (this.active !== state || state.opening || !this.matches(state, entry)) return;
+    state.opening = true; state.track = entry.track;
     try {
-      const audio = this.audioFactory();
-      state.audio = audio;
-      state.track = entry.track;
-      audio.autoplay = false;
-      audio.hidden = true;
-      audio.playsInline = true;
-      const current = () => this.active === state;
-      const onPlaying = () => {
-        if (!current()) return;
-        const time = audio.currentTime;
-        if (!Number.isFinite(time) || time < 0) {
-          this.fail(state, "浏览器未提供可靠的流式播放时钟");
-          return;
-        }
-        // If a stalled MediaStream timeline advanced without playback, that
-        // clock cannot safely certify sample drainage. Do not fabricate ACK.
-        if (state.waitingAt !== null && time - state.waitingAt > 0.05) {
-          this.fail(state, "浏览器流式时钟在等待音频时仍推进，无法确认播放完成");
-          return;
-        }
-        state.waitingAt = null;
-        state.playing = true;
-        state.lastProgressAt = this.now();
-        if (state.origin === null) {
-          state.origin = time;
-          state.callbacks.onPlaying();
-        }
-      };
-      const onWaiting = () => {
-        if (!current()) return;
-        this.position(state);
-        state.playing = false;
-        state.waitingAt = audio.currentTime;
-      };
-      const onEnded = () => {
-        if (!current() || this.checkDrained(state)) return;
-        this.fail(state, "数字人音轨提前结束，未确认完整播放");
-      };
-      const onError = () => { if (current()) this.fail(state, "数字人流式语音无法播放"); };
-      state.handlers = { playing: onPlaying, waiting: onWaiting, stalled: onWaiting,
-        pause: onWaiting, ended: onEnded, error: onError };
-      for (const [type, handler] of Object.entries(state.handlers)) audio.addEventListener(type, handler);
-      entry.track.attach(audio);
-      // Asking play precedes ready, but awaiting play would deadlock: the
-      // publisher is deliberately waiting for ready before sending any PCM.
-      const playing = audio.play();
-      if (current()) state.callbacks.onReady();
-      Promise.resolve(playing).catch(() => {
-        if (current()) this.fail(state, "数字人流式语音播放被浏览器阻止");
+      const player = await this.pcmPlayerFactory({
+        signal: state.abort.signal,
+        onProgress: (value) => this.progress(state, value),
+        onError: () => { if (!state.detached) this.fail(state, "面试官流式语音播放失败", "AUDIO_PLAYBACK_FAILED"); },
       });
-    } catch {
-      this.fail(state, "数字人流式音轨无法连接");
+      if (this.active !== state || state.detached) { player.close(); return; }
+      state.player = player; state.ready = true; state.lastProgressAt = this.now();
+      state.callbacks.onReady();
+    } catch { if (!state.detached) this.fail(state, "浏览器无法开始流式语音播放，请检查音频权限", "AUDIO_OUTPUT_UNAVAILABLE"); }
+  }
+  dataReceived(payload, participant, topic) {
+    const state = this.active;
+    let role;
+    try { role = JSON.parse(participant?.metadata || "{}").role; } catch { return; }
+    if (!state || state.detached || role !== "approved_expression" || participant?.identity !== state.performance.live_audio.publisher_identity
+      || topic !== `interviewer.approved-pcm.${state.performance.live_audio.output_id}`) return;
+    if (!state.ready || !(payload instanceof Uint8Array) || payload.length < 18 || payload.length > 976
+      || payload.length % 2 || state.finalSent) { this.fail(state, "面试官音频分片无效", "AUDIO_STREAM_INVALID"); return; }
+    const view = new DataView(payload.buffer, payload.byteOffset, payload.byteLength);
+    const count = (payload.length - 16) / 2;
+    if (view.getUint32(0) !== 0x49415331 || view.getUint32(4) !== state.sequence + 1
+      || view.getUint32(8) !== state.received || view.getUint32(12) !== 24_000
+      || state.received + count > 24_000 * 300 || state.received + count - state.consumed > 48_000
+      || (state.final !== null && state.received + count > state.final)) {
+      this.fail(state, "面试官音频分片缺失、乱序或超过缓冲限制", "AUDIO_STREAM_INVALID"); return;
+    }
+    state.sequence += 1; state.received += count;
+    try { state.player.append(payload.subarray(16)); this.finishInput(state); }
+    catch { this.fail(state, "面试官音频播放通道已关闭", "AUDIO_PLAYBACK_FAILED"); }
+  }
+  producerFinished(payload) {
+    const state = this.active;
+    if (!state || state.detached || payload.performance_id !== state.performance.performance_id
+      || payload.output_id !== state.performance.live_audio.output_id) return;
+    if (!Number.isSafeInteger(payload.total_samples) || payload.total_samples <= 0
+      || payload.sample_rate_hz !== 24_000 || payload.total_samples > 24_000 * 300
+      || payload.total_samples < state.received || (state.final !== null && state.final !== payload.total_samples)) {
+      this.fail(state, "面试官流式语音结束位置无效", "AUDIO_STREAM_INVALID"); return;
+    }
+    state.final = payload.total_samples; this.finishInput(state);
+  }
+  finishInput(state) {
+    if (state.ready && !state.finalSent && state.final !== null && state.received === state.final) {
+      state.finalSent = true;
+      try { state.player.finish(state.final); }
+      catch { this.fail(state, "面试官音频结束位置无法确认", "AUDIO_STREAM_INVALID"); }
     }
   }
-
-  position(state) {
-    if (this.active !== state || state.origin === null || !state.playing) return state.lastPosition;
-    const position = (state.audio.currentTime - state.origin) * 1000;
-    if (!Number.isFinite(position) || position + 1 < state.lastPosition || position < 0) {
-      this.fail(state, "浏览器流式播放时钟无效或倒退");
-      return state.lastPosition;
+  progress(state, value) {
+    if (this.active !== state || state.detached) return;
+    if (!Number.isSafeInteger(value.consumed) || value.consumed < state.consumed || value.consumed > state.received
+      || !Number.isFinite(value.renderedUntil) || value.renderedUntil < 0) {
+      this.fail(state, "面试官音频消费位置无效", "AUDIO_STREAM_INVALID"); return;
     }
-    if (position > state.lastPosition) state.lastProgressAt = this.now();
-    state.lastPosition = position;
-    return position;
+    if (value.consumed > state.consumed) state.lastProgressAt = this.now();
+    state.consumed = value.consumed; state.progress = value; state.playing = value.producing && !value.buffering;
+    state.callbacks.onQuality?.({ buffering: Boolean(value.buffering), bufferedSamples: value.bufferedSamples,
+      underflowCount: value.underflowCount, underflowSamples: value.underflowSamples });
+    this.checkDrained(state);
   }
-
   checkDrained(state) {
-    const position = this.position(state);
-    if (this.active !== state || state.origin === null || state.finalSamples === null
-      || !state.playing || state.audio.paused === true
-      || position * state.performance.live_audio.sample_rate_hz < state.finalSamples * 1000) return false;
-    const onFinished = state.callbacks.onFinished;
-    this.cancel();
-    onFinished();
-    return true;
-  }
-
-  poll(state) {
-    if (this.active !== state || this.checkDrained(state)) return;
-    if (this.active !== state) return; // A bad media clock may fail during the check.
-    if (this.now() - state.lastProgressAt >= this.timeoutMs) {
-      this.fail(state, "数字人流式音频未形成可靠播放进度，请确认会话状态");
-      return;
+    const progress = state.progress;
+    if (this.active !== state || state.detached || !progress || !state.player) return false;
+    let outputTime;
+    try { outputTime = state.player.outputTime(); }
+    catch { this.fail(state, "浏览器音频输出时钟不可用", "AUDIO_OUTPUT_UNAVAILABLE"); return false; }
+    if (!Number.isFinite(outputTime)) return false;
+    if (!state.firstPlayed && progress.consumed > 0 && outputTime > progress.firstRenderStart) {
+      state.firstPlayed = true; state.callbacks.onPlaying();
     }
-    state.timer = this.setTimer(() => this.poll(state), 50);
+    if (this.active !== state) return false;
+    if (!state.firstPlayed || !state.finalSent || !progress.drained || state.consumed !== state.final
+      || outputTime < progress.renderedUntil) return false;
+    const onFinished = state.callbacks.onFinished;
+    this.cancel(); onFinished(); return true;
   }
-
-  fail(state, message) {
+  poll(state) {
+    if (this.active !== state || state.detached || this.checkDrained(state)) return;
     if (this.active !== state) return;
-    const onError = state.callbacks.onError;
-    this.cancel();
-    onError(new Error(message));
+    if (this.now() - state.lastProgressAt >= this.timeoutMs) { this.fail(state, "面试官语音暂时没有播放进度，请确认会话状态", "AUDIO_PLAYBACK_TIMEOUT"); return; }
+    if (this.now() - state.lastProgressAt >= 100) state.playing = false;
+    state.timer = this.setTimer(() => this.poll(state), 25);
   }
-
+  fail(state, message, code) {
+    if (this.active !== state) return;
+    const onError = state.callbacks.onError; this.cancel();
+    const error = new Error(message); error.candidateProblemCode = code;
+    onError(error);
+  }
   cancel() {
     const state = this.active;
     if (!state) return;
-    this.active = null;
-    this.clearTimer(state.timer);
-    if (!state.audio) return;
-    for (const [type, handler] of Object.entries(state.handlers || {})) {
-      state.audio.removeEventListener(type, handler);
-    }
-    try { state.audio.pause(); } catch { /* invalidated before cleanup */ }
-    try { state.track.detach(state.audio); } catch { /* best effort */ }
-    try { state.audio.srcObject = null; state.audio.remove?.(); } catch { /* best effort */ }
+    this.active = null; this.clearTimer(state.timer); state.abort.abort(); state.player?.close();
   }
-
   dropPending(sid) {
-    const entry = this.pending.get(sid);
-    if (!entry) return;
-    this.pending.delete(sid);
-    this.clearTimer(entry.timer);
+    const entry = this.pending.get(sid); if (!entry) return;
+    this.pending.delete(sid); this.clearTimer(entry.timer);
   }
-
-  reset() {
-    this.cancel();
-    for (const sid of this.pending.keys()) this.dropPending(sid);
-  }
-
+  reset() { this.cancel(); for (const sid of this.pending.keys()) this.dropPending(sid); }
   close() { this.closed = true; this.reset(); }
 }

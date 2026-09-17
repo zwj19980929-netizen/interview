@@ -1,5 +1,27 @@
 # 实时数字人面试系统架构
 
+## 054 · 音频同进程巡检预算
+
+周期性接管与截止巡检从只读、按组织及可处理状态限定的候选查询开始，不在共享音频事件循环反序列化全部历史面试，也不为无任务的轮询取得写锁。候选不是授权：接管 lease 消费、命令领取与截止状态迁移均在原写事务中重新校验；截止巡检按单个会话事务提交，重入和并发修改保持幂等。播放每帧权限围栏、收音和字幕事件、240ms起播/恢复缓冲及设备排空确认不变。实现、负载证据和观察边界见[054说明](steady-audio-054.md)。
+
+## 053：流式播放连续性与取消诊断
+
+批准PCM播放器使用240ms启动/欠载恢复缓冲和2秒容量，暂停供音不推进内容位置；final到达后排空短尾。按约32ms发布进度并记录欠载次数/样本，首声/缓冲变化/结束立即上报。LiveKit同帧两个独立输出并行，帧间保持顺序及背压，任一分支失败取消另一分支。逐帧前后与等待期间仍检查表达权限。不能以首声延迟或drained成功代替长语音连续性，详见[053试音故障修复](warmup-playback-053.md)。
+
+Evidence owner 的20ms控制命令轮询改用仓储 `list_unsettled(interview_id)`，数据库按组织、会话及pending/running状态命中部分索引后才解析文档，避免组织历史命令数量拖慢整个API事件循环。原子领取、租约、版本及期限判断仍由原事务完成，不改变轮询频率。发送任务实际开始时再次验证批准表达身份；取消先撤销当前performance并发送权威interrupt，再等待媒体释放，前端仅给跨通道通知350ms有界容差。内部数字统计区分供应读取、发送等待和事件循环调度延迟。
+
+## 052：持续收听、并行准备与流式表达
+
+实时交流由三个可独立撤销的部分协作：`ContinuousSTT` 持续收音和更新字幕，`SpeculativeTurnPreparation` 对稳定预览提前准备理解，`ApprovedSpeechOutput` 播放已批准的回应。短停顿约 1 秒后，最多一个预览准备任务与轻量接话并行；普通回答的确认等待仍保留，不把静音或预览当作结束授权。
+
+`AnswerEndpoint.listening_snapshot` 只为取得权威 final 短暂收口：先覆盖已确认文字、投影修正字幕，再恢复同一 capture 的识别后执行较慢推理。轮换期间补送音频产生的 partial 保留最新一份显示更新，原录音和证据不丢不重复。新语音、文字、关闭或所有权变化撤销过时任务；提交前再次取得完整 final，核对全部转写及上下文指纹。final 单独新增文字也必须撤销旧口头确认，不能沿用旧完成许可。
+
+`conversation_reception.v2` 可以在面试交流范围内生成简短自然回应，统一合同校验后仍经批准 act、当前输入代次和播报围栏；公司事实问答保留独立来源路径。Skill 和企业资料继续各自可选，不改变评分或完成权限。
+
+动态表达默认启用 `INTERVIEWER_STREAMING_TTS_ENABLED=true`。批准 PCM 通过 LiveKit 可靠数据通道交给可计数的 AudioWorklet；RTC 音轨保留供房间录制，候选端不重复播放该音轨。播放器只按实际消费的源样本推进内容位置，并以设备输出时间确认末帧。题库完整音频优先路径保持；动态承接语与问题合成仍可能需要重新 TTS，但可以边接收边播放。
+
+052 取代下文 012/034/046 当时的默认关闭说明。已完成本机 Chromium/LiveKit 断供时钟场景验证；这不等于真实长面试、跨浏览器或生产延迟已验收，也不承诺零延迟。实现与验收边界见[持续交流改造](continuous-conversation-052.md)。
+
 ## 051：实时错误修复与后续交流边界
 
 LiveKit ingress 的有界队列满仅代表当前积压，不立即等同持续下游失败。饱和时记住当时 accepted 水位与既有背压时限，允许合作式 sink 在原容量内有序交付；持续慢消费不能逐帧重新获得完整时限。交付、失败和取消唤醒等待，只有排过原拥塞水位才重置预算，真正超时仍暂停以避免不完整答案。诊断只记录队列深度、容量、交付水位、等待毫秒与固定结果，不记录录音、身份或凭据。
@@ -57,7 +79,7 @@ execution v3 从空题会话开始，逐次追加实际选择，`awaiting_next_d
 
 补充确认仍归 SpokenSupplementConfirmation/AnswerEndpoint，复用服务端 final 与输入代次围栏。supplement_reply.v3 只选择服务端 evidence_id，集中合同严格校验后恢复逐字 evidence_quote；同一回答最多3次分类失败，声学 revision 不刷新预算，新增服务端文字或明确继续/重试才允许恢复。分类使用8秒网关预算、0次供应商内部重试，端点保留退避；成功通过既有 supplement_awaiting_reply 事件清除临时问题，失败不提交或清空答案。
 
-动态表达新增默认开启的 INTERVIEWER_BUFFERED_TTS_ENABLED：现有模型网关验证过的 TTS PCM 全量收齐、final与EOF验证后，经 AgentExpressionAudioService 写入完整私有WAV，沿用 cascade 的普通文件播放与所有 act/turn/owner/playback 围栏；避免供应商生成后再下载文件。20秒总准备时限、既有字节限制，取消/残片不落盘，不支持流式传输才退回原批量导入。预生成题目优先路径保留。INTERVIEWER_STREAMING_TTS_ENABLED 继续默认 false，本次未启用有媒体时钟缺陷的边接收边播放。追问只朗读已通过校验的问题，逐字引用保留在证据中，避免复读口头语和识别错误。
+动态表达新增默认开启的 INTERVIEWER_BUFFERED_TTS_ENABLED：现有模型网关验证过的 TTS PCM 全量收齐、final与EOF验证后，经 AgentExpressionAudioService 写入完整私有WAV，沿用 cascade 的普通文件播放与所有 act/turn/owner/playback 围栏；避免供应商生成后再下载文件。20秒总准备时限、既有字节限制，取消/残片不落盘，不支持流式传输才退回原批量导入。预生成题目优先路径保留。034 当时保持 INTERVIEWER_STREAMING_TTS_ENABLED=false；052 已替换该接收端时钟并默认开启流式表达。追问只朗读已通过校验的问题，逐字引用保留在证据中，避免复读口头语和识别错误。
 
 候选人展示文案集中在 candidate/presentation.js；内部错误 message 保留在诊断路径，不直接渲染。暂时等待用普通状态，需操作才显示重试，真实致命问题继续停止表达/操作；只有服务器确认后才能显示“已暂停”。设备区合并为画面与麦克风反馈，移除FPS、viseme、WebRTC与重复通道状态。预约同意和录制说明仍可见。
 
@@ -164,9 +186,7 @@ ServerSpeechActivity为本地WebRTC VAD适配器，固定webrtcvad-wheels==2.0.1
 
 ## 可撤销自动轮次（INTERRUPTIBLE-AUTOMATIC-TURNS-012）
 
-发布范围：自动轮次/合并推理与稳定性修复默认生效；下面的 TTS streaming transport **默认关闭，仅显式实验**。
-真实 Chrome 合成测试表明当前 MediaStream 时钟包含发送端停供静音，不等价于内容 sample playhead；在解决同源映射前沿用可靠私有资产播放，
-不为了展示首包速度启用未验收的抢话/截尾风险。当前本机媒体地址漂移（旧.104→实际.108）已更新；`scripts/local-media.sh doctor` 用于只读检查，
+012 最初因 Chrome 的 MediaStream 时钟包含停供静音而默认关闭流式表达；该历史限制已由 052 的可计数 PCM 播放器取代。当前 `INTERVIEWER_STREAMING_TTS_ENABLED=true`，以源样本消费和设备输出时钟验证末帧，保留全部批准及取消围栏。当前本机媒体地址漂移（旧.104→实际.108）已更新；`scripts/local-media.sh doctor` 用于只读检查，
 不能把 HTTP readiness 或信令连接成功当作浏览器 ICE/音频路径成功。
 
 本节替代 011 的强制按钮收口。正式回答使用 `AnswerEndpoint`（提议/撤销/准备/核验）与 `ContinuousSTT`（识别句段轮换/有序缓冲/权威累计 final）两个 seam。VAD 只表示声音活动，本地音频 EOT 概率与最低静音门槛共同产生提议，仍需权威转写和严格理解；不依赖结束词库，也不把静音时长或 STT 句段 final 当作整题结束。`finish_answer` 是可选提前结束建议，新语音同样可以撤销它。暖场仍自动结束。
@@ -177,7 +197,7 @@ ServerSpeechActivity为本地WebRTC VAD适配器，固定webrtcvad-wheels==2.0.1
 
 本轮分阶段计时覆盖 EOT、STT snapshot/final、理解准备、决策提交、TTS 合成/开流/首 PCM/订阅确认、音频导入、远端排空确认及撤销计数，无音频/文本/候选人标签。源码/离线场景验证与目标麦克风/并发/生产验收分开记录；不得以本地 EOT 推理时间代替端到端首音延迟或真实中文轮次准确率。
 
-第二阶段使用 `ApprovedSpeechOutput` 承接已批准动态表达：原 TTS route 的严格 PCM streaming extension → 独立最小权限 LiveKit publisher → 精确绑定的客户端播放器。Provider 开流、候选订阅 ready、首 PCM、唯一 final、本机 source 排空、远端媒体时钟排空是不同阶段；只有最后的当前输出 ACK 才移交 Floor。队列 200ms、20ms 帧、持续 owner/turn/selected-act/performance fence，取消同时停止 Provider 和音轨。预生成题目不改，不支持 streaming 的模型在首 PCM 前回到已有私有资产路径；首 PCM 后失败不整段重播。完整 PCM 经私有资产 seam 归档，供应商 URL 不进入事件。控制连接中断撤销旧轨道，新控制连接只能以新代次重播仍匹配当前题的已批准 act；禁止把不可重放的 transient track 留为永远 active。G2P 和 MediaStream 时钟不等于精确 RTP/sample 对齐，真实浏览器抖动/尾音与端到端首音尚须验收。
+第二阶段使用 `ApprovedSpeechOutput` 承接已批准动态表达：原 TTS route 的严格 PCM streaming extension → 独立最小权限 LiveKit publisher → 精确绑定的客户端播放器。Provider 开流、候选订阅 ready、首 PCM、唯一 final、本机 source 排空、候选源样本消费及设备输出排空是不同阶段；只有最后的当前输出 ACK 才移交 Floor。队列 200ms、20ms 帧、持续 owner/turn/selected-act/performance fence，取消同时停止 Provider 和音轨。预生成题目不改，不支持 streaming 的模型在首 PCM 前回到已有私有资产路径；首 PCM 后失败不整段重播。完整 PCM 经私有资产 seam 归档，供应商 URL 不进入事件。控制连接中断撤销旧轨道，新控制连接只能以新代次重播仍匹配当前题的已批准 act；禁止把不可重放的 transient track 留为永远 active。G2P 仍是口型估计；052 以可计数 PCM 播放取代 MediaStream 时钟。真实长会话抖动、口型同步与端到端首音仍须独立验收。
 
 ## 正式完成确认与理解引用合同（TURN-COMPLETION-UNDERSTANDING-011）
 

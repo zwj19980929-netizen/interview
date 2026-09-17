@@ -1,5 +1,13 @@
 # 接口设计
 
+## 052：连续字幕与批准 PCM 播放合同
+
+无新增 REST 路由。权威快照完成后先覆盖已确认转写、将 final 修正按现有 `transcript.partial` 显示，再恢复识别并继续处理后续字幕；显示更新不生成 CandidateAnswer 或结束许可。`conversation_reception.v2` 的自然回应沿既有 `conversation_acknowledgement`、`avatar.performance.*` 和 `floor.changed` 表达，候选端不能提交模型回复或任意执行动作。
+
+`delivery=streaming_tts` 继续使用下文的 `live_audio` 精确绑定及 ready / producer_finished / drained 控制合同；052 将候选可听输出改为 LiveKit 可靠数据包驱动的 AudioWorklet。只接受 `role=approved_expression`、精确 `publisher_identity` 和 `interviewer.approved-pcm.{output_id}` topic 的数据。每包为 16 字节头（ASCII `IAS1`；sequence、start_sample、sample_rate_hz 三个 uint32 大端整数）与 PCM16LE；固定 24kHz mono、每包最多 20ms / 976 字节，序号和源样本起点必须连续。PCM 不进入 AgentEvent、事件回放或 Redis。
+
+浏览器缓冲最多 2 秒；无效包、缺片、溢出或取消均停止当前输出，不能丢片后伪造 drained。RTC 音轨只保留录制用途，不再另挂音频播放器。仅在全部源样本消费完且 `getOutputTimestamp()` 确认设备输出越过最后渲染帧时发送 drained；断供期间插入的静音不推进源样本位置。未知发布者或旧 output 数据不进入当前播放器。当前默认流式开启，供应商不支持时仅首 PCM 前可回退完整资产；首 PCM 后失败不自动整段重播。详见[052 改造说明](continuous-conversation-052.md)。
+
 ## 2026-09-16：计划准备进度（049）
 
 `POST /api/v1/interview-plans/prepare` 默认保持原JSON响应。工作台可发送 `Accept: text/event-stream`，沿用相同认证、请求体和组织隔离；响应为SSE，`progress` data包含stage（reading/preparing/saving）、completed_points/total_points/reused_points（仅preparing阶段），数量只在校验通过后增加。`complete` data为保存成功的原计划；`error` data含status及error.code/message/details，HTTP头发送后错误通过此终止事件表达。连接中断/超时不能当作成功，客户端应提示先查看计划列表再重试。每10秒心跳保持连接，不模拟进度；断开取消未完成模型任务，事务已提交时不会撤销已保存计划。此接口不创建预约或启动面试。
@@ -192,17 +200,15 @@ supplement_reply.v2保持continue/finish/supplement/pause/unclear三字段返回
 
 ## 批准语音的流式播放（工作项 012）
 
-**实验合同，默认关闭**（`INTERVIEWER_STREAMING_TTS_ENABLED=false`）。2026-09-06 Chrome 实测2秒PCM中间停供3秒，
-媒体 currentTime 在 EOF 已为5.122秒且未触发 waiting，不能证明内容样本的真实排空；以下流式播放/ACK只供显式测试，
-未通过 source sample→播放位置校验前不得作为默认正式表达。默认仍用完整私有资产和原生 ended，自动轮次与合并推理不受此开关影响。
+012 的 MediaStream 墙钟在停供时继续增长，因此当时默认关闭；052 已用源样本可计数 PCM 播放器取代该适配器，并通过本机 Chromium / LiveKit 断供场景验证。当前默认 `INTERVIEWER_STREAMING_TTS_ENABLED=true`；本节控制事件保持，候选播放和排空依据使用上文 052 数据协议，完整资产路径继续保留。
 
 `avatar.performance.started` 新增 `delivery=streaming_tts`：`audio_uri=null`，
 `live_audio={output_id,publisher_identity,track_sid,track_name,sample_rate_hz,channels}`。
-绑定来自本场已批准 act 的独立 LiveKit 音轨；客户端只播放精确匹配的绑定，不播放未知 participant。
+绑定来自本场已批准 act 的独立 LiveKit 音轨；052 客户端验证精确轨道绑定后，仅播放同一批准发布者、output topic 的 PCM，RTC 音轨不再重复挂载播放。
 客户端在绑定音轨并请求播放后发送 `avatar.performance.ready {performance_id,output_id}`；
 服务端等待当前候选人控制连接确认后才发布首个 PCM，防止首段先于订阅丢失。
 `avatar.performance.producer_finished {performance_id,output_id,total_samples,sample_rate_hz}`
-仅表示 Provider 唯一 final 与本机发送队列排空，不表示候选人听完；浏览器按本地媒体时钟实际排空后发送
+仅表示 Provider 唯一 final 与本机发送队列排空，不表示候选人听完；浏览器按源样本消费及设备输出末帧确认后发送
 `avatar.performance.stopped {performance_id,output_id,reason:drained}`，服务端校验当前输出与 EOF 后才移交话轮。
 新流式 started/producer_finished 均为 transient，不重放过期轨道；候选快照新增可选 `active_performance_id`，
 用于暂停、完成、换代时撤销播放。断开/owner 丢失/打断须取消 Provider、清空发送队列和撤销 track。
@@ -776,7 +782,15 @@ React 工作台必须在这个一次性响应弹窗中提供“复制链接”�
 | `GET` | `/api/v1/public/interviews/{interview_id}/avatar-model?grant=...` | 私有、不缓存交付经 hash/许可校验的 VRM；grant 与候选人/面试绑定 |
 | `POST` | `/api/v1/public/interviews/{interview_id}/runtime-problems` | 报告 allow-list 的候选人致命运行故障；校验 token 后真实暂停会话并返回最小确认，不接受浏览器错误文本 |
 
-候选人 token 由至少 32 字符的 `INTERVIEWER_CANDIDATE_TOKEN_SECRET` 对会话 ID 与创建时间做 HMAC-SHA256 派生，不明文持久化或出现在后台详情；验证使用常量时间比较，错误 token 返回 403。正式页面用它换取一次性 Agent/LiveKit ticket。`runtime-problems` 只接受 `AVATAR_ASSET_UNAVAILABLE/AVATAR_MODEL_LOAD_FAILED/AVATAR_RENDERER_FAILED/CANDIDATE_RUNTIME_FAILED`，由服务端映射去敏原因并幂等调用生命周期 pause；响应只含状态、问题码、动作和暂停时间，原始 JS/WebGL/网络异常既不上传也不持久化。候选人端不存在可直接提交录音、转写、Avatar 播报或云会话 close 的第二套业务接口。
+候选人 token 由至少 32 字符的 `INTERVIEWER_CANDIDATE_TOKEN_SECRET` 对会话 ID 与创建时间做 HMAC-SHA256 派生，不明文持久化或出现在后台详情；验证使用常量时间比较，错误 token 返回 403。正式页面用它换取一次性 Agent/LiveKit ticket。`runtime-problems` 只接受 `AVATAR_ASSET_UNAVAILABLE/AVATAR_MODEL_LOAD_FAILED/AVATAR_RENDERER_FAILED/CANDIDATE_RUNTIME_FAILED/AUDIO_TRACK_LOST/AUDIO_STREAM_INVALID/AUDIO_PLAYBACK_FAILED/AUDIO_PLAYBACK_TIMEOUT/AUDIO_OUTPUT_UNAVAILABLE`，由服务端映射去敏原因并在同一生命周期事务内写入 pause 与受限诊断；响应只含状态、问题码、动作和暂停时间，原始 JS/WebGL/网络异常既不上传也不持久化。已手动暂停时保留原暂停原因，但仍记录本次故障码；同次暂停的重复同码报告幂等。浏览器先提交 HTTP 故障报告，失败后才经已认证控制通道发送 `pause.payload.reason=<同一白名单问题码>`，使用同一持久化方法；不再先发送通用暂停覆盖故障原因。候选人端不存在可直接提交录音、转写、Avatar 播报或云会话 close 的第二套业务接口。
+
+053：当前流式输出的音轨撤销时，浏览器立即停止消费和发声，最多等待 350 ms 让独立控制通道的同代次 interrupted、替换或权威快照撤销该输出；若没有相应权威撤销则提交 `AUDIO_TRACK_LOST`。此窗口不回放、不会发送 drained，也不推进试音或正式题；真正断流仍持久暂停。
+
+服务端正常 barge-in、表达替换、补充播报超时和人工接管复用同一输出撤销函数：先按旧 performance ID 撤销授权并发布 interrupted，再等待媒体清理；旧 ID 的迟到清理不能取消新输出。手动或运行故障暂停先持久化并发布权威快照，再清理媒体。
+
+内部指标新增有界数值统计 `tts_provider_read_wait_ms`、`tts_transport_publish_ms`、`tts_content_duration_ms`、`tts_output_scheduler_lag_ms`；候选端不可上报，没有动态标签或文本内容，provider read wait 不包含传输背压等待。
+
+`session.snapshot.runtime_problem_code` 是可空的同一白名单枚举，仅在当前暂停存在相应诊断时返回；刷新后候选人页面按固定安全文案说明播放故障，不下发内部错误消息、诊断历史或凭据。
 
 短期本地 grant 指向隐藏的 `GET|HEAD /api/v1/private-files/{token}`。无 `Range` 时返回 `200`；一个合法的 `bytes=start-end`、`bytes=start-` 或 `bytes=-suffix` 返回 `206`，并携带 `Accept-Ranges: bytes`、精确 `Content-Range` 和所选区间 `Content-Length`；不可满足、畸形或多段范围返回空体 `416`、`Content-Range: bytes */{total}` 与 `Content-Length: 0`。`HEAD` 与等价 `GET` 返回相同状态、媒体类型和长度头但不返回正文。该传输合同适用于受同一 grant 保护的简历和音频，不暴露 object key，也不放宽 token、审计、`private, no-store` 或租户校验。
 

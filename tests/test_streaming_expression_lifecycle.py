@@ -129,12 +129,11 @@ async def _client_ready(h):
     await h.channel.send(ClientSignal(type="client.ready", idempotency_key="replacement_client_ready"))
 
 
-@pytest.mark.parametrize("enabled", [None, "false", "FALSE", "0", ""])
-def test_streaming_tts_is_closed_by_default_or_explicitly_without_provider_or_publisher_calls(monkeypatch, enabled):
+@pytest.mark.parametrize("enabled", ["false", "FALSE", "0", ""])
+def test_explicitly_disabled_streaming_avoids_provider_or_publisher_calls(monkeypatch, enabled):
     async def scenario():
         runtime, channel, _coordinator, _grant = _harness()
-        # Dynamic follow-ups would use streaming when explicitly enabled;
-        # a primary question would mask a broken default by returning early.
+        # A primary question could mask a broken override by returning early.
         _mutate(runtime, channel, lambda session: session["turns"][0].update(is_followup=True))
         if enabled is None:
             monkeypatch.delenv("INTERVIEWER_STREAMING_TTS_ENABLED", raising=False)
@@ -162,11 +161,15 @@ def test_streaming_tts_is_closed_by_default_or_explicitly_without_provider_or_pu
 
 
 @pytest.mark.parametrize("owner_current", [True, False])
-def test_explicit_streaming_opt_in_retains_owner_fence_and_ready_before_pcm(monkeypatch, owner_current):
+@pytest.mark.parametrize("enabled", [None, "true"])
+def test_default_and_enabled_streaming_retain_owner_fence_and_ready_before_pcm(monkeypatch, owner_current, enabled):
     async def scenario():
         runtime, channel, _coordinator, _grant = _harness()
         _mutate(runtime, channel, lambda session: session["turns"][0].update(is_followup=True))
-        monkeypatch.setenv("INTERVIEWER_STREAMING_TTS_ENABLED", "true")
+        if enabled is None:
+            monkeypatch.delenv("INTERVIEWER_STREAMING_TTS_ENABLED", raising=False)
+        else:
+            monkeypatch.setenv("INTERVIEWER_STREAMING_TTS_ENABLED", enabled)
         raw = _RawTTS([b"\1\0" * 480])
         stream = ValidatedTTSStream(raw, provider_id="synthetic_tts", model=raw.meta.model, read_timeout_s=1)
         publisher = _Publisher()

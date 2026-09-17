@@ -25,7 +25,7 @@ def test_expression_grant_is_exact_audio_only_and_does_not_widen_evidence_subscr
     assert json.loads(publisher["metadata"]) == {"role": "approved_expression"}
     assert publisher["video"] == {
         "roomJoin": True, "room": "room_1", "canPublish": True,
-        "canSubscribe": False, "canPublishData": False, "canPublishSources": ["microphone"],
+        "canSubscribe": False, "canPublishData": True, "canPublishSources": ["microphone"],
     }
     assert _claims(media.issue_audio_publisher_token(room_name="room_1", performance_id="performance_1", ttl_seconds=1))["exp"] == 1030
     subscriber = _claims(media.issue_audio_subscriber_token(room_name="room_1", identity="evidence:owner_1"))
@@ -76,6 +76,9 @@ class _Participant:
 
     def __init__(self):
         self.published, self.unpublished = [], []
+        self.data = []
+        self.data_gate = None
+        self.data_entered = asyncio.Event()
         self.publish_entered = asyncio.Event()
         self.publish_gate = None
         self.publish_error = None
@@ -88,6 +91,12 @@ class _Participant:
             raise self.publish_error
         self.published.append((track, options))
         return SimpleNamespace(sid="TR_exact_output", name=track.name)
+
+    async def publish_data(self, payload, **options):
+        self.data_entered.set()
+        if self.data_gate is not None:
+            await self.data_gate.wait()
+        self.data.append((payload, options))
 
     async def unpublish_track(self, sid):
         self.unpublished.append(sid)
@@ -348,3 +357,115 @@ def test_invalid_publisher_configuration_is_rejected_without_rtc(kwargs):
     options.update(kwargs)
     with pytest.raises(ValueError):
         LiveKitApprovedAudioPublisher(SimpleNamespace(), **options)
+
+
+def test_counted_data_packets_exactly_match_recording_pcm_and_do_not_pad_the_tail():
+    import struct
+
+    async def scenario():
+        publisher, room, rtc, _, _ = _harness()
+        publisher.bind_output("speech_output_synthetic")
+        await publisher.open()
+        pcm = b"\x01\x02" * 1099
+        await publisher.publish(pcm)
+        packets = room.local_participant.data
+        assert [struct.unpack("!4sIII", item[0][:16]) for item in packets] == [
+            (b"IAS1", 1, 0, 24000), (b"IAS1", 2, 480, 24000), (b"IAS1", 3, 960, 24000),
+        ]
+        assert b"".join(item[0][16:] for item in packets) == pcm
+        assert b"".join(frame.data for frame in rtc.sources[0].frames) == pcm
+        assert all(item[1] == {"reliable": True, "topic": "interviewer.approved-pcm.speech_output_synthetic"} for item in packets)
+        assert max(len(item[0]) for item in packets) <= 976
+        await publisher.abort()
+
+    asyncio.run(scenario())
+
+
+def test_counted_data_wait_is_cancellable_without_late_audio_after_owner_loss():
+    async def scenario():
+        publisher, room, rtc, _, current = _harness()
+        publisher.bind_output("speech_output_synthetic")
+        await publisher.open()
+        room.local_participant.data_gate = asyncio.Event()
+        task = asyncio.create_task(publisher.publish(b"\x01\x02" * 960))
+        await room.local_participant.data_entered.wait()
+        current["valid"] = False
+        with pytest.raises(ApiError):
+            await task
+        room.local_participant.data_gate.set()
+        await asyncio.sleep(0)
+        assert room.local_participant.data == []
+        assert len(rtc.sources[0].frames) == 1
+        assert rtc.sources[0].cleared >= 1 and publisher.closed
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", ["release", "fence", "native_error"])
+def test_recording_and_counted_playback_share_one_bounded_frame_operation(failure):
+    async def scenario():
+        publisher, room, rtc, _, current = _harness(timeout=0.5)
+        publisher.bind_output("speech_output_synthetic")
+        await publisher.open()
+        source = rtc.sources[0]
+        source.capture_gate = asyncio.Event()
+        participant = room.local_participant
+        participant.data_gate = asyncio.Event()
+        task = asyncio.create_task(publisher.publish(b"\1\0" * 960))
+        try:
+            await asyncio.wait_for(source.capture_entered.wait(), 0.2)
+            # Neither independent sink waits for the other sink's completion.
+            await asyncio.wait_for(participant.data_entered.wait(), 0.2)
+            assert len(source.frames) == 1 and not participant.data
+            if failure == "release":
+                source.capture_gate.set()
+                participant.data_gate.set()
+                await task
+                assert len(source.frames) == len(participant.data) == 2
+                assert publisher.total_samples == 960
+            else:
+                if failure == "fence":
+                    current["valid"] = False
+                else:
+                    source.capture_error = RuntimeError("synthetic native failure")
+                    source.capture_gate.set()
+                with pytest.raises(ApiError):
+                    await asyncio.wait_for(task, 0.3)
+                participant.data_gate.set()
+                source.capture_gate.set()
+                await asyncio.sleep(0)
+                assert not participant.data and len(source.frames) == 1
+                assert publisher.closed and not publisher._pending_operations
+        finally:
+            await publisher.abort()
+            await asyncio.gather(task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("revoke_between_sinks", [False, True])
+def test_queued_owner_revocation_prevents_not_yet_started_sink_send(revoke_between_sinks):
+    async def scenario():
+        publisher, room, rtc, _, current = _harness()
+        publisher.bind_output("speech_output_synthetic")
+        await publisher.open()
+        source = rtc.sources[0]
+        if revoke_between_sinks:
+            original_capture = source.capture_frame
+
+            async def capture_then_revoke(frame):
+                await original_capture(frame)
+                current["valid"] = False
+
+            source.capture_frame = capture_then_revoke
+        else:
+            # Already queued before _current_operation schedules the SDK task.
+            asyncio.get_running_loop().call_soon(current.__setitem__, "valid", False)
+        with pytest.raises(ApiError) as exc:
+            await publisher.publish(b"\1\0" * 480)
+        assert exc.value.code == "EXPRESSION_OWNER_STALE"
+        assert len(source.frames) == (1 if revoke_between_sinks else 0)
+        assert room.local_participant.data == []
+        assert publisher.total_samples == 0 and publisher.closed
+
+    asyncio.run(scenario())

@@ -20,7 +20,7 @@ from app.adapters.private_media import read_managed_audio
 from app.domain.interview_agent import ClientSignal
 from app.model_gateway.schemas import ChatJSONResponse, ProviderMeta, Usage
 from app.persistence.provider import persistence_for
-from app.providers.mock.provider import MockProvider
+from app.providers.mock.provider import MockProvider, MockSTTStream
 from app.services.evidence_coordination import EvidenceOwnershipCoordinator
 
 from test_answer_endpoint import _Clock
@@ -67,7 +67,7 @@ def _semantic_provider(monkeypatch, *, technical=False, probe=False, explicit_fi
     async def invoke(provider, capability, request, context):
         if capability != "llm.chat_json" or request.purpose != "interview_turn_understanding":
             return await original(provider, capability, request, context)
-        if request.metadata.get("prompt_version") == "conversation_reception.v1":
+        if request.metadata.get("prompt_version") == "conversation_reception.v2":
             return await original(provider, capability, request, context)
         if request.metadata.get("prompt_version") == "supplement_reply.v4":
             reply = json.loads(request.messages[-1].content)["reply"]
@@ -347,7 +347,25 @@ def test_declining_a_followup_advances_without_counting_it_as_an_extra_main_ques
     async def scenario():
         declined = "这部分我不了解，这题先到这里吧。"
         reply = "没有补充了。"
-        async with _automatic_session(tmp_path, monkeypatch, [_TECHNICAL, reply, declined, reply, ""], spoken_confirmation=True) as (store, runtime, channel, managed):
+        transcripts = [_TECHNICAL, reply, declined, reply, ""]
+        pending, assigned = iter(transcripts), []
+        original_send = MockSTTStream.send_audio
+
+        async def audio_aligned_send(stream, chunk):
+            # A new recognition connection is not a new spoken utterance.
+            # The final revalidation may open and close an empty connection;
+            # assign this script only when its first voiced PCM really arrives.
+            if any(chunk) and not getattr(stream, "_synthetic_speech_assigned", False):
+                stream._synthetic_speech_assigned = True
+                text = next(pending, "")
+                assigned.append(text)
+                stream.request = stream.request.model_copy(update={"metadata": {
+                    **stream.request.metadata, "development_transcript": text,
+                }})
+            return await original_send(stream, chunk)
+
+        monkeypatch.setattr(MockSTTStream, "send_audio", audio_aligned_send)
+        async with _automatic_session(tmp_path, monkeypatch, transcripts, spoken_confirmation=True) as (store, runtime, channel, managed):
             _add_next_question(store)
             with persistence_for(store).transaction(ORGANIZATION_ID) as transaction:
                 session = transaction.interview_sessions.get(INTERVIEW_ID)
@@ -358,6 +376,7 @@ def test_declining_a_followup_advances_without_counting_it_as_an_extra_main_ques
             await _wait_until(lambda: len(_current(runtime)["answers"]) == 1, timeout=5)
             await _wait_until(lambda: all(c["status"] == "completed" for c in store.evidence_commands.values()))
             _assert_one_automatic_answer(store, runtime, _TECHNICAL + reply, voice_frames=5, continuation_frames=5)
+            assert assigned == [_TECHNICAL, reply], "An empty final cut must not consume the follow-up speech"
             current = _current(runtime)
             followup = next(t for t in current["turns"] if t.get("is_followup"))
             assert current["current_turn_id"] == followup["id"]
@@ -381,6 +400,7 @@ def test_declining_a_followup_advances_without_counting_it_as_an_extra_main_ques
             assert (snapshot["completed_answers"], snapshot["total_primary_questions"]) == (1, 2)
             answer = next(a for a in current["answers"] if a["turn_id"] == followup["id"])
             assert answer["raw_transcript"] == answer["final_transcript"] == declined
+            assert assigned == [_TECHNICAL, reply, declined]
             assert answer["media_evidence"]["complete"] is True
             updated_followup = next(t for t in current["turns"] if t["id"] == followup["id"])
             assert updated_followup["current_understanding"]["intent"] == "answer_declined"

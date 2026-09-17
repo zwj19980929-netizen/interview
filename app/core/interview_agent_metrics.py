@@ -38,6 +38,10 @@ INTERVIEW_AGENT_STAGE_METRICS = frozenset(
         "tts_first_pcm_ms",
         "tts_playback_ready_ms",
         "tts_remote_drain_ms",
+        "tts_provider_read_wait_ms",
+        "tts_transport_publish_ms",
+        "tts_content_duration_ms",
+        "tts_output_scheduler_lag_ms",
     }
 )
 

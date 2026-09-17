@@ -411,7 +411,11 @@ def test_appointment_deadline_closes_unfinished_session_but_not_submitted_proces
         current["candidate_input_completed_at"] = None
         transaction.interview_sessions.update(current, expected_version=current["version"])
 
-    assert asyncio.run(InterviewAgentRuntime(get_store()).sweep_overdue_interviews()) == 1
+    runtime = InterviewAgentRuntime(get_store())
+    # The sweep must use the same clock as the deadline assertions, even if
+    # admission or transaction work crosses a wall-clock second.
+    runtime.interviews = service
+    assert asyncio.run(runtime.sweep_overdue_interviews()) == 1
     current = service.get_interview(interview["id"])
     assert current["status"] == "cancelled"
     assert current["termination_reason"] == "appointment_window_expired"

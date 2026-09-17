@@ -15,7 +15,7 @@ vi.mock("livekit-client", () => ({
   LocalAudioTrack: class { constructor(track) { this.track = track; } },
   LocalVideoTrack: class { constructor(track) { this.track = track; } },
   Track: { Source: { Microphone: "microphone", Camera: "camera" } },
-  RoomEvent: { TrackSubscribed: "subscribed", TrackUnsubscribed: "unsubscribed",
+  RoomEvent: { DataReceived: "data", TrackSubscribed: "subscribed", TrackUnsubscribed: "unsubscribed",
     Reconnecting: "reconnecting", Reconnected: "reconnected", Disconnected: "disconnected" },
 }));
 
@@ -37,6 +37,18 @@ describe("LiveKit output connector", () => {
     expect(onRemoteAudioTrackRemoved).toHaveBeenCalledWith(track);
     await connection.close();
     expect(fake.room.disconnect).toHaveBeenCalledOnce();
+  });
+
+  it("passes only reliable PCM data to the exact approval matcher", async () => {
+    const onApprovedAudioData = vi.fn();
+    const connection = await connectLiveKitMedia({
+      media: { url: "wss://synthetic.invalid", participant_token: "synthetic", video_upstream_allowed: false },
+      stream: { getAudioTracks: () => [{}] }, onState: vi.fn(), onApprovedAudioData,
+    });
+    const payload = new Uint8Array([1]); const publisher = { identity: "expression:synthetic" };
+    fake.room.emit("data", payload, publisher, 1, "topic"); expect(onApprovedAudioData).not.toHaveBeenCalled();
+    fake.room.emit("data", payload, publisher, 0, "topic"); expect(onApprovedAudioData).toHaveBeenCalledWith(payload, publisher, "topic");
+    await connection.close();
   });
 
   it("preserves the independent authorized human audio path", async () => {

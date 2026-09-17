@@ -71,6 +71,9 @@ class _Publisher:
         self.close_calls = 0
         self.abort_calls = 0
 
+    def bind_output(self, output_id):
+        self.output_id = output_id
+
     async def open(self):
         self.opened += 1
         return self.publication
@@ -137,6 +140,42 @@ def _ready(h):
 
 def _drained(h):
     return h.output.acknowledge_drained("performance_synthetic", h.output.output_id, "drained")
+
+
+@pytest.mark.parametrize("publish_fails", [False, True])
+def test_supply_and_transport_timing_stay_separate_including_failure(monkeypatch, publish_fails):
+    async def scenario():
+        clock, measurements = [100.0], {}
+        monkeypatch.setattr(approved_speech_output, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(approved_speech_output, "observe_interview_agent_metric",
+                            lambda name, value: measurements.setdefault(name, []).append(value))
+        h = _harness()
+
+        async def events():
+            for number, chunk in enumerate(h.raw.chunks, start=2):
+                clock[0] += 0.025
+                yield h.raw.event(number, "audio.chunk", pcm_s16le=chunk)
+            clock[0] += 0.010
+            yield h.raw.event(4, "audio.final", total_audio_bytes=1440)
+
+        async def publish(chunk):
+            clock[0] += 0.100
+            if publish_fails:
+                raise RuntimeError("synthetic transport failure")
+
+        h.stream = SimpleNamespace(events=events)
+        h.output.stream = h.stream
+        h.publisher.publish = publish
+        if publish_fails:
+            with pytest.raises(RuntimeError, match="synthetic transport"):
+                await h.output._consume(bytearray())
+        else:
+            await h.output._consume(bytearray())
+        assert measurements["tts_provider_read_wait_ms"] == pytest.approx([25 if publish_fails else 60])
+        assert measurements["tts_transport_publish_ms"] == pytest.approx([100 if publish_fails else 200])
+        assert measurements["tts_content_duration_ms"] == [0 if publish_fails else 30]
+
+    asyncio.run(scenario())
 
 
 def test_no_pcm_before_ready_and_only_exact_private_binding_is_exposed():
@@ -301,6 +340,39 @@ def test_remote_ack_can_move_floor_without_invalidating_cleanup_of_its_exact_tra
     asyncio.run(scenario())
 
 
+def test_concurrent_consumer_failure_and_revocation_retrieve_the_consumer_error():
+    async def scenario():
+        import gc
+        h = _harness()
+        await h.output.open()
+        _ready(h)
+        loop = asyncio.get_running_loop()
+        errors = []
+        old_handler = loop.get_exception_handler()
+        loop.set_exception_handler(lambda _loop, context: errors.append(context))
+
+        async def fail_and_revoke(_pcm):
+            h.current["valid"] = False
+            raise ApiError("SYNTHETIC_CONSUMER_FAILED", "Synthetic failure", status_code=503)
+
+        h.output._consume = fail_and_revoke
+        try:
+            try:
+                await h.output.run(h.on_finished)
+            except ApiError as error:
+                assert error.code == "EXPRESSION_OWNER_STALE"
+            else:
+                pytest.fail("Revoked output must fail closed")
+            gc.collect()
+            await asyncio.sleep(0)
+            assert errors == []
+            assert h.archives == [] and h.publisher.abort_calls >= 1
+        finally:
+            loop.set_exception_handler(old_handler)
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("provider_id,rate", [("mock", 24000), ("synthetic_tts", 16000)])
 def test_open_rejects_development_audio_or_wrong_format_before_publishing(provider_id, rate):
     async def scenario():
@@ -353,5 +425,38 @@ def test_consumer_finishing_after_total_deadline_must_not_create_a_complete_arch
             await h.output.run(finish_and_ack)
         assert exc.value.code == "AGENT_AUDIO_OUTPUT_TIMEOUT"
         assert h.archives == [] and not h.output.producer_finished
+
+    asyncio.run(scenario())
+
+
+def test_first_audio_is_published_while_provider_is_still_generating_the_remainder():
+    async def scenario():
+        h = _harness([b"\1\0" * 480, b"\2\0" * 480])
+        reached_second, finish_generation = asyncio.Event(), asyncio.Event()
+        original = h.raw.events
+
+        async def delayed_events():
+            index = 0
+            async for event in original():
+                if event.type == "audio.chunk":
+                    index += 1
+                    if index == 2:
+                        reached_second.set()
+                        await finish_generation.wait()
+                yield event
+
+        h.raw.events = delayed_events
+        await h.output.open()
+        _ready(h)
+        task = asyncio.create_task(h.output.run(h.on_finished))
+        await reached_second.wait()
+        assert h.publisher.published == [b"\1\0" * 480]
+        assert not h.raw.eof_reached.is_set() and not h.output.producer_finished
+        assert h.archives == [] and h.notifications == []
+        finish_generation.set()
+        await h.producer_notified.wait()
+        assert _drained(h)
+        await task
+        assert b"".join(h.publisher.published) == b"\1\0" * 480 + b"\2\0" * 480
 
     asyncio.run(scenario())

@@ -371,7 +371,8 @@ class LiveKitMediaPlane:
 
         The identity is derived here, never supplied by a browser. Approval
         and ownership remain the caller's domain responsibility; this grant
-        deliberately cannot publish camera/data or subscribe to candidates.
+        may publish only microphone and approved PCM data; it cannot publish
+        camera or subscribe to candidates.
         """
         self.require_ready(recording=False)
         if not isinstance(room_name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,254}", room_name):
@@ -392,7 +393,7 @@ class LiveKitMediaPlane:
                 "room": room_name,
                 "canPublish": True,
                 "canSubscribe": False,
-                "canPublishData": False,
+                "canPublishData": True,
                 "canPublishSources": ["microphone"],
             },
         })

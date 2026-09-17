@@ -1,5 +1,17 @@
 # 领域模型
 
+## 053 · 候选端播放故障与暂停诊断
+
+候选端白名单运行故障通过内部 `PAUSE.runtime_problem_code` 在一个生命周期事务内记录暂停与 `agent_runtime.problems`。首次故障暂停的 `interruption.kind=runtime`；已经手动暂停时不改原始 interruption。每项受限诊断仅保存固定 code/message/action、发生时间、`pause_occurred_at` 和 `pause_epoch`；epoch 使用当前暂停生命周期事件 ID，区分同一秒内恢复后再次暂停。同次暂停同码报告不重复保存，恢复后新的暂停仍可记录同码；记录最多 20 项，无新表或迁移。候选快照只投影当前暂停的单个 `runtime_problem_code`，不给诊断历史或原始错误文本。
+
+## 052：推理准备、结束许可与播放消费事实
+
+`SpeculativeTurnPreparation` 是进程内最多一份、可撤销、有时限的稳定转写准备，不是新的会话状态或持久答案。预览可提前运行理解，只有当前权威 final 的文字、置信度、语言、分段和 Provider 来源全部匹配，且当前 capture / owner / 上下文 / 输入代次仍有效时才可复用结果。准备完成不授权交卷；恢复收听后提交仍需新的完整 final 和音频水位校验。final 新增文字时，即使 VAD 或 partial 没报告续说，也须撤销旧 `confirmed` 及确认快照，重新判断当下意图。
+
+权威 final 的字幕投影只更新展示，先覆盖已有文字再恢复识别，不把自身修正视为新输入。后续真实 partial 或声音仍能撤销旧提案。自然接话采用现有非评分 `conversation_acknowledgement`，不产生能力证据、题目选择或暂停成功事实；企业资料和 Skill 仍各自可选。
+
+`ApprovedSpeechOutput` 的 `producer_finished` 表示供应商和发送端结束；`drained` 表示候选播放器已消费全部源样本且设备输出越过末帧，两者分离。052 的源样本计数不随断供静音增长，替代 012 的 MediaStream 墙钟推断；媒体轨道为录制保留，可听输出由精确绑定的 PCM 播放器承担。没有新表、迁移、评分字段或持久预览缓存。具体实现与验收范围见[052 改造说明](continuous-conversation-052.md)。
+
 ## 2026-09-16：计划准备的临时进度（049）
 
 准备进度是一次请求的临时投影，不是新的计划状态或持久任务。复用数据来自已有不可变approved计划，经同组织与来源版本/内容/能力范围校验后复制到新计划，不修改旧计划，也不复用候选人的答案或评分。仍然只有最终事务成功后才产生新计划。没有新表、迁移或候选资料缓存；简历题复用受候选人及简历审查范围约束。
@@ -145,9 +157,7 @@ ModelRoute 在原 JSON 聚合内保存短期探针所有权和配置指纹，探
 
 ## ApprovedSpeechOutput（工作项 012）
 
-当前为默认关闭的实验输出实现。Chrome 停供实测已否定 MediaStream.currentTime 与内容样本同源；
-drained 的目标领域含义仍是实际排空，但现有媒体时钟适配器尚不能提供充分证据，不能默认启用或标为端到端 verified。
-下步必须补明确 source sample→RTP/播放位置映射，或经授权的可计数客户端 PCM 播放 seam；不靠固定尾音延迟伪造确认。
+012 当时的 MediaStream.currentTime 不能证明源样本消费，曾默认关闭。052 已实现精确绑定的客户端 PCM 播放 seam，默认开启；drained 要求源样本全部消费且设备输出越过末帧，不靠墙钟或固定尾音延迟确认。本机断供验证不代替跨浏览器、长会话和生产端到端验收。
 
 一个已批准 ConversationAct 对应一个可撤销语音输出：唯一 performance/output 标识、当前题/owner/selected-act fence、
 单独的最小权限 LiveKit publisher、严格验证的 PCM 流、播放确认与私有音频归档。

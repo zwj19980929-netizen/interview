@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 import weakref
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
+from app.services.speech_output_interruption import revoke_active_performance
 
 from app.adapters.livekit_audio_ingress import (
     LiveKitAudioIngressBinding,
@@ -618,7 +619,18 @@ class ManagedLiveKitEvidenceSession:
             if source is not None:
                 await source._emit_snapshot(None)
 
-        async def speak(kind: str, guard: Any, *, focus_quote: str = "") -> bool:
+        async def on_snapshot(final: Any) -> None:
+            # A final correction is a subtitle, not answer submission. The
+            # endpoint already covered it before ASR is resumed; do not feed it
+            # back into observe_transcript as if the candidate spoke again.
+            if self._capture_id != capture_id or self._stopped:
+                return
+            await self._route_stream_projection(_PendingProjection("formal", {
+                "type": "transcript.partial", "text": final.text,
+                "confidence": final.confidence,
+            }, turn_id))
+
+        async def speak(kind: str, guard: Any, *, focus_quote: str = "", reply_text: str = "") -> bool:
             guard()
             if self._capture_id != capture_id or self._stopped:
                 raise ApiError("TURN_DECISION_STALE", "Capture changed.", status_code=409)
@@ -634,11 +646,8 @@ class ManagedLiveKitEvidenceSession:
                 performance_id = state.get("active_performance_id")
                 if performance_id != getattr(self, "_supplement_performance_id", None):
                     return False
-                await source._cancel_speech_output()
-                source.runtime._clear_active_performance(self.interview_id, performance_id, self.organization_id)
-                await source._emit("avatar.performance.interrupted", {
-                    "performance_id": performance_id, "reason": "confirmation_playback_timeout", "deadline_ms": 200,
-                }, turn_id=turn_id, causation_id=None, replayability=Replayability.TRANSIENT)
+                await revoke_active_performance(source, performance_id, reason="confirmation_playback_timeout", turn_id=turn_id)
+                await source._cancel_speech_output(expected_performance_id=performance_id)
                 await source._set_floor(FloorOwner.CANDIDATE, "confirmation_playback_timeout", None)
                 return True
             if kind == "pause":
@@ -653,7 +662,7 @@ class ManagedLiveKitEvidenceSession:
                 return True
             from app.core.prompt.contracts import clarification_speech, CLARIFICATION_SPEECH_VERSION
             if kind.startswith("reception_"):
-                from app.core.prompt.conversation_reception import RECEPTION_SPEECH, RECEPTION_SPEECH_VERSION, reception_repeat
+                from app.core.prompt.conversation_reception import RECEPTION_SPEECH, RECEPTION_SPEECH_VERSION, RECEPTION_VERSION, reception_repeat
                 request_kind = kind.removeprefix("reception_")
                 if request_kind == "repeat":
                     session = self.supervisor.interviews.get_interview(self.interview_id, self.organization_id)
@@ -661,11 +670,12 @@ class ManagedLiveKitEvidenceSession:
                     question = turn.get("question_spoken_text") or turn.get("question_snapshot", {}).get("question_text", "")
                     text = reception_repeat(question)
                 else:
-                    text = RECEPTION_SPEECH[request_kind]
+                    text = reply_text or RECEPTION_SPEECH.get(request_kind, RECEPTION_SPEECH["unclear"])
                 performance = await source._select_act(
                     act_type="conversation_acknowledgement", text=text,
                     turn_id=turn_id, causation_id=None, evidence_refs=[], gesture="listen",
-                    approval_guard=guard, prompt_version=RECEPTION_SPEECH_VERSION,
+                    approval_guard=guard, prompt_version=RECEPTION_VERSION if reply_text else RECEPTION_SPEECH_VERSION,
+                    on_playback_selected=lambda: self._answer_endpoint.confirmation.playback_selected(self._answer_endpoint),
                 )
                 self._supplement_performance_id = performance.performance_id if performance else None
                 return performance is not None
@@ -674,6 +684,7 @@ class ManagedLiveKitEvidenceSession:
                 text=clarification_speech(focus_quote) if kind == "answer_clarify" else SUPPLEMENT_SPEECH[kind],
                 turn_id=turn_id, causation_id=None, evidence_refs=[], gesture="listen",
                 approval_guard=guard,
+                on_playback_selected=lambda: self._answer_endpoint.confirmation.playback_selected(self._answer_endpoint),
                 **({"prompt_version": CLARIFICATION_SPEECH_VERSION} if kind == "answer_clarify" else {}),
             )
             self._supplement_performance_id = performance.performance_id if performance else None
@@ -693,10 +704,11 @@ class ManagedLiveKitEvidenceSession:
                 self.assert_controller(source)
                 if self._capture_id != capture_id or self._stopped or source is not (self._channel or self._event_source):
                     raise ApiError("TURN_DECISION_STALE", "Company exchange capture changed.", status_code=409)
-                self.chain.assert_snapshot_current()
+                if not self.chain.is_open:
+                    raise ApiError("TURN_DECISION_STALE", "Company exchange capture closed.", status_code=409)
 
             assert_current()
-            self.chain.assert_snapshot_current(prepared)
+            self.supervisor.interviews.assert_prepared_streaming_decision(prepared, final, self.organization_id)
             session = self.supervisor.interviews.get_interview(self.interview_id, self.organization_id)
             turn = next(item for item in session["turns"] if item["id"] == turn_id)
             span = prepared.understanding.company_question.model_dump(mode="json")
@@ -715,18 +727,27 @@ class ManagedLiveKitEvidenceSession:
             if reply["source_hash"] != source_hash(str((session.get("plan_snapshot") or {}).get("company_context") or "").strip()):
                 raise ApiError("TURN_DECISION_STALE", "Company reference changed.", status_code=409)
             assert_current()
-            self.chain.assert_snapshot_current(prepared)
-            checkpoint = self.chain.checkpoint_incomplete() or {}
-            if exchange is None:
-                exchange, _ = record_company_exchange(self.supervisor.interviews, prepared, final, reply,
-                    checkpoint=checkpoint, capture_id=capture_id, evidence_fence=owner_fence,
-                    organization_id=self.organization_id, guard=assert_current)
-            self._answer_endpoint.confirmation.phase = "speaking"
-            self._answer_endpoint.confirmation._playback_started_at = self._answer_endpoint.clock()
+            try:
+                # Extraction ran while listening. Only the short durable
+                # exchange transaction cuts ASR and rechecks the complete final.
+                current_final = await self.chain.transcript_snapshot(resume=False)
+                assert_current()
+                self.chain.assert_snapshot_current(prepared)
+                if current_final is None:
+                    raise ApiError("TURN_DECISION_STALE", "Company exchange final unavailable.", status_code=409)
+                checkpoint = self.chain.checkpoint_incomplete() or {}
+                if exchange is None:
+                    exchange, _ = record_company_exchange(self.supervisor.interviews, prepared, current_final, reply,
+                        checkpoint=checkpoint, capture_id=capture_id, evidence_fence=owner_fence,
+                        organization_id=self.organization_id, guard=assert_current)
+            finally:
+                if self.chain.is_open:
+                    await self.chain.resume_capture()
             performance = await source._select_act(act_type="company_answer", text=reply["text"],
                 turn_id=turn_id, causation_id=exchange["id"],
                 evidence_refs=[item["quote"] for item in reply["citations"]], gesture="listen",
-                approval_guard=assert_current, prompt_version=COMPANY_REPLY_VERSION)
+                approval_guard=assert_current, prompt_version=COMPANY_REPLY_VERSION,
+                on_playback_selected=lambda: self._answer_endpoint.confirmation.playback_selected(self._answer_endpoint))
             self._supplement_performance_id = performance.performance_id if performance else None
             if performance:
                 update_company_delivery(self.supervisor.interviews, self.interview_id, exchange["id"],
@@ -738,6 +759,7 @@ class ManagedLiveKitEvidenceSession:
         self._answer_endpoint = AnswerEndpoint(
             detector=self.supervisor.turn_detector, capture=self.chain, commit=commit, notify=notify,
             on_failure=on_failure,
+            on_snapshot=on_snapshot,
             trace=trace,
             confirmation=SpokenSupplementConfirmation(speak=speak, respond_company=respond_company),
             speech_activity=ServerSpeechActivity(),
@@ -1851,26 +1873,14 @@ class ManagedLiveKitEvidenceSession:
                 self.interview_id, "listening", self.organization_id
             )
         if runtime_state.get("floor") == FloorOwner.AGENT.value:
-            await source._cancel_speech_output()
+            await revoke_active_performance(source, runtime_state.get("active_performance_id"), reason="barge_in",
+                turn_id=effective_turn_id,
+                causation_id=signal.causation_id,
+            )
+            await source._cancel_speech_output(expected_performance_id=runtime_state.get("active_performance_id"))
             if self._presentation_task is not None and not self._presentation_task.done():
                 self._presentation_task.cancel()
                 await asyncio.gather(self._presentation_task, return_exceptions=True)
-            await source._emit(
-                "avatar.performance.interrupted",
-                {
-                    "reason": "barge_in",
-                    "deadline_ms": 200,
-                    "performance_id": runtime_state.get("active_performance_id"),
-                },
-                turn_id=effective_turn_id,
-                causation_id=signal.causation_id,
-                replayability=Replayability.TRANSIENT,
-            )
-            source.runtime._clear_active_performance(
-                self.interview_id,
-                runtime_state.get("active_performance_id"),
-                self.organization_id,
-            )
         await source._set_floor(
             FloorOwner.CANDIDATE, "barge_in", signal.causation_id
         )

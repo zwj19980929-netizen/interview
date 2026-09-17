@@ -2,6 +2,7 @@ from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from app.domain.adaptive_interview import AdaptiveInterviewPolicy
+from app.domain.candidate_runtime import CandidateRuntimeProblemCode
 
 
 class KeyPointInput(BaseModel):
@@ -328,12 +329,7 @@ class CandidateRuntimeProblemReport(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    code: Literal[
-        "AVATAR_ASSET_UNAVAILABLE",
-        "AVATAR_MODEL_LOAD_FAILED",
-        "AVATAR_RENDERER_FAILED",
-        "CANDIDATE_RUNTIME_FAILED",
-    ]
+    code: CandidateRuntimeProblemCode
 
 
 class TakeoverMediaPermitCreate(BaseModel):

@@ -64,22 +64,29 @@ class SpokenSupplementConfirmation:
         endpoint._last_voice = endpoint.clock()
         endpoint._blocked_revision = None
 
-    async def _say(self, endpoint: Any, kind: str, *, afterwards: str) -> bool:
+    def playback_selected(self, endpoint: Any) -> None:
+        """Gate microphone echo only once playable output is selected."""
+        if self.phase in {"preparing_speech", "preparing_company"}:
+            self.phase = "speaking"
+            self._playback_started_at = endpoint.clock()
+
+    async def _say(self, endpoint: Any, kind: str, *, afterwards: str, reply_text: str = "") -> bool:
         endpoint.assert_current()
-        self.phase = "speaking"
+        self.phase = "preparing_speech"
         self._after_speech = afterwards
         self._playback_started_at = endpoint.clock()
         try:
-            spoken = await self.speak(kind, endpoint.assert_current)
-            if spoken and self.phase == "speaking":
-                self._playback_started_at = endpoint.clock()
-            if not spoken and self.phase == "speaking":
+            spoken = await endpoint._infer(self.speak(kind, endpoint.assert_current,
+                                      **({"reply_text": reply_text} if reply_text else {})), timeout=45)
+            if spoken:
+                self.playback_selected(endpoint)
+            if not spoken and self.phase in {"preparing_speech", "speaking"}:
                 self.phase = "listening" if afterwards == "pause_requested" else afterwards
                 self.reply_seen = endpoint.revision != endpoint._proposal_revision
                 endpoint._last_voice = endpoint.clock()
             return bool(spoken)
         except BaseException:
-            if self.phase == "speaking":
+            if self.phase in {"preparing_speech", "speaking"}:
                 self.phase = "listening" if afterwards == "pause_requested" else afterwards
                 self.reply_seen = endpoint.revision != endpoint._proposal_revision
             raise
@@ -120,6 +127,11 @@ class SpokenSupplementConfirmation:
                     # Waiting on the same words must leave the next healthy
                     # recognition stream open, including long quiet pauses.
                     return
+                # The single speculative analysis runs alongside the small
+                # reception call while the recognizer keeps accepting speech.
+                # It cannot speak or submit; a matching final is still needed.
+                if endpoint._prepare_failures < 3:
+                    endpoint.preparation.start(preview)
             if early:
                 # Do not cut ordinary answers into new STT streams just to
                 # inspect a social request. A preview can only precompute.
@@ -142,10 +154,8 @@ class SpokenSupplementConfirmation:
         if quiet < endpoint.min_silence_seconds:
             return
         endpoint._proposal_revision = endpoint.revision
-        # Keep this final's recognition cut until intent and answer preparation
-        # finish. PCM intake/recording continues; new speech still revokes the
-        # input revision and the capture's pending-audio fence.
-        final = await endpoint.capture.transcript_snapshot(resume=False)
+        final = (await endpoint.listening_snapshot() if self.semantic_first
+                 else await endpoint.capture.transcript_snapshot(resume=False))
         try:
             endpoint.assert_current()
             if final is not None and await self._receive_request(endpoint, final):
@@ -156,7 +166,8 @@ class SpokenSupplementConfirmation:
                 await endpoint.capture.resume_capture()
 
     async def _listen(self, endpoint: Any, *, allow_answer_review: bool = True) -> None:
-        final = await endpoint.capture.transcript_snapshot(resume=not self.semantic_first)
+        final = (await endpoint.listening_snapshot() if self.semantic_first
+                 else await endpoint.capture.transcript_snapshot(resume=True))
         endpoint.assert_current()
         endpoint.cover_transcript(final)
         if final is None:
@@ -228,10 +239,12 @@ class SpokenSupplementConfirmation:
         self._confirmed_final = None
         endpoint._explicit_revision = None
         endpoint._discard_confirmed_preparation()
+        endpoint.preparation.cancel()
         await endpoint._notify("answer_listening")
         endpoint.assert_current()
         spoken = await self._say(endpoint, "reception_" + kind,
-                                 afterwards="pause_requested" if kind == "pause" else "listening")
+                                 afterwards="pause_requested" if kind == "pause" else "listening",
+                                 reply_text=decision.get("reply_text", ""))
         if spoken:
             self._semantic_wait_identity = identity
             self.boundary, self._boundary_segments = text, len(final.segments)
@@ -280,9 +293,10 @@ class SpokenSupplementConfirmation:
         if ConversationUnderstandingService.can_complete_without_confirmation(understanding, final.text):
             endpoint.trace("semantic_completion_selected", intent=understanding.turn_intent,
                            revision=endpoint.revision, text=final.text)
-            # Reuse the prepared result against this exact paused final. The
-            # evidence layer rechecks owner/capture/audio/context at commit.
-            await endpoint._propose(final_snapshot=final, prepared_decision=prepared)
+            # Recognition has continued while reasoning. A fresh final cut
+            # must match before the evidence transaction can accept anything.
+            await endpoint._propose(final_snapshot=final, prepared_decision=prepared,
+                                    recognition_resumed=True)
             return True
         if understanding.suggested_action == "continue_listening":
             self._semantic_wait_identity = identity
@@ -294,7 +308,8 @@ class SpokenSupplementConfirmation:
                 endpoint._retry_at = endpoint.clock() + 2
             return True
         if understanding.suggested_action in {"clarify", "repeat", "pause"}:
-            await endpoint._propose(final_snapshot=final, prepared_decision=prepared)
+            await endpoint._propose(final_snapshot=final, prepared_decision=prepared,
+                                    recognition_resumed=True)
             return True
         # Ordinary complete-looking content does not grant consent to close
         # the topic. An uncertain turn retains the existing spoken handshake.
@@ -342,12 +357,14 @@ class SpokenSupplementConfirmation:
         self._clarification_revision = endpoint.revision
         endpoint._explicit_revision = None
         endpoint._discard_confirmed_preparation()
-        self.phase, self._after_speech = "speaking", "listening"
+        self.phase, self._after_speech = "preparing_speech", "listening"
         self._playback_started_at = endpoint.clock()
         try:
-            spoken = await self.speak("answer_clarify", endpoint.assert_current,
-                                      focus_quote=target.focus_quote if target else "")
-            if not spoken and self.phase == "speaking":
+            spoken = await endpoint._infer(self.speak("answer_clarify", endpoint.assert_current,
+                                      focus_quote=target.focus_quote if target else ""), timeout=45)
+            if spoken:
+                self.playback_selected(endpoint)
+            if not spoken and self.phase in {"preparing_speech", "speaking"}:
                 self.phase = "listening"
         except BaseException:
             self.phase = "listening"
@@ -455,4 +472,4 @@ class SpokenSupplementConfirmation:
         self._confirmed_final = final.model_copy(deep=True)
         self.boundary = final.text.strip()
         self._boundary_segments = len(final.segments)
-        await endpoint._propose(final_snapshot=final)
+        await endpoint._propose(final_snapshot=final, recognition_resumed=self.semantic_first)

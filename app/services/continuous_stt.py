@@ -63,6 +63,10 @@ class ContinuousSTT:
         self._forward_idle = asyncio.Event()
         self._inflight_has_speech = False
         self._forward_idle.set()
+        # Rotation/recovery can recognize queued audio outside send_audio's
+        # caller. Keep only the latest cumulative display hypothesis until the
+        # next intake tick; provider evidence and recorded PCM remain lossless.
+        self._pending_update: Optional[StreamingSTTEvent] = None
 
     @property
     def paused(self) -> bool:
@@ -150,7 +154,7 @@ class ContinuousSTT:
         self._assert_open()
         self._assert_no_capture_gap()
         if not chunk:
-            return []
+            return self._drain_updates()
         if self._received_bytes + len(chunk) > self._max_bytes:
             self._recovery_error = ProviderError("provider_audio_stream_too_large",
                                                  "Capture size limit exceeded.", retryable=False)
@@ -174,9 +178,9 @@ class ContinuousSTT:
         self._pending_bytes += len(chunk)
         if (self._rotating or self._stream is None or self.recovery_required
                 or not self._forward_idle.is_set()):
-            return []
+            return self._drain_updates()
         self._forward_idle.clear()
-        events: list[StreamingSTTEvent] = []
+        events: list[StreamingSTTEvent] = self._drain_updates()
         try:
             while self._pending and not self._rotating and not self.recovery_required:
                 self._assert_open()
@@ -227,6 +231,18 @@ class ContinuousSTT:
         return [event.model_copy(update={"text": prefix + event.text})
                 if event.type == "transcript.partial" else event for event in events]
 
+    def _queue_updates(self, events: list[StreamingSTTEvent], *, prepend_final: bool = False) -> None:
+        if self._closed:
+            return
+        prefix = self._final.text if prepend_final and self._final else ""
+        for event in events:
+            if event.type == "transcript.partial" and event.text.strip():
+                self._pending_update = event.model_copy(deep=True, update={"text": prefix + event.text})
+
+    def _drain_updates(self) -> list[StreamingSTTEvent]:
+        update, self._pending_update = self._pending_update, None
+        return [update] if update is not None else []
+
     async def snapshot(self, *, resume: bool = True) -> Optional[StreamingSTTEvent]:
         async with self._lock:
             self._assert_open()
@@ -241,7 +257,7 @@ class ContinuousSTT:
                 # must be included. New frames during finish remain pending.
                 pending_count = len(self._pending) if self._stream is not None else 0
                 for _ in range(pending_count):
-                    await self._forward_pending(wait_for_capacity=True)
+                    self._queue_updates(await self._forward_pending(wait_for_capacity=True))
                     await asyncio.sleep(0)
                     self._assert_open()
                     self._assert_no_capture_gap()
@@ -288,6 +304,10 @@ class ContinuousSTT:
                                      self._final is not None, end_bytes - self._segment_start_bytes)
                         self._missing_final_logged = True
                     if final is not None:
+                        # The caller projects the validated final correction.
+                        # A delayed preview from this old stream cannot replace
+                        # that correction on a subsequent audio tick.
+                        self._pending_update = None
                         self._missing_final_logged = False
                         offset = int(self._segment_start_bytes * 1000 / self._bytes_per_second)
                         segments = [s.model_copy(update={"start_ms": s.start_ms + offset,
@@ -352,6 +372,7 @@ class ContinuousSTT:
                 self._assert_no_capture_gap()
                 try:
                     events = await stream.send_audio(chunk, wait_for_capacity=True)
+                    self._queue_updates(events, prepend_final=True)
                     self._segment_text_seen |= any(
                         event.type in {"transcript.partial", "transcript.final"} and event.text.strip()
                         for event in events
@@ -362,7 +383,7 @@ class ContinuousSTT:
                 self._assert_open()
         while self._pending:
             self._assert_open()
-            await self._forward_pending(wait_for_capacity=True)
+            self._queue_updates(await self._forward_pending(wait_for_capacity=True))
             await asyncio.sleep(0)
         self._assert_open()
         self._assert_no_capture_gap()
@@ -506,6 +527,7 @@ class ContinuousSTT:
         self._closed = True
         self._pending_bytes = 0
         self._segment_audio.clear()
+        self._pending_update = None
         return self._final.model_copy(deep=True)
 
     async def abort(self) -> None:
@@ -515,6 +537,7 @@ class ContinuousSTT:
             self._pending.clear()
             self._pending_bytes = 0
             self._segment_audio.clear()
+            self._pending_update = None
             streams = {id(item): item for item in
                        (stream, self._finishing_stream, self._retired_stream) if item is not None}
             # A revoked owner can cancel its caller immediately. This capture

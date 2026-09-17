@@ -43,6 +43,32 @@ def setup():
     return endpoint, clock, notices, commits, spoken
 
 
+def test_playback_deadline_starts_at_selected_output_not_a_late_speak_return():
+    async def scenario():
+        endpoint, clock, _, commits, _ = setup()
+        selected, release = asyncio.Event(), asyncio.Event()
+
+        async def speak(kind, guard):
+            guard()
+            endpoint.confirmation.playback_selected(endpoint)
+            selected.set()
+            await release.wait()
+            return True
+
+        endpoint.confirmation.speak = speak
+        endpoint._proposal_revision = endpoint.revision
+        task = asyncio.create_task(endpoint.confirmation._say(endpoint, "check", afterwards="awaiting_reply"))
+        await asyncio.wait_for(selected.wait(), 1)
+        began = endpoint.confirmation._playback_started_at
+        clock.value += 31
+        release.set()
+        assert await task
+        assert endpoint.confirmation._playback_started_at == began
+        assert not commits
+        await endpoint.close()
+    asyncio.run(scenario())
+
+
 async def ask(endpoint, clock, spoken):
     endpoint.speech_started()
     endpoint.start()

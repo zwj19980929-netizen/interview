@@ -2,6 +2,11 @@ import { describe, expect, it } from "vitest";
 import { candidateEntryMessage, candidateEntryFailure, candidateNotice } from "./presentation.js";
 
 describe("candidate copy separates actions from diagnostics", () => {
+  it.each(["AUDIO_TRACK_LOST", "AUDIO_STREAM_INVALID", "AUDIO_PLAYBACK_FAILED", "AUDIO_PLAYBACK_TIMEOUT", "AUDIO_OUTPUT_UNAVAILABLE"])("explains the persisted %s using safe copy", code => {
+    const notice = candidateNotice({ code, recoverable: false, message: "secret provider diagnostics" }, true);
+    expect(notice.detail).toContain("语音"); expect(notice.detail).toContain("协助恢复");
+    expect(JSON.stringify(notice)).not.toMatch(/secret|provider|AUDIO_/);
+  });
   it.each(["UNDERSTANDING_UNAVAILABLE", "UNDERSTANDING_RETRY_EXHAUSTED", "CAPTURE_RECOVERING", "CAPTURE_RETRY_REQUIRED", "UNEXPECTED_PROVIDER_ERROR"])("does not expose backend details for %s", (code) => {
     const notice = candidateNotice({ code, message: "secret-endpoint WebRTC provider_schema_invalid", recoverable: true });
     expect(JSON.stringify(notice)).not.toMatch(/secret|WebRTC|provider|schema/);

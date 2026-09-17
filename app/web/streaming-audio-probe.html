@@ -13,15 +13,21 @@
 </head>
 <body>
   <h1>本机流式音频时钟探针</h1>
-  <p>每次播放两秒低音量合成音（前半低、后半高）。不请求麦克风或摄像头、不读取历史数据、不调用外部语音服务、不录制。
-    请先降低扬声器音量。断供用例用于观察 MediaStream 时钟是否仍在补偿静音时推进；“完成”仅是当前模块回执，不代表准确同步已通过验收。</p>
+  <p>播放低音量合成音，可验证两秒正常流或二十秒轻微抖动。长模式对每个 20ms 音频包加入 1–5ms 发送抖动。纯合成模式不调用外部语音服务；公开中文模式仅在本轮诊断服务启用后可用，调用当前配置的语音供应商并叠加只读会话校验成本，发送内容只有下方公开测试文本。不请求麦克风或摄像头、不发送候选人资料、不录制。
+    请先降低扬声器音量。断供期间源样本位置应保持不动；只有完整样本消费且设备输出时钟通过最后一帧才确认结束。此探针不代替真实中文语音和生产环境验收。</p>
   <div>
     <button data-mode="normal">开始：正常合成流</button>
     <button data-mode="gap600">开始：中途停供 600ms</button>
     <button data-mode="gap3000">开始：中途停供 3 秒</button>
+    <button data-mode="burst6000">开始：六秒音频突发</button>
+    <button data-mode="jitter20000">开始：二十秒轻微抖动</button>
+    <button data-mode="real_tts" disabled>开始：公开中文语音</button>
+    <button data-mode="normal" data-stop-on-playing="true">开始：首声后立即停止</button>
     <button id="stop" disabled>停止并清理</button>
   </div>
   <div id="status" role="status">就绪：仅连接本机探针</div>
+  <div id="quality" role="status">连续播放质量：尚未测量</div>
+  <details><summary>查看公开中文测试文本</summary><p>你好，我们先确认一下音频是否清楚。这是一段用于检查语音连续性的公开测试文本，不包含任何候选人资料。你可以按照自己的节奏回答问题，暂时想不起来也没有关系。如果需要我重复问题，或者希望稍微停顿一下，直接告诉我就好。准备好了，我们再继续交流。</p></details>
   <pre id="events" aria-label="合成音频播放事件"></pre>
   <script type="module">
     import { Room, RoomEvent, LogLevel, setLogLevel } from "livekit-client";
@@ -30,9 +36,11 @@
     setLogLevel(LogLevel.silent);
     const log = document.querySelector("#events");
     const status = document.querySelector("#status");
+    const quality = document.querySelector("#quality");
     const buttons = [...document.querySelectorAll("[data-mode]")];
     const stop = document.querySelector("#stop");
     let active = null;
+    let supportedModes = new Set(["normal", "gap600", "gap3000", "burst6000", "jitter20000"]);
     // Only numeric diagnostics and fixed event names are exposed for inspection.
     window.syntheticAudioProbeEvents = [];
 
@@ -41,7 +49,10 @@
       const item = { event, elapsed_ms: Math.round((performance.now() - state.started) * 10) / 10 };
       if (Number.isFinite(state.audio?.currentTime)) item.current_time = Math.round(state.audio.currentTime * 1000) / 1000;
       for (const [name, value] of Object.entries(values)) {
-        if (["samples", "gap_ms", "server_ms", "concealed_samples", "silent_concealed_samples", "received_samples"].includes(name)
+        if (["source_ms", "samples", "gap_ms", "server_ms", "concealed_samples", "silent_concealed_samples", "received_samples",
+          "underflow_count", "underflow_samples", "content_ms", "playback_span_ms", "excess_playback_ms", "buffered_samples",
+          "render_span_ms", "excess_render_ms", "render_gap_samples", "rendered_samples", "expected_samples",
+          "source_complete", "underflow_matches_render"].includes(name)
           && typeof value === "number" && Number.isFinite(value)) item[name] = value;
       }
       window.syntheticAudioProbeEvents.push(item);
@@ -59,6 +70,35 @@
         current_time: Number.isFinite(state.audio?.currentTime) ? state.audio.currentTime : 0 });
     }
 
+    function qualitySummary(state) {
+      const contentMs = state.totalSamples / 24;
+      const spanMs = performance.now() - state.playingAt;
+      const measured = state.quality;
+      // Worklet frame time survives delayed main-thread callbacks. Keep the
+      // callback wall clock as a separate observation, never as the sole
+      // evidence of uninterrupted audio.
+      const renderSpanMs = Number.isFinite(measured.firstRenderStart) && Number.isFinite(measured.renderedUntil)
+        ? (measured.renderedUntil - measured.firstRenderStart) * 1000 : null;
+      const renderGapSamples = renderSpanMs === null || !Number.isSafeInteger(measured.renderedSamples)
+        ? null : Math.round(renderSpanMs * 24) - measured.renderedSamples;
+      const values = { underflow_count: state.quality.underflowCount,
+        underflow_samples: state.quality.underflowSamples,
+        content_ms: contentMs, playback_span_ms: Math.round(spanMs * 10) / 10,
+        excess_playback_ms: Math.round((spanMs - contentMs) * 10) / 10,
+        expected_samples: state.totalSamples, received_samples: measured.receivedSamples,
+        rendered_samples: measured.renderedSamples,
+        source_complete: state.totalSamples > 0 && measured.receivedSamples === state.totalSamples
+          && measured.renderedSamples === state.totalSamples ? 1 : 0,
+        render_span_ms: renderSpanMs === null ? null : Math.round(renderSpanMs * 10) / 10,
+        excess_render_ms: renderSpanMs === null ? null : Math.round((renderSpanMs - contentMs) * 10) / 10,
+        render_gap_samples: renderGapSamples,
+        underflow_matches_render: renderGapSamples !== null && renderGapSamples >= 0
+          && renderGapSamples === measured.underflowSamples ? 1 : 0 };
+      record(state, "quality_summary", values);
+      send(state, { type: "observation", event: "quality", elapsed_ms: performance.now() - state.started, ...values });
+      quality.textContent = `连续播放质量：欠载 ${values.underflow_count ?? "未知"} 次，插入静音 ${values.underflow_samples ?? "未知"} 个样本；接收/渲染/预期 ${values.received_samples ?? "未知"}/${values.rendered_samples ?? "未知"}/${values.expected_samples}，完整性 ${values.source_complete ? "通过" : "未通过"}。内容 ${contentMs}ms，音频渲染跨度 ${values.render_span_ms ?? "未知"}ms，渲染差值 ${values.excess_render_ms ?? "未知"}ms，欠载计数核对 ${values.underflow_matches_render ? "一致" : "未通过"}；主线程首次发声至排空 ${values.playback_span_ms}ms，墙钟差值 ${values.excess_playback_ms}ms。`;
+    }
+
     async function cleanup(state, result) {
       if (active !== state || state.cleaning) return;
       state.cleaning = true;
@@ -70,12 +110,12 @@
       if (active !== state) return;
       active = null;
       status.textContent = result;
-      buttons.forEach((button) => { button.disabled = false; });
+      buttons.forEach((button) => { button.disabled = !supportedModes.has(button.dataset.mode); });
       stop.disabled = true;
     }
 
-    async function start(mode) {
-      if (active) return;
+    async function start(mode, stopOnPlaying = false) {
+      if (active || !supportedModes.has(mode)) return;
       if (location.origin !== "http://127.0.0.1:5178") {
         status.textContent = "必须从指定的本机 Vite 地址打开此页面";
         return;
@@ -84,17 +124,13 @@
       stop.disabled = false;
       window.syntheticAudioProbeEvents = [];
       const state = { started: performance.now(), ws: null, room: null, player: null,
-        audio: null, track: null, binding: null, timer: null, statsBusy: false, cleaning: false };
+        audio: null, track: null, binding: null, timer: null, statsBusy: false, cleaning: false,
+        playingAt: null, totalSamples: 0, quality: { underflowCount: null, underflowSamples: null, bufferedSamples: null,
+          receivedSamples: null, renderedSamples: null, firstRenderStart: null, renderedUntil: null } };
       active = state;
-      status.textContent = "运行中：仅播放本机合成音频";
-      state.player = new LiveSpeechPlayback({ audioFactory: () => {
-        const audio = new Audio();
-        state.audio = audio;
-        for (const event of ["play", "playing", "timeupdate", "waiting", "stalled", "pause", "ended", "error"]) {
-          audio.addEventListener(event, () => record(state, "audio_" + event));
-        }
-        return audio;
-      } });
+      status.textContent = mode === "real_tts" ? "运行中：配置供应商合成公开中文，含只读校验成本，最长 90 秒" : "运行中：仅播放本机合成音频";
+      quality.textContent = "连续播放质量：正在测量…";
+      state.player = new LiveSpeechPlayback();
       record(state, "begin");
       const ws = new WebSocket("ws://127.0.0.1:5179/probe");
       state.ws = ws;
@@ -108,6 +144,9 @@
           if (event.type === "room") {
             const room = new Room({ adaptiveStream: true, dynacast: true });
             state.room = room;
+            room.on(RoomEvent.DataReceived, (payload, participant, kind, topic) => {
+              if (kind === 0 && active === state && !state.cleaning) state.player.dataReceived(payload, participant, topic);
+            });
             room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
               if (active !== state || state.cleaning) return;
               record(state, "track_subscribed");
@@ -127,10 +166,27 @@
             state.binding = event.performance;
             const identity = { performance_id: event.performance.performance_id,
               output_id: event.performance.live_audio.output_id };
-            state.player.begin(event.performance, {
+            state.playback = state.player.begin(event.performance, {
               onReady: () => { record(state, "ready"); send(state, { type: "ready", ...identity }); },
-              onPlaying: () => { record(state, "playing"); observation(state, "playing"); },
-              onFinished: () => { record(state, "drained"); observation(state, "drained"); send(state, { type: "drained", ...identity }); },
+              onPlaying: () => {
+                state.playingAt = performance.now();
+                record(state, "playing"); observation(state, "playing");
+                if (stopOnPlaying) cleanup(state, "已在首声后停止并清理，未确认完整播放");
+              },
+              onQuality: (value) => {
+                // This is our synthetic probe's own player, not a candidate
+                // page. onQuality runs before checkDrained clears active.
+                const output = state.player.active;
+                const progress = output?.progress;
+                state.quality = { ...value, receivedSamples: output?.received ?? null,
+                  renderedSamples: progress?.consumed ?? null,
+                  firstRenderStart: progress?.firstRenderStart ?? null,
+                  renderedUntil: progress?.renderedUntil ?? null };
+              },
+              onFinished: () => {
+                qualitySummary(state);
+                record(state, "drained"); observation(state, "drained"); send(state, { type: "drained", ...identity });
+              },
               onError: (error) => {
                 const message = String(error?.message || "");
                 const kind = message.includes("等待音频时仍推进") ? "clock_advanced_while_waiting"
@@ -141,6 +197,7 @@
               },
             });
           } else if (event.type === "producer_finished") {
+            state.totalSamples = event.payload.total_samples;
             record(state, "producer_finished", event);
             observation(state, "eof");
             state.player.producerFinished(event.payload);
@@ -148,7 +205,7 @@
             record(state, event.type, event);
           } else if (event.type === "complete") {
             record(state, "complete", event);
-            cleanup(state, "本轮完成并清理；请比较时钟与停供区间，不代表同步验收通过");
+            cleanup(state, "本轮完成并清理；已核对源样本消费和设备输出时钟");
           } else if (event.type === "probe_failed") {
             record(state, "server_failed"); cleanup(state, "服务器探针结束，已清理");
           }
@@ -159,7 +216,9 @@
       };
       state.timer = setInterval(async () => {
         if (active !== state || state.cleaning) return;
-        record(state, "clock_sample");
+        record(state, "clock_sample", { source_ms: state.playback?.positionMs() ?? 0,
+          underflow_count: state.quality.underflowCount, underflow_samples: state.quality.underflowSamples,
+          buffered_samples: state.quality.bufferedSamples });
         if (!state.track?.getRTCStatsReport || state.statsBusy) return;
         state.statsBusy = true;
         try {
@@ -174,7 +233,12 @@
         finally { state.statsBusy = false; }
       }, 200);
     }
-    buttons.forEach((button) => button.addEventListener("click", () => start(button.dataset.mode)));
+    buttons.forEach((button) => button.addEventListener("click", () => start(button.dataset.mode, button.dataset.stopOnPlaying === "true")));
+    fetch("http://127.0.0.1:5179/healthz").then(response => response.json()).then(value => {
+      if (!Array.isArray(value.modes) || active) return;
+      supportedModes = new Set(value.modes);
+      buttons.forEach((button) => { button.disabled = !supportedModes.has(button.dataset.mode); });
+    }).catch(() => { /* unavailable diagnostic service leaves provider mode disabled */ });
     stop.addEventListener("click", () => { if (active) cleanup(active, "已手动停止并清理"); });
     window.addEventListener("pagehide", () => { if (active) cleanup(active, "页面关闭"); });
   </script>

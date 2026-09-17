@@ -679,6 +679,7 @@ function CandidateSessionGate({ problem }) {
 }
 
 export function WarmupPanel({ calibration, experience, act }) {
+  const blocked = experience.phase === "paused" || experience.session?.status === "paused" || experience.problem?.recoverable === false;
   const awaiting = calibration.status === "awaiting_confirmation";
   const retryable = calibration.status === "retrying"
     && (calibration.retryRequired === true || (
@@ -692,8 +693,8 @@ export function WarmupPanel({ calibration, experience, act }) {
     <ConversationState phase={experience.phase} endpoint={experience.endpoint} />
     <CaptionPanel captions={experience.captions} expanded />
     {(awaiting || retryable) && <div className="candidate-warmup-actions">
-      {awaiting && <button className="button button-primary" type="button" onClick={() => act("warmup.confirm")}>字幕正确，开始正式面试</button>}
-      <button className="button button-secondary" type="button" onClick={() => act("warmup.retry")}>
+      {awaiting && <button className="button button-primary" type="button" disabled={blocked} onClick={() => act("warmup.confirm")}>字幕正确，开始正式面试</button>}
+      <button className="button button-secondary" type="button" disabled={blocked} onClick={() => act("warmup.retry")}>
         {retryable ? "重新试音" : "听写不对，重新试音"}
       </button>
     </div>}

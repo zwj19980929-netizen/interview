@@ -1030,7 +1030,7 @@ class ModelGateway:
             "estimated_cost_usd": estimated_cost_usd,
             "error_code": error_code,
             "prompt_version": prompt_version if prompt_version in {
-                "company_question_reply.v1", "answer_evaluation.v7", "supplement_reply.v4", "conversation_reception.v1", "conversation_reception_speech.v1", "interviewer_supervisor.v1", "interviewer_supervisor.v2", "interviewer_evidence_expert.v1", "interviewer_transition.v1",
+                "company_question_reply.v1", "answer_evaluation.v7", "supplement_reply.v4", "conversation_reception.v1", "conversation_reception.v2", "conversation_reception_speech.v1", "interviewer_supervisor.v1", "interviewer_supervisor.v2", "interviewer_evidence_expert.v1", "interviewer_transition.v1",
                 "interview_turn_understanding.v10", "interview_turn_decision.v9",
                 "interview_turn_understanding.v11", "interview_turn_decision.v10",
                 "interview_turn_understanding.v12", "interview_turn_understanding.v13",

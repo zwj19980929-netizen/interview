@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Response, WebSocket, WebSocketDisconnect
 
 from app.core.access_log import install_sensitive_access_log_filter
 
@@ -35,7 +35,8 @@ from app.domain.interview_agent import AvatarPerformance, LiveSpeechBinding, Vis
 _ORIGIN = "http://127.0.0.1:5178"
 _RATE = 24_000
 _TOTAL = _RATE * 2
-_MODES = {"normal": 0.0, "gap600": 0.6, "gap3000": 3.0}
+_MODES = {"normal": 0.0, "gap600": 0.6, "gap3000": 3.0, "burst6000": 0.0,
+          "jitter20000": 0.0}
 _LOG = logging.getLogger("streaming_audio_probe")
 app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 _busy = False
@@ -98,17 +99,24 @@ def _event(kind: str, started: float, **numbers: Any) -> dict:
 
 
 async def _receive(websocket: WebSocket, expected: str, *, started: float,
-                   performance_id: str = "", output_id: str = "") -> dict:
+                   performance_id: str = "", output_id: str = "", timeout: float = 15) -> dict:
     async def wait() -> dict:
         while True:
             data = await websocket.receive_json()
             if not isinstance(data, dict):
                 raise ValueError("Invalid probe message")
             if data.get("type") == "observation":
-                if data.get("event") not in {"playing", "eof", "drained", "failed"}:
+                if data.get("event") not in {"playing", "eof", "drained", "failed", "quality"}:
                     raise ValueError("Invalid observation")
                 _event("client_" + data["event"], started,
-                       client_ms=data.get("elapsed_ms"), current_time=data.get("current_time"))
+                       client_ms=data.get("elapsed_ms"), current_time=data.get("current_time"),
+                       underflow_count=data.get("underflow_count"), underflow_samples=data.get("underflow_samples"),
+                       content_ms=data.get("content_ms"), playback_span_ms=data.get("playback_span_ms"),
+                       excess_playback_ms=data.get("excess_playback_ms"),
+                       expected_samples=data.get("expected_samples"), received_samples=data.get("received_samples"),
+                       rendered_samples=data.get("rendered_samples"), source_complete=data.get("source_complete"),
+                       render_span_ms=data.get("render_span_ms"), excess_render_ms=data.get("excess_render_ms"),
+                       render_gap_samples=data.get("render_gap_samples"), underflow_matches_render=data.get("underflow_matches_render"))
                 continue
             allowed = {"type", "mode"} if expected == "start" else {"type"}
             if expected in {"ready", "drained"}:
@@ -120,12 +128,13 @@ async def _receive(websocket: WebSocket, expected: str, *, started: float,
             ):
                 raise ValueError("Stale probe acknowledgement")
             return data
-    return await asyncio.wait_for(wait(), timeout=15)
+    return await asyncio.wait_for(wait(), timeout=timeout)
 
 
 @app.get("/healthz")
-async def healthz() -> dict:
-    return {"probe": "synthetic_audio_only", "busy": _busy}
+async def healthz(response: Response) -> dict:
+    response.headers["Access-Control-Allow-Origin"] = _ORIGIN
+    return {"probe": "synthetic_audio_only", "busy": _busy, "modes": sorted(_MODES)}
 
 
 @app.websocket("/probe")
@@ -147,13 +156,14 @@ async def probe(websocket: WebSocket) -> None:
     started = time.monotonic()
     room = "synthetic-browser-probe-" + uuid.uuid4().hex
     performance_id = "performance_probe_" + uuid.uuid4().hex
-    output_id = "output_probe_" + uuid.uuid4().hex
+    output_id = "speech_output_probe_" + uuid.uuid4().hex
     reader = None
     publisher = None
     created = False
     alive = True
     drained = False
     producer_done = False
+    drain_budget = 15.0
 
     def assert_current() -> None:
         if not alive:
@@ -162,7 +172,8 @@ async def probe(websocket: WebSocket) -> None:
     async def wait_drained() -> None:
         nonlocal alive
         try:
-            await _receive(websocket, "drained", started=started, performance_id=performance_id, output_id=output_id)
+            await _receive(websocket, "drained", started=started, performance_id=performance_id,
+                           output_id=output_id, timeout=drain_budget)
             if not producer_done:
                 raise ValueError("Premature probe acknowledgement")
         except BaseException:
@@ -175,6 +186,8 @@ async def probe(websocket: WebSocket) -> None:
         if request.get("mode") not in _MODES:
             raise ValueError("Unsupported synthetic mode")
         gap = _MODES[request["mode"]]
+        frame_count = 1000 if request["mode"] == "jitter20000" else 300 if request["mode"] == "burst6000" else 100
+        drain_budget = frame_count / 50 + gap + 15
         await _room_admin(plane, room, delete=False)
         created = True
         token = plane.issue_participant_token(room_name=room,
@@ -186,6 +199,7 @@ async def probe(websocket: WebSocket) -> None:
         _event("client_connected", started)
         publisher = LiveKitApprovedAudioPublisher(plane, room_name=room, performance_id=performance_id,
                                                  assert_current=assert_current, sample_rate_hz=_RATE)
+        publisher.bind_output(output_id)
         publication = await publisher.open()
         performance = AvatarPerformance(performance_id=performance_id, turn_id=None, audio_uri=None,
             audio_clock_origin_ms=0, text="本机低音量合成音频测试", delivery="streaming_tts",
@@ -197,15 +211,24 @@ async def probe(websocket: WebSocket) -> None:
         await _receive(websocket, "ready", started=started, performance_id=performance_id, output_id=output_id)
         _event("ready", started)
         reader = asyncio.create_task(wait_drained())
-        for index in range(100):
+        paced_start = time.monotonic()
+        paced_gap = 0.0
+        for index in range(frame_count):
             if index == 50 and gap:
                 await websocket.send_json(_event("gap_started", started, samples=publisher.total_samples, gap_ms=gap * 1000))
                 await asyncio.sleep(gap)
+                paced_gap += gap
                 await websocket.send_json(_event("gap_finished", started, samples=publisher.total_samples))
+            if request["mode"] != "burst6000":
+                # Absolute deadlines prevent SDK time from accumulating into
+                # permanent slow supply. The long mode deliberately varies
+                # packet availability by 1–5 ms without modifying source PCM.
+                jitter = (1 + index * 37 % 5) / 1000 if request["mode"] == "jitter20000" else 0.0
+                deadline = paced_start + index * 0.02 + paced_gap + jitter
+                await asyncio.sleep(max(0, deadline - time.monotonic()))
             await publisher.publish(_frame(index))
-            await asyncio.sleep(0.02)
         await publisher.finish()
-        if publisher.total_samples != _TOTAL:
+        if publisher.total_samples != frame_count * 480:
             raise RuntimeError("Synthetic sample count differs from the declared probe")
         producer_done = True
         eof = {"performance_id": performance_id, "output_id": output_id,

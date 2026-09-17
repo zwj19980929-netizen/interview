@@ -6,6 +6,69 @@
 
 每个工作项必须包含：日期、ID、目标、关联问题、状态、实际修改文件、验证命令与结果、未完成事项或恢复说明。
 
+## 2026-09-17 · STEADY-AUDIO-054
+
+- 状态：`verified（本机负载、浏览器及完整回归；真人长时/生产未验收）`。
+- 目标：修复053后真实试音仍有小停顿的问题，保持持续收音、字幕、即时打断、暂停恢复与严格播放完成边界，不以实时性为由接受声音碎裂。
+- 初始证据：最新试音两次输出内容23360/5920ms，媒体发布累计24744/6219ms，供应读取累计43/14.5ms；输出监控调度延迟333/316ms，仍超过240ms缓冲。此指标指向残留共享事件循环阻塞，不足以单独归因某个函数或证明浏览器欠载次数。
+- 范围：先只读定位残留同步热路径并构造带并发业务负载的可重复验收，再针对证据修复。保留此前全部未提交工作、真实会话与录音；不重放候选资料、不自动恢复面试、不清空历史命令。接口/状态/存储若变化同步文档及回归，发布前检查活动候选人/worker。
+- 验证计划：覆盖中文长音频连续性、抖动与短尾、首声取消/暂停/换题/旧输出、收音及字幕；执行相关与完整回归，并仅在空闲时更新本地前后端及worker。实际文件、失败过程、测量与恢复说明在本项补齐。
+
+- 054定位：严格只读重演40场旧全量巡检，中位297.192ms/最大354.550ms；新定向读取在真实库尚未建索引时已降为7.373/11.238ms。完整复制成本仅在内存，未改真实会话。
+- 054先红后绿：持SQLite写锁的巡检4项失败→服务联合125 passed；空command/get读先4 failed/12 passed→124 passed/2 skipped；定向候选接口10 failed→10 passed，PG合同7 failed→存储联合73 passed。命令误写不存在测试文件导致一次no tests，探针首次构建缺少 /web/src alias失败，均已修正且保留/private/tmp/interviewer-054-*日志。子任务py_compile写系统缓存遭sandbox限制，改为内存compile通过，未出现审批拒绝。
+- 054组合证据：同一16秒/384000样本LiveKit PCM，叠加20ms空poll+terminal读、1s接管巡检和每帧完整只读fence；旧全量finish16.933秒、发包最大310.703ms、loop lag285.029ms，新定向finish16.011秒、发包最大49.244ms、lag28.664ms，两个变体样本全齐。新巡检p50 .079/max .187ms。范围仅列出的读取负载，未包含真实写入、STT和录制，不替代完整API或真人验收。证据/private/tmp/interviewer-054-combined-watchdog-results.json。
+
+- 054实际文件：`app/services/{interviews,interview_agent,evidence_command_journal}.py`；`app/persistence/{interface,memory,sqlite,postgresql,read_only}.py`、`app/repositories/sqlite.py`、`migrations/007_interview_watchdog_candidates.sql`；`tests/{test_idle_evidence_reads,test_interview_watchdog_query,test_watchdog_realtime_054,test_postgresql_adapter}.py`；诊断 `app/web/streaming-audio-probe.html`、`scripts/streaming_audio_browser_probe.py`；`docs/{architecture,database-and-vector-storage,known-issues-and-remediation,development-progress,implementation-roadmap,steady-audio-054,change-log}.md`。没有业务Prompt、模型路由、用户API或状态字段改动。
+- 054最终回归：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest -q -o faulthandler_timeout=30 --tb=short` **2307 passed/8 skipped/159.16s**；`npm test -- --run` **384 passed/24 files**；`npm run build -- --outDir /private/tmp/interviewer-054-dist` 成功，7份构建文件与当前服务产物hash一致，无需静态切换。独立pycache compileall、7份文档链接和 `git diff --check`通过。没有在通过后无故重复全量测试。
+- 054浏览器验收：正式压缩probe BUNYaMhh，叠加当前空poll、终态读、接管巡检及每帧完整只读校验；20秒PCM/118字公开中文21.52秒，worklet渲染跨度均等于内容时长，分别480000/516480样本完整，欠载0/静音0。3秒停供恢复48000样本，72000静音样本与实际3秒gap一致；首声取消0.2ms进入cleanup，无drained。结果 `/private/tmp/interviewer-054-browser-acceptance.json`；主动取消场景server probe_failed表示诊断连接被主动中止，非业务异常。4个随机房间、临时5178/5179服务及验收标签均清理。
+- 054加载与核验：重复确认候选人0、worker active/reserved0后正常TERM旧API76101/worker76102及Beat，复用原环境启动API **80893**、worker **80894**。healthz200/ok、readyz200/ready、原前端bundlehash匹配；worker单节点pong、Beat正常派发。SQLite两个新部分索引实际EXPLAIN命中，3个媒体Docker running/OOMfalse。维护窗口API/worker新增锁错误、音频背压、Traceback、未读取Task异常均0。原试音JSON摘要与本轮初始及维护前均相同，仍in_progress/0答案；没有恢复面试、重写材料或发邀请。
+- 054收尾失败留痕：临时runtime-check初次缺repo模块路径报ModuleNotFoundError，修正sys.path后通过；原日志保留，成功日志 `interviewer-054-runtime-check-final.log`。源代码未因这个工具路径问题更改。
+- 054范围与恢复：已修复并验证本轮定位的历史巡检阻塞和空轮询锁竞争；没有削弱播放授权、延长缓冲或将断供计入真实消费。读取负载探针不等同完整API写入/上行STT/录制并发；真人长时、弱网多浏览器及真实PG007仍另验。回退仅054增量并空闲重启，保留053及以前未提交工作和业务记录；新增索引不更改业务行可保留。未Git提交/推送、未部署生产。
+
+## 2026-09-17 · WARMUP-PLAYBACK-053
+
+- 状态：`verified（本机故障回归、负载与真实TTS浏览器；真人长时/生产未验收）`。
+- 目标：修复052上线后真实试音语音碎裂及前端运行错误导致整场暂停的问题，补足连续播放质量及试音打断验收。
+- 初步证据：目标试音在05:04:48选择确认表达，05:04:49发生barge_in并被记为candidate_requested_pause，随后有runtime-problems上报；实际媒体断订阅/离线在05:07:21，晚于暂停，不能倒置为直接原因。浏览器fatal路径先发通用pause，后端忽略原因，使诊断丢失；当前持久记录不能确定原始前端错误分支。
+- 播放调查：052播放器首包即播、欠载直接补零，没有启动/恢复缓冲。实际worklet确定性模拟4秒音频，20ms包每21ms到达产生约201ms静音及151次断点。旧验证核对样本完整性但未统计听感连续性，本轮补充抖动、发送节奏与取消竞态验证；不以首声时间或drained成功代替可听质量。
+- 范围与边界：保留052及之前未提交改动；真实会话、转写和音频只读，不外发重放、不自动恢复或重写。先登记后修改，接口/状态/协议若调整同步文档与合同测试；本地更新前检查活动候选人和worker。实际修改、失败过程、验证结果与恢复方式在本项追加。
+
+- 053继续定位：原22.08秒开场消费墙时69.052秒包含下游背压。隔离发布基准新旧均22.09秒，不能据此宣称改并行已解决3倍慢播。105字公开中文真实TTS快速消费21.6秒音频仅4.821秒；带完整只读表达校验的LK路径23.2秒音频23.656秒完成。真实API每20ms扫描全部3353条组织历史命令，空轮询p50 96.693ms/p95 130.223ms；owner调度延迟p95 249.397ms，命令定向仓储查询修复纳入053。只读诊断未领取真实命令或外发候选材料。
+- 053中间回归：双路并行发布新增测试修前3 failed，消费者并发失败修前1 failed；修复后发布/输出/阶段指标组合73 passed。播放器抖动先红后绿9项通过。暂停分支新增测试首次21 pass/1 fail因fixture空turn在resume自动完成，修正真实asking状态后通过；后续相关后端162 passed、前端167 passed。保留全部失败日志，不修改恢复策略以迁就测试。
+- 053生产压缩探针：20秒合成轻微抖动480000样本，播放20016ms/欠载0/插入静音0；118字公开中文真实TTS533760样本，内容22240ms，播放22251.9ms/欠载0/插入静音0。随机LiveKit房间已清理，真实会话只读校验2749次；结果在 `/private/tmp/interviewer-053-{production-acceptance,tts-production-acceptance}.json`。仅代表已验证的本机播放链路，真人长时与共享API负载另行核验。
+- 053负载因果验证：同一6秒PCM与真实LiveKit并发20ms控制命令轮询，旧全量扫描12.409秒排空、新定向索引6.016秒，均收齐144000样本；循环lag p95从98.317降至7.625ms。采用只读来源的进程内SQLite副本，不落磁盘敏感副本、不领取真实命令。证据 `interviewer-053-combined-poll-results.json`；性能基准包含最终每个发送子任务启动时的权限检查。
+- 053独立审查补漏：异步发送排队后、真正启动前撤销仍可能发送一帧；新增call_soon撤销及两路间撤销用例先2 failed，再为每个发送子任务加启动时校验。75项发布/输出/数值指标回归通过，独立复查通过。前端全量384 passed/24 files、主页面正式构建成功；已有大bundle提示保留。首声取消无drained、3秒断供一次完整缓冲后48000样本排空，5178/5179临时进程、房间、标签均清理。
+- 053实际文件：`app/adapters/livekit_audio_output.py`、`app/core/interview_agent_metrics.py`；`app/domain/{candidate_runtime,interview_lifecycle}.py`；`app/persistence/{interface,memory,sqlite,postgresql,read_only}.py`、`app/repositories/sqlite.py`、`migrations/006_evidence_command_poll.sql`；`app/schemas/api.py`；`app/services/{approved_speech_output,evidence_command_journal,interview_agent,interviews,livekit_evidence_ingress,speech_output_interruption}.py`；`app/web/src/features/candidate/{Page.jsx,agent-experience.js,approved-pcm-player.js,live-speech-playback.js,presentation.js}`及同名测试；`app/web/src/features/interviews/agent-event-runtime.js`及同名测试；`app/web/streaming-audio-probe.html`、`scripts/streaming_audio_browser_probe.py`；`tests/{test_approved_speech_output,test_livekit_audio_output,test_interview_agent_stage_metrics,test_candidate_audio_failure_053,test_streaming_expression_lifecycle,test_evidence_command_query,test_postgresql_adapter}.py`；`docs/{architecture,api-design,domain-model,model-provider-plugins,database-and-vector-storage,known-issues-and-remediation,development-progress,implementation-roadmap,change-log,warmup-playback-053}.md`及下述静态产物。保留052及此前未提交代码；未修改业务Prompt/模型路由/凭据。
+- 053最终完整回归：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest -q -o faulthandler_timeout=30 --tb=short` **2263 passed /8 skipped /159.34s**，日志 `/private/tmp/interviewer-053-backend.log`；`npm test -- --run` **384 passed /24 files**，日志 `interviewer-053-frontend.log`；`npm run build -- --outDir /private/tmp/interviewer-053-dist` 成功，日志 `interviewer-053-build.log`。独立pycache compileall、10份文档链接与 `git diff --check` 通过。命令仓储定向测试先红，最终70 passed/2 skipped；8项完整套件外部环境skip不计为已通过。
+- 053本机加载：再次确认活动候选人0、worker active/reserved均0后，资源先复制、index原子切换，保留旧bundle及 `/private/tmp/interviewer-053-previous-index.html`。新增 `index-DRdpRMQ5.js`、`VrmAvatar-IfCK3Aro.js`；CSS保持 `index-BDdseLuw.css`。正常TERM原API65506/worker65507及Beat，复用原环境启动API **76101**、worker **76102**。healthz=200/ok、readyz=200/ready，线上JS/CSS hash匹配，worker单节点pong、Beat正常派发，四项新音频内部指标已加载。日志 `interviewer-053-{publish,restart,verify}.log`。
+- 053数据与运行核验：SQLite幂等建立命令部分索引，实际EXPLAIN确认命中；PostgreSQL仅新增006迁移文件，未在目标生产数据库执行。原试音会话整体JSON摘要相对本轮初始及维护前均不变，仍paused/0答案；未自动恢复、重新评分、发邀请或重写材料。三个媒体容器running/OOMfalse，未无故重建；维护窗口API/worker新增数据库锁、音频背压、Traceback、未读取Task异常均0。证据 `/private/tmp/interviewer-053-runtime-summary.json`。
+- 053边界与恢复：已修复可复现的阻塞和取消竞态，原场次具体浏览器fatal原因因旧日志缺失不能恢复，也不把6秒合成负载当作完整重现69秒或真人长时验收。有限缓冲不能弥补持续低速供给；弱网、多浏览器、目标PostgreSQL与真人整场仍另验，不标closed。静态回退可恢复保留index和旧bundle；代码仅回退053增量并在空闲时重启，保留历史资料/052。新增索引不改变业务行，可保留；未Git提交/推送或生产部署。
+
+## 2026-09-17 · CONTINUOUS-CONVERSATION-052
+
+- 状态：`verified（完整回归、真实合成媒体及本机加载；真人长时/生产未验收）`。
+- 目标：按用户要求实际落地持续识别/字幕、可撤销提前准备、减少串行模型调用和流式播报，并补全面试范围内的自然接话。
+- 设计范围：沿既有Evidence、AnswerEndpoint、ApprovedConversationAct与Expression seam拆开即时交流和较慢证据处理，保持服务器final、所有权、输入revision和提交围栏。预理解不等于提交；新发言、换题、断线或暂停撤销旧准备/播报。Skill及企业资料独立可选，不增加用户配置步骤。
+- 验证计划：先做带可控延迟/取消的合成回归，覆盖持续字幕、补充/改口撤销、未预设交流、流式首声/欠载/打断与最终完整性；再做全量回归、前端构建和本机无活动面试/任务时更新。允许用合成材料验证现有模型路由，不重放真实候选资料，不代替真人整场延迟验收。
+- 关联：051报告中仍开放的交互与媒体时延问题；保留037–051未提交成果与原暂停会话。实际修改、失败过程、验证、加载及尚未完成事项在本项追加。
+
+- 052过程证据：连续识别底层新增回归修前3 failed/1 passed，修后4项通过；并行理解与提交边界新增18项通过，包含final仅末尾新增话语、旧口头/按钮结束许可撤销、恢复识别期间新输入不启动过时推理。TTS准备阶段续说仅服务端PCM即可取消旧合成，全部音频仍进入同一capture；接话/公司问答24项通过。
+- 052失败留痕：初次端点组合11 failed/69 passed，主要旧合同要求推理时关闭ASR或模拟器按开流消耗下一句；分别复核后更新为有声PCM绑定话语并保留逐字转写/录音完整性断言。首次全量在旧SimpleNamespace预览缺少真实协议字段处9 failed/558 passed/2 skipped并中止挂起用例；修正模拟器为真实预览类型及有界等待。第二次全量2200 passed/8 skipped/8 failed，7项旧final修正不重开识别断言和1项跨追问模拟脚本空流消耗，正在逐项复验。原失败日志保留/private/tmp/interviewer-052-{endpoint-first,backend,backend-final}.log。
+- 052播放证据：真实IAB Chromium/LiveKit通过3秒停供源时钟不增长、6秒突发不超缓冲、首声取消不drain；真实已配置TTS两次纯合成短句从请求到首次播放420.8/454.5ms（不包含1.1–1.4秒冷媒体连接及STT/语义理解）。正常归档样本109440/101760，未重放真人内容。自然接话真实模型14/14通过。明细/private/tmp/interviewer-052-streaming-acceptance.json，限制见[052说明](continuous-conversation-052.md)。
+- 052环境与发布前检查：发现LiveKit仍广播192.168.0.108而当前网卡192.168.0.106；确认房间0/候选人0后执行scripts/local-media.sh up，仅重建LiveKit，Redis/Egress保持运行。首次sandbox进程检查被系统权限阻止，使用已授权本地诊断的提升权限重试成功；未出现自动审批拒绝。静态源前端363项与构建先通过，但独立复核发现class.toString生成worklet在生产minify后语法失效，保留失败证据并修复，不以源码测试替代产物测试。
+- 052数据基线：本轮重启前只读核对原iv_808c4900d30342a4已经是report_ready、5份答案、updated_at=2026-09-17T03:27:10Z，与051当时paused基线不同；不能宣称仍暂停或与051摘要相同。维护前另存052摘要作为重启前后对照，未主动恢复、重写或重新评分该会话。
+
+- 052最终补验过程：生产压缩worklet问题先红后绿，固定序列化类名绑定后，前端364 passed/24files，正式构建成功；新增minified bundle→实际worklet渲染与drained回归。父任务IAB成功验证Vite正式产物：停供2443–5444.3ms期间源时钟1000ms，恢复后消费48000样本，6560.9ms device-drained，6617.1ms清理；子任务无浏览器控制权限时交回父任务操作，没有改用未授权控制方式。证据/private/tmp/interviewer-052-production-acceptance.json，临时5178/5179、房间和标签已清理。
+- 052第三次全量2210 passed/8 skipped/1 failed：唯一失败暴露语音已选定后 `_say` 返回再次重置播放超时起点的时序缺陷；删除重复计时，只以同步playback_selected事实起算，补可控延迟回归。该新增测试首次漏设proposal revision而失败（非业务错误），补齐正确状态后重跑；日志保留interviewer-052-playback-deadline*.log。最终全量正在复验，不把前次失败记为通过。
+- 052第四次全量2211 passed/8 skipped/1 failed：重试预算测试在失败计数增加后、异步恢复播报开始前就检查speaking，漏掉播放完成确认，假时钟不再前进导致超时。用通知gate稳定复现后，仅修正测试为等待实际播报再确认结束，保留三次预算、噪声不重置及不提交断言；相关100项与预算9项通过。没有扩大业务超时或改重试次数；证据interviewer-052-{backend-release,semantic-budget-race,semantic-budget-after,preparation-budget-after}.log，随后完整复验。
+- 052第五次全量2211 passed/8 skipped/1 failed：全部交互项通过，旧会话过期测试把固定deadline与另建runtime的系统时钟比较，跨秒得到04:11:24/25差异。`tests/test_interview_session_aggregate.py`仅让runtime复用已有固定时钟的InterviewService，保留严格过期时间及状态断言；该文件8项通过。证据interviewer-052-{backend-acceptance,session-clock}.log，业务过期策略未改。
+- 052实际文件：`.env.example`；`app/adapters/{livekit_audio_output,livekit_media}.py`；`app/core/prompt/conversation_reception.py`、`app/model_gateway/gateway.py`、`app/providers/mock/provider.py`；`app/services/{answer_endpoint,approved_speech_output,continuous_stt,conversation_understanding,interview_agent,interview_evidence,livekit_evidence_ingress,spoken_supplement,speculative_turn_preparation}.py`；`app/web/src/features/candidate/{agent-experience,approved-pcm-player,live-speech-playback}.js`及同名测试、`livekit-output-connection.test.js`；`app/web/streaming-audio-probe.html`、`scripts/streaming_audio_browser_probe.py`；`tests/{test_approved_speech_output,test_company_question_integration,test_continuous_listening_052,test_conversation_reception,test_conversation_reception_integration,test_declined_answer_integration,test_livekit_audio_output,test_natural_reception_052,test_nonclosing_answer_endpoint,test_nonclosing_capture_integration,test_parallel_conversation_052,test_semantic_turn_endpoint,test_spoken_supplement,test_spoken_supplement_integration,test_streaming_expression_lifecycle}.py`；`docs/{api-design,architecture,change-log,continuous-conversation-052,development-progress,domain-model,implementation-roadmap,known-issues-and-remediation,model-provider-plugins,retrieval-and-evaluation}.md`。静态发布文件及进程、最终验收在后续记录。
+
+- 052最终完整验证：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/pytest -q -o faulthandler_timeout=30 --tb=short` **2212 passed /8 skipped /155.48s (0:02:35)**，日志 `/private/tmp/interviewer-052-backend-complete.log`。前端 `npm test -- --run` **364 passed /24 files**，`npm run build -- --outDir /private/tmp/interviewer-052-dist` 成功，保留既有大bundle提示；日志 `interviewer-052-frontend-verified.log`、`interviewer-052-build.log`。独立pycache compileall、10份文档链接及 `git diff --check` 通过。8项外部环境测试未计入通过。
+- 052本机加载：再次确认LiveKit活动候选人0、worker active/reserved=0；资源先复制、index最后原子切换，加载 `index-DJBosd8n.js` / `index-BDdseLuw.css`，旧bundle及 `/private/tmp/interviewer-052-previous-index.html` 保留。正常TERM原API/worker及Beat后，按原环境启动API **65506**、worker **65507**，流式TTS采用新的默认启用设置。healthz=200/ok、readyz=200/ready、线上资源hash等于构建产物；worker单节点pong、Beat继续派发。证据 `interviewer-052-{publish,restart,verify}.log` 及对应结果JSON。
+- 052更新后只读核验：三个媒体Docker均running且OOMfalse，LiveKit当前广播地址与本机一致；维护窗口API/worker未新增数据库锁、音频背压或Traceback。原会话相对052维护前整体JSON摘要相同，仍report_ready、5份答案；此处不沿用051的paused状态。证据 `/private/tmp/interviewer-052-runtime-summary.json`。没有恢复真实面试、重写转写、发邀请、执行数据库迁移或Git提交/推送。
+- 052完成范围与恢复：本地自动化、真实供应商合成材料、正式压缩产物浏览器及运行加载已验收，状态不标closed或生产通过。普通回答保守等待、过渡语与题目分段资产复用、真人长时/弱网/多浏览器和足量端到端p50/p95仍待后续。回退语音可显式关闭 `INTERVIEWER_STREAMING_TTS_ENABLED` 并在空闲时重启；前端可恢复保留index和bundle。代码回退只针对052增量，保留037–051及历史资料。具体能力与边界见[052说明](continuous-conversation-052.md)。
+
 ## 2026-09-16 · REALTIME-ERRORS-AND-LATENCY-051
 
 - 状态：`verified（故障回归与本机加载；真人语音及交互优化未验收）`。

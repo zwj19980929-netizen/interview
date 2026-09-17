@@ -150,6 +150,18 @@ describe("candidate capture recovery presentation", () => {
 });
 
 describe("candidate warm-up recovery", () => {
+  it("disables confirmation and retry while the trial is paused", async () => {
+    const host = document.createElement("div"); document.body.append(host); const root = createRoot(host); const send = vi.fn();
+    try {
+      await act(async () => root.render(<WarmupPanel calibration={{ status: "awaiting_confirmation" }}
+        experience={{ phase: "paused", endpoint: { active: false }, captions: { recent: [], full: [] } }} act={send} />));
+      expect(host.querySelectorAll("button")).toHaveLength(2);
+      for (const button of host.querySelectorAll("button")) {
+        expect(button.disabled).toBe(true); await act(async () => button.click());
+      }
+      expect(send).not.toHaveBeenCalled();
+    } finally { await act(async () => root.unmount()); host.remove(); }
+  });
   it("labels the expanded warm-up transcript as complete", async () => {
     const host = document.createElement("div");
     document.body.append(host);

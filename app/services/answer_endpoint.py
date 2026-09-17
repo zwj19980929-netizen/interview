@@ -14,6 +14,7 @@ from typing import Any, Awaitable, Callable, Optional
 from app.core.errors import ApiError
 from app.core.interview_agent_metrics import measure_interview_agent_stage, observe_interview_agent_metric
 from app.services.capture_recovery import CaptureFailure, classify_capture_failure
+from app.services.speculative_turn_preparation import SpeculativeTurnPreparation
 
 _LOG = logging.getLogger(__name__)
 _CONFIRMED_PREPARATION_TIMEOUT = 45.0
@@ -36,6 +37,7 @@ class AnswerEndpoint:
                  commit: Callable[[Any, Callable[[], None]], Awaitable[None]],
                  notify: Callable[[str], Awaitable[None]],
                  on_failure: Optional[Callable[[BaseException], Awaitable[None]]] = None,
+                 on_snapshot: Optional[Callable[[Any], Awaitable[None]]] = None,
                  confirmation: Any = None,
                  speech_activity: Any = None,
                  trace: Any = None,
@@ -48,6 +50,7 @@ class AnswerEndpoint:
         self.detector, self.capture = detector, capture
         self.commit, self.notify = commit, notify
         self.on_failure = on_failure
+        self.on_snapshot = on_snapshot
         self.confirmation = confirmation
         self.speech_activity = speech_activity
         self.trace = trace or (lambda *_args, **_kwargs: None)
@@ -89,6 +92,7 @@ class AnswerEndpoint:
         self.max_recovery_attempts = 3
         self.recovery_timeout = max(0.01, min(15.0, recovery_timeout))
         self.recovery_backoff = max(0.0, min(0.5, recovery_backoff))
+        self.preparation = SpeculativeTurnPreparation(capture.prepare_decision, self._identity)
 
     def start(self) -> None:
         self._task = asyncio.create_task(self._run())
@@ -110,6 +114,7 @@ class AnswerEndpoint:
     def speech_started(self, *, source: str = "client") -> None:
         if self._closed:
             return
+        self.preparation.cancel()
         if source == "transcript":
             self._discard_confirmed_preparation()
         self.revision += 1
@@ -179,6 +184,23 @@ class AnswerEndpoint:
         if (self._closed or not self.capture.is_open
                 or self._proposal_revision != self.revision):
             raise ApiError("TURN_DECISION_STALE", "Candidate input changed; keep listening.", status_code=409)
+
+    async def listening_snapshot(self) -> Any:
+        """Publish a corrected prefix, then resume ASR before model work.
+
+        Cover the final before reopening so its own corrected subtitle is not
+        mistaken for a new candidate utterance. Later speech still revokes it.
+        """
+        try:
+            final = await self.capture.transcript_snapshot(resume=False)
+            self.assert_current()
+            self.cover_transcript(final)
+            if final is not None and self.on_snapshot is not None:
+                await self.on_snapshot(final)
+            return final
+        finally:
+            if not self._closed and self.capture.is_open:
+                await self.capture.resume_capture()
 
     async def _run(self) -> None:
         try:
@@ -265,7 +287,8 @@ class AnswerEndpoint:
         finally:
             await self._close_preparations()
 
-    async def _propose(self, *, final_snapshot: Any = None, prepared_decision: Any = None) -> None:
+    async def _propose(self, *, final_snapshot: Any = None, prepared_decision: Any = None,
+                       recognition_resumed: bool = False) -> None:
         stage = "snapshot"
         recovery_handled = False
         nonclosing = bool(getattr(self.capture, "supports_stable_preview", False))
@@ -287,7 +310,8 @@ class AnswerEndpoint:
                     # normal endpoint policy. It must still work if this
                     # provider has not emitted a usable stable sentence.
                     needs_resume = True
-                    final = await self.capture.transcript_snapshot(resume=False)
+                    final = await self.listening_snapshot()
+                    recognition_resumed = True
                     already_finalized = True
             else:
                 # Optional provider capability: adapters without stable
@@ -341,26 +365,53 @@ class AnswerEndpoint:
             # Only the final commit candidate cuts recognition. Its complete
             # result remains mandatory: sentence timing is not an input ACK.
             needs_resume = True
-            confirmed = final if already_finalized else await self.capture.transcript_snapshot(resume=False)
+            confirmed = (final if already_finalized and not recognition_resumed
+                         else await self.capture.transcript_snapshot(resume=False))
             self.assert_current()
             if confirmed is None:
                 self._blocked_revision = None
                 return
             if self._identity(confirmed) != self._identity(final):
                 self._blocked_revision = None
-                if not nonclosing:
+                if not nonclosing and not recognition_resumed:
                     return
                 observe_interview_agent_metric("stt_preview_final_revised", 1)
-                # Reconcile a revised final on this same cut. Do not reopen
-                # only to finish an empty replacement task for the same text.
+                # A corrected final can need new reasoning. Resume recognition
+                # during that work, then revalidate a fresh cut before commit.
                 stage = "understanding"
-                prepared = await self._prepare_transcript(confirmed)
+                self.cover_transcript(confirmed)
+                if self.on_snapshot is not None:
+                    await self.on_snapshot(confirmed)
+                await self.capture.resume_capture()
+                self.assert_current()
+                if self.confirmation and confirmed.text != final.text:
+                    # A final-only addition can escape VAD and partials. The
+                    # old spoken confirmation cannot authorize new words.
+                    self.confirmation.confirmed = False
+                    self.confirmation._confirmed_final = None
+                    self.confirmation.phase = "listening"
+                    self.confirmation._semantic_wait_identity = None
+                    self._explicit_revision = None
+                semantic_first = bool(self.confirmation and self.confirmation.semantic_first
+                                      and not self.confirmation.confirmed)
+                prepared = await self._prepare_transcript(confirmed, semantic_first=semantic_first)
                 self.assert_current()
                 if prepared.understanding.problem is not None:
                     await self._understanding_failed(record_failure=False)
                     return
                 if prepared.understanding.suggested_action == "continue_listening":
                     return
+                if (semantic_first and self._explicit_revision != self.revision
+                        and prepared.understanding.suggested_action not in {"clarify", "repeat", "pause", "respond_company"}):
+                    from app.services.conversation_understanding import ConversationUnderstandingService
+                    if not ConversationUnderstandingService.can_complete_without_confirmation(
+                            prepared.understanding, confirmed.text):
+                        return
+                latest = await self.capture.transcript_snapshot(resume=False)
+                self.assert_current()
+                if latest is None or self._identity(latest) != self._identity(confirmed):
+                    return
+                confirmed = latest
             if self.confirmation is not None and prepared.understanding.suggested_action == "respond_company":
                 await self.confirmation.company_answer(self, prepared, confirmed)
                 return
@@ -428,6 +479,19 @@ class AnswerEndpoint:
                                status_code=503)
             kwargs = ({"semantic_first": True} if semantic_first else
                       {"completion_confirmed": True} if self.confirmation and self.confirmation.confirmed else {})
+            if semantic_first and self.preparation.matching(transcript):
+                try:
+                    prepared = await self._infer(self.preparation.take(transcript), timeout=16)
+                    self.assert_current()
+                    if prepared is not None and prepared.understanding.problem is None:
+                        observe_interview_agent_metric("stt_preview_reused", 1)
+                        return prepared
+                except ApiError:
+                    raise
+                except Exception:
+                    # Preview failure does not consume the authoritative
+                    # attempt's budget or turn missing inference into consent.
+                    self.preparation.cancel()
             if semantic_first or not kwargs or (getattr(transcript, "type", None) != "transcript.final"
                               or not getattr(transcript, "is_final", False)):
                 self._discard_confirmed_preparation()
@@ -528,6 +592,7 @@ class AnswerEndpoint:
             task.cancel()
 
     async def _close_preparations(self) -> None:
+        await self.preparation.close()
         self._discard_confirmed_preparation()
         tasks = tuple(self._preparation_tasks)
         for task in tasks:

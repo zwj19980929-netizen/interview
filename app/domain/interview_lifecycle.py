@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Sequence
 from app.core.errors import ApiError
 from app.core.ids import new_id
 from app.core.time import utc_now
+from app.domain.candidate_runtime import CANDIDATE_RUNTIME_PROBLEM_REASONS, runtime_pause_epoch
 from app.domain.adaptive_interview import (
     append_adaptive_question, assessment_contract, budget_summary, coverage_summary,
     closed_source_question_ids, is_adaptive, record_decision, validate_decision,
@@ -179,7 +180,27 @@ class InterviewSessionLifecycle:
         self._emit(session, events, "interview.started", {"current_turn_id": session.get("current_turn_id")}, now)
 
     def _pause(self, session: Document, payload: Document, now: str, events: List[Document], effects: List[Document]) -> None:
-        self._interrupt(session, payload, now, events, event_type="interview.paused", kind="manual")
+        code = payload.get("runtime_problem_code")
+        if code is None:
+            self._interrupt(session, payload, now, events, event_type="interview.paused", kind="manual")
+            return
+        reason = CANDIDATE_RUNTIME_PROBLEM_REASONS.get(code)
+        if reason is None:
+            raise ApiError("CANDIDATE_RUNTIME_PROBLEM_INVALID", "Candidate runtime problem code is not supported.", status_code=422)
+        self._interrupt(session, {"reason": reason}, now, events, event_type="interview.paused", kind="runtime")
+        # Diagnostics survive an earlier manual pause, without rewriting its
+        # cause. The event identity also distinguishes same-second pauses.
+        pause_at = (session.get("interruption") or {}).get("occurred_at", now)
+        pause_epoch = runtime_pause_epoch(session)
+        problems = session.setdefault("agent_runtime", {}).setdefault("problems", [])
+        if any(problem.get("code") == code and problem.get("pause_epoch") == pause_epoch for problem in problems):
+            return
+        problems.append({
+            "code": code, "message": "Candidate runtime could not continue safely.",
+            "recoverable": False, "action": "await_human_takeover",
+            "occurred_at": now, "pause_occurred_at": pause_at, "pause_epoch": pause_epoch,
+        })
+        del problems[:-20]
 
     def _timeout(self, session: Document, payload: Document, now: str, events: List[Document], effects: List[Document]) -> None:
         self._interrupt(session, payload, now, events, event_type="interview.timed_out", kind="timeout")

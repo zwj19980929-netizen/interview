@@ -4,9 +4,16 @@ export function candidateNotice(problem, pauseConfirmed = false) {
   if (!problem) return null;
   if (problem.recoverable === false) {
     if (problem.pausePending) return { title: "正在暂停面试", detail: "请先停止作答，稍等片刻。", urgent: true };
+    const audioReason = {
+      AUDIO_TRACK_LOST: "面试官的语音连接已中断。",
+      AUDIO_STREAM_INVALID: "面试官的语音传输不完整，暂时无法继续播放。",
+      AUDIO_PLAYBACK_FAILED: "面试官的语音未能正常播放。",
+      AUDIO_PLAYBACK_TIMEOUT: "面试官的语音长时间没有播放进度。",
+      AUDIO_OUTPUT_UNAVAILABLE: "浏览器未能开启语音播放，请检查声音播放权限。",
+    }[problem.code] || "";
     return pauseConfirmed
-      ? { title: "面试已暂停", detail: "请联系面试安排人协助恢复。", urgent: true }
-      : { title: "连接中断，请先停止作答", detail: "请联系面试安排人确认后再继续。", urgent: true };
+      ? { title: "面试已暂停", detail: `${audioReason}请联系面试安排人协助恢复。`, urgent: true }
+      : { title: "连接中断，请先停止作答", detail: `${audioReason}请联系面试安排人确认后再继续。`, urgent: true };
   }
   if (problem.action === "retry_planning") {
     return { title: "下一话题暂时没准备好", detail: "你的回答已保留，可以重试继续面试。", retry: true, action: "planning.retry" };

@@ -147,24 +147,47 @@ def test_multiple_thinking_pauses_reuse_one_stt_and_commit_all_pcm_exactly_once(
     asyncio.run(scenario())
 
 
-def test_final_tail_revision_is_reunderstood_without_reopening_an_empty_stt(tmp_path, monkeypatch):
+def test_final_tail_revision_keeps_asr_open_during_reasoning_and_seals_once(tmp_path, monkeypatch):
     async def scenario():
         state = _ControlledTranscript()
         state.final_extra = _SUFFIX
         inputs = []
+        entered, release = asyncio.Event(), asyncio.Event()
         original_prepare = InterviewEvidenceChain.prepare_decision
 
         async def inspect_prepare(chain, transcript):
             inputs.append((type(transcript).__name__, transcript.text))
-            return await original_prepare(chain, transcript)
+            decision = await original_prepare(chain, transcript)
+            if isinstance(transcript, StreamingSTTEvent):
+                entered.set()
+                await release.wait()
+            return decision
 
         monkeypatch.setattr(InterviewEvidenceChain, "prepare_decision", inspect_prepare)
         async with _controlled_session(tmp_path, monkeypatch, state) as (store, runtime, channel, managed):
+            capture_id = managed._capture_id
             await _feed(managed._ingress, _VOICE, 10)
-            await _settled_answer(store, runtime, managed._ingress)
+            await _feed(managed._ingress, _SILENCE, 1)
+            await _wait_until(entered.is_set)
+            _no_domain_answer(store, runtime)
+            assert state.finishes == 1 and len(state.raw_streams) == 2
+            assert state.raw_streams[0].closed and not state.raw_streams[1].closed
+            assert state.raw_streams[1].byte_count == 0
+            assert managed._capture_id == capture_id and managed.chain.is_open
+            # No new speech arrived during this slow inference. The reopened
+            # stream is ready to receive it, but must not fabricate another
+            # provider final or seal the earlier prefix before revalidation.
+            await asyncio.sleep(0.05)
+            _no_domain_answer(store, runtime)
+            assert not state.raw_streams[1].closed
+            release.set()
+            await _wait_until(lambda: len(_current(runtime)["answers"]) == 1)
+            await _wait_until(lambda: all(command["status"] == "completed"
+                                         for command in store.evidence_commands.values()))
             assert inputs == [("StableTranscriptPreview", _PREFIX), ("StreamingSTTEvent", _PREFIX + _SUFFIX)]
             assert state.understood == [_PREFIX, _PREFIX + _SUFFIX]
-            assert state.finishes == 1 and len(state.raw_streams) == 1
+            assert state.finishes == 1 and len(state.raw_streams) == 2
+            assert state.raw_streams[1].closed
             _assert_one_automatic_answer(store, runtime, _PREFIX + _SUFFIX, voice_frames=10)
 
     asyncio.run(scenario())

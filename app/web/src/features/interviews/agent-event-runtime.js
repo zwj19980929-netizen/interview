@@ -91,7 +91,7 @@ const CANDIDATE_SNAPSHOT_KEYS = Object.freeze([
   "capture_recovery",
   "supplement_confirmation",
   "answer_preparation",
-  "execution_schema_version", "dialogue_state", "planning_problem",
+  "execution_schema_version", "dialogue_state", "planning_problem", "runtime_problem_code",
 ]);
 
 const ENTERPRISE_SNAPSHOT_KEYS = Object.freeze([
@@ -363,6 +363,10 @@ function validateSnapshot(payload, audience) {
     || payload.planning_problem.recoverable !== true || payload.planning_problem.action !== "retry_planning"
     || !validatePayload("problem", payload.planning_problem, audience).ok
   )) return invalidPayload("session.snapshot");
+  if (payload.runtime_problem_code != null && (payload.status !== "paused" || ![
+    "AVATAR_ASSET_UNAVAILABLE", "AVATAR_MODEL_LOAD_FAILED", "AVATAR_RENDERER_FAILED", "CANDIDATE_RUNTIME_FAILED",
+    "AUDIO_TRACK_LOST", "AUDIO_STREAM_INVALID", "AUDIO_PLAYBACK_FAILED", "AUDIO_PLAYBACK_TIMEOUT", "AUDIO_OUTPUT_UNAVAILABLE",
+  ].includes(payload.runtime_problem_code))) return invalidPayload("session.snapshot");
   if (!validateRecording(payload.recording)
     || !validateCurrentQuestion(payload.current_question)
     || !validateTakeover(payload.takeover, audience)

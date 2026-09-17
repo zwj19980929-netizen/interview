@@ -21,7 +21,7 @@ def provider(monkeypatch, *, blocked_reply=None):
     calls = []
     async def invoke(instance, capability, request, context):
         version = request.metadata.get("prompt_version")
-        if version == "conversation_reception.v1":
+        if version == "conversation_reception.v2":
             return await original(instance, capability, request, context)
         if version == "company_question_reply.v1":
             calls.append(("company", json.loads(request.messages[-1].content)))
@@ -70,6 +70,27 @@ def configure(store, *, has_company=True):
         tx.interview_sessions.update(session, expected_version=session["version"])
 
 
+def audio_aligned_transcripts(monkeypatch, transcripts):
+    """Assign synthetic speech when audio arrives, not when an empty stream opens.
+
+    Continuous listening may cut/reopen an empty stream to revalidate a final.
+    Such a cut must not consume the next synthetic candidate utterance.
+    """
+    from app.providers.mock.provider import MockSTTStream
+    pending = iter(transcripts)
+    original_send = MockSTTStream.send_audio
+
+    async def send(stream, chunk):
+        if any(chunk) and not getattr(stream, "_synthetic_speech_assigned", False):
+            stream._synthetic_speech_assigned = True
+            stream.request = stream.request.model_copy(update={"metadata": {
+                **stream.request.metadata, "development_transcript": next(pending, ""),
+            }})
+        return await original_send(stream, chunk)
+
+    monkeypatch.setattr(MockSTTStream, "send_audio", send)
+
+
 def acts(runtime):
     return [e for e in _current(runtime)["agent_events"] if e["type"] == "conversation.act.selected"]
 
@@ -81,7 +102,8 @@ def test_real_company_reply_keeps_capture_question_and_scoring_unchanged(tmp_pat
     async def scenario():
         initial = (TECH if mixed and not supplement else "") + QUESTION
         transcripts = [TECH, QUESTION, "下一题吧。", ""] if supplement else [initial, "下一题吧。", ""]
-        async with _automatic_session(tmp_path, monkeypatch, transcripts, spoken_confirmation=True) as (store, runtime, channel, managed):
+        audio_aligned_transcripts(monkeypatch, transcripts)
+        async with _automatic_session(tmp_path, monkeypatch, [], spoken_confirmation=True) as (store, runtime, channel, managed):
             configure(store, has_company=has_company)
             spoken = _synthetic_tts(runtime)
             endpoint = managed._answer_endpoint

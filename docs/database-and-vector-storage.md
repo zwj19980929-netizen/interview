@@ -1,5 +1,15 @@
 # 数据库与向量存储设计
 
+## 053：Evidence 命令按会话查询
+
+`EvidenceCommandRepository.list_unsettled(interview_id)` 是实时命令轮询的读取接口：backend 必须按当前组织、精确 interview ID、`pending/running` 状态筛选后再反序列化，不能通过 `list_documents` 读取全部历史命令。Repository 对返回的少量候选再次校验组织、会话和状态，保留防御性租户边界。Memory/SQLite/PostgreSQL 保持同一筛选语义；只读 transaction 允许此查询。`has_unsettled` 使用相同定向查询，历史 completed/rejected/failed/expired 命令仍保留用于审计和幂等查询。
+
+SQLite 初始化增加 `idx_evidence_commands_unsettled` 部分索引，键为 JSON 中的 organization/interview；PostgreSQL 新增 `migrations/006_evidence_command_poll.sql`，索引 organization 列与 JSON interview，继续保留 documents 的 RLS。两者部分条件均为 evidence_commands 集合的 pending/running 行。SQLite 在正常 schema 初始化时幂等创建；PostgreSQL 由迁移角色按既有流程执行，不由业务连接执行 DDL，启动 schema 验证要求该索引存在。
+
+查询结果只是待核验候选，不授予执行权。`claim_next` 仍在同一写事务中先校验/锁定 owner lease，再锁选中命令并核验当前状态、deadline、control generation、available/claim expiry、版本与 claim ID。排序仍由 journal 执行。时间和租约判断保留在领域层，避免 SQL 比较改变旧缺失/异常时间按 due 处理或过时代次必须拒绝的既有语义；不提高轮询间隔，不清理历史记录。Memory 的事务快照仍遵循原回滚合同，本改动只减少 SQL 热路径的历史扫描与解析。
+
+本地组合验收：仅将 3353 条既有命令及必要记录复制到进程内 SQLite，源库全程只读，合成 6 秒 PCM 经随机 LiveKit 房间发送，同时每 20ms 执行一次空命令轮询与完整 owner/session/Skill 读取守卫。全量历史读取使 6 秒音频耗时 12.409 秒；定向索引查询为 6.016 秒，两组均收齐 144000 个样本，未放松每帧和真正启动输出前的守卫。轮询 p50 从 74.085ms 降至 1.557ms，事件循环延迟 p95 从 98.317ms 降至 7.625ms。测试不领取真实命令，不产生候选答案或评分，临时房间和内存副本已清理。Memory/SQLite 回归及 PostgreSQL SQL/迁移合同已通过；真实 PostgreSQL/RLS 部署联调仍需环境验收，不能以本地 SQL 合同测试替代。
+
 ## 051：只读任务扫描与写事务分离
 
 `Persistence.transaction(organization_id, read_only=True)` 用于读取已提交的持久状态，不获得可写工作区；默认仍为原写事务。SQLite 以 `BEGIN` 和连接级 `query_only` 读取，避免周期 dispatcher 只查待执行工作却抢占 `BEGIN IMMEDIATE` 写锁。PostgreSQL 只读事务不为查询附加 `FOR UPDATE`；Memory 保持同一禁止写入合同。组织隔离仍由 transaction/repository 边界执行。
@@ -544,6 +554,13 @@ finish/token 诊断；活动进度、后续 merge 和停止/恢复只处理替�
 启用后也只通过可替换的 projection/adapter 服务后台治理或长文档分段检索。Question Selection 的 interface、批准候选清单和答案评分输入保持不变。
 
 ## 迁移与验收要求
+
+054 实时巡检使用存储端按组织筛选的 `InterviewSessionRepository.watchdog_candidates(kind)`：
+`takeover` 只读取保留接管 lease 且未从列表移除的会话；`deadline` 只读取未完成候选人输入的 scheduled/waiting/in_progress/paused 会话。
+SQLite 与 PostgreSQL 增加部分索引，历史完成面试不再在音频事件循环内整批反序列化。
+候选查询与无任务检查采用只读事务；查询结果不构成状态变更许可，实际 lease 消费、截止关闭与命令领取仍在写事务内重新读取、校验数据库时钟/版本/所有权。
+截止巡检按会话事务提交，单场失败由后续周期重试；不把已完成输入或重新延长预约的会话按过期候选结果关闭。
+该优化不删除历史记录、不缓存播放授权，也不改变候选人 API。
 
 切换 PostgreSQL/对象存储时必须保持：
 

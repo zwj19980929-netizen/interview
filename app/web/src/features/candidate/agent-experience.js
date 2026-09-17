@@ -89,7 +89,7 @@ export function createCandidateInterviewExperience({
     (module) => module.verifyLicensedVrmAsset(context),
   ),
   audioFactory = (url) => new Audio(url),
-  liveAudioFactory = () => new Audio(),
+  livePcmPlayerFactory,
   clock = () => Date.now(),
 } = {}) {
   if (typeof request !== "function") throw new TypeError("CandidateInterviewExperience requires a request adapter");
@@ -106,7 +106,7 @@ export function createCandidateInterviewExperience({
         ringFactory,
         verifyAvatar,
         audioFactory,
-        liveAudioFactory,
+        livePcmPlayerFactory,
         clock,
       });
       await run.open(signal);
@@ -114,6 +114,11 @@ export function createCandidateInterviewExperience({
     },
   };
 }
+
+const CANDIDATE_RUNTIME_PROBLEM_CODES = new Set([
+  "AVATAR_ASSET_UNAVAILABLE", "AVATAR_MODEL_LOAD_FAILED", "AVATAR_RENDERER_FAILED", "CANDIDATE_RUNTIME_FAILED",
+  "AUDIO_TRACK_LOST", "AUDIO_STREAM_INVALID", "AUDIO_PLAYBACK_FAILED", "AUDIO_PLAYBACK_TIMEOUT", "AUDIO_OUTPUT_UNAVAILABLE",
+]);
 
 export function reportCandidateRuntimeProblem({
   apiBase = "/api/v1",
@@ -127,8 +132,9 @@ export function reportCandidateRuntimeProblem({
   }
   return request(`${apiBase}/public/interviews/${encodeURIComponent(interviewId || "")}/runtime-problems`, {
     method: "POST",
+    timeoutMs: 5000,
     headers: { "X-Candidate-Session-Token": candidateSessionToken || "" },
-    body: { code },
+    body: { code: CANDIDATE_RUNTIME_PROBLEM_CODES.has(code) ? code : "CANDIDATE_RUNTIME_FAILED" },
   });
 }
 
@@ -186,7 +192,7 @@ class CandidateExperienceRun {
     this.ring = null;
     this.audio = null;
     this.activePlayback = null;
-    this.liveSpeech = new LiveSpeechPlayback({ audioFactory: this.liveAudioFactory });
+    this.liveSpeech = new LiveSpeechPlayback({ pcmPlayerFactory: this.livePcmPlayerFactory });
     this.performanceFrame = 0;
     this.performance = null;
     this.currentAct = null;
@@ -357,6 +363,7 @@ class CandidateExperienceRun {
 
   async act({ type, idempotencyKey, turnId, payload = {} } = {}) {
     if (!type) throw new Error("候选人动作缺少 type");
+    if (["warmup.confirm", "warmup.retry"].includes(type) && this.isSafetyStopped()) return false;
     if (type === "retry_speech") return this.retrySpeech();
     let causationId = null;
     let warmupConfirmRollback = null;
@@ -500,6 +507,7 @@ class CandidateExperienceRun {
         onState: (value) => this.onMediaState(value),
         onRemoteAudioTrack: (track, publication, participant) => this.liveSpeech.trackSubscribed(track, publication, participant),
         onRemoteAudioTrackRemoved: (track) => this.liveSpeech.trackUnsubscribed(track),
+        onApprovedAudioData: (payload, participant, topic) => this.liveSpeech.dataReceived(payload, participant, topic),
       });
       this.mediaConnectionState = "connected";
       this.patch({ connection: { ...this.state.connection, media: "connected" } });
@@ -1418,6 +1426,8 @@ class CandidateExperienceRun {
     if (!planning) this.planningRetryCausationId = null;
     const planningProblem = planning && payload.planning_problem
       ? { ...payload.planning_problem, recoverable: true, action: "retry_planning" } : null;
+    const runtimeProblem = sessionStatus === "paused" && CANDIDATE_RUNTIME_PROBLEM_CODES.has(payload.runtime_problem_code)
+      ? { code: payload.runtime_problem_code, recoverable: false, action: "pause_or_human_takeover", pauseConfirmed: true } : null;
     this.patch({
       session: payload,
       floor: payload.floor || this.state.floor,
@@ -1425,6 +1435,7 @@ class CandidateExperienceRun {
       planningRetryPending: planning ? this.state.planningRetryPending : false,
       ...(this.state.problem?.recoverable !== false && (planningProblem || this.state.problem?.action === "retry_planning")
         ? { problem: planningProblem } : {}),
+      ...(runtimeProblem ? { problem: runtimeProblem } : {}),
       mediaPolicy: { ...(this.state.mediaPolicy || {}), recording: payload.recording },
       calibration: {
         ...this.state.calibration,
@@ -1994,6 +2005,10 @@ class CandidateExperienceRun {
   }
 
   async failClosed(error) {
+    if (this.runtimeFailurePending || this.closed) return;
+    this.runtimeFailurePending = true;
+    const code = CANDIDATE_RUNTIME_PROBLEM_CODES.has(error.candidateProblemCode)
+      ? error.candidateProblemCode : "CANDIDATE_RUNTIME_FAILED";
     this.stopPerformance("fatal", false);
     this.evidenceOpen = false;
     this.evidenceReady = false;
@@ -2005,7 +2020,8 @@ class CandidateExperienceRun {
     this.warmupRetryRequested = false;
     this.warmupRetryCausationId = null;
     this.evidenceReassertPending = false;
-    try { if (this.socket?.readyState === WebSocket.OPEN) this.sendSignal("pause", { reason: "candidate_runtime_fatal" }); } catch { /* channel may already be unavailable */ }
+    this.patch({ phase: "paused", evidence: { requested: false, ready: false },
+      problem: { code, recoverable: false, action: "pause_or_human_takeover", pausePending: true, pauseConfirmed: false } });
     let pauseConfirmed = false;
     try {
       const result = await reportCandidateRuntimeProblem({
@@ -2013,15 +2029,20 @@ class CandidateExperienceRun {
         request: this.request,
         interviewId: this.interviewId,
         candidateSessionToken: this.candidateSessionToken,
-        code: "CANDIDATE_RUNTIME_FAILED",
+        code,
       });
       pauseConfirmed = result?.status === "paused";
-    } catch { /* UI distinguishes an unconfirmed server pause below */ }
+    } catch {
+      // The HTTP report normally commits both diagnosis and pause. Only use
+      // the authenticated channel as fallback, preserving that same code.
+      try { if (!this.closed && this.socket?.readyState === WebSocket.OPEN) this.sendSignal("pause", { reason: code }); } catch { /* both transports may be unavailable */ }
+    }
+    if (this.closed) return;
     this.patch({
       phase: "paused",
       evidence: { requested: false, ready: false },
       problem: {
-        code: "CANDIDATE_EXPERIENCE_FATAL",
+        code,
         message: error.message || String(error),
         recoverable: false,
         action: "pause_or_human_takeover",
@@ -2114,7 +2135,7 @@ class CandidateExperienceRun {
   }
 }
 
-export async function connectLiveKitMedia({ media, stream, onState, onRemoteAudioTrack, onRemoteAudioTrackRemoved }) {
+export async function connectLiveKitMedia({ media, stream, onState, onRemoteAudioTrack, onRemoteAudioTrackRemoved, onApprovedAudioData }) {
   const { LocalAudioTrack, LocalVideoTrack, Room, RoomEvent, Track } = await import("livekit-client");
   const room = new Room({ adaptiveStream: true, dynacast: true, disconnectOnPageLeave: true });
   const remoteAudioElements = new Set();
@@ -2127,6 +2148,10 @@ export async function connectLiveKitMedia({ media, stream, onState, onRemoteAudi
   });
   room.on(RoomEvent.Reconnected, () => onState("connected"));
   room.on(RoomEvent.Disconnected, () => onState("disconnected"));
+  room.on(RoomEvent.DataReceived, (payload, participant, kind, topic) => {
+    if (kind !== 0) return; // LiveKit reliable ordered data only.
+    onApprovedAudioData?.(payload, participant, topic);
+  });
   room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
     if (track.kind !== "audio") return;
     if (!isAuthorizedTakeoverAudioParticipant(participant)) {
