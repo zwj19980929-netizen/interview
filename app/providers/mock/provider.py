@@ -62,10 +62,10 @@ class MockProvider:
             elif request.metadata.get("prompt_version") == "interview_inquiry_units.v2":
                 from app.core.prompt.inquiry_units import mock_inquiry_units_result
                 data = mock_inquiry_units_result(request)
-            elif request.metadata.get("prompt_version") in {"conversation_reception.v1", "conversation_reception.v2"}:
+            elif request.metadata.get("prompt_version") in {"conversation_reception.v1", "conversation_reception.v2", "conversation_reception.v3"}:
                 data = {"kind": "other", "confidence": 0.0,
                         "evidence_id": next(iter(json.loads(request.messages[-1].content)["evidence"]))}
-                if request.metadata.get("prompt_version") == "conversation_reception.v2":
+                if request.metadata.get("prompt_version") in {"conversation_reception.v2", "conversation_reception.v3"}:
                     data["reply_text"] = ""
             elif request.purpose == "interview_turn_understanding" and request.metadata.get("prompt_version") in {"supplement_reply.v1", "supplement_reply.v2", "supplement_reply.v3", "supplement_reply.v4"}:
                 reply = json.loads(request.messages[-1].content)["reply"]
@@ -115,9 +115,9 @@ class MockProvider:
                     "interview_turn_understanding.v11", "interview_turn_decision.v10",
                     "interview_turn_understanding.v12", "interview_turn_understanding.v13",
                     "interview_turn_decision.v11", "interview_turn_decision.v12",
-                "interview_turn_understanding.v14", "interview_turn_understanding.v15", "interview_turn_decision.v13", "interview_turn_decision.v14", "interview_turn_understanding.v16", "interview_turn_understanding.v17", "interview_turn_understanding.v18", "interview_turn_understanding.v19", "interview_turn_decision.v15", "interview_turn_decision.v16", "interview_turn_decision.v17", "interview_turn_decision.v18",
+                "interview_turn_understanding.v14", "interview_turn_understanding.v15", "interview_turn_decision.v13", "interview_turn_decision.v14", "interview_turn_understanding.v16", "interview_turn_understanding.v17", "interview_turn_understanding.v18", "interview_turn_understanding.v19", "interview_turn_decision.v15", "interview_turn_decision.v16", "interview_turn_decision.v17", "interview_turn_decision.v18", "interview_turn_understanding.v20", "interview_turn_understanding.v21", "interview_turn_understanding.v22", "interview_turn_understanding.v23", "interview_turn_decision.v19", "interview_turn_decision.v20", "interview_turn_decision.v21", "interview_turn_decision.v22",
                     "interview_turn_decision.v3", "interview_turn_decision.v4",
-                    "interview_turn_decision.v5", "interview_turn_decision.v6", "interview_turn_decision.v7", "interview_turn_decision.v8",
+                    "interview_turn_decision.v5", "interview_turn_decision.v6", "interview_turn_decision.v7", "interview_turn_decision.v8", "interview_turn_decision.v23", "interview_turn_decision.v24",
                 }:
                     references = understanding_references(transcript, points)
                     point_ids = {text: key for key, text in references["capabilities"].items()}
@@ -127,7 +127,7 @@ class MockProvider:
                     data["claims"] = [{"claim": transcript[:600], "evidence_id": evidence_ids[0]}] if evidence_ids else []
                     data["covered_point_ids"] = [point_ids[point] for point in data.pop("covered_capability_points")]
                     data["missing_point_ids"] = [point_ids[point] for point in data.pop("missing_capability_points")]
-                    if request.metadata.get("prompt_version") in {"interview_turn_understanding.v10", "interview_turn_decision.v9", "interview_turn_understanding.v11", "interview_turn_decision.v10", "interview_turn_understanding.v12", "interview_turn_understanding.v13", "interview_turn_decision.v11", "interview_turn_decision.v12", "interview_turn_understanding.v14", "interview_turn_understanding.v15", "interview_turn_decision.v13", "interview_turn_decision.v14", "interview_turn_understanding.v16", "interview_turn_understanding.v17", "interview_turn_understanding.v18", "interview_turn_understanding.v19", "interview_turn_decision.v15", "interview_turn_decision.v16", "interview_turn_decision.v17", "interview_turn_decision.v18"}:
+                    if request.metadata.get("prompt_version") in {"interview_turn_understanding.v10", "interview_turn_decision.v9", "interview_turn_understanding.v11", "interview_turn_decision.v10", "interview_turn_understanding.v12", "interview_turn_understanding.v13", "interview_turn_decision.v11", "interview_turn_decision.v12", "interview_turn_understanding.v14", "interview_turn_understanding.v15", "interview_turn_decision.v13", "interview_turn_decision.v14", "interview_turn_understanding.v16", "interview_turn_understanding.v17", "interview_turn_understanding.v18", "interview_turn_understanding.v19", "interview_turn_decision.v15", "interview_turn_decision.v16", "interview_turn_decision.v17", "interview_turn_decision.v18", "interview_turn_understanding.v20", "interview_turn_understanding.v21", "interview_turn_understanding.v22", "interview_turn_understanding.v23", "interview_turn_decision.v19", "interview_turn_decision.v20", "interview_turn_decision.v21", "interview_turn_decision.v22"}:
                         # A deterministic development mock cannot decide a
                         # candidate's completion intent. Keep it unconfirmed.
                         data.update(answer_content="technical", turn_intent="answering",
@@ -563,7 +563,6 @@ def text_vector(text: str, dimensions: int = 16) -> List[float]:
 def evaluate_answer(metadata: Dict[str, Any]) -> Dict[str, Any]:
     answer_text = metadata.get("answer_text", "")
     key_points = metadata.get("key_points", [])
-    answer_tokens = set(tokenize(answer_text))
     covered = []
     missing = []
 
@@ -571,9 +570,12 @@ def evaluate_answer(metadata: Dict[str, Any]) -> Dict[str, Any]:
         key_point_id = item.get("id")
         text = item.get("text", "")
         kp_tokens = set(tokenize(text))
-        is_covered = bool(text and text in answer_text) or bool(kp_tokens and kp_tokens.intersection(answer_tokens))
-        if is_covered:
-            covered.append({"key_point_id": key_point_id, "evidence": answer_text[:160]})
+        candidates = ([entry["answer_text"] for entry in metadata["evidence_chain"]
+                       if key_point_id in entry["target_point_ids"]] if metadata.get("evidence_chain") else [answer_text])
+        evidence = next((value for value in candidates if (text and text in value)
+                         or (kp_tokens and kp_tokens.intersection(tokenize(value)))), None)
+        if evidence:
+            covered.append({"key_point_id": key_point_id, "evidence": evidence[:160]})
         else:
             missing.append({"key_point_id": key_point_id, "reason": "候选人回答未覆盖该关键点"})
 

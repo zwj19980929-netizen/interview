@@ -449,14 +449,18 @@ function LiveInterview() {
 
   if (!interview) return <Empty title="面试不可用" copy="未找到指定会话" />;
 
-  const current = interview.turns?.find((item) => item.id === interview.current_turn_id);
+  const persistedCurrent = interview.turns?.find((item) => item.id === interview.current_turn_id);
+  const current = monitorState.session
+    ? monitorState.session.current_question && { ...monitorState.session.current_question,
+      id: monitorState.session.current_question.turn_id, question_spoken_text: monitorState.session.current_question.question_text }
+    : persistedCurrent;
   const persistedStatus = review?.status || monitorState.session?.status || interview.status;
   const effectiveStatus = persistedStatus === "cancelled" && interview.termination_reason === "appointment_window_expired"
     ? "expired"
     : persistedStatus;
   const activeTakeover = monitorState.takeover?.status === "active";
   const ownsTakeover = activeTakeover && monitorState.takeover?.actor_id === auth?.actor_id;
-  const latestCaption = [...monitorState.captions].reverse().find((item) => item.text);
+  const latestCaption = [...monitorState.captions].reverse().find((item) => item.text && item.turnId === current?.id);
   const capture = monitorState.session?.media_capture;
   const hasVideo = Boolean(monitorState.candidateStream?.getVideoTracks?.().length);
   const hasAudio = Boolean(monitorState.candidateStream?.getAudioTracks?.().length);
@@ -561,7 +565,7 @@ function LiveInterview() {
       <aside className="session-panel enterprise-agent-panel">
         <div className="question-panel">
           <p className="eyebrow">{current?.is_followup ? "受控追问" : "当前问题"}</p>
-          <h2>{current?.question_spoken_text || monitorState.session?.current_question?.question_text || "当前没有待答题目"}</h2>
+          <h2>{current?.question_spoken_text || "当前没有待答题目"}</h2>
           <div className="enterprise-live-caption" aria-live="polite">
             <small>服务端权威转写</small>
             <p>{latestCaption?.text || "候选人开口后，实时字幕会显示在这里。"}</p>

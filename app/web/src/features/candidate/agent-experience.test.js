@@ -207,6 +207,12 @@ describe("captions belong to the current question", () => {
       expect(run.getSnapshot().captions.full).toEqual([]);
       emit("transcript.final", { text: "嗯，我得想一下。可以采用多阶段构建。", authoritative: true }, "turn_followup");
       expect(run.getSnapshot().captions.full.map(row => row.text)).toEqual(["嗯，我得想一下。可以采用多阶段构建。"]);
+      const followupCaptions = run.getSnapshot().captions;
+      emit("conversation.act.selected", { act_id: "repeat_followup", act_type: "repeat", text: "镜像如何优化？", approved: true }, "turn_followup");
+      expect(run.getSnapshot().currentQuestion).toMatchObject({ turn_id: "turn_followup", is_followup: true });
+      expect(run.getSnapshot().captions).toEqual(followupCaptions);
+      await run.act({ type: "request_repeat" });
+      expect(latestSentSignal(socket, "request_repeat").turn_id).toBe("turn_followup");
     } finally { await run.close(); }
   });
 
@@ -911,11 +917,17 @@ describe("candidate real-time experience contracts", () => {
       }), replayability: "transient" }) });
       await flushPlaybackEvents(); expect(liveSink.finish).toHaveBeenCalledWith(480);
       expect(socket.sent.filter(item => item.type === "avatar.performance.stopped")).toHaveLength(0);
-      liveSink.progress({ consumed: 480, renderedUntil: 1, firstRenderStart: 0, producing: false, drained: true });
+      liveSink.progress({ consumed: 480, renderedUntil: 1, firstRenderStart: 0, producing: false, drained: true,
+        underflowCount: 2, underflowSamples: 12000 });
       expect(socket.sent.filter(item => item.type === "avatar.performance.stopped")).toEqual([
         expect.objectContaining({ payload: { performance_id: performance.performance_id, output_id: performance.live_audio.output_id, reason: "drained" } }),
       ]);
       expect(liveSink.close).toHaveBeenCalledOnce(); expect(runtimeProblemCalls(request)).toHaveLength(0);
+      expect(socket.sent.filter(item => item.type === "telemetry.observe" && item.payload.metric.startsWith("audio_playback_"))
+        .map(item => item.payload)).toEqual([
+          { metric: "audio_playback_underflow_count", value: 2 },
+          { metric: "audio_playback_underflow_ms", value: 500 },
+        ]);
     } finally { await run.close(); }
   });
 

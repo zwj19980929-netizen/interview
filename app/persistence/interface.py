@@ -33,6 +33,10 @@ class TransactionBackend(Protocol):
 
     def get_document(self, collection: str, item_id: str) -> Optional[Document]: ...
 
+    def get_interview_realtime_state(
+        self, *, organization_id: str, interview_id: str,
+    ) -> Optional[Document]: ...
+
     def list_documents(self, collection: str) -> List[Document]: ...
 
     def list_unsettled_evidence_commands(
@@ -160,6 +164,15 @@ class VersionedDocumentRepository:
 class InterviewSessionRepository(VersionedDocumentRepository):
     def __init__(self, backend: TransactionBackend, organization_id: str) -> None:
         super().__init__(backend, organization_id, collection="interviews", entity_name="InterviewSession")
+
+    def realtime_state(self, interview_id: str) -> Optional[Document]:
+        """Fresh durable media guard fields only; not suitable for update()."""
+        item = self._backend.get_interview_realtime_state(
+            organization_id=self._organization_id, interview_id=interview_id,
+        )
+        if not item or item.get("organization_id") != self._organization_id or item.get("id") != interview_id:
+            return None
+        return deepcopy(item)
 
     def watchdog_candidates(self, kind: InterviewWatchdogKind) -> List[Document]:
         # Validate before delegating even if this tenant has no stored rows.

@@ -526,6 +526,8 @@ class ConversationUnderstandingService:
                 transcript=utterance.text,
                 allowed_evidence=scope["evidence"],
                 allowed_targets=scope["targets"],
+                missing_targets=scope["missing_targets"],
+                claim_evidence=scope["claim_evidence"],
                 difficulty=scope["difficulty"],
                 root=scope["root"],
                 max_chars=int(scope["policy"]["max_probe_chars"]),
@@ -595,14 +597,18 @@ class ConversationUnderstandingService:
                 transcript=utterance.text,
                 allowed_evidence=evidence,
                 allowed_targets=targets,
+                missing_targets=scope["missing_targets"],
+                claim_evidence=scope["claim_evidence"],
                 difficulty=difficulty,
                 root=root,
                 max_chars=int(policy["max_probe_chars"]),
             )
             provider = response.provider.model_dump()
         except (ProviderError, ValueError, KeyError):
+            if not scope["missing_targets"]:
+                return self._no_followup("optional_detail_probe_unavailable", policy)
             return self._fallback_probe(
-                turn, targets, evidence, "model_unavailable_or_rejected", policy,
+                turn, scope["missing_targets"], evidence, "model_unavailable_or_rejected", policy,
             )
         return self._approved_followup_selection(
             turn, data, scope, provider=provider, prompt_version=contract.version,
@@ -666,15 +672,20 @@ class ConversationUnderstandingService:
             for item in root_followups
             for point in item.get("target_key_points", [])
         }
-        missing_points = understanding.missing_capability_points if understanding is not None else self._capability_points(turn)
+        allowed_points = self._capability_points(turn)
+        missing_points = understanding.missing_capability_points if understanding is not None else allowed_points
+        # Mentioning a point does not establish the details behind a claim.
+        # The model may inspect any still-unprobed point in this frozen scope;
+        # it must choose whether an evidence-bound probe is actually useful.
+        ordered_points = list(dict.fromkeys([*missing_points, *allowed_points]))
         targets = [
             point
-            for point in missing_points
-            if point not in previously_probed
-        ][:2]
+            for point in ordered_points
+            if point in allowed_points and point not in previously_probed
+        ]
         if not targets:
             return self._no_followup(
-                "capability_points_covered_or_already_probed", policy
+                "capability_points_already_probed", policy
             )
         if any(_SENSITIVE.search(item) for item in targets):
             return self._no_followup("sensitive_capability_target", policy)
@@ -697,6 +708,8 @@ class ConversationUnderstandingService:
         difficulty = str(root.get("question_snapshot", {}).get("difficulty") or "mid")
         return {
             "policy": policy, "targets": targets, "evidence": evidence,
+            "missing_targets": [point for point in targets if point in missing_points],
+            "claim_evidence": [claim.evidence_quote for claim in understanding.claims] if understanding is not None else [],
             "root": root, "root_turn_id": root_turn_id, "difficulty": difficulty,
             "previously_probed": previously_probed,
         }
@@ -741,7 +754,8 @@ class ConversationUnderstandingService:
             "root_turn_id": root_turn_id,
             "parent_turn_id": turn["id"],
             "followup_depth": depth + 1,
-            "reason": "missing_capability_evidence",
+            "reason": ("missing_capability_evidence" if any(point in scope["missing_targets"]
+                       for point in act.target_capability_points) else "claim_detail_verification"),
             "target_key_points": list(act.target_capability_points),
             "question_text": act.text,
             "evidence_quotes": list(act.evidence_quotes),
@@ -963,6 +977,8 @@ class ConversationUnderstandingService:
         difficulty: str,
         root: Dict[str, Any],
         max_chars: int,
+        missing_targets: Optional[Sequence[str]] = None,
+        claim_evidence: Optional[Sequence[str]] = None,
     ) -> None:
         if not data.get("selected"):
             return
@@ -975,6 +991,13 @@ class ConversationUnderstandingService:
             raise FollowupProposalError("evidence_binding_invalid", "$.followup.evidence_id")
         if not targets or not set(targets).issubset(set(allowed_targets)):
             raise FollowupProposalError("capability_binding_invalid", "$.followup.target_point_ids")
+        # A new detail-only probe needs a declared claim source and an explicit
+        # reason. Do not infer whether the claim is correct or sufficiently detailed.
+        if missing_targets is not None and not set(targets).intersection(missing_targets):
+            if not str(data.get("rationale") or "").strip():
+                raise FollowupProposalError("detail_rationale_missing", "$.followup.rationale")
+            if quote not in (claim_evidence or []):
+                raise FollowupProposalError("detail_claim_binding_invalid", "$.followup.evidence_id")
         if data.get("difficulty") != difficulty:
             raise FollowupProposalError("difficulty_escalation", "$.followup.difficulty")
         if (

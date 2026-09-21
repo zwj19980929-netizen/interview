@@ -10,6 +10,7 @@ from psycopg.types.json import Jsonb
 from app.persistence.errors import ConcurrencyConflict, RecordAlreadyExists
 from app.persistence.interface import Document, InterviewWatchdogKind, PersistenceTransaction, Predicate, TransactionBackend
 from app.persistence.read_only import ReadOnlyTransactionBackend
+from app.persistence.realtime_state import REALTIME_PATHS, realtime_state_from_values
 from app.repositories.postgresql import PostgreSQLStore
 
 
@@ -40,6 +41,22 @@ _INTERVIEW_WATCHDOG_PREDICATES = {
 }
 
 
+_REALTIME_FIELDS = ", ".join("d.data#>'{%s}'" % ",".join(path) for path in REALTIME_PATHS)
+_REALTIME_QUERY = """
+SELECT jsonb_build_array(""" + _REALTIME_FIELDS + """) AS fields,
+       jsonb_typeof(d.data->'plan_snapshot') AS plan_type,
+       jsonb_typeof(d.data->'agent_runtime') AS runtime_type,
+       jsonb_typeof(d.data#>'{agent_runtime,takeover}') AS takeover_type,
+       (SELECT jsonb_build_array(e.value->'event_id', e.value#>'{payload,act_id}', e.value#>'{payload,approved}')
+          FROM jsonb_array_elements(CASE WHEN jsonb_typeof(d.data->'agent_events') = 'array'
+                                        THEN d.data->'agent_events' ELSE '[]'::jsonb END)
+               WITH ORDINALITY e(value, position)
+         WHERE e.value->>'type' = 'conversation.act.selected'
+         ORDER BY e.position DESC LIMIT 1) AS selected
+FROM documents d WHERE d.collection = 'interviews' AND d.id = %s AND d.organization_id = %s
+"""
+
+
 class _PostgreSQLTransactionBackend(TransactionBackend):
     def __init__(self, connection: psycopg.Connection, *, read_only: bool = False) -> None:
         self.connection = connection
@@ -61,6 +78,17 @@ class _PostgreSQLTransactionBackend(TransactionBackend):
             (collection, item_id),
         ).fetchone()
         return dict(row["data"]) if row else None
+
+    def get_interview_realtime_state(
+        self, *, organization_id: str, interview_id: str,
+    ) -> Optional[Document]:
+        row = self.connection.execute(_REALTIME_QUERY, (interview_id, organization_id)).fetchone()
+        if not row:
+            return None
+        return realtime_state_from_values(
+            row["fields"], row["selected"], plan_type=row["plan_type"], runtime_type=row["runtime_type"],
+            takeover_type=row["takeover_type"],
+        )
 
     def list_documents(self, collection: str) -> List[Document]:
         rows = self.connection.execute(

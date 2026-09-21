@@ -67,7 +67,7 @@ def _semantic_provider(monkeypatch, *, technical=False, probe=False, explicit_fi
     async def invoke(provider, capability, request, context):
         if capability != "llm.chat_json" or request.purpose != "interview_turn_understanding":
             return await original(provider, capability, request, context)
-        if request.metadata.get("prompt_version") == "conversation_reception.v2":
+        if request.metadata.get("prompt_version") == "conversation_reception.v3":
             return await original(provider, capability, request, context)
         if request.metadata.get("prompt_version") == "supplement_reply.v4":
             reply = json.loads(request.messages[-1].content)["reply"]
@@ -95,7 +95,7 @@ def _semantic_provider(monkeypatch, *, technical=False, probe=False, explicit_fi
                 "ambiguities": [], "contradictions": [], "confidence": .96,
                 "suggested_action": "next",
             }
-            if request.metadata["prompt_version"] in {"interview_turn_understanding.v16", "interview_turn_decision.v15", "interview_turn_understanding.v17", "interview_turn_decision.v16", "interview_turn_understanding.v18", "interview_turn_understanding.v19", "interview_turn_decision.v17", "interview_turn_decision.v18"}:
+            if request.metadata["prompt_version"] in {"interview_turn_understanding.v20", "interview_turn_decision.v19", "interview_turn_understanding.v21", "interview_turn_decision.v20", "interview_turn_understanding.v22", "interview_turn_understanding.v23", "interview_turn_decision.v21", "interview_turn_decision.v22"}:
                 thinking = transcript.startswith("我得想一下")
                 ending = (explicit_finish or stop_interview or not technical_response) and not thinking
                 data.update(answer_content="partial" if technical_response else "none",
@@ -195,7 +195,7 @@ def test_first_final_decline_preserves_original_audio_and_advances_once(tmp_path
             assert "supplement_check" not in acts and "question" in acts
             assert SUPPLEMENT_SPEECH["check"] not in spoken
             assert not [c for c in calls if c[0] == "supplement"]
-            assert [c[2] for c in calls if c[0] == "understanding"] == ["interview_turn_decision.v17"]
+            assert [c[2] for c in calls if c[0] == "understanding"] == ["interview_turn_decision.v21"]
             assert understanding["completion_basis"]["source"] == "explicit_server_intent"
 
             # Replay the committed journal command and an additional stale
@@ -272,7 +272,7 @@ def test_end_interview_in_supplement_reply_preserves_answer_and_stops_whole_inte
     async def semantic_reply(provider, capability, request, context):
         response = await original(provider, capability, request, context)
         if (request.purpose == "interview_turn_understanding" and request.metadata.get("transcript", "").endswith(stop)
-                and request.metadata.get("prompt_version") in {"interview_turn_understanding.v17", "interview_turn_decision.v16", "interview_turn_understanding.v19", "interview_turn_decision.v18"}):
+                and request.metadata.get("prompt_version") in {"interview_turn_understanding.v21", "interview_turn_decision.v20", "interview_turn_understanding.v23", "interview_turn_decision.v22"}):
             data = response.data.get("understanding", response.data)
             refs = understanding_references(request.metadata["transcript"], request.metadata["capability_points"])
             data.update(answer_content="partial", turn_intent="stop_interview", followup_allowed=False,
@@ -290,7 +290,7 @@ def test_end_interview_in_supplement_reply_preserves_answer_and_stops_whole_inte
             await _wait_until(lambda: all(c["status"] == "completed" for c in store.evidence_commands.values()))
             session = _current(runtime)
             _assert_one_automatic_answer(store, runtime, _TECHNICAL + stop, voice_frames=5, continuation_frames=5)
-            assert session["turns"][0]["current_understanding"]["prompt_version"] == "interview_turn_decision.v18"
+            assert session["turns"][0]["current_understanding"]["prompt_version"] == "interview_turn_decision.v22"
             assert session["turns"][0]["current_understanding"]["turn_intent"] == "stop_interview"
             assert session.get("candidate_input_completion_reason") == "candidate_requested"
             assert session["turns"][0]["current_understanding"]["claims"][0]["claim"] == _TECHNICAL

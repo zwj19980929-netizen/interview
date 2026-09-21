@@ -83,7 +83,7 @@ async def test_semantic_content_and_turn_intent_remain_independent(text, content
         assert followup["selected"] is False
     if intent == "finish_topic":
         assert followup["reason"] == "candidate_topic_boundary", "Even a proposed probe cannot override an explicit boundary"
-    assert gateway.requests[0].metadata["prompt_version"] == "interview_turn_decision.v15"
+    assert gateway.requests[0].metadata["prompt_version"] == "interview_turn_decision.v19"
     assert gateway.requests[0].execution_budget.max_provider_retries == 0
     assert len(gateway.requests) == 1
 
@@ -136,7 +136,7 @@ def test_semantic_contract_has_real_basis_and_frozen_company_context():
         "transcript": "这题我不会。", "capability_points": ["任务重试"], "semantic_first": True,
         "interviewer_context": {"enterprise_skill": {"instructions": "语气温和。"}},
     })
-    assert contract.version == "interview_turn_decision.v15"
+    assert contract.version == "interview_turn_decision.v19"
     messages = "\n".join(message.content for message in contract.messages)
     assert "语气温和" in messages and "优先级低于平台规则" in messages
     assert "服务端已通过独立口头确认" not in messages
@@ -145,8 +145,8 @@ def test_semantic_contract_has_real_basis_and_frozen_company_context():
     assert fields["properties"]["completion_basis"]["properties"]["evidence_ids"]["items"]["enum"] == ["E1"]
 
 
-@pytest.mark.parametrize("purpose,version", [("interview_turn_understanding", "interview_turn_understanding.v17"),
-                                           ("interview_turn_decision", "interview_turn_decision.v16")])
+@pytest.mark.parametrize("purpose,version", [("interview_turn_understanding", "interview_turn_understanding.v21"),
+                                           ("interview_turn_decision", "interview_turn_decision.v20")])
 def test_confirmed_semantic_contract_preserves_stop_scope_and_real_confirmation(purpose, version):
     contract = prompt_contract(purpose, {"transcript": "我用幂等键。请结束整场面试。",
         "capability_points": ["幂等键"], "semantic_first": True, "completion_confirmed": True})
@@ -171,14 +171,14 @@ async def test_real_confirmation_can_allow_a_probe_without_inventing_explicit_to
     assert understanding.problem is None and understanding.turn_intent == "answering"
     assert understanding.completion_basis is None and understanding.followup_allowed
     assert followup["selected"] is True
-    assert gateway.requests[0].metadata["prompt_version"] == "interview_turn_decision.v16"
+    assert gateway.requests[0].metadata["prompt_version"] == "interview_turn_decision.v20"
 
 
 @pytest.mark.parametrize("purpose,confirmed,version", [
-    ("interview_turn_understanding", False, "interview_turn_understanding.v18"),
-    ("interview_turn_understanding", True, "interview_turn_understanding.v19"),
-    ("interview_turn_decision", False, "interview_turn_decision.v17"),
-    ("interview_turn_decision", True, "interview_turn_decision.v18"),
+    ("interview_turn_understanding", False, "interview_turn_understanding.v22"),
+    ("interview_turn_understanding", True, "interview_turn_understanding.v23"),
+    ("interview_turn_decision", False, "interview_turn_decision.v21"),
+    ("interview_turn_decision", True, "interview_turn_decision.v22"),
 ])
 @pytest.mark.parametrize("has_skill,has_company", [(False, False), (True, False), (False, True), (True, True)])
 def test_optional_context_contract_is_versioned_without_changing_evidence_or_confirmation(purpose, confirmed, version, has_skill, has_company):
@@ -230,7 +230,7 @@ async def test_optional_context_service_preserves_partial_answer_and_exact_stop_
     assert understanding.completion_basis.evidence_quotes == ["请结束整场面试。"]
     assert service.can_complete_without_confirmation(understanding, utterance.text)
     assert followup["selected"] is False
-    assert understanding.prompt_version == ("interview_turn_decision.v18" if confirmed else "interview_turn_decision.v17")
+    assert understanding.prompt_version == ("interview_turn_decision.v22" if confirmed else "interview_turn_decision.v21")
 
 
 @pytest.mark.anyio

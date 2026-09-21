@@ -1102,3 +1102,13 @@ stateDiagram-v2
 - 物理文件删除在聚合状态提交前执行；删除失败时不把数据库伪标为已清理。已清理的签名 token 无法再解析到 ready FileObject。
 - 每次周期留存工作同时回收 `capture_revision < current` 的已放弃 Evidence media；对象键只以 SHA-256 进入审计，重复执行不会重复删除对象或影响当前 revision。
 - 留存清理是管理员显式、不可逆动作；审计事件不得包含被删除正文或联系方式。
+
+## FOLLOWUP-CONTEXT-055：对话焦点与证据链
+
+正式考察追问继续复用InterviewTurn的parent_turn_id/root_turn_id/followup_depth及独立CandidateAnswer，在播报前提交持久状态。交流回应不能提出新的技术考察题；重读、安抚、补充确认和术语澄清不创建计分子题。turn.dialogue_focus可选保存最近题意/术语澄清的act_id，引用同turn已批准的表达；缺省回到该turn实际问题。只读兼容历史v2已说出的问句以供重读，不猜测拆分历史混合录音。父子评分输入带按序evidence_chain和原始回答版本指纹，回答修改撤销旧计算的提交资格。
+
+### 056 完成回答与结束话题
+
+`TurnUnderstanding.turn_intent=finish_answer` 表示候选人明确完成了当前这一次回答，已有技术内容与逐字结束证据保留，`followup_allowed=true`；不再重复询问是否补充。`finish_topic/decline_topic/stop_interview` 分别表示关闭当前话题、拒答、结束整场，继续令 `followup_allowed=false`。按钮确认没有口头结束证据时不伪造 `completion_basis`。此扩展无需迁移旧理解记录，不能把历史 `finish_topic` 猜测改成新意图或补造追问。
+
+正式子问题可以核实已提及能力点的具体做法与依据，`claim_detail_verification` 记录这种选择原因；覆盖某点不等于其细节已经充分。是否选择由有证据约束的模型决定，受冻结范围、既有追问次数与深度、剩余时间和候选边界约束。

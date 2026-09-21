@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useWorkbench } from "../../core/WorkbenchProvider.jsx";
 import { Status, formatDate } from "../../core/ui.jsx";
+import { flattenQuestions, questionTree } from "./question-tree.js";
 
 const recordingLabels = { completed: "录像已保存", hash_pending: "录像正在封存校验", stopping: "录像正在收尾", recording: "正在录制", failed: "录像处理失败", unavailable: "暂无全场录像", cancelled: "未开始录制", retention_purged: "录像已按留存策略清除" };
 const fitLabels = { strong_match: "高度匹配", match: "匹配", partial_match: "部分匹配", insufficient_evidence: "证据不足", manual_review: "建议人工复核" };
@@ -50,7 +51,10 @@ export default function InterviewReview({ interviewId, review, error, reload, ca
   const processing = review.processing || {};
   const recording = review.recording || {};
   const turns = review.turns || [];
+  const questionGroups = questionTree(turns);
   const selected = turns.find((turn) => turn.turn_id === selectedId) || turns[0];
+  const selectedRoot = questionGroups.find(node => node.id !== selected?.turn_id
+    && flattenQuestions(node.children).some(child => child.id === selected?.turn_id));
   const report = review.report;
   const adaptive = review.execution_schema_version === 3 || report?.execution_schema_version === 3;
   const completionReason = review.candidate_input_completion_reason || report?.candidate_input_completion_reason;
@@ -131,13 +135,12 @@ export default function InterviewReview({ interviewId, review, error, reload, ca
     </section>
     {turns.length > 0 && <section className="report-panel review-question-panel">
       <h3>逐题复核</h3>
-      <div className="review-question-tabs" role="group" aria-label="选择回答题目">
-        {turns.map((turn) => <button key={turn.turn_id} className={`button ${turn.turn_id === selected?.turn_id ? "button-primary" : "button-secondary"}`} aria-pressed={turn.turn_id === selected?.turn_id} onClick={() => select(turn.turn_id)}>
-          第 {turn.order} 题{turn.is_followup ? " · 追问" : ""} · {turn.skip_reason === "resume_speech_not_ready" ? "语音未就绪，已跳过" : turn.status === "skipped" && completionLabels[turn.skip_reason] ? "面试结束，未考察" : turn.answer?.evaluation_status === "failed" ? "评分失败" : turn.answer?.evaluation_status === "pending" ? "正在评分" : turn.evaluation?.score != null ? `${turn.evaluation.score}分` : turn.answer ? "待评分" : "未作答"}
-        </button>)}
+      <div className="review-question-tree" role="group" aria-label="选择回答题目">
+        {questionGroups.map(node => <ReviewQuestionNode key={node.id} node={node} selectedId={selected?.turn_id} select={select} />)}
       </div>
       {selected && <article className="review-answer">
-        <h3>{selected.question?.question_text}</h3>
+        {selectedRoot && <p className="form-hint">所属主问题：{selectedRoot.text}</p>}
+        <h3>{selected.question_spoken_text || selected.question?.question_text}</h3>
         {selected.skip_reason === "resume_speech_not_ready" && <p role="status">本题读题语音在提问时尚未就绪，系统已跳过，不计入评分。</p>}
         {selected.status === "skipped" && completionLabels[selected.skip_reason] && <p role="status">{completionLabels[selected.skip_reason]}，本题没有形成完整回答证据，不计零分。</p>}
         {adaptive && !selected.is_followup && selected.presented_unit_ids?.includes("complete_question") && <p className="form-hint">本题评分范围：完整呈现的题目与全部 {selected.assessed_rubric_point_ids?.length || 0} 项关键点。</p>}
@@ -183,6 +186,22 @@ export default function InterviewReview({ interviewId, review, error, reload, ca
       {media?.kind === "audio" && <audio key={media.url} ref={player} src={media.url} controls autoPlay preload="metadata" onError={() => setMediaError("录音加载失败或签名已过期。请重新获取播放地址。")}/>}
     </section>}
   </section>;
+}
+
+function ReviewQuestionNode({ node, selectedId, select }) {
+  const turn = node.turn;
+  const status = turn.skip_reason === "resume_speech_not_ready" ? "语音未就绪，已跳过"
+    : turn.status === "skipped" && completionLabels[turn.skip_reason] ? "面试结束，未考察"
+      : turn.answer?.evaluation_status === "failed" ? "评分失败"
+        : turn.answer?.evaluation_status === "pending" ? "正在评分"
+          : turn.evaluation?.score != null ? `${turn.evaluation.score}分` : turn.answer ? "待评分" : "未作答";
+  return <div className={`review-question-node${node.id === selectedId ? " is-selected" : ""}`} data-turn-id={node.id}>
+    <button className={`button ${node.id === selectedId ? "button-primary" : "button-secondary"}`}
+      aria-pressed={node.id === selectedId} onClick={() => select(node.id)}>{node.label} · {status}</button>
+    <p className="review-question-text">{node.text}</p>
+    {turn.answer?.final_transcript && <details className="review-outline-answer"><summary>查看本题回答</summary><p>{turn.answer.final_transcript}</p></details>}
+    {!!node.children.length && <ol className="question-record-children">{node.children.map(child => <li key={child.id}><ReviewQuestionNode node={child} selectedId={selectedId} select={select} /></li>)}</ol>}
+  </div>;
 }
 
 

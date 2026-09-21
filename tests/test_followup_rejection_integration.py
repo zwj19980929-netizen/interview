@@ -14,7 +14,7 @@ from test_declined_answer_integration import (
 from test_evidence_owner_recovery_integration import _wait_until
 
 
-@pytest.mark.parametrize("rejection", ["answer_leakage", "covered_target"])
+@pytest.mark.parametrize("rejection", ["answer_leakage", "multiple_questions"])
 def test_invalid_optional_probe_advances_valid_answer_without_repeating_inference(
     tmp_path, monkeypatch, rejection,
 ):
@@ -28,9 +28,8 @@ def test_invalid_optional_probe_advances_valid_answer_without_repeating_inferenc
             if rejection == "answer_leakage":
                 data["followup"]["leaks_answer"] = True
             else:
-                # P1 is a valid wire reference but already covered: the
-                # follow-up domain gate must reject targeting it again.
-                data["followup"]["target_point_ids"] = ["P1"]
+                # Wire-valid text still needs the single-question domain gate.
+                data["followup"]["question_text"] = "如何恢复？恢复之后怎么验证？"
             response = response.model_copy(update={"data": data})
         return response
 
@@ -55,7 +54,7 @@ def test_invalid_optional_probe_advances_valid_answer_without_repeating_inferenc
             assert understanding["intent"] == "answer" and understanding["problem"] is None
             assert understanding["evidence_quotes"] == [_TECHNICAL]
             assert [call[2] for call in calls if call[0] == "understanding"] == [
-                "interview_turn_decision.v17", "interview_turn_decision.v18",
+                "interview_turn_decision.v21", "interview_turn_decision.v22",
             ], "One semantic preparation per distinct final, no rejected-probe retries"
             assert not any(turn.get("is_followup") for turn in current["turns"])
             acts = [event["payload"]["act_type"] for event in current["agent_events"]

@@ -921,3 +921,13 @@ token；ModelInvocationLog 在失败 attempt 也保存这些诊断，不记录�
 - 豆包端到端实时语音（Seeduplex）API：<https://docs.volcengine.com/docs/DoubaoVoice/endtoend-realtime-voice-full-duplex-version?lang=zh>
 
 外部文档只决定 adapter 的厂商协议转换；领域能力、route、日志、隐私和 readiness 仍以本仓库统一 schema 为准。
+
+## FOLLOWUP-CONTEXT-055：接话合同
+
+conversation_reception.v3明确将考察追问交给正式子题链路；接话只响应候选人的交流请求，不自行生成技术追问或发起补充确认。wait/continue/presence/interview_dialogue生成问句在统一合同校验处拒绝，端点回到正式理解路径，不播出未批准的新问题。最近实际问题/澄清和新发言进入上下文，完整评分证据不截断。语音供应商、分片、缓冲与媒体协议保持054实现。
+
+父子合并评分升级为answer_evaluation.v8：完整输入含经来源校验及公司反问/拒答过滤的evidence_chain；评分原文必须归属于对应考察点允许的回答。统一seam派生evidence_sources，拒绝引用题干、其他考察方向或不存在的原文。结构链不一致为不可重试evaluation_evidence_invalid；模型引用不合法同码可重试。单答案保持原有v5/v6/v7合同选择。
+
+### 056 回答结束语义合同
+
+语义提示升级 `semantic_turn.v5/v6`，对应理解 `interview_turn_understanding.v20–v23` 与组合决策 `interview_turn_decision.v19–v22`；非语义组合决策的细节追问提示升级v23/v24，独立 `controlled_followup.v2`。新枚举 `finish_answer` 仍由集中响应 Schema 与内容校验约束：真实专业回答、置信度门槛、逐字结束证据、允许追问；关闭话题的旧枚举仍禁止追问。补充确认表达升级 `supplement_confirmation.v2`，不再提前承诺“没有补充就进入下一题”。历史版本继续可读，当前调用与诊断使用新版本。

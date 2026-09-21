@@ -14,6 +14,30 @@ from app.services.conversation_understanding import ConversationUnderstandingSer
 from test_dashscope_provider import make_provider, context
 
 
+@pytest.mark.parametrize("kind", ["check", "continue", "clarify"])
+def test_new_supplement_approval_uses_central_version_and_keeps_frozen_history(kind):
+    from app.core.prompt.contracts import SUPPLEMENT_SPEECH, SUPPLEMENT_SPEECH_VERSION
+    from app.services.interview_agent import InterviewAgentRuntime
+    from test_interview_agent_contracts import _runtime_session
+
+    store = InMemoryStore()
+    session = _runtime_session(store)
+    runtime = InterviewAgentRuntime(store)
+    arguments = {"act_type": "supplement_" + kind, "text": SUPPLEMENT_SPEECH[kind],
+        "turn_id": "turn_1", "evidence_quotes": [], "approved_by": "synthetic",
+        "organization_id": "org_default"}
+    current = runtime._approve_conversation_act(session["id"], **arguments)
+    assert current.prompt_version == SUPPLEMENT_SPEECH_VERSION == "supplement_confirmation.v2"
+    assert runtime._approve_conversation_act(session["id"], **arguments).act_id == current.act_id
+
+    legacy_arguments = {**arguments, "text": "历史补充话语。", "prompt_version": "supplement_confirmation.v1"}
+    legacy = runtime._approve_conversation_act(session["id"], **legacy_arguments)
+    replay = runtime._approve_conversation_act(session["id"], **{**arguments, "text": legacy.text})
+    assert replay.act_id == legacy.act_id and replay.prompt_version == "supplement_confirmation.v1"
+    saved = runtime.interviews.get_interview(session["id"])["turns"][0]["conversation_acts"]
+    assert [item["prompt_version"] for item in saved] == [SUPPLEMENT_SPEECH_VERSION, "supplement_confirmation.v1"]
+
+
 @pytest.mark.parametrize("change", [
     {"intent": "yes"}, {"confidence": 2}, {"evidence_id": " "},
     {"unknown": "field"}, {"intent": None}, {"confidence": True}, {"evidence_id": "E999"},
@@ -30,7 +54,7 @@ def test_confirmation_understanding_has_traceable_version_and_ignores_old_contro
     contract = prompt_contract("interview_turn_understanding", context)
     assert contract.version == "interview_turn_understanding.v9"
     assert "不作为能力主张或评分证据" in "".join(m.content for m in contract.messages)
-    assert prompt_contract("interview_turn_decision", context).version == "interview_turn_decision.v8"
+    assert prompt_contract("interview_turn_decision", context).version == "interview_turn_decision.v24"
 
 
 def test_reply_evidence_cannot_be_invented_even_after_valid_json():
@@ -174,7 +198,7 @@ def test_followup_speaks_validated_question_without_repeating_hesitant_evidence(
     result = ConversationUnderstandingService(InMemoryStore())._approved_followup_selection(
         {"id": "turn_synthetic", "followup_depth": 0},
         {"selected": True, "evidence_quote": quote, "question_text": question, "target_capability_points": ["状态管理"]},
-        {"policy": {"max_probe_chars": 300}, "root_turn_id": "turn_synthetic"},
+        {"policy": {"max_probe_chars": 300}, "root_turn_id": "turn_synthetic", "missing_targets": ["状态管理"]},
         provider={"provider_id": "synthetic"}, prompt_version="interview_turn_decision.v8",
     )
     assert result["question_text"] == question

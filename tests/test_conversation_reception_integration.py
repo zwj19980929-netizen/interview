@@ -20,7 +20,7 @@ def reception_provider(monkeypatch, kind, *, release=None, reply_text=None):
     calls = []
 
     async def invoke(provider, capability, request, context):
-        if request.metadata.get("prompt_version") != "conversation_reception.v2":
+        if request.metadata.get("prompt_version") != "conversation_reception.v3":
             return await original(provider, capability, request, context)
         value = json.loads(request.messages[-1].content)
         calls.append(value)
@@ -75,7 +75,7 @@ def test_request_is_audible_before_answer_review_and_continues_same_capture(tmp_
             # it must neither delay reception nor commit/switch the question.
             versions = [v["prompt_version"] for v in store.model_invocations
                         if v["purpose"] == "interview_turn_understanding"]
-            assert versions.count("conversation_reception.v2") == 1
+            assert versions.count("conversation_reception.v3") == 1
             await _finish_playback(channel, runtime, managed)
             assert endpoint.confirmation.phase == "listening" and managed.chain.is_open
             clock.value += 30
@@ -219,7 +219,7 @@ def test_unpreset_interview_request_speaks_generated_reply_while_analysis_is_pen
             spoken = _synthetic_tts(runtime)
             original = MockProvider.invoke
             async def hold_deep_analysis(provider, capability, request, context):
-                if request.purpose == "interview_turn_understanding" and request.metadata.get("prompt_version") != "conversation_reception.v2":
+                if request.purpose == "interview_turn_understanding" and request.metadata.get("prompt_version") != "conversation_reception.v3":
                     analysis_entered.set()
                     await analysis_release.wait()
                 return await original(provider, capability, request, context)
@@ -240,7 +240,7 @@ def test_unpreset_interview_request_speaks_generated_reply_while_analysis_is_pen
                 current = _current(runtime)
                 stored_act = next(item for item in current["turns"][0]["conversation_acts"]
                                   if item["act_id"] == act["act_id"])
-                assert stored_act["prompt_version"] == "conversation_reception.v2"
+                assert stored_act["prompt_version"] == "conversation_reception.v3"
                 assert stored_act["evaluative"] is False
                 assert current["current_turn_id"] == before["current_turn_id"]
                 assert current["turn_ids"] == before["turn_ids"] and not current["answers"]

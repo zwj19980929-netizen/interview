@@ -1,5 +1,11 @@
 # 数据库与向量存储设计
 
+## 056：实时媒体守卫最小投影
+
+`InterviewSessionRepository.realtime_state(interview_id)` 每次读取当前持久化记录，只返回组织/版本/状态/当前题目、输入完成标记、播放守卫需要的 runtime 字段、完整 Skill 身份快照，以及数组中最后一个 `conversation.act.selected` 的事件 ID、act ID 和原始 approved 布尔值。它不是完整会话，不得用于保存或生命周期变更。SQLite/PostgreSQL 在数据库内投影后才交给 Python 解码，Memory 保持相同字段与隔离语义；不读取答案、简历、题库、对话正文或整个历史对象。没有新增持久化字段、授权缓存或迁移。
+
+每帧的 owner lease、组织、状态、turn、floor、performance 和最新 selected act 检查次数保持不变；Skill 仍在同一只读事务中独立读取当前授权，不能仅相信冻结快照。新事务可以立即看到其他实例已提交的暂停、换题、接管、表达替换或 Skill 撤销。最后事件按持久数组顺序选择，即便其 approved=false 也不得退回先前批准事件；JSON true 与数字 1 不可互换。仅由此投影做终态轮询与播放校验，写事务仍使用完整聚合和原 CAS/租约合同。
+
 ## 053：Evidence 命令按会话查询
 
 `EvidenceCommandRepository.list_unsettled(interview_id)` 是实时命令轮询的读取接口：backend 必须按当前组织、精确 interview ID、`pending/running` 状态筛选后再反序列化，不能通过 `list_documents` 读取全部历史命令。Repository 对返回的少量候选再次校验组织、会话和状态，保留防御性租户边界。Memory/SQLite/PostgreSQL 保持同一筛选语义；只读 transaction 允许此查询。`has_unsettled` 使用相同定向查询，历史 completed/rejected/failed/expired 命令仍保留用于审计和幂等查询。
@@ -589,3 +595,7 @@ SQLite 与 PostgreSQL 增加部分索引，历史完成面试不再在音频事�
 明确无 final 的采集使用现有 `transcription.started/failed` 生命周期事实与同事务 stream CAS；归档元数据增加 `reason=transcript_unavailable`、`untranscribed_audio_uri`，录音继续受既有留存/访问控制约束，不增加虚构 utterance。Evidence command payload 允许经长度/字符校验的 `capture_id` 和（仅自动 seal）`endpoint_id`，作为迟到计时命令的作用域证据；它们不能代替数据库 owner fence 或媒体 checkpoint。无需 DDL 迁移。
 
 Memory、SQLite 与 PostgreSQL 通用 documents/RLS adapter 已实现上述 collection 合同。数据库时钟 ownership lease、单调 epoch、control generation、CandidateAnswer 事务 commit fence 与持久 command submit/claim/result journal 已由连接无关 owner executor 执行：数据库 polling 是正确性路径，Redis 只作 wake hint，remote controller 只等待 terminal receipt。LiveKit subscriber、StreamingSTTSession 与端点 timer 是当前 owner 的进程态，但新 owner 可从已 seal 的私有 segment/checkpoint 重建并执行 batch repair；未 seal 的内存后缀不冒充已持久化证据，必要时只接受服务端授权 sequence gap 内的浏览器私有 backfill。目标 PostgreSQL/RLS 并发、Redis/LiveKit 故障注入和真实 Egress 对象一致性仍必须由绑定当前 release 的外部验收报告证明，因此实时 Agent 状态继续为 `in_progress`。
+
+## FOLLOWUP-CONTEXT-055：持久对话引用与评分版本
+
+现有InterviewSession文档增加可选turn.dialogue_focus（已选中可播放澄清act_id）及answer.pending/current_evidence_fingerprint；不增加表/索引，不迁移旧会话。Outbox的evidence_fingerprint为入队快照，评分执行从当前持久答案计算input_fingerprint并在提交前重验；变化时保留旧评分、可观察有界重试。report版本冻结独立父子Q/A与来源引用。原始音频、服务端转写以及更正历史仍分开保留。

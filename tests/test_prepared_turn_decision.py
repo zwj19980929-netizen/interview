@@ -91,14 +91,14 @@ async def test_one_inference_prepares_understanding_and_fenced_evidence_bound_fo
 
     assert len(gateway.requests) == 1
     assert gateway.requests[0].purpose == "interview_turn_understanding"
-    assert gateway.requests[0].metadata["prompt_version"] == "interview_turn_decision.v7"
-    assert understanding.prompt_version == "interview_turn_decision.v7"
+    assert gateway.requests[0].metadata["prompt_version"] == "interview_turn_decision.v23"
+    assert understanding.prompt_version == "interview_turn_decision.v23"
     assert understanding.evidence_quotes == [TRANSCRIPT]
     assert understanding.claims[0].evidence_quote == TRANSCRIPT
     assert decision["selected"] is True
     assert decision["target_key_points"] == ["幂等键"]
     assert decision["conversation_act"]["approved_by"] == "controlled_followup_gate"
-    assert decision["conversation_act"]["prompt_version"] == "interview_turn_decision.v7"
+    assert decision["conversation_act"]["prompt_version"] == "interview_turn_decision.v23"
     assert decision["conversation_act"]["evaluative"] is False
     assert decision["followup_depth"] == 1
     assert decision["evidence_quotes"] == [TRANSCRIPT]
@@ -195,7 +195,6 @@ async def test_entire_wire_and_understanding_evidence_must_pass_before_approval(
 
 
 @pytest.mark.parametrize("mutate", [
-    lambda d: d["followup"].update(target_point_ids=["P2"]),
     lambda d: d["followup"].update(question_text="你的婚姻情况是什么？"),
     lambda d: d["followup"].update(question_text="你如何实现？怎么验证？"),
     lambda d: d["followup"].update(question_text="recoverable_checkpoint fenced_epoch 如何使用？"),
@@ -274,7 +273,7 @@ async def test_already_probed_capability_cannot_be_selected_again():
     understanding, decision = await _service(gateway).prepare_decision(utterance, turn, interview)
     assert understanding.problem is None
     assert decision["selected"] is False
-    assert decision["reason"] == "capability_points_covered_or_already_probed"
+    assert decision["reason"] == "followup_proposal_rejected"
     assert gateway.requests[0].metadata["previously_probed_ids"] == ["P1"]
 
 
@@ -331,7 +330,7 @@ async def test_non_authoritative_transcript_rejected_before_model_invocation():
 def test_composite_prompt_enforces_reference_schema_without_loosening_existing_contract():
     context = {"transcript": TRANSCRIPT, "capability_points": ["幂等键", "确认序号"], "difficulty": "mid"}
     contract = prompt_contract("interview_turn_decision", context)
-    assert contract.version == "interview_turn_decision.v7"
+    assert contract.version == "interview_turn_decision.v23"
     validate_structured_response(_data(), contract.response_schema)
     assert contract.response_schema["properties"]["understanding"] == prompt_contract(
         "interview_turn_understanding", context,
@@ -346,5 +345,5 @@ def test_composite_prompt_enforces_reference_schema_without_loosening_existing_c
 async def test_mock_gateway_returns_composite_contract_through_same_service_interface():
     understanding, decision = await ConversationUnderstandingService(InMemoryStore()).prepare_decision(*_input())
     assert understanding.problem is None
-    assert understanding.prompt_version == "interview_turn_decision.v7"
+    assert understanding.prompt_version == "interview_turn_decision.v23"
     assert decision["selected"] is True

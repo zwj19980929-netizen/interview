@@ -11,6 +11,7 @@ from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
 from app.services.interviews import InterviewService
 from app.services.interview_evidence import InterviewEvidenceChain
+from app.domain.evaluation_evidence import evidence_fingerprint
 
 
 NOW = "2026-08-31T12:00:00Z"
@@ -336,6 +337,7 @@ def test_depth_two_followups_queue_one_root_evidence_revision() -> None:
         "revision": 2,
         "trigger_reason": "followup_evidence_merged",
         "evidence_answer_ids": ["ans_root", "ans_followup_one", "ans_followup_two"],
+        "evidence_fingerprint": evidence_fingerprint(decision.session["answers"]),
     }
     stored_root = next(item for item in decision.session["answers"] if item["id"] == "ans_root")
     assert stored_root["evaluation_status"] == "pending"

@@ -22,6 +22,8 @@ CANDIDATE_INTERVIEW_AGENT_METRICS = frozenset(
         "avatar_fps",
         "avatar_viseme_drift_ms",
         "avatar_freeze_ms",
+        "audio_playback_underflow_count",
+        "audio_playback_underflow_ms",
     }
 )
 

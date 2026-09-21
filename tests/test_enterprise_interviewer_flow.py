@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 
 from app.main import create_app
 from app.persistence.provider import persistence_for
+from app.providers.mock.provider import MockProvider
 from app.repositories.memory import InMemoryStore
 from app.services.appointments import AppointmentService
 from app.services.interviews import InterviewService
@@ -28,6 +29,23 @@ COMPANY_CONTEXT = "独立企业资料039：这家公司的项目是离线数据�
 @pytest.mark.parametrize("context_mode", ["none", "skill", "company", "both", "legacy_skill", "bank"])
 async def test_enterprise_plan_real_admission_autonomous_selection_scoring_and_http_report(monkeypatch, context_mode):
     monkeypatch.setenv("INTERVIEWER_LOCAL_MEDIA", "true")
+    declined_probes = []
+    if context_mode == "bank":
+        original_invoke = MockProvider.invoke
+
+        async def sufficient_answer(provider, capability, request, context):
+            result = await original_invoke(provider, capability, request, context)
+            if request.purpose == "controlled_followup":
+                # This fixture exercises sufficient answers and report delivery.
+                # Formal child delivery/scoring has its own end-to-end coverage;
+                # a fully covered point is now eligible, not a mandatory probe.
+                declined_probes.append(request.metadata["root_turn_id"])
+                result = result.model_copy(update={"data": {**result.data,
+                    "selected": False, "question_text": "", "evidence_quote": "",
+                    "target_capability_points": [], "rationale": ""}})
+            return result
+
+        monkeypatch.setattr(MockProvider, "invoke", sufficient_answer)
     store = InMemoryStore()
     catalog, position, kb, role, candidate = create_scope(store, "自主后端", ["python", "database"], 15)
     for skill, point in (("python", "线程边界"), ("database", "事务隔离")):
@@ -126,6 +144,8 @@ async def test_enterprise_plan_real_admission_autonomous_selection_scoring_and_h
         assert not current.get("candidate_input_completed_at")
         assert current["dialogue_state"] == "awaiting_next_decision"
     session = await service.advance_adaptive_interview(interview_id)
+    if context_mode == "bank":
+        assert len(declined_probes) == 2 and len(set(declined_probes)) == 2
     assert session["candidate_input_completed_at"]
     assert session["candidate_input_completion_reason"] in {"evidence_sufficient", "budget_exhausted"}
     with persistence_for(store).transaction("org_default") as tx:

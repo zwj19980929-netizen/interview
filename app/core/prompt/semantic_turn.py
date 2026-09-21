@@ -8,18 +8,24 @@ from copy import deepcopy
 
 
 SEMANTIC_TURN_INSTRUCTION = (
-    "本轮采用语义优先接话合同semantic_turn.v3。服务端尚未向候选人询问是否补充，"
+    "本轮采用语义优先接话合同semantic_turn.v5。服务端尚未向候选人询问是否补充，"
     "不得假定已发生独立确认。分别判断answer_content与turn_intent，不按关键词匹配。"
     "answer_content=technical/partial/none只描述是否存在实际专业回答，不是得分。"
-    "turn_intent=answering/thinking/finish_topic/decline_topic/stop_interview/repeat/clarify/correction/pause。"
+    "turn_intent=answering/thinking/finish_answer/finish_topic/decline_topic/stop_interview/repeat/clarify/correction/pause。"
+    "必须区分完成一次回答和拒绝继续这个话题。已有技术内容后说‘我讲完了’、‘就这些’、"
+    "‘没有需要补充的了’只表示finish_answer：保留已有claims和证据，followup_allowed=true；"
+    "面试官仍可围绕这份回答追问具体做法或依据，不能推断候选人拒绝追问。"
+    "只有明确要求‘下一题’、‘这个方向不用再问’、‘换个话题’才是finish_topic。"
     "明确本人本题不会且不再作答用none+decline_topic；已有技术内容后说下一题用partial或technical"
     "+finish_topic，保留技术claims和证据，绝不能将前文丢掉。"
     "finish_topic/decline_topic/stop_interview必须confidence至少0.75，suggested_action=next，"
     "followup_allowed=false，并提供completion_basis={source:explicit_server_intent,evidence_ids:[E编号]}。"
+    "finish_answer同样必须confidence至少0.75、suggested_action=next，并用completion_basis逐字引用"
+    "实际完成回答的原文；已有技术内容时intent=answer，answer_content=partial或technical。"
     "这里只能引用当前完整原文中实际表达结束意图的证据，不把静音、普通陈述结束或模型把握当结束授权。"
     "‘我不想继续面试了’明确结束整场时使用stop_interview，不能误解成只跳过本题。"
     "这时有实际技术内容仍intent=answer，否则answer_declined，原文和已答内容全部保留。"
-    "其他情况completion_basis必须null；疑问、转述、否定、引用的不会都不是本人拒答。"
+    "除finish_answer/finish_topic/decline_topic/stop_interview外completion_basis必须null；疑问、转述、否定、引用的不会都不是本人拒答。"
     "‘Celery我不会，不过我用Redis做过队列’仍应提取实际经验，不能凭前半句判结束。"
     "‘同事说他不会，我就接手了’是在讲经历；‘让我想一下’、‘等一下我还没说完’"
     "是thinking与continue_listening，必须继续听，不能问是否还有补充。"
@@ -37,17 +43,20 @@ SEMANTIC_TURN_INSTRUCTION = (
     "只有未解决疑点才clarify；上下文已消除疑点仍保留原文并正常理解。"
     "repeat/pause分别使用repeat/pause动作。普通answering没有结束依据时可以建议accept，"
     "运行时会在需要时确认，不得凭此建议捏造结束依据。"
-    "followup_allowed描述是否允许继续本话题；明确结束、思考或控制请求均为false。"
+    "followup_allowed描述是否允许继续本话题；完成一次回答的finish_answer允许追问，"
+    "只有关闭话题、拒答、结束整场、思考或控制请求才为false。"
 )
 
 # A real supplement reply permits completing this answer. It must still be
 # understood semantically so a request to stop the whole interview survives.
 SEMANTIC_CONFIRMED_TURN_INSTRUCTION = SEMANTIC_TURN_INSTRUCTION.replace(
-    "本轮采用语义优先接话合同semantic_turn.v3。服务端尚未向候选人询问是否补充，"
+    "本轮采用语义优先接话合同semantic_turn.v5。服务端尚未向候选人询问是否补充，"
     "不得假定已发生独立确认。",
-    "本轮采用语义接话合同semantic_turn.v4。服务端已取得本次回答的真实结束确认，"
+    "本轮采用语义接话合同semantic_turn.v6。服务端已取得本次回答的真实结束确认，"
     "确认来源由服务端保证，不能从静音或普通陈述伪造。"
-    "‘没有补充了’只结束本次回答；没有明确拒绝追问或结束本话题时仍可answering且允许追问。"
+    "‘没有补充了’只结束本次回答；已有技术回答时，确认回复的‘没有’、‘补充完了’使用"
+    "finish_answer且followup_allowed=true。不能因为否定补充就写finish_topic或拒绝后续追问。"
+    "若确认来源是按钮且原文没有口头完成证据，保留answering、completion_basis=null，不能伪造口头证据。"
     "如果确认回复明确要求结束整场面试，必须stop_interview；明确跳过话题则finish_topic。",
 )
 
@@ -59,7 +68,7 @@ def semantic_turn_fields(*, evidence_ids=None):
     return {
         "answer_content": {"type": "string", "enum": ["technical", "partial", "none"]},
         "turn_intent": {"type": "string", "enum": [
-            "answering", "thinking", "finish_topic", "decline_topic", "stop_interview", "repeat", "clarify", "correction", "pause",
+            "answering", "thinking", "finish_answer", "finish_topic", "decline_topic", "stop_interview", "repeat", "clarify", "correction", "pause",
         ]},
         "followup_allowed": {"type": "boolean"},
         "completion_basis": {
@@ -115,7 +124,7 @@ def validate_semantic_turn(data, transcript):
                     raise ValueError("company_question_covers_technical_evidence")
     elif company is not None or data["suggested_action"] == "respond_company" or data["intent"] == "company_question":
         raise ValueError("company_question_contract_invalid")
-    ending = intent in {"finish_topic", "decline_topic", "stop_interview"}
+    ending = intent in {"finish_answer", "finish_topic", "decline_topic", "stop_interview"}
     if bool(basis) != ending:
         raise ValueError("semantic_completion_contract_invalid")
     if content == "none" and (data["claims"] or data["covered_capability_points"]):
@@ -125,7 +134,9 @@ def validate_semantic_turn(data, transcript):
     if data["intent"] == "answer_declined" and content != "none":
         raise ValueError("semantic_content_contract_invalid")
     if ending:
-        if (data["confidence"] < .75 or data["followup_allowed"] or data["suggested_action"] != "next"
+        if (data["confidence"] < .75 or data["suggested_action"] != "next"
+                or (data["followup_allowed"] != (intent == "finish_answer"))
+                or (intent == "finish_answer" and content == "none")
                 or data["ambiguities"] or data["intent"] not in {"answer", "answer_declined"}
                 or (content == "none") != (data["intent"] == "answer_declined")):
             raise ValueError("semantic_completion_contract_invalid")

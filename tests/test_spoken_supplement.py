@@ -255,8 +255,9 @@ def test_revised_prefix_cannot_be_treated_as_a_new_confirmation():
         endpoint.capture.current_final = _final("修订了旧回答。没有补充。")
         endpoint.speech_started()
         clock.value += 1
-        await _until(lambda: spoken[-1] == "clarify")
+        await _until(lambda: endpoint.capture.snapshots == [True, False])
         assert not endpoint.capture.replies and not commits
+        assert spoken == ["check"], "A rewrite entirely before the time boundary is not new speech"
         await endpoint.close()
     asyncio.run(scenario())
 

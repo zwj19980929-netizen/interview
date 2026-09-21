@@ -134,6 +134,25 @@ it("loads submitted interviews without opening a dead live monitor and refreshes
   expect(host.textContent).toContain("高度匹配");
 });
 
+it("shows the live followup over a stale REST question and hides captions belonging to the old turn", async () => {
+  workbench.route = { view: "live" };
+  workbench.data = { selectedInterview: { id: "synthetic", status: "in_progress", current_turn_id: "old",
+    turns: [{ id: "old", order: 1, question_spoken_text: "REST旧主问题" }] } };
+  workbench.request.mockResolvedValue({ ...review, processing: { report_status: "awaiting_submission" } });
+  let publish;
+  const state = { connection: { control: "connected", media: "connected" }, session: { status: "in_progress", current_turn_id: "child",
+    current_question: { turn_id: "child", question_text: "实时追问", is_followup: true } }, floor: "candidate", takeover: null,
+    captions: [{ text: "旧回答字幕", turnId: "old" }], acts: [], candidateStream: null, problem: null };
+  monitorOpen.mockResolvedValue({ close: vi.fn(), subscribe: (callback) => { publish = callback; callback(state); return () => {}; } });
+  await act(async () => root.render(<InterviewsPage />));
+  expect(host.querySelector(".question-panel h2").textContent).toBe("实时追问");
+  expect(host.querySelector(".question-panel").textContent).not.toContain("旧回答字幕");
+  await act(async () => publish({ ...state, captions: [...state.captions, { text: "当前追问字幕", turnId: "child" }] }));
+  expect(host.querySelector(".question-panel").textContent).toContain("当前追问字幕");
+  await act(async () => publish({ ...state, session: { ...state.session, current_turn_id: null, current_question: null } }));
+  expect(host.querySelector(".question-panel h2").textContent).toBe("当前没有待答题目");
+});
+
 it("labels regrading explicitly while retaining the previous evidence for reference", async () => {
   const value = warningReview();
   value.turns[0].answer.evaluation_status = "pending";
@@ -217,4 +236,24 @@ it("shows scoped short questions and safe committed planning metadata", async ()
   expect(host.textContent).toContain("检索批准题池、咨询专业证据专家");
   expect(host.textContent).toContain("模型调用 2 次");
   expect(host.textContent).not.toContain("NEVER_RENDER");
+});
+
+it("nests persisted followups under their parent with separate answers and their own playback", async () => {
+  const parent = { ...warningReview().turns[0], root_turn_id: "turn_1", parent_turn_id: null, question_spoken_text: "实际主问题" };
+  const child = { ...warningReview().turns[1], is_followup: true, root_turn_id: "turn_1", parent_turn_id: "turn_1", followup_depth: 1,
+    question_spoken_text: "实际追问", answer: { ...warningReview().turns[1].answer, final_transcript: "只属于追问的回答" } };
+  workbench.request.mockResolvedValue({ url: "/api/v1/private-media/child_answer" });
+  await show({ ...warningReview(), execution_schema_version: 3, turns: [parent, child] });
+  const childNode = host.querySelector('[data-turn-id="turn_1"] [data-turn-id="turn_2"]');
+  expect(childNode).not.toBeNull();
+  expect(childNode.textContent).toContain("实际追问");
+  expect(childNode.textContent).toContain("只属于追问的回答");
+  expect(childNode.textContent).not.toContain("回答原文1");
+  await act(async () => childNode.querySelector("button").click());
+  expect(host.querySelector(".review-answer h3").textContent).toBe("实际追问");
+  expect(host.querySelector(".review-answer").textContent).toContain("所属主问题：实际主问题");
+  expect(host.querySelector(".review-transcript").textContent).toBe("只属于追问的回答");
+  expect(host.querySelector(".review-answer").textContent).toContain("不重复计权");
+  await act(async () => button("播放本题音频").click());
+  expect(workbench.request).toHaveBeenCalledWith("/api/v1/interviews/synthetic/answers/answer_2/audio-url", { method: "POST" });
 });

@@ -7,7 +7,24 @@ from typing import Dict, Iterator, List, Optional, Set, Tuple
 
 from app.persistence.interface import Document, InterviewWatchdogKind, PersistenceTransaction, Predicate, TransactionBackend
 from app.persistence.read_only import ReadOnlyTransactionBackend
+from app.persistence.realtime_state import REALTIME_PATHS, realtime_state_from_values
 from app.repositories.sqlite import INTERVIEW_WATCHDOG_PREDICATES, SQLiteStore
+
+
+_REALTIME_FIELDS = ", ".join("'$.%s'" % ".".join(path) for path in REALTIME_PATHS)
+_REALTIME_QUERY = """
+SELECT json_extract(d.data, %s) AS fields,
+       json_type(d.data, '$.plan_snapshot') AS plan_type,
+       json_type(d.data, '$.agent_runtime') AS runtime_type,
+       json_type(d.data, '$.agent_runtime.takeover') AS takeover_type,
+       (SELECT json_extract(e.value, '$.event_id', '$.payload.act_id', '$.payload.approved')
+          FROM json_each(CASE WHEN json_type(d.data, '$.agent_events') = 'array'
+                             THEN json_extract(d.data, '$.agent_events') ELSE '[]' END) e
+         WHERE e.type = 'object' AND json_extract(e.value, '$.type') = 'conversation.act.selected'
+         ORDER BY e.key DESC LIMIT 1) AS selected
+FROM documents d WHERE d.collection = 'interviews' AND d.id = ?
+AND json_extract(d.data, '$.organization_id') = ?
+""" % _REALTIME_FIELDS
 
 
 class _SQLiteTransactionBackend(TransactionBackend):
@@ -38,6 +55,18 @@ class _SQLiteTransactionBackend(TransactionBackend):
             (collection, item_id),
         ).fetchone()
         return json.loads(row["data"]) if row else None
+
+    def get_interview_realtime_state(
+        self, *, organization_id: str, interview_id: str,
+    ) -> Optional[Document]:
+        row = self.connection.execute(_REALTIME_QUERY, (interview_id, organization_id)).fetchone()
+        if not row:
+            return None
+        return realtime_state_from_values(
+            json.loads(row["fields"]), json.loads(row["selected"]) if row["selected"] else None,
+            plan_type=row["plan_type"], runtime_type=row["runtime_type"],
+            takeover_type=row["takeover_type"],
+        )
 
     def list_documents(self, collection: str) -> List[Document]:
         rows = self.connection.execute(

@@ -64,6 +64,13 @@ class EnterpriseReviewService:
             turns.append(
                 {
                     "turn_id": turn["id"],
+                    "parent_turn_id": turn.get("parent_turn_id"),
+                    "root_turn_id": turn.get("root_turn_id") or turn["id"],
+                    "followup_depth": int(turn.get("followup_depth", 0)),
+                    "question_text": (turn.get("question_spoken_text") or turn["question_snapshot"].get("spoken_text")
+                                      or turn["question_snapshot"].get("question_text", "")),
+                    "question_spoken_text": (turn.get("question_spoken_text") or turn["question_snapshot"].get("spoken_text")
+                                             or turn["question_snapshot"].get("question_text", "")),
                     "phase": turn.get("phase", "position_bank"),
                     "status": turn["status"],
                     "skip_reason": turn.get("skip_reason"),
@@ -233,7 +240,8 @@ class EnterpriseReviewService:
                    if (item.get("root_turn_id") or item["turn_id"]) == root):
                 raise ApiError("TRANSCRIPTION_REVIEW_BUSY", "本题正在评分，请等待后刷新。", status_code=409)
             revisions = answer.setdefault("transcript_revisions", [])
-            revision = max([int(item["revision"]) for item in revisions], default=0) + 1
+            revision = max(int(answer.get("current_transcript_revision", 1)),
+                           max([int(item["revision"]) for item in revisions], default=0)) + 1
             now = utc_now()
             revisions.append(
                 {

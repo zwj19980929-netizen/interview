@@ -761,6 +761,13 @@ class InterviewService:
         with self.persistence.transaction(organization_id, read_only=True) as transaction:
             return self._required(transaction.interview_sessions.get(interview_id))
 
+    def get_realtime_state(
+        self, interview_id: str, organization_id: str = "org_default",
+    ) -> Dict[str, Any]:
+        """Read current guard fields without loading interview content/history."""
+        with self.persistence.transaction(organization_id, read_only=True) as transaction:
+            return self._required(transaction.interview_sessions.realtime_state(interview_id))
+
     def get_candidate_interview(
         self,
         interview_id: str,
@@ -781,7 +788,7 @@ class InterviewService:
                 "root_turn_id": turn.get("root_turn_id") or turn["id"],
                 "followup_depth": int(turn.get("followup_depth", 0)),
             }
-            if turn["id"] == current_turn_id or turn["status"] in {"completed", "skipped"}:
+            if turn["id"] == current_turn_id or turn["status"] in {"transcribing", "evaluating", "completed", "skipped"}:
                 projection["question_spoken_text"] = turn.get("question_spoken_text", "")
             turns.append(projection)
         return {
@@ -804,6 +811,7 @@ class InterviewService:
                     "id": answer.get("id"),
                     "turn_id": answer.get("turn_id"),
                     "evaluation_status": answer.get("evaluation_status"),
+                    "final_transcript": answer.get("final_transcript", ""),
                 }
                 for answer in session.get("answers", [])
             ],
@@ -1855,6 +1863,11 @@ class InterviewService:
             answer_id = payload["answer_id"]
             session = self._required(transaction.interview_sessions.get(interview_id))
             answer = deepcopy(self._answer_by_id(session, answer_id))
+            next_revision = max((item["revision"] for item in session.get("evaluation_revisions", [])
+                                 if item["answer_id"] == answer_id), default=0) + 1
+            if int(payload["revision"]) < next_revision:
+                transaction.outbox.complete(work_item_id, lease_token=running_work["lease_token"])
+                return {"status": "superseded", "answer_id": answer_id}
             if answer.get("evaluation_status") == "failed":
                 decision, _ = self._decide_and_persist(
                     transaction,
@@ -1872,6 +1885,10 @@ class InterviewService:
                 or answer.get("current_evidence_answer_ids")
                 or [answer_id]
             )
+            from app.domain.evaluation_evidence import evidence_fingerprint
+            input_fingerprint = evidence_fingerprint([
+                self._answer_by_id(session, item_id) for item_id in evidence_answer_ids
+            ])
             if len(evidence_answer_ids) > 1:
                 answer = self._merged_authoritative_answer(
                     session,
@@ -1889,6 +1906,7 @@ class InterviewService:
                 session.get("plan_snapshot", {}).get("role_requirement"),
             )
             evaluation["evidence_answer_ids"] = list(evidence_answer_ids)
+            evaluation["evidence_fingerprint"] = input_fingerprint
             evaluation["evidence_utterance_ids"] = [
                 item
                 for item in answer.get("evidence_utterance_ids", [])
@@ -1924,6 +1942,17 @@ class InterviewService:
 
         with self.persistence.transaction(organization_id) as transaction:
             session = self._required(transaction.interview_sessions.get(interview_id))
+            if evidence_fingerprint([self._answer_by_id(session, item_id)
+                                     for item_id in evidence_answer_ids]) != input_fingerprint:
+                failed = transaction.outbox.fail(work_item_id, "回答版本已变化，正在重新整理评分证据。",
+                    lease_token=running_work["lease_token"], error_code="evaluation_evidence_changed",
+                    retryable=True, retry_after_seconds=1)
+                if failed.get("status") == "dead_letter":
+                    self._decide_and_persist(transaction, session, LifecycleCommand(
+                        LifecycleCommandType.EVALUATION_FAILED,
+                        {"answer_id": answer_id, "error": "回答版本发生变化，请重试评分。",
+                         "error_code": "evaluation_evidence_changed"}), organization_id)
+                return {"id": evaluation["id"], "status": "superseded", "evidence_answer_ids": evidence_answer_ids}
             decision, work_items = self._decide_and_persist(
                 transaction,
                 session,
@@ -2106,6 +2135,8 @@ class InterviewService:
                     work_payload["evidence_answer_ids"] = list(
                         payload["evidence_answer_ids"]
                     )
+                if payload.get("evidence_fingerprint"):
+                    work_payload["evidence_fingerprint"] = payload["evidence_fingerprint"]
             elif effect["type"] == "report.requested":
                 kind = "interview.report.generate"
                 idempotency_key = "interview.report:%s:%s" % (interview_id, payload["revision"])
@@ -2295,6 +2326,19 @@ class InterviewService:
             item.get("utterance_id") for item in ordered if item.get("utterance_id")
         ]
         merged["root_turn_id"] = root_turn_id
+        merged["evidence_chain"] = []
+        for item in ordered:
+            turn = self._turn_by_id(session, item["turn_id"])
+            snapshot = turn["question_snapshot"]
+            merged["evidence_chain"].append({
+                "answer_id": item["id"], "turn_id": turn["id"],
+                "parent_turn_id": turn.get("parent_turn_id"), "root_turn_id": root_turn_id,
+                "question_text": turn.get("question_spoken_text") or snapshot.get("question_text", ""),
+                "answer_text": item["final_transcript"],
+                "target_point_ids": list(turn.get("assessed_rubric_point_ids") or snapshot.get("assessed_rubric_point_ids")
+                    or [p["id"] if isinstance(p, dict) else str(p) for p in snapshot.get("key_points", [])]),
+                "transcript_revision": int(item.get("current_transcript_revision", 1)),
+            })
         return merged
 
     def _build_followup_turn(

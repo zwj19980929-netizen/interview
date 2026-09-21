@@ -7,6 +7,7 @@ from app.core.errors import ApiError
 from app.core.ids import new_id
 from app.core.time import utc_now
 from app.domain.candidate_runtime import CANDIDATE_RUNTIME_PROBLEM_REASONS, runtime_pause_epoch
+from app.domain.evaluation_evidence import evidence_fingerprint
 from app.domain.adaptive_interview import (
     append_adaptive_question, assessment_contract, budget_summary, coverage_summary,
     closed_source_question_ids, is_adaptive, record_decision, validate_decision,
@@ -701,6 +702,10 @@ class InterviewSessionLifecycle:
         )
         if evidence_answer_ids:
             event_payload["evidence_answer_ids"] = list(evidence_answer_ids)
+            answers_by_id = {item["id"]: item for item in session.get("answers", [])}
+            event_payload["evidence_fingerprint"] = evidence_fingerprint(
+                [answers_by_id[item_id] for item_id in evidence_answer_ids]
+            )
         self._emit(session, events, "evaluation.requested", event_payload, now)
         effects.append({"type": "evaluation.requested", "payload": deepcopy(event_payload)})
 
@@ -735,8 +740,12 @@ class InterviewSessionLifecycle:
             or [answer["id"]]
         )
         answer["current_evidence_answer_ids"] = evidence_answer_ids
+        answer["current_evidence_fingerprint"] = (evaluation.get("evidence_fingerprint")
+            or payload.get("evidence_fingerprint") or answer.get("pending_evidence_fingerprint")
+            or evidence_fingerprint([self._answer(session, item_id) for item_id in evidence_answer_ids]))
         answer["evidence_group_status"] = "completed"
         answer.pop("pending_evidence_answer_ids", None)
+        answer.pop("pending_evidence_fingerprint", None)
         self._emit(
             session,
             events,
@@ -790,6 +799,14 @@ class InterviewSessionLifecycle:
                 and not self._has_unresolved_evaluations(session)
             ):
                 self._activate_next_or_report(session, now, events, effects)
+        elif turn.get("is_followup"):
+            # Correcting/regrading an already completed child must invalidate
+            # the score-bearing root too; its turn no longer says evaluating.
+            self._maybe_request_evidence_group_evaluation(
+                session, str(turn.get("root_turn_id") or ""), now, events, effects,
+            )
+            if previous_id and session.get("current_report_id") and not self._has_unresolved_evaluations(session):
+                self._request_report(session, "answer_regraded", now, events, effects, force=True)
         elif previous_id and session.get("current_report_id"):
             self._request_report(session, "answer_regraded", now, events, effects, force=True)
         elif (
@@ -1130,10 +1147,15 @@ class InterviewSessionLifecycle:
         root_answer = answers_by_turn.get(root_turn_id)
         if root_answer is None:
             return
-        evidence_answer_ids = [item["id"] for item in evidence_answers]
-        if root_answer.get("pending_evidence_answer_ids") == evidence_answer_ids:
+        if any(item.get("evaluation_status") != "completed" for item in evidence_answers):
             return
-        if root_answer.get("current_evidence_answer_ids") == evidence_answer_ids:
+        evidence_answer_ids = [item["id"] for item in evidence_answers]
+        fingerprint = evidence_fingerprint(evidence_answers)
+        if (root_answer.get("pending_evidence_answer_ids") == evidence_answer_ids
+                and root_answer.get("pending_evidence_fingerprint") == fingerprint):
+            return
+        if (root_answer.get("current_evidence_answer_ids") == evidence_answer_ids
+                and root_answer.get("current_evidence_fingerprint") == fingerprint):
             return
         existing = [
             item
@@ -1149,6 +1171,7 @@ class InterviewSessionLifecycle:
         root_answer["evaluation_status"] = "pending"
         root_answer["evidence_group_status"] = "pending"
         root_answer["pending_evidence_answer_ids"] = evidence_answer_ids
+        root_answer["pending_evidence_fingerprint"] = fingerprint
         root_answer["updated_at"] = now
         self._emit(
             session,

@@ -557,3 +557,13 @@ AgentEvent fan-out 先把每个可回放事件收敛为按类型 allow-list 的�
 `telemetry.observe` 是候选人鉴权后的无 PII、best-effort 进程观测旁路，不是 Agent 领域命令。合法样本直接进入固定指标词汇并显式让出调度；它不获取领域信号锁，不读写幂等键、InterviewSession、事件历史、Evidence journal 或 takeover 状态，非法/越界样本静默丢弃且不能暂停面试。候选端对 `avatar_viseme_drift_ms` 和 `avatar_freeze_ms` 分指标使用 1 秒窗口，只发送窗口最大值；连接关闭、播放停止或页面关闭时丢弃未发送窗口，其他低频延迟指标仍即时上报。Evidence owner 续租另以无标识符的 `evidence_owner_renew_scheduler_lag_ms`、`evidence_owner_renew_db_latency_ms` 和 `evidence_owner_renew_success` 观测调度、数据库与结果；观测失败不能改变续租正确性，已过期或 fence 不匹配仍严格 self-fence，旧 owner 不能恢复权威 Evidence。该 `EVIDENCE-LEASE-TELEMETRY-004` 合同已在仓库验证，目标新会话仍待复验，不能据此宣称生产完成。
 
 `REALTIME-WARMUP-VAD-RANGE-003` 当前状态为“verified（仓库），目标环境复验 pending”。该项只收紧私有媒体传输、Evidence 握手、暖场失败恢复、本地 VAD 与显示帧率门禁：暖场 final 失败只消费/封存一次原流，持久写入 `calibration_retry_required`，必须由候选人显式 `warmup.retry` 清门后才能新开流；服务端在该 durable gate 未清时拒绝直接 open。owner 执行 reset 后，live `warmup_retry` 或 snapshot 的 `retrying + retry_required=false` 都是已授权恢复事实，当前 control 可用新 causation open/reassert；重复 retry ACK 被忽略，旧 control 由 generation fence 拒绝，existing-open 只重发 ready ACK 而不重复创建付费 Provider 流。VRM FPS 健康判断使用与 UI 相同的显示整数 `Math.round(fps) >= minimum_fps`。面试抽题、冻结证据、答案形成、评分、追问、S2S/cascade 和人工接管业务规则均未改变；目标浏览器新会话中的 LiveKit/STT、私有媒体 seek/Range、扬声器回声与真实打断仍须环境复验。
+
+## FOLLOWUP-CONTEXT-055：接话与子题职责
+
+即时交流只响应思考、重读、题意澄清及面试流程；所有能力细节考察复用正式Followup → 独立Turn/Capture/Answer → root evidence group链路。问题选中即持久化，字幕/重读/候选问答树/复核报告引用同一turn身份。对白记忆按conversation.act.selected的sequence复原（含复用A→B→A），不是按审批对象创建时间猜测，且不把选中当成实际听到或评分证据。
+
+### 056 实际回答投影、完成范围与实时读取修复
+
+候选问答历史必须从候选 token 授权的最终 HTTP 白名单读取本人的 `answers.final_transcript`，不能只在 service 层添加后假定客户端已收到；“答案存在但文字尚未同步”不等于未提交。正式回答完成采用 `finish_answer`，保留独立追问机会；明确下一题、拒答或结束整场才关闭话题。追问仍在权威音频提交后形成独立子 turn，并沿055父子证据链展示、评分与报告。
+
+语音输出每帧仍检查持久化状态与所有权，但通过 `InterviewSessionRepository.realtime_state` 读取当前权限、话轮、播放和已选择表达所需字段，不反复把转写、计划与评分复制到实时事件循环。此读模型不是 TTL 缓存，也不授予新的播放或答案权限。正常完成、取消和恢复条件沿用原播放协议；缓冲、源样本时钟和帧序不变。

@@ -3,6 +3,7 @@ import { EncryptedAudioRingBuffer } from "./encrypted-audio-ring.js";
 import { claimPreparedCandidateMedia, runCandidatePreflight } from "./preflight.js";
 import { OrderedAgentEventStream } from "../interviews/agent-event-runtime.js";
 import { LiveSpeechPlayback } from "./live-speech-playback.js";
+import { questionFromAct } from "../interviews/question-tree.js";
 
 const EMPTY_AVATAR = {
   status: "idle",
@@ -1053,7 +1054,8 @@ class CandidateExperienceRun {
     }
     if (event.type === "conversation.act.selected") {
       this.currentAct = { ...payload, turnId: event.turn_id };
-      if (event.turn_id && ["question", "repeat", "followup"].includes(payload.act_type)) {
+      const selectedQuestion = questionFromAct(this.state.currentQuestion, event);
+      if (selectedQuestion) {
         const turnChanged = event.turn_id !== this.currentTranscriptTurnId();
         if (turnChanged) {
           window.clearTimeout(this.captionFreshnessTimer);
@@ -1064,12 +1066,7 @@ class CandidateExperienceRun {
           ...(turnChanged && this.state.phase === "answer_preparing" ? {
             phase: this.state.floor === "candidate" ? "preparing" : phaseForFloor(this.state.floor, this.state.phase),
           } : {}),
-          currentQuestion: {
-            ...(this.state.currentQuestion || {}),
-            turn_id: event.turn_id,
-            question_text: payload.text,
-            is_followup: payload.act_type === "followup",
-          },
+          currentQuestion: selectedQuestion,
         });
       }
       return;
@@ -1849,6 +1846,10 @@ class CandidateExperienceRun {
     const identity = { performance_id: performance.performance_id, output_id: performance.live_audio.output_id };
     try {
       playback.live = this.liveSpeech.begin(performance, {
+        onQualitySummary: ({ underflowCount, underflowMs }) => {
+          this.observeMetric("audio_playback_underflow_count", underflowCount);
+          this.observeMetric("audio_playback_underflow_ms", underflowMs);
+        },
         onReady: () => {
           if (this.isActivePlayback(playback)) this.sendSignal("avatar.performance.ready", identity, { turnId });
         },

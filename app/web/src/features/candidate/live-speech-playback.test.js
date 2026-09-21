@@ -26,6 +26,21 @@ function harness(id = "one", factory) {
 }
 afterEach(() => vi.useRealTimers());
 describe("counted approved PCM playback", () => {
+  it("reports underflow once at cleanup without allowing telemetry errors to interrupt cleanup", async () => {
+    vi.useFakeTimers(); const h = harness();
+    h.callbacks.onQualitySummary = vi.fn(() => { throw new Error("telemetry unavailable"); });
+    h.subscribe(); h.player.begin(h.performance, h.callbacks); await Promise.resolve();
+    h.data(); h.progress(480);
+    Object.assign(h.player.active.progress, { underflowCount: 2, underflowSamples: 12_000 });
+    expect(h.callbacks.onQualitySummary).not.toHaveBeenCalled();
+    h.player.cancel(); h.player.cancel(); h.player.close();
+    expect(h.callbacks.onQualitySummary).toHaveBeenCalledExactlyOnceWith({ underflowCount: 2, underflowMs: 500 });
+    expect(h.sink.close).toHaveBeenCalledOnce();
+    expect(h.callbacks.onError).not.toHaveBeenCalled();
+    expect(h.callbacks.onFinished).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it.each([true, false])("waits for exact track and worklet before ready, never double-plays RTC (%s)", async (trackFirst) => {
     vi.useFakeTimers(); const h = harness();
     if (trackFirst) h.subscribe(); h.player.begin(h.performance, h.callbacks); if (!trackFirst) h.subscribe();

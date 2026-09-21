@@ -7,6 +7,7 @@ import json
 from typing import Any, Dict
 
 from app.domain.adaptive_interview import closed_source_question_ids
+from app.services.dialogue_history import recent_turn_dialogue
 
 
 def assessment_contract(session: Dict[str, Any]) -> Dict[str, Any]:
@@ -31,6 +32,7 @@ def context_fingerprint(session: Dict[str, Any]) -> str:
         "company_context": (session.get("plan_snapshot") or {}).get("company_context"),
         "agenda": session.get("agenda"), "competency_evidence": session.get("competency_evidence"),
         "turns": [{"id": t["id"], "understanding": t.get("current_understanding"),
+                   "dialogue_focus": t.get("dialogue_focus"),
                    "question_id": t.get("question_id")} for t in session.get("turns", [])],
         "input_completed": session.get("candidate_input_completed_at"),
         "scheduled_end_at": session.get("scheduled_end_at"),
@@ -43,13 +45,7 @@ def conversation_memory(session: Dict[str, Any]) -> Dict[str, Any]:
     dialogue = []
     preferences = []
     for turn in session.get("turns", [])[-8:]:
-        utterances = turn.get("utterances") or []
-        if utterances:
-            dialogue.append({"speaker": "interviewer", "turn_id": turn["id"],
-                             "text": str(turn.get("question_spoken_text") or "")[:1000]})
-        for utterance in utterances[-2:]:
-            dialogue.append({"speaker": "candidate", "turn_id": turn["id"],
-                             "utterance_id": utterance.get("utterance_id"), "text": str(utterance.get("text") or "")[:1600]})
+        dialogue.extend(recent_turn_dialogue(session, turn))
         understanding = turn.get("current_understanding") or {}
         if understanding.get("intent") == "answer_declined" or understanding.get("followup_allowed") is False:
             preferences.append({"turn_id": turn["id"], "question_id": turn.get("question_id"),

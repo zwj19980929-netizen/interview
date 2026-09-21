@@ -4952,6 +4952,36 @@ body.candidate-mode .content {
 /* Interview processing and private replay */
 .interview-review { display: grid; gap: 20px; margin-top: 24px; }
 .review-question-tabs { display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0; }
+.candidate-parent-question { margin-bottom: 18px; padding: 14px 18px; border-left: 3px solid #9bbbae; background: #edf4f0; border-radius: 0 8px 8px 0; }
+.candidate-parent-question > span, .question-record-answer > span { color: var(--ink-muted); font-size: 13px; }
+.candidate-parent-question p { margin: 6px 0 0; line-height: 1.65; overflow-wrap: anywhere; }
+.question-history { width: 100%; margin-top: 30px; text-align: left; }
+.question-history-heading { display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px; margin-bottom: 14px; }
+.question-history-heading h2 { margin: 0; font-size: 19px; }
+.question-history-heading > span { color: var(--ink-muted); font-size: 13px; }
+.question-history-topic { margin: 12px 0; border: 1px solid var(--line, #dce3df); border-radius: 10px; background: white; overflow: hidden; }
+.question-history-topic > summary { cursor: pointer; padding: 16px 18px; line-height: 1.65; overflow-wrap: anywhere; }
+.question-history-topic > summary > span, .question-record-title > span { color: #436a59; margin-right: 12px; font-size: 13px; font-weight: 700; }
+.question-history-topic > summary small, .question-record-title small { display: inline-block; margin-left: 12px; color: #436a59; font-size: 12px; }
+.question-record { padding: 14px 18px; }
+.question-record.is-current { background: #f0f7f3; }
+.question-record-title { line-height: 1.7; overflow-wrap: anywhere; }
+.question-record-answer { margin-top: 10px; }
+.question-record-answer p, .review-outline-answer p { margin: 5px 0 0; line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; }
+.question-record-children { list-style: none; margin: 16px 0 0; padding: 0 0 0 16px; border-left: 2px solid #d9e8df; }
+.question-record-children > li + li { margin-top: 12px; }
+.question-record-children .question-record-children { padding-left: 8px; }
+.review-question-tree { display: grid; gap: 14px; margin: 20px 0; }
+.review-question-node { border: 1px solid #dce3df; padding: 16px; border-radius: 10px; background: #fcfdfc; }
+.review-question-node.is-selected { border-color: #8eb29e; }
+.review-question-text { margin: 12px 0 0; line-height: 1.7; overflow-wrap: anywhere; }
+.review-outline-answer { margin-top: 12px; color: var(--ink-muted); }
+.review-outline-answer summary { cursor: pointer; font-size: 13px; }
+@media (max-width: 600px) {
+  .question-record, .review-question-node { padding: 12px; }
+  .question-record-children { padding-left: 8px; }
+  .question-history-topic > summary { padding: 12px; }
+}
 .review-answer { border-top: 1px solid var(--border, #dce3df); padding-top: 20px; }
 .review-transcript { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.8; }
 .review-dimensions { display: flex; flex-wrap: wrap; gap: 24px; }

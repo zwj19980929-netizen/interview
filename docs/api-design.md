@@ -978,3 +978,17 @@ ProviderConnection 与 ModelConfiguration 响应增加单调递增的 `configura
 流式能力的管理员测试采用分层语义：`stt.streaming` 和 `speech.dialogue_realtime` 在收到 Provider 的 ready/session-created/session-updated 确认后返回 `probe_mode=handshake`，证明端点、凭据、模型访问和 session 参数可用，并立即主动关闭连接。探针不要求静音产生 final transcript，也不生成自由回答；WER、真实 final、首音、音质和打断必须继续用脱敏语音样本及候选人端到端链路验收。模型路由测试复用相同握手合同。
 
 具体 Provider manifest、STT/TTS 请求响应和错误语义见 [模型供应商插件化设计](model-provider-plugins.md)。
+
+## FOLLOWUP-CONTEXT-055：父子问答投影
+
+候选人GET仍鉴权并隐藏未来题、标准答案、评分依据和内部提示；已呈现的主题/追问（含evaluating）提供question_spoken_text和parent_turn_id/root_turn_id/followup_depth。answers新增final_transcript，仅返回该会话已落库的服务端权威回答（含已审计的人工更正），不能通过此接口提交文本答案。复核turn新增同样的父子关系和实际question_spoken_text。报告question_evaluations按根题附带独立answer与followups问答链，各子节点说明考察范围及是否纳入该根题证据；追问无第二份总分权重。
+
+## INTERVIEW-REGRESSIONS-056：候选人回答历史交付
+
+`GET /api/v1/public/interviews/{interview_id}` 的最终 HTTP 字段白名单保留 `answers[].final_transcript`，与服务层候选人投影一致。每条回答只交付 `id`、`turn_id`、`evaluation_status` 和服务端已持久化的 `final_transcript`；仍必须校验 `X-Candidate-Session-Token` 与部署租户，不能返回其他场次回答、未来题目文字、音频地址、供应商片段、评分依据、标准答案或内部提示。
+
+候选人问答记录以该题是否存在回答对象判断提交状态：已有回答但文字缺失时显示“回答已提交，文字记录暂未同步”并提供重新同步；当前题尚无回答时显示正在交流；非当前题尚无回答才显示尚未提交。同步仅发生在既有题目/回答边界或显式重试，不以字幕 partial 或音频帧触发请求，页面显示的文字也不能形成新答案。
+
+056 音频诊断补充：候选端流式输出结束、打断或取消时，若已有有效消费统计，仅发送一次 `audio_playback_underflow_count` 与 `audio_playback_underflow_ms` 数值摘要，包含播放中发生并已恢复的欠载；没有首声、未知统计或已关闭连接不补报。沿用 `telemetry.observe` 的进程内固定词汇及非权威属性，不写问答、不触发暂停、不充当播放完成确认；遥测异常不能阻断播放清理。启动缓冲不计欠载，终止时仍未恢复的断供可能没有包含在此统计中，不能据零值推断任何环境下均无卡顿。
+
+问答树展示时按持久turn的order排序，主题编号扣除已知的前置追问，子题在父题内独立编号；稀疏历史记录仍保留既有order信息。该编号仅供展示，不更改turn_id、父子引用或评分归属。

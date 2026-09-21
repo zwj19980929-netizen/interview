@@ -23,6 +23,7 @@ from app.core.interview_agent_metrics import (
 )
 from app.core.time import utc_now
 from app.domain.adaptive_interview import is_adaptive
+from app.core.prompt.contracts import SUPPLEMENT_SPEECH_VERSION
 from app.core.prompt.interviewer_supervisor import transition_speech
 from app.domain.interview_agent import (
     ApprovedConversationAct,
@@ -1243,10 +1244,10 @@ class AgentChannel:
                 ):
                     return False
                 try:
-                    with self.runtime.persistence.transaction(self.organization_id) as transaction:
+                    with self.runtime.persistence.transaction(self.organization_id, read_only=True) as transaction:
                         if closing_fence is not None:
                             assert_current_evidence_fence(transaction, closing_fence)
-                        current = transaction.interview_sessions.get(self.interview_id)
+                        current = transaction.interview_sessions.realtime_state(self.interview_id)
                         if not current or current.get("current_turn_id") != closing_turn_id:
                             return False
                         state = current.get("agent_runtime") or {}
@@ -1811,7 +1812,10 @@ class AgentChannel:
         current = self.runtime._current_turn(session)
         if current is None:
             raise ApiError("INTERVIEW_TURN_NOT_ACTIVE", "There is no question to repeat.", status_code=409)
-        await self._select_turn(current, signal.causation_id, act_type="repeat")
+        from app.services.dialogue_focus import question_for_repeat
+        await self._select_act(act_type="repeat", text=question_for_repeat(current),
+            turn_id=current["id"], causation_id=signal.causation_id,
+            evidence_refs=[], gesture="look_at_candidate")
 
     async def _select_turn(
         self,
@@ -1853,6 +1857,7 @@ class AgentChannel:
         approval_guard: Any = None,
         prompt_version: Optional[str] = None,
         on_playback_selected: Any = None,
+        dialogue_question: bool = False,
     ) -> Optional[AvatarPerformance]:
         if not text.strip():
             raise ApiError("CONVERSATION_ACT_EMPTY", "Approved conversation act is empty.", status_code=409)
@@ -1914,7 +1919,7 @@ class AgentChannel:
                 with self.runtime.persistence.transaction(self.organization_id, read_only=True) as transaction:
                     if owner_fence is not None:
                         assert_current_evidence_fence(transaction, owner_fence)
-                    session = transaction.interview_sessions.get(self.interview_id)
+                    session = transaction.interview_sessions.realtime_state(self.interview_id)
                     if not session or session.get("status") not in allowed_statuses:
                         return False
                     self.runtime.interviews.assert_skill_authorized(transaction, session)
@@ -1999,6 +2004,7 @@ class AgentChannel:
                         self.runtime._set_active_performance(
                             self.interview_id, performance.performance_id, self.organization_id,
                             output_id=output.output_id, act_event_id=selected_event.event_id,
+                            dialogue_act_id=act.act_id if dialogue_question or act_type == "clarification" else None,
                         )
                         expected_performance_id = performance.performance_id
                         if on_playback_selected is not None:
@@ -2069,7 +2075,8 @@ class AgentChannel:
         if not expression_is_current():
             return None
         self.runtime._set_active_performance(
-            self.interview_id, performance.performance_id, self.organization_id
+            self.interview_id, performance.performance_id, self.organization_id,
+            dialogue_act_id=act.act_id if dialogue_question or act_type == "clarification" else None,
         )
         if on_playback_selected is not None:
             on_playback_selected()
@@ -3062,6 +3069,7 @@ class InterviewAgentRuntime:
     def _set_active_performance(
         self, interview_id: str, performance_id: Optional[str], organization_id: str,
         *, output_id: Optional[str] = None, act_event_id: Optional[str] = None,
+        dialogue_act_id: Optional[str] = None,
     ) -> None:
         with self.persistence.transaction(organization_id) as transaction:
             session = self._required(transaction.interview_sessions.get(interview_id))
@@ -3071,6 +3079,12 @@ class InterviewAgentRuntime:
             session["agent_runtime"]["active_output_id"] = output_id
             session["agent_runtime"]["active_expression_act_event_id"] = act_event_id
             session["agent_runtime"]["expression_replay_act_event_id"] = None
+            if dialogue_act_id and performance_id and session.get("status") == "in_progress":
+                turn = next((item for item in session.get("turns", [])
+                             if item["id"] == session.get("current_turn_id")), None)
+                if turn and any(act.get("act_id") == dialogue_act_id and act.get("turn_id") == turn["id"]
+                                for act in turn.get("conversation_acts", [])):
+                    turn["dialogue_focus"] = {"act_id": dialogue_act_id}
             session["updated_at"] = utc_now()
             transaction.interview_sessions.update(session, expected_version=session["version"])
 
@@ -3348,7 +3362,7 @@ class InterviewAgentRuntime:
                 prompt_version=(
                     prompt_version or "controlled_followup.v1"
                     if act_type == "followup"
-                    else prompt_version or ("supplement_confirmation.v1" if act_type.startswith("supplement_")
+                    else prompt_version or (SUPPLEMENT_SPEECH_VERSION if act_type.startswith("supplement_")
                     else None)
                 ),
                 created_at=utc_now(),

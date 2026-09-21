@@ -9,6 +9,7 @@ from app.persistence.interface import (
     is_interview_watchdog_candidate,
 )
 from app.persistence.read_only import ReadOnlyTransactionBackend
+from app.persistence.realtime_state import project_realtime_state
 from app.repositories.memory import InMemoryStore
 
 
@@ -64,6 +65,14 @@ class _MemoryTransactionBackend(TransactionBackend):
 
     def get_document(self, collection: str, item_id: str) -> Optional[Document]:
         return deepcopy(self.documents[collection].get(item_id))
+
+    def get_interview_realtime_state(
+        self, *, organization_id: str, interview_id: str,
+    ) -> Optional[Document]:
+        item = self.documents["interviews"].get(interview_id)
+        if not item or item.get("organization_id") != organization_id:
+            return None
+        return project_realtime_state(item)
 
     def list_documents(self, collection: str) -> List[Document]:
         return [deepcopy(item) for item in self.documents[collection].values()]

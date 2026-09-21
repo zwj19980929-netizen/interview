@@ -9,7 +9,7 @@ from array import array
 from app.adapters.private_media import pcm_wav_header
 from app.model_gateway.schemas import TTSSynthesizeResponse, ProviderMeta
 
-from app.core.prompt.contracts import SUPPLEMENT_SPEECH
+from app.core.prompt.contracts import SUPPLEMENT_SPEECH, SUPPLEMENT_SPEECH_VERSION
 from app.domain.interview_agent import ClientSignal
 from app.services.conversation_understanding import ConversationUnderstandingService
 from test_answer_endpoint import _Clock
@@ -154,6 +154,9 @@ def test_five_second_check_then_spoken_no_submits_original_answer_with_no_button
             await _finish_playback(channel, runtime, managed)
             acts = [e["payload"] for e in _current(runtime)["agent_events"] if e["type"] == "conversation.act.selected"]
             assert acts[-1]["act_type"] == "supplement_check" and acts[-1]["text"] == SUPPLEMENT_SPEECH["check"]
+            stored_turn = next(turn for turn in _current(runtime)["turns"] if turn["id"] == TURN_ID)
+            approved = next(act for act in stored_turn["conversation_acts"] if act["act_id"] == acts[-1]["act_id"])
+            assert approved["prompt_version"] == SUPPLEMENT_SPEECH_VERSION == "supplement_confirmation.v2"
             assert tts_texts == [SUPPLEMENT_SPEECH["check"]]
             assert not _current(runtime)["answers"]
             assert managed._capture_id == capture_id
@@ -164,7 +167,7 @@ def test_five_second_check_then_spoken_no_submits_original_answer_with_no_button
             await _wait_until(lambda: all(c["status"] == "completed" for c in store.evidence_commands.values()))
             _assert_one_automatic_answer(store, runtime, _PREFIX + "没有补充了。", voice_frames=5, continuation_frames=5)
             assert _current(runtime)["turns"][0]["current_understanding"]["prompt_version"] in {
-                "interview_turn_understanding.v19", "interview_turn_decision.v18",
+                "interview_turn_understanding.v23", "interview_turn_decision.v22",
             }
     asyncio.run(scenario())
 

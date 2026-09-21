@@ -10,6 +10,75 @@ import logging
 
 _LOG = logging.getLogger(__name__)
 
+
+def _mapped_segments(transcript: Any) -> Any:
+    """Map every segment's exact words into the complete server text."""
+    segments = getattr(transcript, "segments", ())
+    if not segments:
+        return None
+    text, cursor, mapped = transcript.text.strip(), 0, []
+    for segment in segments:
+        if not segment.text.strip():
+            return None
+        # Some adapters separate sentences with whitespace while others
+        # concatenate them. Map exact segment words into the final; only
+        # whitespace may occur between them, never missing recognized words.
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        words = segment.text.strip()
+        if not text.startswith(words, cursor):
+            return None
+        start = cursor
+        cursor += len(words)
+        mapped.append((segment, start, cursor))
+    if text[cursor:].strip():
+        return None
+    return mapped
+
+
+def _timed_segments(transcript: Any) -> Any:
+    """Return a complete, ordered capture timeline, or no timing authority."""
+    mapped = _mapped_segments(transcript)
+    if not mapped:
+        return None
+    previous_end = 0
+    for segment, _, _ in mapped:
+        if (type(segment.start_ms) is not int or type(segment.end_ms) is not int
+                or segment.start_ms < previous_end or segment.end_ms <= segment.start_ms):
+            return None
+        previous_end = segment.end_ms
+    return [segment for segment, _, _ in mapped], [start for _, start, _ in mapped]
+
+
+def _speech_since(transcript: Any, previous: Any, previous_text: str) -> Any:
+    """Separate fresh server speech from earlier words, without guessing edits.
+
+    Exact text prefixes retain support for final providers without useful
+    timestamps. If old words changed, only a complete capture-relative timeline
+    with an intact old time boundary can identify new speech. A segment spanning
+    that boundary, missing history or stream-relative/reset times is ambiguous.
+    Current speech is never truncated: an early qualification, quoted command or
+    unresolved transcription dispute must remain available to the classifier.
+    """
+    text = transcript.text.strip()
+    if text.startswith(previous_text):
+        return text[len(previous_text):].strip()
+    prior_timing = _timed_segments(previous) if previous is not None else None
+    timing = _timed_segments(transcript)
+    if not prior_timing or not timing:
+        return None
+    prior_segments, _ = prior_timing
+    segments, starts = timing
+    boundary_ms = prior_segments[-1].end_ms
+    past = [segment for segment in segments if segment.end_ms <= boundary_ms]
+    fresh = [segment for segment in segments if segment.start_ms >= boundary_ms]
+    if (len(past) + len(fresh) != len(segments) or not past
+            or past[0].start_ms != prior_segments[0].start_ms
+            or past[-1].end_ms != boundary_ms):
+        return None
+    return text[starts[len(past)]:].strip() if fresh else ""
+
+
 class SpokenSupplementConfirmation:
     """Keep the answer and its control replies on the same private recording.
 
@@ -30,7 +99,7 @@ class SpokenSupplementConfirmation:
         self.reply_seen = False
         self._after_speech = "awaiting_reply"
         self._reminded = False
-        self._boundary_segments = 0
+        self._boundary_final = None
         self._playback_started_at = 0.0
         self._missing_reply_since = None
         self._confirmed_final = None
@@ -38,7 +107,12 @@ class SpokenSupplementConfirmation:
         self._semantic_wait_identity = None
         self._reception_cache = None
         self._reception_seen_text = ""
+        self._reception_seen_final = None
         self._failure_spoken_identity = None
+
+    def _remember_boundary(self, final: Any) -> None:
+        self.boundary = final.text.strip()
+        self._boundary_final = final.model_copy(deep=True)
 
     @property
     def speaking(self) -> bool:
@@ -187,9 +261,8 @@ class SpokenSupplementConfirmation:
             return
         if self.semantic_first and await self._semantic_turn(endpoint, final):
             return
-        self.boundary = final.text.strip()
+        self._remember_boundary(final)
         self._clarification_revision = None
-        self._boundary_segments = len(final.segments)
         self._reminded = False
         await self._say(endpoint, "check", afterwards="awaiting_reply")
 
@@ -208,14 +281,14 @@ class SpokenSupplementConfirmation:
         if not text:
             return False
         phase = "awaiting_reply" if self.phase in {"awaiting_reply", "classifying"} else "listening"
-        cache_key = (text, phase)
+        previous = self._reception_seen_text
+        new_text = _speech_since(final, self._reception_seen_final, previous)
+        if not new_text:
+            return False
+        cache_key = (text, phase, previous)
         if self._reception_cache and self._reception_cache[0] == cache_key:
             decision = self._reception_cache[1]
         else:
-            previous = self._reception_seen_text
-            new_text = text[len(previous):].strip() if previous and text.startswith(previous) else text
-            if not new_text:
-                return False
             try:
                 decision = await endpoint._infer(classify(new_text, phase=phase, preceding_text=previous), timeout=5.5)
                 endpoint.assert_current()
@@ -227,7 +300,11 @@ class SpokenSupplementConfirmation:
                 endpoint.trace("reception_unavailable", error_type=type(exc).__name__)
                 decision = {"kind": "other", "confidence": 0.0}
             self._reception_cache = (cache_key, decision)
+        if not prepare_only:
+            # A preview may be repaired at the final cut. It is never a cursor
+            # that can consume words or hide the eventual corrected request.
             self._reception_seen_text = text
+            self._reception_seen_final = final.model_copy(deep=True)
         confidence = minimum_reported_confidence(final.confidence, decision["confidence"])
         if decision["kind"] == "other" or confidence is None or confidence < .75:
             return False
@@ -247,7 +324,7 @@ class SpokenSupplementConfirmation:
                                  reply_text=decision.get("reply_text", ""))
         if spoken:
             self._semantic_wait_identity = identity
-            self.boundary, self._boundary_segments = text, len(final.segments)
+            self._remember_boundary(final)
         else:
             endpoint._retry_at = endpoint.clock() + 2
         return True
@@ -300,7 +377,7 @@ class SpokenSupplementConfirmation:
             return True
         if understanding.suggested_action == "continue_listening":
             self._semantic_wait_identity = identity
-            self.boundary, self._boundary_segments = final.text.strip(), len(final.segments)
+            self._remember_boundary(final)
             await endpoint._notify("answer_listening")
             if not await self._say(endpoint, "reception_wait" if understanding.turn_intent == "thinking" else "reception_continue",
                                    afterwards="listening"):
@@ -328,7 +405,7 @@ class SpokenSupplementConfirmation:
         self._confirmed_final = None
         endpoint._explicit_revision = None
         endpoint._discard_confirmed_preparation()
-        self.boundary, self._boundary_segments = final.text.strip(), len(final.segments)
+        self._remember_boundary(final)
         self.phase, self._after_speech = "preparing_company", "listening"
         self._playback_started_at = endpoint.clock()
         try:
@@ -352,8 +429,7 @@ class SpokenSupplementConfirmation:
             raise ValueError("Clarification target is not grounded in the current final")
         self.confirmed = False
         self._confirmed_final = None
-        self.boundary = final.text.strip()
-        self._boundary_segments = len(final.segments)
+        self._remember_boundary(final)
         self._clarification_revision = endpoint.revision
         endpoint._explicit_revision = None
         endpoint._discard_confirmed_preparation()
@@ -388,14 +464,16 @@ class SpokenSupplementConfirmation:
             await endpoint._notify("transcript_unavailable")
             return
         self._missing_reply_since = None
+        if getattr(final, "type", None) != "transcript.final" or not getattr(final, "is_final", False):
+            raise ValueError("Supplement completion requires a complete server final")
         text = final.text.strip()
-        if not text.startswith(self.boundary):
-            # A revised old prefix is not a fresh answer to our question.
-            self.boundary = text
-            self._boundary_segments = len(final.segments)
+        reply = _speech_since(final, self._boundary_final, self.boundary)
+        if reply is None:
+            # An ambiguous edit still needs another reply; a positively timed
+            # new segment does not lose consent merely because old ASR changed.
+            self._remember_boundary(final)
             await self._say(endpoint, "clarify", afterwards="awaiting_reply")
             return
-        reply = text[len(self.boundary):].strip()
         if not reply:
             self.reply_seen = False
             if (self._confirmed_final is not None
@@ -404,11 +482,18 @@ class SpokenSupplementConfirmation:
                 # acoustic interruption added no words. Never reuse on None.
                 await self._accept_finish(endpoint, final)
             return
-        segments = final.segments[self._boundary_segments:]
+        # Map the reply's exact suffix rather than trusting an old segment
+        # count after repair. A segment spanning the boundary still contributes
+        # its confidence; absent mapping falls back conservatively. Clear new
+        # words must not inherit individual old-segment quality forever, while
+        # the provider's aggregate final confidence remains a separate gate.
+        mapped = _mapped_segments(final)
+        reply_start = len(text) - len(reply)
+        segments = ([segment for segment, _, end in mapped if end > reply_start]
+                    if mapped else final.segments)
         confidence = minimum_reported_confidence(final.confidence, *(s.confidence for s in segments))
         if confidence is not None and confidence < 0.65:
-            self.boundary = text
-            self._boundary_segments = len(final.segments)
+            self._remember_boundary(final)
             await self._say(endpoint, "clarify", afterwards="awaiting_reply")
             return
         self.phase = "classifying"
@@ -455,21 +540,18 @@ class SpokenSupplementConfirmation:
             await self._accept_finish(endpoint, final)
         elif action in {"continue", "supplement"} and decision["confidence"] >= 0.75:
             self._confirmed_final = None
-            self.boundary = text
-            self._boundary_segments = len(final.segments)
+            self._remember_boundary(final)
             await self._say(endpoint, "continue", afterwards="listening")
         elif action == "pause" and decision["confidence"] >= 0.75:
             await self.speak("pause", endpoint.assert_current)
         else:
             self._confirmed_final = None
-            self.boundary = text
-            self._boundary_segments = len(final.segments)
+            self._remember_boundary(final)
             await self._say(endpoint, "clarify", afterwards="awaiting_reply")
 
     async def _accept_finish(self, endpoint: Any, final: Any) -> None:
         self.confirmed = True
         self.phase = "confirmed"
         self._confirmed_final = final.model_copy(deep=True)
-        self.boundary = final.text.strip()
-        self._boundary_segments = len(final.segments)
+        self._remember_boundary(final)
         await endpoint._propose(final_snapshot=final, recognition_resumed=self.semantic_first)

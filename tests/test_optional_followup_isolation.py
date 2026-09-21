@@ -76,7 +76,7 @@ class ValidatingGateway:
 
 
 @pytest.mark.parametrize("patch,reason,path", [
-    ({"target_point_ids": ["P2"]}, "capability_binding_invalid", "$.followup.target_point_ids"),
+    ({"target_point_ids": ["P2"], "rationale": ""}, "detail_rationale_missing", "$.followup.rationale"),
     ({"evidence_id": "E2"}, "evidence_binding_invalid", "$.followup.evidence_id"),
     ({"question_text": "怎样执行？又怎样验证？"}, "question_shape_invalid", "$.followup.question_text"),
     ({"sensitive_attribute_inference": True}, "safety_gate_rejected", "$.followup"),
@@ -259,7 +259,7 @@ async def test_each_rejection_has_scope_without_reusing_a_previous_provider_requ
 @pytest.mark.anyio
 async def test_unexpected_provider_identifier_is_omitted_from_diagnostics(caplog):
     data = response()
-    data["followup"]["target_point_ids"] = ["P2"]
+    data["followup"]["question_text"] = "怎样执行？又怎样验证？"
     gateway = ValidatingGateway(data, request_id="https://private.invalid/path?token=private_secret\n")
     service = ConversationUnderstandingService(InMemoryStore(), gateway=gateway)
     await service.prepare_decision(*inputs())

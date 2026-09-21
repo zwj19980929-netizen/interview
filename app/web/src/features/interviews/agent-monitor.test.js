@@ -84,6 +84,28 @@ describe("enterprise takeover media contracts", () => {
     };
   });
 
+  it("updates the current question immediately on a followup act and retains it through repeat", async () => {
+    const socket = new FakeSocket();
+    const monitor = createEnterpriseInterviewMonitor({ socketFactory: () => socket,
+      request: async () => ({ agent_ticket: "synthetic", agent_ws_url: "/agent",
+        media: { status: "ready", url: "wss://livekit.test", participant_token: "synthetic-observer" } }) });
+    const run = await monitor.open({ interviewId: "iv_1", actorId: "admin", canTakeover: false });
+    let state;
+    const unsubscribe = run.subscribe(value => { state = value; });
+    try {
+      socket.emit("message", { data: JSON.stringify(agentEvent(1, "session.snapshot", enterpriseSnapshot())) });
+      socket.emit("message", { data: JSON.stringify({ ...agentEvent(2, "conversation.act.selected",
+        { act_id: "follow", act_type: "followup", text: "追问当前方案的回滚边界", approved: true }), turn_id: "child" }) });
+      expect(state.session).toMatchObject({ current_turn_id: "child", current_question: { turn_id: "child", is_followup: true, question_text: "追问当前方案的回滚边界" } });
+      socket.emit("message", { data: JSON.stringify({ ...agentEvent(3, "conversation.act.selected",
+        { act_id: "repeat", act_type: "repeat", text: "追问当前方案的回滚边界", approved: true }), turn_id: "child" }) });
+      expect(state.session.current_question.is_followup).toBe(true);
+      socket.emit("message", { data: JSON.stringify({ ...agentEvent(4, "conversation.act.selected",
+        { act_id: "ack", act_type: "conversation_acknowledgement", text: "我在听", approved: true }), turn_id: "child" }) });
+      expect(state.session.current_question.question_text).toBe("追问当前方案的回滚边界");
+    } finally { unsubscribe(); await run.close(); }
+  });
+
   it("keeps the base room subscribe-only and exchanges an active lease for microphone media", async () => {
     const socket = new FakeSocket();
     const audioTrack = { stop: vi.fn() };

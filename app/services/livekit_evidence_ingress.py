@@ -667,7 +667,8 @@ class ManagedLiveKitEvidenceSession:
                 if request_kind == "repeat":
                     session = self.supervisor.interviews.get_interview(self.interview_id, self.organization_id)
                     turn = next(item for item in session["turns"] if item["id"] == turn_id)
-                    question = turn.get("question_spoken_text") or turn.get("question_snapshot", {}).get("question_text", "")
+                    from app.services.dialogue_focus import question_for_repeat
+                    question = question_for_repeat(turn)
                     text = reception_repeat(question)
                 else:
                     text = reply_text or RECEPTION_SPEECH.get(request_kind, RECEPTION_SPEECH["unclear"])
@@ -675,6 +676,7 @@ class ManagedLiveKitEvidenceSession:
                     act_type="conversation_acknowledgement", text=text,
                     turn_id=turn_id, causation_id=None, evidence_refs=[], gesture="listen",
                     approval_guard=guard, prompt_version=RECEPTION_VERSION if reply_text else RECEPTION_SPEECH_VERSION,
+                    dialogue_question=request_kind == "question_clarification",
                     on_playback_selected=lambda: self._answer_endpoint.confirmation.playback_selected(self._answer_endpoint),
                 )
                 self._supplement_performance_id = performance.performance_id if performance else None
@@ -1527,7 +1529,7 @@ class ManagedLiveKitEvidenceSession:
         )
 
     def _interview_is_terminal(self) -> bool:
-        session = self.supervisor.interviews.get_interview(
+        session = self.supervisor.interviews.get_realtime_state(
             self.interview_id, self.organization_id
         )
         return session.get("status") in _TERMINAL_INTERVIEW_STATUSES

@@ -85,6 +85,7 @@ class ReportService:
                     "covered_key_points": deepcopy(evaluation["covered_key_points"]),
                     "missing_key_points": deepcopy(evaluation["missing_key_points"]),
                     "evidence": [item["evidence"] for item in evaluation["covered_key_points"]],
+                    "evidence_sources": deepcopy(evaluation.get("evidence_sources", [])),
                     "evidence_answer_ids": deepcopy(
                         evaluation.get("evidence_answer_ids") or [answer["id"]]
                     ),
@@ -92,6 +93,9 @@ class ReportService:
                         evaluation.get("evidence_utterance_ids") or []
                     ),
                     "summary": evaluation["feedback"],
+                    **(self._question_chain(interview, turns_by_id[answer["turn_id"]],
+                                           evaluation.get("evidence_answer_ids") or [answer["id"]])
+                       if answer.get("turn_id") in turns_by_id else {}),
                 }
             )
 
@@ -180,6 +184,52 @@ class ReportService:
                                 followup_suggestions=["结合未考察范围与已有证据人工复核。"])
         return project_report(document, interview)
 
+    @staticmethod
+    def _question_chain(interview, root, evidence_answer_ids):
+        """Freeze presented Q/A pairs; only the root carries a report weight."""
+        answers = {item["turn_id"]: item for item in interview.get("answers", [])}
+        evidence_ids = set(evidence_answer_ids)
+        root_id = root.get("id")
+
+        def project(turn):
+            answer = answers.get(turn.get("id"))
+            snapshot = turn.get("question_snapshot") or {}
+            return {
+                "turn_id": turn.get("id"), "parent_turn_id": turn.get("parent_turn_id"),
+                "root_turn_id": turn.get("root_turn_id") or turn.get("id"),
+                "followup_depth": int(turn.get("followup_depth", 0)),
+                "question_text": turn.get("question_spoken_text") or snapshot.get("spoken_text") or snapshot.get("question_text", ""),
+                "status": turn.get("status"),
+                "answer": ({"id": answer["id"], "turn_id": answer["turn_id"],
+                            "root_turn_id": answer.get("root_turn_id") or answer["turn_id"],
+                            "utterance_id": answer.get("utterance_id"),
+                            "final_transcript": answer.get("final_transcript", ""),
+                            "transcript_revision": int(answer.get("current_transcript_revision", 1)),
+                            "transcript_source": answer.get("transcript_source"),
+                            "evaluation_id": answer.get("current_evaluation_id"),
+                            "evaluation_status": answer.get("evaluation_status")} if answer else None),
+                "included_in_root_evidence": bool(answer and answer["id"] in evidence_ids),
+                "scope": {"inquiry_unit_id": turn.get("inquiry_unit_id") or snapshot.get("inquiry_unit_id"),
+                          "assessed_rubric_point_ids": deepcopy(turn.get("assessed_rubric_point_ids") or
+                                                               snapshot.get("assessed_rubric_point_ids") or
+                                                               [p["id"] if isinstance(p, dict) else str(p) for p in snapshot.get("key_points", [])]),
+                          "target_key_points": deepcopy(turn.get("target_key_points", [])),
+                          "competency_ids": deepcopy(turn.get("competency_ids", [])),
+                          "counts_toward_score": not bool(turn.get("is_followup")),
+                          "weight": 0.0 if turn.get("is_followup") else float(turn.get("weight", 0.0))},
+            }
+
+        result = project(root)
+        linked = {root_id}
+        children = []
+        for turn in sorted(interview.get("turns", []), key=lambda item: int(item.get("order", 0))):
+            if (turn.get("is_followup") and turn.get("root_turn_id") == root_id
+                    and turn.get("parent_turn_id") in linked):
+                children.append(project(turn))
+                linked.add(turn["id"])
+        result["followups"] = children
+        return result
+
     def get_report(self, interview_id: str, organization_id: str = "org_default") -> Dict[str, Any]:
         interview = self._get_interview(interview_id, organization_id)
         report_id = interview.get("current_report_id")
@@ -227,6 +277,7 @@ class ReportService:
                 "strengths",
                 "risks",
                 "followup_suggestions",
+                "question_evaluations",
                 "generated_at",
             ]
             writer = csv.DictWriter(output, fieldnames=fields)
@@ -244,6 +295,7 @@ class ReportService:
                     "strengths": json.dumps(report.get("strengths", []), ensure_ascii=False),
                     "risks": json.dumps(report.get("risks", []), ensure_ascii=False),
                     "followup_suggestions": json.dumps(report.get("followup_suggestions", []), ensure_ascii=False),
+                    "question_evaluations": json.dumps(report.get("question_evaluations", []), ensure_ascii=False),
                     "generated_at": report["generated_at"],
                 }
             )

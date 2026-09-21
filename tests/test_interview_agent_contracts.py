@@ -592,6 +592,11 @@ def test_candidate_telemetry_is_ephemeral_non_idempotent_and_fair_on_sqlite(
             await channel.send(shared_sample)
         assert metrics.snapshot()["avatar_viseme_drift_ms"]["count"] == 512
 
+        for name, value in (("audio_playback_underflow_count", 2), ("audio_playback_underflow_ms", 500)):
+            await channel.send(ClientSignal(type="telemetry.observe", idempotency_key="quality_" + name,
+                                            payload={"metric": name, "value": value}))
+            assert metrics.snapshot()[name]["max"] == value
+
         invalid_samples = [
             {},
             {"metric": "not_registered", "value": 1},
@@ -1402,7 +1407,8 @@ def test_warmup_is_ephemeral_and_question_is_selected_only_after_confirmation(
     asyncio.run(scenario())
 
 
-def test_expression_reuses_frozen_controlled_followup_act_without_duplication() -> None:
+@pytest.mark.parametrize("frozen_version", ["controlled_followup.v1", "controlled_followup.v2", "interview_turn_decision.v22", None])
+def test_expression_reuses_frozen_controlled_followup_act_without_duplication(frozen_version) -> None:
     store = InMemoryStore()
     session = _runtime_session(store)
     frozen = {
@@ -1416,7 +1422,7 @@ def test_expression_reuses_frozen_controlled_followup_act_without_duplication() 
         "followup_depth": 1,
         "evaluative": False,
         "approved_by": "controlled_followup.v1",
-        "prompt_version": "controlled_followup.v1",
+        "prompt_version": frozen_version,
         "created_at": utc_now(),
     }
     with persistence_for(store).transaction("org_default") as transaction:
@@ -1440,10 +1446,12 @@ def test_expression_reuses_frozen_controlled_followup_act_without_duplication() 
         evidence_quotes=frozen["evidence_quotes"],
         approved_by="controlled_followup.v1",
         organization_id="org_default",
+        prompt_version="controlled_followup.v1",
     )
     stored = runtime.interviews.get_interview(session["id"])["turns"][0]
     assert approved.act_id == frozen["act_id"]
     assert approved.turn_id == "turn_1"
+    assert approved.prompt_version == frozen_version, "The frozen producer version overrides an expression default"
     assert stored["conversation_acts"] == [approved.model_dump(mode="json")]
 
 
@@ -3258,7 +3266,8 @@ def test_agent_projects_understanding_failure_as_problem_and_pauses() -> None:
     asyncio.run(scenario())
 
 
-def test_agent_plays_materialized_s2s_followup_without_invoking_cascade_tts() -> None:
+@pytest.mark.parametrize("frozen_version", ["controlled_followup.v1", "controlled_followup.v2", "interview_turn_decision.v22", None])
+def test_agent_plays_materialized_s2s_followup_without_invoking_cascade_tts(frozen_version) -> None:
     store = InMemoryStore()
     session = _runtime_session(store)
     with persistence_for(store).transaction("org_default") as transaction:
@@ -3282,7 +3291,7 @@ def test_agent_plays_materialized_s2s_followup_without_invoking_cascade_tts() ->
                         followup_depth=1,
                         evaluative=False,
                         approved_by="controlled_followup_gate",
-                        prompt_version="controlled_followup.v1",
+                        prompt_version=frozen_version,
                         created_at=utc_now(),
                     ).model_dump(mode="json")
                 ],
@@ -3349,6 +3358,10 @@ def test_agent_plays_materialized_s2s_followup_without_invoking_cascade_tts() ->
         assert performance.payload["delivery"] == "s2s"
         assert performance.payload["audio_uri"] == "/media/approved-s2s.wav"
         assert performance.payload["alignment_source"] == "g2p_estimate"
+        selected = next(item for item in events if item.type == "conversation.act.selected")
+        saved = runtime.interviews.get_interview(session["id"])["turns"][0]["conversation_acts"]
+        assert len(saved) == 1 and saved[0]["act_id"] == selected.payload["act_id"]
+        assert saved[0]["prompt_version"] == frozen_version
         await channel.close("test_complete")
 
     asyncio.run(scenario())
@@ -3488,9 +3501,9 @@ def test_controlled_followup_binds_frozen_target_and_verbatim_evidence() -> None
             "time_budget_exhausted",
         ),
         (
-            lambda interview, turn, understanding: understanding.missing_capability_points.__setitem__(
-                slice(None), ["年龄"]
-            ),
+            # Probe targets now come from the frozen rubric, not arbitrary
+            # additions to the model's missing-point list.
+            lambda interview, turn, understanding: turn["question_snapshot"].update(key_points=[{"text": "年龄"}]),
             "sensitive_capability_target",
         ),
         (

@@ -150,6 +150,14 @@ export class LiveSpeechPlayback {
     const state = this.active;
     if (!state) return;
     this.active = null; this.clearTimer(state.timer); state.abort.abort(); state.player?.close();
+    // One numeric summary per output, including interruption. Telemetry must
+    // never affect drainage, cancellation, or the interview state machine.
+    const quality = state.progress;
+    if (state.consumed > 0 && Number.isSafeInteger(quality?.underflowCount) && quality.underflowCount >= 0
+      && Number.isSafeInteger(quality?.underflowSamples) && quality.underflowSamples >= 0) {
+      try { state.callbacks.onQualitySummary?.({ underflowCount: quality.underflowCount,
+        underflowMs: quality.underflowSamples / 24 }); } catch { /* best effort */ }
+    }
   }
   dropPending(sid) {
     const entry = this.pending.get(sid); if (!entry) return;

@@ -16,6 +16,7 @@ class ReadOnlyTransactionBackend:
         "get_work_item", "list_work_items", "get_secret", "list_invocations",
         "list_unsettled_evidence_commands",
         "list_interview_watchdog_candidates",
+        "get_interview_realtime_state",
     })
 
     def __init__(self, backend: TransactionBackend) -> None:

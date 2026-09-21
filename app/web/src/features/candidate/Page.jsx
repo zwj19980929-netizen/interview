@@ -9,6 +9,7 @@ import {
 } from "react";
 
 import { candidateNotice, candidateEntryMessage, candidateEntryFailure } from "./presentation.js";
+import { CandidateQuestionContext, CandidateQuestionHistory, useCandidateQuestionHistory } from "./QuestionHistory.jsx";
 
 import { useWorkbench } from "../../core/WorkbenchProvider.jsx";
 import { Empty, Field, Status } from "../../core/ui.jsx";
@@ -548,6 +549,12 @@ function CandidateRoom({ interview, token }) {
   const completion = experience.completion;
   const calibration = experience.calibration || EMPTY_EXPERIENCE.calibration;
   const currentQuestion = experience.currentQuestion;
+  const questionHistory = useCandidateQuestionHistory({ apiBase: API, request, interview, token,
+    currentTurnId: currentQuestion?.turn_id,
+    finalRevision: experience.captions.full.filter(row => row.final).map(row => row.text).join("\n"),
+    completedAnswers: session.completed_answers,
+    completed: Boolean(completion), enabled: calibration.status === "completed" || Boolean(completion),
+  });
   const adaptive = session.execution_schema_version === 3;
   const planning = experience.phase === "planning";
   const totalQuestions = adaptive ? null : Number(session.total_primary_questions ?? interview?.turns?.filter((item) => !item.is_followup).length ?? 0);
@@ -581,6 +588,7 @@ function CandidateRoom({ interview, token }) {
         </div>
         <p>{receipt.recording_retention_notice}</p>
         <p>自动评分仅提供辅助证据，不会自动决定录用或淘汰。</p>
+        <CandidateQuestionHistory {...questionHistory} />
       </main>
     </div>;
   }
@@ -631,6 +639,7 @@ function CandidateRoom({ interview, token }) {
 
         <SpeechPlaybackState playback={problem?.recoverable === false ? null : experience.speechPlayback} act={act} />
         {!experience.session ? <CandidateSessionGate problem={problem} /> : calibration.status !== "completed" ? <WarmupPanel calibration={calibration} experience={visibleExperience} act={act} /> : <>
+          <CandidateQuestionContext history={questionHistory.history} currentQuestion={currentQuestion} />
           <div className="candidate-question-head">
             <div>
               <p className="eyebrow">{planning ? "稍作停顿" : currentQuestion?.is_followup ? "基于你刚才回答的追问" : adaptive ? `交流话题 ${currentQuestion?.order || answered + 1}` : `正式问题 ${currentQuestion?.order || answered + 1}`}</p>
@@ -661,6 +670,7 @@ function CandidateRoom({ interview, token }) {
             </div>}
             <button className="button button-danger" type="button" onClick={() => act("pause")}>暂停面试</button>
           </div>
+          <CandidateQuestionHistory {...questionHistory} currentQuestion={currentQuestion} />
         </>}
       </section>
     </main>

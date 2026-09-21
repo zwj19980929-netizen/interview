@@ -238,21 +238,21 @@ class InterviewEvidenceChain:
         turn = next(item for item in session["turns"] if item["id"] == self.turn_id)
         # Only candidate-visible conversation and actual scheduling facts enter
         # free speech. Never pass whole turns, rubrics or assessment answers.
+        from app.services.dialogue_history import recent_turn_dialogue
         history = []
         for prior in session.get("turns", [])[-2:]:
-            history.extend({"role": "candidate", "text": item.get("text", "")}
-                           for item in prior.get("utterances", [])[-1:])
-            history.extend({"role": "interviewer", "text": item.get("text", "")}
-                           for item in prior.get("conversation_acts", [])[-2:])
+            history.extend({"role": item["speaker"], "text": item["text"]}
+                           for item in recent_turn_dialogue(session, prior))
         plan = session.get("plan_snapshot") or {}
         facts = {"duration_minutes": plan.get("duration_minutes"),
                  "completed_topics": len({item.get("root_turn_id") or item.get("id") for item in session.get("turns", [])
                      if any(answer.get("turn_id") == item.get("id") for answer in session.get("answers", []))})}
         skill = stream.interviews.supervisor.load_skill(session)
+        from app.services.dialogue_focus import question_for_repeat
         result = await stream.interviews.conversation.classify_reception(text, self.organization_id,
             phase=phase, preceding_text=preceding_text,
             history=history[-4:], process_facts=facts, skill_instructions=skill.get("instructions", ""),
-            question=turn.get("question_spoken_text") or turn.get("question_snapshot", {}).get("question_text", ""))
+            question=question_for_repeat(turn))
         if stream is not self._stt or self._input_revoked:
             raise ApiError("TURN_DECISION_STALE", "Capture changed.", status_code=409)
         stream._assert_commit_allowed()

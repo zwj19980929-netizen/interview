@@ -456,3 +456,11 @@ RESUME-TAIL-AND-CHINESE-ASR-028 / verified（仓库、本机API与合成ASR；�
 - 旧计划只能在应用升级前通过 `python -m app.migrations.plan_execution_v2 --dry-run` 检查，再执行无 `--dry-run` 的显式一次性迁移；运行时不会懒迁移。
 - 旧模型配置只能在升级前通过 `python -m app.migrations.model_configuration_v2 data/interviewer.sqlite3 --dry-run` 检查，再执行同命令去掉 `--dry-run`；运行时不读取旧 collection 或 route target。
 - 当前仓库 SQLite 数据检查为 0 份 InterviewPlan，未产生数据改写。接口删除和迁移行为由 `tests/test_production_compatibility.py`、`tests/test_plan_assembly.py` 覆盖，`COMPAT-001` 已标 `closed`。
+
+## FOLLOWUP-CONTEXT-055
+
+已实现父子问答候选/复核/导出展示、按选中事件的对白记忆、最近问题重读、长回答增量回复识别、结构化评分证据链及子回答更正后的根题重评。完整后端2373 passed/8 skipped、前端394 passed，新增版本围栏专项通过；API/worker及最新静态已在本机加载并通过ready检查。浏览器视觉和真人整场仍待验，详见操作日志055。未变更054音频分片或播放缓冲；未重写真实旧场次。
+
+### 056 修复与本机验证完成
+
+已修复候选回答文字HTTP过滤、完成回答误禁追问、语音热路径全记录读取；新增播放欠载摘要指标及主/子题独立编号。后端全量2466 passed/8 skipped，末次版本追踪补丁定向158 passed，前端400 passed并完成构建。本机API/worker正常加载，候选HTTP实际返回5份完整回答且原会话hash不变；三个媒体容器正常。同一快照16秒音频负载排空19.499→16.006秒，样本完整。六句合成话语最终语义均正确，一例模型自主不追问使原“必须选追问”探针5/6，不将可选能力改为强制。真人听感、视觉、完整STT/录像并发与真实PostgreSQL仍待验，详见056操作日志。

@@ -20,6 +20,7 @@ PUBLIC_ANSWER_FIELDS = {
     "id": raw(default=None),
     "turn_id": raw(default=None),
     "evaluation_status": raw(default=None),
+    "final_transcript": string(default=""),
 }
 
 PUBLIC_INTERVIEW_FIELDS = {
