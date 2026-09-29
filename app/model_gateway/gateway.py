@@ -397,6 +397,7 @@ class ModelGateway:
         request: TTSSynthesizeRequest,
         *,
         route: Optional[Dict[str, Any]] = None,
+        first_audio_deadline: Optional[float] = None,
     ) -> ValidatedTTSStream:
         """Stream approved TTS text through the existing synthesis route policy.
 
@@ -432,6 +433,10 @@ class ModelGateway:
             provider_id = provider_connection_id = model = "unknown"
             circuit_key = "%s:%s:%s" % (request.organization_id, model_configuration_id, capability)
             for attempt in range(1, retry_count + 2):
+                if first_audio_deadline is not None and monotonic() >= first_audio_deadline:
+                    error = ProviderError("provider_timeout", "TTS first audio budget exhausted.", retryable=False)
+                    self._annotate_error(error, invocation_id, resolved_route, total_attempts)
+                    raise error
                 total_attempts += 1
                 started_at = perf_counter()
                 provider_stream = None
@@ -461,7 +466,9 @@ class ModelGateway:
                         provider_connection_id=provider_connection_id,
                         model_configuration_id=model_configuration_id,
                         model_type=configuration["model_type"], capability=capability,
-                        purpose=request.purpose, model=model, timeout_s=timeout_s,
+                        purpose=request.purpose, model=model,
+                        timeout_s=(min(timeout_s, max(0.001, first_audio_deadline - monotonic()))
+                                   if first_audio_deadline is not None else timeout_s),
                         attempt=attempt, fallback_index=fallback_index,
                         connection_config=connection.get("connection_config") or {},
                         model_settings=configuration.get("settings") or {},
@@ -471,7 +478,7 @@ class ModelGateway:
                     try:
                         provider_stream = await asyncio.wait_for(
                             open_stream(self._apply_model_defaults(request, context.default_parameters), context),
-                            timeout=timeout_s,
+                            timeout=context.timeout_s,
                         )
                     except asyncio.TimeoutError as exc:
                         raise ProviderError("provider_timeout", "TTS stream open timed out.", retryable=True) from exc
@@ -498,7 +505,8 @@ class ModelGateway:
 
                     stream = ValidatedTTSStream(
                         provider_stream, provider_id=provider_id, model=model,
-                        read_timeout_s=timeout_s, on_terminal=terminal,
+                        read_timeout_s=min(8.0, timeout_s), on_terminal=terminal,
+                        first_audio_deadline=first_audio_deadline,
                     )
                     self._log_invocation(
                         **log_fields,
@@ -522,7 +530,10 @@ class ModelGateway:
                     )
                     if exc.retryable and exc.code != "provider_circuit_open" and attempt <= retry_count:
                         if backoff_ms:
-                            await asyncio.sleep(backoff_ms * attempt / 1000.0)
+                            delay = backoff_ms * attempt / 1000.0
+                            if first_audio_deadline is not None:
+                                delay = min(delay, max(0, first_audio_deadline - monotonic()))
+                            await asyncio.sleep(delay)
                         continue
                     if exc.retryable and exc.code != "provider_circuit_open":
                         self.circuits.record_failure(circuit_key, threshold=threshold)
@@ -1030,7 +1041,7 @@ class ModelGateway:
             "estimated_cost_usd": estimated_cost_usd,
             "error_code": error_code,
             "prompt_version": prompt_version if prompt_version in {
-                "company_question_reply.v1", "answer_evaluation.v7", "answer_evaluation.v8", "controlled_followup.v2", "controlled_followup.v3", "controlled_followup.v4", "controlled_followup.v5", "controlled_followup.v6", "controlled_followup_repair.v1", "supplement_reply.v4", "supplement_reply.v5", "conversation_reception.v1", "conversation_reception.v2", "conversation_reception.v3", "conversation_reception.v4", "conversation_reception.v5", "conversation_reception.v6", "conversation_reception_speech.v1", "conversation_reception_speech.v2", "conversation_reception_speech.v3", "interviewer_supervisor.v1", "interviewer_supervisor.v2", "interviewer_supervisor.v3", "interviewer_evidence_expert.v1", "interviewer_transition.v1",
+                "company_question_reply.v1", "answer_evaluation.v7", "answer_evaluation.v8", "controlled_followup.v2", "controlled_followup.v3", "controlled_followup.v4", "controlled_followup.v5", "controlled_followup.v6", "controlled_followup_repair.v1", "supplement_reply.v4", "supplement_reply.v5", "conversation_reception.v1", "conversation_reception.v2", "conversation_reception.v3", "conversation_reception.v4", "conversation_reception.v5", "conversation_reception.v6", "conversation_reception.v7", "conversation_reception_speech.v1", "conversation_reception_speech.v2", "conversation_reception_speech.v3", "interviewer_supervisor.v1", "interviewer_supervisor.v2", "interviewer_supervisor.v3", "interviewer_supervisor.v4", "interviewer_evidence_expert.v1", "interviewer_evidence_expert.v2", "interviewer_transition.v1",
                 "interview_turn_understanding.v10", "interview_turn_decision.v9",
                 "interview_turn_understanding.v11", "interview_turn_decision.v10",
                 "interview_turn_understanding.v12", "interview_turn_understanding.v13",
@@ -1039,13 +1050,13 @@ class ModelGateway:
                 "interview_turn_understanding.v1", "interview_turn_understanding.v2", "interview_turn_understanding.v3",
                 "interview_turn_understanding.v4", "interview_turn_understanding.v5",
                 "interview_turn_understanding.v6", "interview_turn_understanding.v7",
-                "interview_turn_understanding.v8", "interview_turn_understanding.v58", "interview_turn_understanding.v44", "interview_turn_understanding.v60", "interview_turn_understanding.v9", "interview_turn_understanding.v59", "interview_turn_understanding.v45", "interview_turn_understanding.v61",
+                "interview_turn_understanding.v8", "interview_turn_understanding.v58", "interview_turn_understanding.v70", "interview_turn_understanding.v44", "interview_turn_understanding.v60", "interview_turn_understanding.v72", "interview_turn_understanding.v9", "interview_turn_understanding.v59", "interview_turn_understanding.v71", "interview_turn_understanding.v45", "interview_turn_understanding.v61", "interview_turn_understanding.v73",
                 "interview_inquiry_units.v1", "interview_inquiry_units.v2", "answer_evaluation.v6",
                 "interview_turn_decision.v3", "interview_turn_decision.v4", "answer_evaluation.v2",
                 "answer_evaluation.v3", "answer_evaluation.v4", "answer_evaluation.v5",
                 "interview_turn_decision.v5", "interview_turn_decision.v6",
                 "interview_turn_decision.v7", "interview_turn_decision.v8", "interview_turn_decision.v23", "interview_turn_decision.v24",
-                "interview_turn_understanding.v24", "interview_turn_understanding.v25", "interview_turn_understanding.v26", "interview_turn_understanding.v27", "interview_turn_decision.v25", "interview_turn_decision.v26", "interview_turn_decision.v27", "interview_turn_decision.v28", "interview_turn_decision.v29", "interview_turn_decision.v30", "interview_turn_understanding.v28", "interview_turn_understanding.v29", "interview_turn_understanding.v30", "interview_turn_understanding.v31", "interview_turn_decision.v31", "interview_turn_decision.v32", "interview_turn_decision.v33", "interview_turn_decision.v34", "interview_turn_decision.v35", "interview_turn_decision.v36", "interview_turn_decision.v37", "interview_turn_decision.v38", "interview_turn_decision.v39", "interview_turn_decision.v40", "interview_turn_understanding.v32", "interview_turn_understanding.v36", "interview_turn_understanding.v40", "interview_turn_understanding.v50", "interview_turn_understanding.v46", "interview_turn_understanding.v54", "interview_turn_understanding.v33", "interview_turn_understanding.v37", "interview_turn_understanding.v41", "interview_turn_understanding.v51", "interview_turn_understanding.v47", "interview_turn_understanding.v55", "interview_turn_understanding.v34", "interview_turn_understanding.v38", "interview_turn_understanding.v42", "interview_turn_understanding.v52", "interview_turn_understanding.v48", "interview_turn_understanding.v56", "interview_turn_understanding.v35", "interview_turn_understanding.v39", "interview_turn_understanding.v43", "interview_turn_understanding.v53", "interview_turn_understanding.v49", "interview_turn_understanding.v57", "interview_turn_decision.v41", "interview_turn_decision.v42", "interview_turn_decision.v43", "interview_turn_decision.v44", "interview_turn_decision.v45", "interview_turn_decision.v46", "interview_turn_decision.v47", "interview_turn_decision.v48", "interview_turn_decision.v49", "interview_turn_decision.v50", "interview_turn_decision.v51", "interview_turn_decision.v52", "interview_turn_decision.v53", "interview_turn_decision.v59", "interview_turn_decision.v65", "interview_turn_decision.v71", "interview_turn_decision.v81", "interview_turn_decision.v77", "interview_turn_decision.v85", "interview_turn_decision.v54", "interview_turn_decision.v60", "interview_turn_decision.v66", "interview_turn_decision.v72", "interview_turn_decision.v82", "interview_turn_decision.v78", "interview_turn_decision.v86", "interview_turn_decision.v55", "interview_turn_decision.v61", "interview_turn_decision.v67", "interview_turn_decision.v73", "interview_turn_decision.v83", "interview_turn_decision.v79", "interview_turn_decision.v87", "interview_turn_decision.v56", "interview_turn_decision.v62", "interview_turn_decision.v68", "interview_turn_decision.v74", "interview_turn_decision.v84", "interview_turn_decision.v80", "interview_turn_decision.v88", "interview_turn_decision.v57", "interview_turn_decision.v63", "interview_turn_decision.v69", "interview_turn_decision.v89", "interview_turn_decision.v75", "interview_turn_decision.v91", "interview_turn_decision.v58", "interview_turn_decision.v64", "interview_turn_decision.v70", "interview_turn_decision.v90", "interview_turn_decision.v76", "interview_turn_decision.v92",
+                "interview_turn_understanding.v24", "interview_turn_understanding.v25", "interview_turn_understanding.v26", "interview_turn_understanding.v27", "interview_turn_decision.v25", "interview_turn_decision.v26", "interview_turn_decision.v27", "interview_turn_decision.v28", "interview_turn_decision.v29", "interview_turn_decision.v30", "interview_turn_understanding.v28", "interview_turn_understanding.v29", "interview_turn_understanding.v30", "interview_turn_understanding.v31", "interview_turn_decision.v31", "interview_turn_decision.v32", "interview_turn_decision.v33", "interview_turn_decision.v34", "interview_turn_decision.v35", "interview_turn_decision.v36", "interview_turn_decision.v37", "interview_turn_decision.v38", "interview_turn_decision.v39", "interview_turn_decision.v40", "interview_turn_understanding.v32", "interview_turn_understanding.v36", "interview_turn_understanding.v40", "interview_turn_understanding.v50", "interview_turn_understanding.v62", "interview_turn_understanding.v46", "interview_turn_understanding.v54", "interview_turn_understanding.v66", "interview_turn_understanding.v33", "interview_turn_understanding.v37", "interview_turn_understanding.v41", "interview_turn_understanding.v51", "interview_turn_understanding.v63", "interview_turn_understanding.v47", "interview_turn_understanding.v55", "interview_turn_understanding.v67", "interview_turn_understanding.v34", "interview_turn_understanding.v38", "interview_turn_understanding.v42", "interview_turn_understanding.v52", "interview_turn_understanding.v64", "interview_turn_understanding.v48", "interview_turn_understanding.v56", "interview_turn_understanding.v68", "interview_turn_understanding.v35", "interview_turn_understanding.v39", "interview_turn_understanding.v43", "interview_turn_understanding.v53", "interview_turn_understanding.v65", "interview_turn_understanding.v49", "interview_turn_understanding.v57", "interview_turn_understanding.v69", "interview_turn_decision.v41", "interview_turn_decision.v42", "interview_turn_decision.v43", "interview_turn_decision.v44", "interview_turn_decision.v45", "interview_turn_decision.v46", "interview_turn_decision.v47", "interview_turn_decision.v48", "interview_turn_decision.v49", "interview_turn_decision.v50", "interview_turn_decision.v51", "interview_turn_decision.v52", "interview_turn_decision.v53", "interview_turn_decision.v59", "interview_turn_decision.v65", "interview_turn_decision.v71", "interview_turn_decision.v81", "interview_turn_decision.v93", "interview_turn_decision.v77", "interview_turn_decision.v85", "interview_turn_decision.v97", "interview_turn_decision.v54", "interview_turn_decision.v60", "interview_turn_decision.v66", "interview_turn_decision.v72", "interview_turn_decision.v82", "interview_turn_decision.v94", "interview_turn_decision.v78", "interview_turn_decision.v86", "interview_turn_decision.v98", "interview_turn_decision.v55", "interview_turn_decision.v61", "interview_turn_decision.v67", "interview_turn_decision.v73", "interview_turn_decision.v83", "interview_turn_decision.v95", "interview_turn_decision.v79", "interview_turn_decision.v87", "interview_turn_decision.v99", "interview_turn_decision.v56", "interview_turn_decision.v62", "interview_turn_decision.v68", "interview_turn_decision.v74", "interview_turn_decision.v84", "interview_turn_decision.v96", "interview_turn_decision.v80", "interview_turn_decision.v88", "interview_turn_decision.v100", "interview_turn_decision.v57", "interview_turn_decision.v63", "interview_turn_decision.v69", "interview_turn_decision.v89", "interview_turn_decision.v101", "interview_turn_decision.v75", "interview_turn_decision.v91", "interview_turn_decision.v103", "interview_turn_decision.v58", "interview_turn_decision.v64", "interview_turn_decision.v70", "interview_turn_decision.v90", "interview_turn_decision.v102", "interview_turn_decision.v76", "interview_turn_decision.v92", "interview_turn_decision.v104",
                 "interview_turn_decision.v1", "interview_turn_decision.v2", "supplement_reply.v1", "supplement_reply.v2", "supplement_reply.v3", "candidate_exit_reply.v1",
             } else None,
             "http_status": diagnostics.get("http_status") if diagnostics.get("http_status") in {400, 402, 404, 409, 413, 422} else None,

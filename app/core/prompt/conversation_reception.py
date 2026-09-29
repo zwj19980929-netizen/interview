@@ -5,7 +5,7 @@ import re
 from app.core.prompt.understanding_references import understanding_references
 from app.model_gateway.schemas import ChatMessage
 
-RECEPTION_VERSION = "conversation_reception.v6"
+RECEPTION_VERSION = "conversation_reception.v7"
 RECEPTION_SPEECH_VERSION = "conversation_reception_speech.v3"
 RECEPTION_SPEECH = {
     "idle_check": "我还在听。需要一点时间，或希望我再解释一下题目，都可以告诉我。",
@@ -70,6 +70,11 @@ def reception_context(context):
                 for key in ("turn_id", "act_id", "utterance_id", "exchange_id", "created_at"):
                     if isinstance(item.get(key), str) and item[key].strip():
                         entry[key] = item[key][:128]
+                if item["role"] == "interviewer":
+                    status = item.get("delivery_status")
+                    entry["delivery_status"] = status if status in {
+                        "selected", "playing", "delivered", "interrupted", "failed", "unknown"
+                    } else "unknown"
                 history.append(entry)
     skill = context.get("skill_instructions")
     def bounded_text(value, limit):
@@ -107,6 +112,8 @@ def reception_contract(context):
             "你始终是面试官，new_speech是候选人本轮新说的话；history中的role明确区分候选人与面试官。"
             "不能把候选人的话说成自己的经历，不代替候选人作答，不要求候选人扮演面试官。"
             "preceding_text和history只帮助理解指代，不能把历史发言当作本轮新请求。"
+            "面试官历史的delivery_status只有delivered表示完整播完；其余状态不能假定候选人听完，"
+            "尤其interrupted或failed时要结合新的请求继续解释，不能声称已经解释清楚。"
             "current_question是当前正式问题，可能是父题下的子问题；root_question仅提供其原话题背景。"
             "last_clarification是上次解释而不是题目，不能把last_clarification当作current_question。"
             "仅输出合同JSON：kind、confidence、evidence_id、reply_text，以及可选repeat_target。不是机械地找关键词或套固定话术。"

@@ -94,7 +94,7 @@ def test_read_context_without_reference_keeps_existing_summary_and_skill_permiss
 
 def test_supervisor_contract_describes_targeted_history_without_new_tool_or_unbounded_context():
     contract = supervisor_contract({}, [], tools=["interview.read_context"], question_ids=[])
-    assert contract.version == "interviewer_supervisor.v3"
+    assert contract.version == "interviewer_supervisor.v4"
     instructions = contract.messages[0].content
     assert "turn_id" in instructions and "interview.read_context" in instructions
     assert contract.response_schema["properties"]["argument"]["maxLength"] == 128

@@ -1,5 +1,11 @@
 # 接口设计
 
+### AGENT-CHAIN-IMPROVEMENTS-067
+
+管理端 Agent metrics 接口保留既有 `metrics`，新增 `aggregation`（`interview-agent-metrics.aggregate.v1`）：进程 `instance_id`、`started_at`、累计 counters、固定桶 histograms，以及 stage 的 success/failure/cancelled 结果数。聚合不包含候选原话、凭据或媒体；跨进程采集须按 instance_id 区分重启。`stt_preview_reused` 纳入服务端指标白名单。
+
+普通交流历史/私有 input context 新增 `delivery_status`，unknown/selected/playing/interrupted/failed 均不证明已播完；只供模型理解历史，不能由客户端提交为退出或答题许可。已收到当前权威发言后的认知与首音准备共用 20 秒期限，超时通过既有 retry_required 提示恢复，原始录音和转写保留。验收输入升级 v3，缺失类别、空恢复记录及非有限数值必须拒绝，不兼容把 v2 报告当作本轮验收通过。细节见[067说明](agent-chain-improvements-067.md)。
+
 ### INTERACTION-RECOVERY-066（仓库与本机验证完成）
 
 当前 capture 的 `answer_preparation` 投影增加 `retrying` / `retry_required`，与 `preparing` 共用 `turn_id`、`capture_id`。失败在重连 snapshot 中保留；普通 listening/preparing 事件不得擦除。只有同 capture 的 `understanding_recovered`、有效答案提交、换题或终态清除。失败 problem 与恢复事件都携带 turn/capture 归属。重试复用 `continue_speaking` 控制，不授予完成回答或退出面试的权限。

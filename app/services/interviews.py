@@ -11,7 +11,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from app.core.errors import ApiError
 from app.core.prompt.interviewer_supervisor import SUPERVISOR_VERSION
 from app.model_gateway.errors import ProviderError
-from app.domain.speech_quality import confidence_source, minimum_reported_confidence, transcript_identity
+from app.domain.speech_quality import confidence_source, minimum_reported_confidence, transcript_identity, transcript_confidence_segments
 from app.core.ids import new_id
 from app.core.time import utc_now
 from app.adapters.private_media import read_managed_audio
@@ -961,6 +961,7 @@ class InterviewService:
             authoritative=True,
             audio_uri=str(payload["audio_uri"]),
             stt_confidence=payload.get("stt_confidence"),
+            stt_segments=transcript_confidence_segments(str(payload["final_transcript"]).strip(), payload.get("transcript_segments", [])),
             source=transcript_source,
             created_at=now,
         )
@@ -978,7 +979,8 @@ class InterviewService:
             # Preserve this path's existing semantic/confirmation permissions.
             understanding_session = {**source_session, "_interviewer_context": {
                 **(source_session.get("_interviewer_context") or {}),
-                "input_context": conversation_input_context(source_session, source_turn, utterance.text),
+                "input_context": conversation_input_context(source_session, source_turn, utterance.text,
+                    segments=utterance.stt_segments, source_capture=payload.get("media_evidence")),
             }}
             understanding = await self.conversation.understand(
                 utterance, source_turn, understanding_session
@@ -1515,6 +1517,7 @@ class InterviewService:
                 utterance_id=new_id("utterance_preview"), revision=1, speaker="candidate",
                 text=final.text.strip(), is_final=True, authoritative=True, audio_uri=snapshot_ref,
                 stt_confidence=final.confidence, source="server_streaming", created_at=utc_now(),
+                stt_segments=transcript_confidence_segments(final.text.strip(), final.segments),
             )
             understanding, followup = await self.supervisor.prepare_turn(utterance, turn, session)
         return PreparedTurnDecision(
@@ -1560,6 +1563,7 @@ class InterviewService:
     @staticmethod
     def _prepared_context_fingerprint(session: Dict[str, Any], turn: Dict[str, Any]) -> str:
         """Freeze decision inputs without coupling to heartbeat/store versions."""
+        from app.services.conversation_delivery import selected_events
 
         root_id = turn.get("root_turn_id") or turn["id"]
         root = next((item for item in session.get("turns", []) if item.get("id") == root_id), turn)
@@ -1585,10 +1589,14 @@ class InterviewService:
                                             if act.get("prompt_version") == "answer_clarification.v1"],
             "exit_confirmation_acts": [act for act in turn.get("conversation_acts", [])
                                        if act.get("prompt_version") == "candidate_exit_confirmation.v1"],
-            "reception_selections": [event for event in session.get("agent_events", [])
+            "reception_selections": [{
+                "event_id": event.get("event_id"), "turn_id": event.get("turn_id"),
+                "session_sequence": event.get("session_sequence"),
+                "payload": {key: (event.get("payload") or {}).get(key) for key in ("act_id", "text", "approved")},
+            } for event in selected_events(session, turn)
                                      if event.get("event_id") in {
                                          item.get("selected_event_id") for item in turn.get("reception_exchanges", [])}],
-            "reception_acts": [{key: act.get(key) for key in ("act_id", "turn_id", "text")}
+            "reception_acts": [{key: act.get(key) for key in ("act_id", "turn_id", "text", "selection_receipts")}
                                for act in turn.get("conversation_acts", [])
                                if act.get("act_id") in {
                                    item.get("act_id") for item in (turn.get("reception_exchanges") or [])[-6:]}],

@@ -138,7 +138,6 @@ async def test_finishing_answer_does_not_override_followup_budgets(budget, reaso
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("mutation", [
-    lambda data: data["understanding"].update(followup_allowed=False),
     lambda data: data["understanding"].update(completion_basis=None),
     lambda data: data["understanding"].update(confidence=.74),
     lambda data: data["understanding"].update(answer_content="none", claims=[], covered_point_ids=[], missing_point_ids=["P1", "P2"]),
@@ -156,6 +155,26 @@ async def test_invalid_finish_answer_neither_commits_nor_creates_a_followup(muta
     assert not service.can_complete_without_confirmation(understanding, utterance.text)
     assert not followup["selected"] and "conversation_act" not in followup
     assert len(gateway.requests) == 2
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("allow_followup", [True, False])
+async def test_derived_followup_permission_still_requires_source_evidence_and_real_budget(allow_followup):
+    utterance, turn, interview = _input()
+    utterance = utterance.model_copy(update={"text": utterance.text + "我讲完了。"})
+    interview["_semantic_first"] = True
+    turn["allow_followup"] = allow_followup
+    data = completed_answer()
+    data["understanding"]["followup_allowed"] = False
+    gateway = Gateway(data if allow_followup else data["understanding"])
+    service = _service(gateway)
+    understanding, followup = await service.prepare_decision(utterance, turn, interview)
+    assert understanding.problem is None and understanding.followup_allowed
+    assert understanding.claims and understanding.completion_basis.evidence_quotes == ["我讲完了。"]
+    assert service.can_complete_without_confirmation(understanding, utterance.text)
+    assert followup["selected"] is allow_followup and len(gateway.requests) == 1
+    if not allow_followup:
+        assert followup["reason"] == "followup_disabled" and "conversation_act" not in followup
 
 
 @pytest.mark.anyio
@@ -256,7 +275,7 @@ async def test_spoken_finish_answer_commits_parent_and_delivers_formal_child_onc
         assert child["followup_depth"] == 1 and current["current_turn_id"] == child["id"]
         assert current["answers"][0]["turn_id"] == TURN_ID
         assert current["turns"][0]["current_understanding"]["turn_intent"] == "finish_answer"
-        assert child["conversation_acts"][0]["prompt_version"] == current["turns"][0]["current_understanding"]["prompt_version"] == "interview_turn_decision.v83"
+        assert child["conversation_acts"][0]["prompt_version"] == current["turns"][0]["current_understanding"]["prompt_version"] == "interview_turn_decision.v95"
         assert SUPPLEMENT_SPEECH["check"] not in spoken
         assert len([call for call in calls if call[0] == "understanding"]) == 1
         assert not [call for call in calls if call[0] == "supplement"]

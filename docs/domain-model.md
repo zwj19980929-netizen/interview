@@ -1145,3 +1145,10 @@ stateDiagram-v2
 新增信息均是当前采集周期内的短期交流状态，无表或迁移：补充确认保存实际确认问题、前次已确认原文及对应来源；未定稿识别保存重试额度与等待新输入标记。前次确认仅供理解当前短尾，不能恢复旧完成许可；capture 更换、owner 变更或输入修订时继续检查并拒绝陈旧决定。空识别段不形成 Answer，暂定字幕不属于已提交证据。父子题/独立回答/评分引用不变，见[059改进计划](agent-conversation-improvement-plan-059.md)。
 
 `UnderstandingProblem.reason_code` 增加固定诊断枚举 `semantic_control_contract_invalid`，表示已判断的交流意图与动作/追问许可冲突，例如 thinking 却要求 next。它不携带候选正文，不形成结束授权；托管实时会话仍按原有保留音频、有限纠正、提示重试的失败路径处理。旧理解快照与合同版本保留。
+# 067：交流选择、送达与交互预算
+
+服务端将 `conversation.act.selected` 的审批事实与 `selection_receipts` 一同保存到所属 ConversationAct。收据绑定 event、turn、act、sequence 和原文摘要，每个 act 保留最近 8 次选择；客户端重放历史裁剪不删除当前选择事实。送达状态按 performance 身份从 selected/playing 进入 delivered、interrupted 或 failed；只有当前播放的合法 drain/stop 回执可标记 delivered，旧播放不能更新新播放。审批与供应商产出均不代表候选人听完。退出/内容澄清仍须通过原有 capture、新回复与实际送达校验。
+
+服务端完整稳定文本开始推理后共享 20 秒准备预算；同一文本的元数据修订、未稳定假设和声学噪声不能续期。新稳定文本或显式重试建立新的预算，预备理解、内部重试、模型与首音准备共用剩余时间；仍须当前权威final才可表达或提交。超时保留原始证据，不产生完成或退出授权。
+
+浏览器仍持有当前performance和selection时，failed可经用户重播恢复为playing/delivered；输出已撤销或清空后不得重新打开旧送达事实。未播语音失败恢复须同时复原本地speaking及本次已处理游标，不回退更早已送达历史。

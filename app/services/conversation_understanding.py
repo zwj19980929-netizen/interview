@@ -9,16 +9,18 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-from app.domain.speech_quality import limit_semantic_confidence
+from app.domain.speech_quality import limit_semantic_confidence, control_evidence_confidence, transcript_confidence_segments
 from app.domain.adaptive_interview import is_adaptive, assessment_contract
 from app.core.ids import new_id
 from app.core.prompt.contracts import prompt_contract, understanding_canonical_schema, supplement_reply_canonical_schema
 from app.core.prompt.semantic_turn import (
     with_semantic_turn_schema, validate_semantic_turn, validate_current_speech, validate_unresolved_completion, SemanticContractError,
+    derive_semantic_controls,
 )
 from app.core.prompt.understanding_references import (
     understanding_references,
     resolve_understanding_references,
+    completion_reference_ranges,
 )
 from app.core.prompt.validation import (
     StructuredResponseValidationError,
@@ -76,6 +78,7 @@ def _log_validation_rejection(
     provider_request_id: Optional[str] = None,
 ) -> None:
     """Log fixed diagnostic categories and schema paths, never exception text."""
+    stage = getattr(exc, "understanding_stage", stage)
     if isinstance(exc, StructuredResponseValidationError):
         reason = exc.reason_code
         path += exc.schema_path[1:]
@@ -142,6 +145,92 @@ class ConversationUnderstandingService:
             or not utterance.audio_uri
         ):
             raise ValueError("formal understanding requires an authoritative final utterance")
+
+    def _materialize_understanding(
+        self, raw: Dict[str, Any], references: Dict[str, Any], utterance: ConversationUtterance,
+        turn: Dict[str, Any], context: Dict[str, Any], *, provider: Dict[str, Any],
+        prompt_version: str, deterministic: bool = False,
+    ) -> TurnUnderstanding:
+        """One seam for source resolution, semantic policy and domain creation.
+
+        Callers validate their whole wire envelope first. This projection never
+        adds claims, ending evidence or confirmation receipts. Optional followup
+        planning cannot change the verified understanding returned here.
+        """
+        stage = "understanding_references"
+        try:
+            data = deepcopy(raw) if deterministic else resolve_understanding_references(raw, references)
+            semantic_first = context.get("semantic_first") is True
+            if semantic_first:
+                data = derive_semantic_controls(data)
+            stage = "understanding_canonical"
+            validate_structured_response(data, self._canonical_schema(semantic_first))
+            stage = "understanding_content"
+            dialogue = context.get("interviewer_context") or {}
+            self._validate_understanding_content(data, utterance.text, context["capability_points"],
+                input_context=dialogue.get("input_context"), exit_confirmation=dialogue.get("exit_confirmation"),
+                content_clarification=dialogue.get("content_clarification"))
+            acoustic = utterance.stt_confidence
+            if semantic_first and data.get("completion_basis"):
+                ranges = completion_reference_ranges(raw, references)
+                scoped = self._control_evidence_quality(utterance, ranges, dialogue)
+                if scoped is not None:
+                    acoustic = scoped
+            confidence = limit_semantic_confidence(float(data["confidence"]), acoustic)
+            if (not deterministic and confidence < float(self.DEFAULT_POLICY["low_confidence_threshold"])
+                    and data.get("turn_intent") != "thinking"):
+                data["suggested_action"] = "clarify"
+            confidence = self._apply_ambiguity_policy(data, confidence)
+            stage = "understanding_domain"
+            current = turn.get("current_understanding") or {}
+            return TurnUnderstanding(
+                understanding_id=new_id("understanding"), revision=int(current.get("revision", 0)) + 1,
+                prompt_version=prompt_version, utterance_id=utterance.utterance_id,
+                provider=provider, created_at=utc_now(), **{**data, "confidence": confidence},
+            )
+        except (ValueError, KeyError, TypeError) as exc:
+            exc.understanding_stage = stage
+            raise
+
+    @staticmethod
+    def _control_evidence_quality(utterance, ranges, dialogue):
+        """Scope quality to fresh, unambiguous ending references only.
+
+        Complete source segments are required. Acoustic uncertainty in earlier
+        technical evidence remains on the utterance; it is never upgraded by
+        a clearer request to finish. All semantic/receipt validation runs first.
+        """
+        text, start, has_scope = utterance.text, 0, False
+        context = dialogue.get("input_context") or {}
+        boundary = context.get("current_speech_start")
+        if (context.get("version") == "conversation_input_context.v1" and type(boundary) is int
+                and 0 <= boundary <= len(text) and text[boundary:] == context.get("current_speech")):
+            has_scope = True
+            start = boundary
+            if not context["current_speech"]:
+                # A successful quick response can consume the latest request;
+                # only its exact recorded occurrence remains eligible for review.
+                exchanges = context.get("responded_exchanges") or []
+                if exchanges:
+                    last = exchanges[-1]
+                    candidate_start, candidate_end = last.get("request_start"), last.get("request_end")
+                    if (type(candidate_start) is int and type(candidate_end) is int
+                            and 0 <= candidate_start < candidate_end <= len(text)
+                            and text[candidate_start:candidate_end] == last.get("request_text")):
+                        start = candidate_start
+        for key in ("content_clarification", "exit_confirmation"):
+            exchange = dialogue.get(key)
+            if isinstance(exchange, dict) and isinstance(exchange.get("request_text"), str):
+                has_scope = True
+                start = max(start, len(exchange["request_text"]))
+        if not has_scope:
+            return None
+        for begin, end in ranges:
+            quote = text[begin:end]
+            if (begin < start or not quote or text.find(quote, start) != begin
+                    or text.find(quote, begin + 1) >= 0):
+                return None
+        return control_evidence_confidence(text, utterance.stt_segments, ranges)
 
     async def _understand(
         self,
@@ -215,18 +304,8 @@ class ConversationUnderstandingService:
                     request_id = response.provider.request_id
                     stage = "wire_schema"
                     validate_structured_response(response.data, contract.response_schema)
-                    stage = "understanding_references"
-                    data = resolve_understanding_references(response.data, references)
-                    stage = "understanding_canonical"
-                    validate_structured_response(data, self._canonical_schema(semantic_first))
-                    stage = "understanding_content"
-                    self._validate_understanding_content(data, utterance.text, capability_points,
-                        input_context=context["interviewer_context"].get("input_context"),
-                        exit_confirmation=context["interviewer_context"].get("exit_confirmation"),
-                        content_clarification=context["interviewer_context"].get("content_clarification"))
-                    provider = response.provider.model_dump()
-                    confidence = limit_semantic_confidence(float(data["confidence"]), utterance.stt_confidence)
-                    break
+                    return self._materialize_understanding(response.data, references, utterance, turn, context,
+                        provider=response.provider.model_dump(), prompt_version=contract.version)
                 except (ProviderError, asyncio.TimeoutError) as exc:
                     if getattr(exc, "code", None) != "provider_schema_invalid":
                         return self._safe_failure_understanding(
@@ -253,33 +332,9 @@ class ConversationUnderstandingService:
                         prompt_version=contract.version,
                     )
                 contract = prompt_contract("interview_turn_understanding", {**context, "correction_reason": reason})
-        if deterministic:
-            validate_structured_response(data, understanding_canonical_schema())
-            self._validate_understanding_content(
-                data, utterance.text, capability_points
-            )
-            confidence = limit_semantic_confidence(float(data["confidence"]), utterance.stt_confidence)
-        # An exact, deterministic meta-intent is a control instruction rather
-        # than an answer.  It is safe to honour even when the provider reports
-        # low acoustic confidence; otherwise "请再说一遍" could be turned into
-        # an unrelated clarification loop.
-        if (
-            deterministic is None
-            and confidence < float(self.DEFAULT_POLICY["low_confidence_threshold"])
-            and data.get("turn_intent") != "thinking"
-        ):
-            data["suggested_action"] = "clarify"
-        confidence = self._apply_ambiguity_policy(data, confidence)
-        current = turn.get("current_understanding") or {}
-        return TurnUnderstanding(
-            understanding_id=new_id("understanding"),
-            revision=int(current.get("revision", 0)) + 1,
-            prompt_version=contract.version,
-            utterance_id=utterance.utterance_id,
-            provider=provider,
-            created_at=utc_now(),
-            **{**data, "confidence": confidence},
-        )
+        # Exact deterministic controls retain their existing acoustic policy.
+        return self._materialize_understanding(data, references, utterance, turn, context,
+            provider=provider, prompt_version=contract.version, deterministic=True)
 
     async def prepare_decision(
         self,
@@ -414,6 +469,7 @@ class ConversationUnderstandingService:
             utterance_id=new_id("utterance_preview"), revision=1, speaker="candidate",
             text=preview.text.strip(), is_final=False, authoritative=False,
             audio_uri=snapshot_ref, stt_confidence=preview.confidence,
+            stt_segments=transcript_confidence_segments(preview.text.strip(), preview.segments),
             source="server_streaming", created_at=utc_now(),
         )
         return await self._prepare_decision(utterance, turn, interview)
@@ -501,30 +557,8 @@ class ConversationUnderstandingService:
                 # resolving any vendor-authored value into domain semantics.
                 stage = "wire_schema"
                 validate_structured_response(response.data, contract.response_schema)
-                stage = "understanding_references"
-                data = resolve_understanding_references(response.data["understanding"], references)
-                stage = "understanding_canonical"
-                validate_structured_response(data, self._canonical_schema(context["semantic_first"]))
-                stage = "understanding_content"
-                self._validate_understanding_content(data, utterance.text, capability_points,
-                    input_context=context["interviewer_context"].get("input_context"),
-                    exit_confirmation=context["interviewer_context"].get("exit_confirmation"),
-                        content_clarification=context["interviewer_context"].get("content_clarification"))
-                confidence = limit_semantic_confidence(float(data["confidence"]), utterance.stt_confidence)
-                if confidence < float(self.DEFAULT_POLICY["low_confidence_threshold"]) and data.get("turn_intent") != "thinking":
-                    data["suggested_action"] = "clarify"
-                confidence = self._apply_ambiguity_policy(data, confidence)
-                current = turn.get("current_understanding") or {}
-                stage = "understanding_domain"
-                understanding = TurnUnderstanding(
-                    understanding_id=new_id("understanding"),
-                    revision=int(current.get("revision", 0)) + 1,
-                    prompt_version=contract.version,
-                    utterance_id=utterance.utterance_id,
-                    provider=response.provider.model_dump(),
-                    created_at=utc_now(),
-                    **{**data, "confidence": confidence},
-                )
+                understanding = self._materialize_understanding(response.data["understanding"], references,
+                    utterance, turn, context, provider=response.provider.model_dump(), prompt_version=contract.version)
                 approved_scope = self._followup_scope(interview, turn, utterance, understanding)
                 if approved_scope.get("selected") is False:
                     return understanding, approved_scope
@@ -553,7 +587,7 @@ class ConversationUnderstandingService:
                 reason = exc.reason_code if isinstance(exc, (UnderstandingContentError, SemanticContractError)) else "wire_schema_invalid"
                 _log_validation_rejection(
                     "turn_decision_contract_rejected", exc, stage=stage, attempt=attempt,
-                    path="$.understanding" if stage.startswith("understanding_") else "$",
+                    path="$.understanding" if getattr(exc, "understanding_stage", stage).startswith("understanding_") else "$",
                     interview_id=interview.get("id"), turn_id=turn.get("id"), provider_request_id=request_id,
                 )
             if attempt == 2:

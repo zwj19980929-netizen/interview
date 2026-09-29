@@ -419,3 +419,12 @@ _Avoid_: BackgroundTask、FireAndForgetJob、QueueMessage
 **AuditEvent**:
 对鉴权、敏感访问、导出、人工修正、供应商和运维动作形成的元数据级不可变审计事实；不得包含 URL token、联系方式或正文载荷。
 _Avoid_: DebugLog、RequestBodyLog、MutableHistory
+# 067 新增领域术语
+
+**ConversationSelectionReceipt**:
+一次经过审批的面试官回应被选中表达的事实，关联所属题目、回应及选择次序；它不表示候选人已听到回应。
+_Avoid_: PlaybackCompleted、CandidateAnswer
+
+**ConversationDelivery**:
+某次面试官回应播放的进展与结局，区分准备播放、开始播放、完整播完、被打断和失败；完整送达须有当前播放的有效完成回执。
+_Avoid_: ModelResponse、SpeechGenerated

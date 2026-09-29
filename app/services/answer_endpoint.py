@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import inspect
 import math
 import logging
 import time
@@ -12,12 +13,14 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
 from app.core.errors import ApiError
+from app.core.interaction_budget import interaction_deadline, remaining_interaction_seconds
 from app.core.interview_agent_metrics import measure_interview_agent_stage, observe_interview_agent_metric
 from app.services.capture_recovery import CaptureFailure, classify_capture_failure
 from app.services.speculative_turn_preparation import SpeculativeTurnPreparation
 
 _LOG = logging.getLogger(__name__)
 _CONFIRMED_PREPARATION_TIMEOUT = 45.0
+_INTERACTION_PREPARATION_TIMEOUT = 20.0
 
 
 @dataclass
@@ -84,6 +87,8 @@ class AnswerEndpoint:
         self._preparation_failures_by_evidence: dict[str, int] = {}
         self._preparation_failure_notice_pending = False
         self._last_server_transcript = ""
+        self._interaction_text = ""
+        self._interaction_deadline = None
         self._covered_server_transcript = ""
         self._missing_final_attempts = 0
         self._awaiting_fresh_audio = False
@@ -175,6 +180,7 @@ class AnswerEndpoint:
         same prefix must not cancel the confirmation that used its final.
         """
         if final is not None:
+            self._begin_interaction(final.text)
             self._use_preparation_budget(final.text)
             if (self._confirmed_preparation is not None
                     and self._identity(final) != self._confirmed_preparation_identity):
@@ -183,6 +189,7 @@ class AnswerEndpoint:
             self._last_server_transcript = self._covered_server_transcript
 
     def request_finish(self) -> None:
+        self._interaction_deadline = None
         self._manual_retry_notice_pending = self._understanding_recovery_active
         self._reset_missing_final_budget()
         self._explicit_revision = self.revision
@@ -195,6 +202,7 @@ class AnswerEndpoint:
     def continue_speaking(self) -> None:
         """An explicit user action renews retries; microphone noise does not."""
         retrying = self._prepare_failures > 0
+        self._interaction_deadline = None
         self._manual_retry_notice_pending = self._understanding_recovery_active
         self._reset_missing_final_budget()
         self._reset_preparation_budget()
@@ -505,7 +513,8 @@ class AnswerEndpoint:
                 return
             stage = "commit"
             with measure_interview_agent_stage("decision_commit_ms"):
-                await self.commit(prepared, self.assert_current)
+                with interaction_deadline(self._interaction_deadline):
+                    await self.commit(prepared, self.assert_current)
             self._discard_confirmed_preparation()
         except ApiError as exc:
             # An unchanged transcript is insufficient when the frozen turn,
@@ -562,6 +571,7 @@ class AnswerEndpoint:
 
     async def _prepare_transcript(self, transcript: Any, *, semantic_first: bool = False) -> Any:
         with measure_interview_agent_stage("understanding_prepare_ms"):
+            self._begin_interaction(transcript.text)
             self._use_preparation_budget(transcript.text)
             if self.preparation_blocked:
                 self._blocked_revision = self.revision
@@ -618,13 +628,14 @@ class AnswerEndpoint:
                 return task.result()
             if task is None:
                 attempt = _PreparationAttempt(self._preparation_budget_epoch, self._preparation_budget_key)
-                task = asyncio.create_task(self._bounded_confirmed_preparation(transcript))
+                with interaction_deadline(self._interaction_deadline):
+                    task = asyncio.create_task(self._bounded_confirmed_preparation(transcript))
                 self._confirmed_preparation = task
                 self._confirmed_preparation_identity = identity
                 self._confirmed_preparation_capture = self.capture
                 self._confirmed_preparation_attempt = attempt
                 self._confirmed_preparation_deadline = (
-                    asyncio.get_running_loop().time() + _CONFIRMED_PREPARATION_TIMEOUT
+                    min(time.monotonic() + _CONFIRMED_PREPARATION_TIMEOUT, self._interaction_deadline)
                 )
                 self._preparation_tasks.add(task)
                 task.add_done_callback(lambda done: self._preparation_finished(done, attempt))
@@ -670,7 +681,8 @@ class AnswerEndpoint:
             kwargs["content_clarification"] = content_context
         return await asyncio.wait_for(
             self.capture.prepare_decision(transcript, **kwargs),
-            timeout=_CONFIRMED_PREPARATION_TIMEOUT,
+            timeout=min(_CONFIRMED_PREPARATION_TIMEOUT, remaining_interaction_seconds()
+                        if remaining_interaction_seconds() is not None else _CONFIRMED_PREPARATION_TIMEOUT),
         )
 
     @staticmethod
@@ -714,7 +726,17 @@ class AnswerEndpoint:
 
     async def _infer(self, work: Any, *, timeout: float,
                      preparation_attempt: Optional[_PreparationAttempt] = None) -> Any:
-        self._inference_task = asyncio.create_task(work)
+        with interaction_deadline(self._interaction_deadline):
+            remaining = remaining_interaction_seconds()
+            if remaining is not None:
+                timeout = min(timeout, remaining)
+            if timeout <= 0:
+                if inspect.iscoroutine(work):
+                    work.close()
+                elif isinstance(work, asyncio.Future):
+                    work.cancel()
+                raise asyncio.TimeoutError()
+            self._inference_task = asyncio.create_task(work)
         if preparation_attempt is not None:
             self._inference_task.add_done_callback(
                 lambda done: self._observe_preparation_result(done, preparation_attempt)
@@ -737,6 +759,19 @@ class AnswerEndpoint:
                 elif not self._inference_task.cancelled():
                     self._inference_task.exception()
             self._inference_task = None
+
+    def _begin_interaction(self, text: str) -> None:
+        text = text.strip()
+        if text and (text != self._interaction_text or self._interaction_deadline is None):
+            self._interaction_text = text
+            self._interaction_deadline = time.monotonic() + _INTERACTION_PREPARATION_TIMEOUT
+
+    def prepare_stable_preview(self, preview: Any) -> None:
+        if preview is None or getattr(preview, "has_unstable_tail", True) or not preview.text.strip():
+            return
+        self._begin_interaction(preview.text)
+        with interaction_deadline(self._interaction_deadline):
+            self.preparation.start(preview)
 
     async def _recover_capture(self, exc: BaseException, stage: str) -> None:
         self.failure = classify_capture_failure(exc, stage)
@@ -866,6 +901,19 @@ class AnswerEndpoint:
         if record_failure:
             self._record_preparation_failure()
         await self._publish_preparation_failure()
+
+    async def expression_preparation_failed(self) -> None:
+        """A selected reply could not become playable within its budget.
+
+        Preserve this capture and stop automatic retries for these words. Only
+        new authoritative speech or the existing explicit retry controls may
+        start another preparation; failure never grants answer completion.
+        """
+        self._record_preparation_failure()
+        self._preparation_terminal = True
+        self._blocked_revision = self.revision
+        self._preparation_failure_notice_pending = False
+        await self._notify("understanding_retry_exhausted")
 
     async def _notify(self, reason: str) -> None:
         critical = reason in {"capture_recovering", "capture_recovered", "capture_retry_required", "capture_failed"}

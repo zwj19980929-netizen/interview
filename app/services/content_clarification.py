@@ -4,6 +4,7 @@ import hashlib
 
 from app.core.errors import ApiError
 from app.core.prompt.contracts import CLARIFICATION_SPEECH_VERSION, clarification_speech
+from app.services.conversation_delivery import selected_events
 
 
 def text_hash(text):
@@ -36,7 +37,7 @@ def validated_content_clarification(session, turn, transcript, context):
                          and (e.get("payload") or {}).get("act_id") == context["question_act_id"]
                          and (e.get("payload") or {}).get("approved") is True
                          and (e.get("payload") or {}).get("text") == clarification_speech(focus)
-                         for e in session.get("agent_events", [])))
+                         for e in selected_events(session, turn)))
     if not valid:
         raise ApiError("CONTENT_CLARIFICATION_REQUIRED", "A delivered current content clarification is required.", status_code=409)
     return deepcopy(context)

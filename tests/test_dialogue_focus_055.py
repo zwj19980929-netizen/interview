@@ -58,7 +58,7 @@ async def test_social_reply_cannot_smuggle_an_untracked_technical_question(kind)
     with pytest.raises(StructuredResponseValidationError, match="Reception") as err:
         await _service(gateway).classify_reception("这一部分讲完了。", "org_default")
     assert err.value.reason_code == "reception_cannot_ask_question"
-    assert gateway.requests[0].metadata["prompt_version"] == "conversation_reception.v6"
+    assert gateway.requests[0].metadata["prompt_version"] == "conversation_reception.v7"
 
 
 def test_reception_routes_completion_and_repeat_to_server_without_a_new_probe():

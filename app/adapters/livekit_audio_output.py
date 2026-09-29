@@ -12,6 +12,7 @@ import inspect
 import math
 import re
 import struct
+from time import monotonic
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
@@ -59,6 +60,7 @@ class LiveKitApprovedAudioPublisher:
         room_factory: Optional[Callable[[], Any]] = None,
         operation_timeout_seconds: float = 5.0,
         before_abort: Optional[Callable[[], Awaitable[None]]] = None,
+        first_audio_deadline: Optional[float] = None,
     ) -> None:
         if not isinstance(room_name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,254}", room_name):
             raise ValueError("An exact server-issued room identifier is required")
@@ -79,6 +81,9 @@ class LiveKitApprovedAudioPublisher:
         self.track_name = "approved-expression:%s" % performance_id
         self.sample_rate_hz = sample_rate_hz
         self.total_samples = 0
+        # Either sink may deliver before the other's await completes. Sample
+        # counters alone cannot prove that a failed first frame was unheard.
+        self.pcm_delivery_started = False
         self._output_id: Optional[str] = None
         self._sequence = 0
         self._fence = assert_current
@@ -86,6 +91,7 @@ class LiveKitApprovedAudioPublisher:
         self._rtc = rtc if rtc_module is None else rtc_module
         self._room_factory = room_factory or self._rtc.Room
         self._timeout = float(operation_timeout_seconds)
+        self._first_audio_deadline = first_audio_deadline
         self._room: Any = None
         self._source: Any = None
         self._publication: Optional[LiveKitApprovedAudioPublication] = None
@@ -131,6 +137,8 @@ class LiveKitApprovedAudioPublisher:
         task = asyncio.ensure_future(awaitable)
         self._pending_operations.add(task)
         deadline = asyncio.get_running_loop().time() + self._timeout
+        if self.total_samples == 0 and self._first_audio_deadline is not None:
+            deadline = min(deadline, asyncio.get_running_loop().time() + self._first_audio_deadline - monotonic())
         try:
             while True:
                 self._assert_current()
@@ -231,6 +239,7 @@ class LiveKitApprovedAudioPublisher:
             # child starts. Validate at each actual SDK send, without yielding
             # between authorization and creating/entering its operation.
             self._assert_current()
+            self.pcm_delivery_started = True
             await operation()
 
         tasks = [asyncio.create_task(send_current(lambda: self._source.capture_frame(frame)))]

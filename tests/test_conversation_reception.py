@@ -28,7 +28,7 @@ async def test_reception_uses_small_grounded_schema_and_no_answer_preparation():
     assert request.max_output_tokens == 320
     assert request.execution_budget.timeout_s == 4
     assert request.execution_budget.max_provider_retries == 0
-    assert request.metadata == {'prompt_version': 'conversation_reception.v6'}
+    assert request.metadata == {'prompt_version': 'conversation_reception.v7'}
     assert 'standard_answer' not in str(request.messages)
 
 

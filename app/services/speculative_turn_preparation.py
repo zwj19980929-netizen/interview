@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Any, Callable
+from app.core.interaction_budget import remaining_interaction_seconds
 
 
 class SpeculativeTurnPreparation:
@@ -30,7 +31,9 @@ class SpeculativeTurnPreparation:
         task.add_done_callback(self._done)
 
     async def _run(self, preview: Any) -> Any:
-        return await asyncio.wait_for(self._prepare(preview, semantic_first=True), timeout=self._timeout)
+        remaining = remaining_interaction_seconds()
+        timeout = min(self._timeout, remaining) if remaining is not None else self._timeout
+        return await asyncio.wait_for(self._prepare(preview, semantic_first=True), timeout=timeout)
 
     def matching(self, snapshot: Any) -> bool:
         task = self._task

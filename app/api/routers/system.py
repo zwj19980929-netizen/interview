@@ -61,6 +61,7 @@ async def interview_agent_metric_snapshot() -> Dict[str, Any]:
     return {
         "schema": "interview-agent-metrics.v1",
         "metrics": interview_agent_metrics().snapshot(),
+        "aggregation": interview_agent_metrics().aggregation(),
     }
 
 

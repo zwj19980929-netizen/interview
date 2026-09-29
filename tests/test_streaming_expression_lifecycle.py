@@ -192,7 +192,8 @@ def test_default_and_enabled_streaming_retain_owner_fence_and_ready_before_pcm(m
         publisher = _Publisher()
         requests, publications = [], []
 
-        async def provider(request):
+        async def provider(request, *, first_audio_deadline):
+            assert first_audio_deadline > 0
             requests.append(request)
             return stream
 
@@ -225,7 +226,7 @@ def test_default_and_enabled_streaming_retain_owner_fence_and_ready_before_pcm(m
             assert requests[0].purpose == "interview_agent_expression"
             assert len(publications) == 1 and publications[0]["assert_current"] is fence
             assert publications[0]["performance_id"] == "performance_synthetic"
-            assert publisher.opened == 0 and publisher.published == [] and not raw.started.is_set()
+            assert publisher.opened == 1 and publisher.published == [] and not raw.started.is_set()
         finally:
             await output.abort()
 

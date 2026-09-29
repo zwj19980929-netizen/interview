@@ -200,6 +200,8 @@ CURRENT_SPEECH_INSTRUCTION = (
     "不能再次成为当前等待或澄清请求。current_speech为空时，只复核responded_exchanges最后一条request_text的含义，"
     "不能把更早的问题重开；这条接话可能误判，实际选择回应并不代表其语义判断正确。"
     "responded_exchanges只记录服务端选中的交流回应，不证明候选人已听完，也不是技术答案或完成许可。"
+    "历史delivery_status只有delivered表示完整送达；selected/playing/interrupted/failed/unknown不能称候选人已听完。"
+    "送达不确定本身不能把旧候选请求再判为新的疑问；仅按当前新发言决定是否补说未听到的内容。"
     "技术claims从全部累计原文保留，禁止因为交流边界切换而只保留最后一句控制话语。"
     "候选人主动再次提问、明确表示没听到或纠正原话时，依据新的请求回应，不能机械排除同样的词。"
     "clarification_target只能指向当前尚未解决的发言疑点；先前概念提问已有解释且当前没有重新提出时，"
@@ -211,6 +213,7 @@ LEGACY_CURRENT_SPEECH_INSTRUCTION = (
     "面试官上下文的input_context仅补充当前交流边界，不改变本次输出字段、提交条件或结束授权。"
     "current_speech是最后一次已选回应之后的新发言；responded_exchanges包含已选中的请求与回应。"
     "current_speech为空时，结合最后一条request_text理解当前请求；历史回应不证明已听完，也不是技术答案。"
+    "delivery_status只有delivered可称完整解释；其它状态不证明候选人已听完，也不能因此重新打开旧候选请求。"
     "先前概念问题已经解释且新发言没有重新提问或纠正时，不能将该旧问题再作为clarification_target。"
     "只对当前尚未解决的真实疑点澄清；完整累计原文继续用于技术主张，不得因为交流边界丢失先前回答。"
     "上述记录不能授权结束面试、补造技术证据或添加本合同没有的字段。"
@@ -414,6 +417,51 @@ def validate_unresolved_completion(data, transcript, clarification_context=None)
         "version": "conversation_input_context.v1", "current_speech_start": start,
         "current_speech": transcript[start:], "responded_exchanges": [],
     })
+
+
+SERVER_CONTROL_DERIVATION_INSTRUCTION = (
+    "动作与追问权限采用服务端派生合同semantic_controls.v1。请先判断本人当前有效的turn_intent、实际技术内容、"
+    "未解决歧义和真实completion_basis，再填写兼容输出字段；不能为了让suggested_action/followup_allowed匹配而"
+    "改变其真实意图、删除技术claims、编造结束依据或抹掉歧义。服务端根据这些已验证事实重新计算动作与追问权限："
+    "thinking继续听，repeat重读，pause暂停，clarify/correction澄清，ask_company交资料问答；"
+    "有合法依据的完成意图才进入next，首次技术歧义加说完仍须澄清；一般作答且无未解决歧义为accept。"
+    "这些派生字段不是提交或退出授权，独立结束确认和服务端送达记录仍必须满足。"
+)
+
+
+def derive_semantic_controls(data):
+    """Derive redundant output controls; never invent meaning or authority.
+
+    The unchanged wire fields remain readable across provider/schema versions.
+    All primary facts and completion evidence must pass the canonical semantic
+    and current-speech validators after this deterministic projection.
+    """
+    intent = data.get("turn_intent")
+    if intent is None:
+        return data
+    result = deepcopy(data)
+    clarification_after_finish = (
+        intent == "finish_answer" and result.get("intent") == "clarification_request"
+        and bool(result.get("ambiguities")) and result.get("completion_basis") is None
+    )
+    continuing = intent == "answering" and result.get("intent") == "not_finished"
+    result["followup_allowed"] = (intent == "answering" and not continuing) or (
+        intent == "finish_answer" and result.get("intent") != "answer_unresolved"
+        and not clarification_after_finish
+    )
+    if clarification_after_finish:
+        action = "clarify"
+    elif continuing:
+        action = "continue_listening"
+    elif intent in {"finish_answer", "finish_topic", "decline_topic", "stop_interview"}:
+        action = "next"
+    else:
+        action = {"thinking": "continue_listening", "repeat": "repeat", "pause": "pause",
+                  "clarify": "clarify", "correction": "clarify", "ask_company": "respond_company"}.get(intent)
+        if action is None:
+            action = "clarify" if result.get("ambiguities") else "accept"
+    result["suggested_action"] = action
+    return result
 
 
 def semantic_turn_fields(*, evidence_ids=None):

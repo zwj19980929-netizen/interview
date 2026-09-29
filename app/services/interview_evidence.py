@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from app.core.errors import ApiError
 from app.domain.evidence_coordination import EvidenceCommitFence
+from app.domain.speech_quality import transcript_confidence_segments
 from app.persistence.interface import Persistence
 from app.persistence.provider import persistence_for
 from app.services.streaming_stt import StreamingInterviewSTT
@@ -263,6 +264,12 @@ class InterviewEvidenceChain:
         token = {"stream": stream, "turn_id": self.turn_id, "after_sequence": sequence,
                  "request_text": request_text.strip(), "kind": kind,
                  "source_stream_id": final.stream_id}
+        from app.services.conversation_input_context import reception_source_boundary
+        token["source_boundary"] = reception_source_boundary(
+            final.text.strip(), request_text.strip(),
+            segments=transcript_confidence_segments(final.text.strip(), getattr(final, "segments", [])),
+            source_capture=getattr(stream, "last_media_checkpoint", None),
+        )
         self._pending_reception_exchange = token
         return token
 
@@ -284,6 +291,11 @@ class InterviewEvidenceChain:
         try:
             guard()
             self._stt._assert_commit_allowed()
+            from app.services.conversation_input_context import capture_source_fingerprint
+            proof = staged.get("source_boundary")
+            if proof and proof["capture_fingerprint"] != capture_source_fingerprint(
+                    getattr(self._stt, "last_media_checkpoint", None)):
+                return False
             with self.persistence.transaction(self.organization_id) as tx:
                 if self.commit_fence is not None:
                     from app.services.evidence_coordination import assert_current_evidence_fence
@@ -322,7 +334,10 @@ class InterviewEvidenceChain:
                     "request_text": request[-1600:], "request_sha256": digest,
                     "act_id": act["act_id"], "selected_event_id": selected["event_id"],
                     "session_sequence": selected["session_sequence"], "created_at": selected.get("occurred_at", ""),
-                    "source_stream_id": staged["source_stream_id"], "kind": staged["kind"]})
+                    "source_stream_id": staged["source_stream_id"], "kind": staged["kind"],
+                    # Explicitly retain missing proof. Only historical receipts
+                    # without this field may use the legacy unique-text cursor.
+                    "source_boundary": staged.get("source_boundary")})
                 del exchanges[:-6]
                 tx.interview_sessions.update(session, expected_version=session["version"])
             return True

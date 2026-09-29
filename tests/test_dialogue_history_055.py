@@ -87,5 +87,5 @@ def test_reusable_projection_exposes_only_dialogue_fields_and_supports_smaller_l
     result = recent_turn_dialogue(session, session["turns"][0], max_acts=2, max_utterances=1, candidate_limit=3)
     assert [item.get("act_id") for item in result[:2]] == ["b", "a"]
     assert result[-1]["text"] == "已讲完"
-    assert all(set(item) <= {"speaker", "turn_id", "text", "created_at", "act_id", "utterance_id"} for item in result)
+    assert all(set(item) <= {"speaker", "turn_id", "text", "created_at", "act_id", "utterance_id", "delivery_status"} for item in result)
     assert "DO_NOT_EXPOSE" not in str(result) and "PRIVATE" not in str(result)

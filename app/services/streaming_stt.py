@@ -13,7 +13,7 @@ from app.core.prompt.realtime_dialogue import (
 )
 from app.model_gateway.errors import ProviderError
 from app.model_gateway.gateway import ModelGateway
-from app.model_gateway.dialogue import ValidatedSpeechDialogueStream
+from app.model_gateway.dialogue import OptionalSpeechDialogueInput
 from app.model_gateway.schemas import (
     RealtimeSpeechDialogueRequest,
     RealtimeSpeechResponseCommand,
@@ -60,7 +60,8 @@ class StreamingInterviewSTT:
         self.expression_audio = AgentExpressionAudioService(self.persistence)
         self.recording: Optional[Any] = None
         self.stream: Optional[ValidatedSTTStream] = None
-        self.dialogue: Optional[ValidatedSpeechDialogueStream] = None
+        self.dialogue: Optional[OptionalSpeechDialogueInput] = None
+        self._dialogue_cleanup_tasks: set[asyncio.Task] = set()
         self.turn_id: Optional[str] = None
         self.content_type = "audio/webm;codecs=opus"
         self.language = "zh-CN"
@@ -224,7 +225,9 @@ class StreamingInterviewSTT:
                         except Exception:
                             pass
                         raise
-                self.dialogue = dialogue
+                self.dialogue = OptionalSpeechDialogueInput(
+                    dialogue, max_pending_bytes=max(1, sample_rate_hz * channels),
+                )
                 ready.extend(item.model_dump() for item in self.dialogue.ready_events)
             except ProviderError as exc:
                 # S2S is the low-latency expression track, never the evidence
@@ -278,26 +281,28 @@ class StreamingInterviewSTT:
         if not self.continuous:
             self._record_frame(chunk)
         try:
-            stt_task = self.stream.send_audio(chunk)
-            dialogue_task = self.dialogue.send_audio(chunk) if self.dialogue else None
-            if dialogue_task is None:
-                events = await stt_task
-                dialogue_events: List[Any] = []
-            else:
-                stt_result, dialogue_result = await asyncio.gather(
-                    stt_task, dialogue_task, return_exceptions=True
-                )
-                if isinstance(stt_result, Exception):
-                    raise stt_result
-                events = stt_result
-                if isinstance(dialogue_result, Exception):
+            events = await self.stream.send_audio(chunk)
+            dialogue_events: List[Any] = []
+            if self.dialogue is not None:
+                try:
+                    dialogue_result = await self.dialogue.send_audio(chunk)
+                except Exception as exc:
                     dialogue_events = [
                         self._dialogue_error(
-                            getattr(dialogue_result, "code", "provider_stream_failed"),
+                            getattr(exc, "code", "provider_stream_failed"),
                             "S2S stream failed; authoritative STT continues.",
                         )
                     ]
-                    await self._abort_dialogue()
+                    # Detach immediately. Even optional-provider cleanup must
+                    # not make the next authoritative audio frame wait.
+                    dialogue, self.dialogue = self.dialogue, None
+                    task = asyncio.create_task(dialogue.abort())
+                    self._dialogue_cleanup_tasks.add(task)
+                    def done(completed):
+                        self._dialogue_cleanup_tasks.discard(completed)
+                        if not completed.cancelled():
+                            completed.exception()
+                    task.add_done_callback(done)
                 else:
                     dialogue_events = [item.model_dump() for item in dialogue_result]
         except ProviderError as exc:
@@ -532,10 +537,10 @@ class StreamingInterviewSTT:
                         ),
                     )
                     followup_event["delivery"] = "s2s"
-                    followup_event["expression"] = self._materialize_dialogue_expression(
+                    followup_event["expression"] = await self._materialize_dialogue_expression(
                         dialogue_events
                     )
-                except (ApiError, ProviderError, ValueError) as exc:
+                except (ApiError, ProviderError, ValueError, asyncio.TimeoutError) as exc:
                     response.append(
                         self._dialogue_error(
                             getattr(exc, "code", "dialogue_response_failed"),
@@ -900,7 +905,7 @@ class StreamingInterviewSTT:
             "message": message,
         }
 
-    def _materialize_dialogue_expression(
+    async def _materialize_dialogue_expression(
         self, events: List[Any]
     ) -> Dict[str, Any]:
         audio_events = [item for item in events if item.type == "output.audio.delta"]
@@ -928,7 +933,7 @@ class StreamingInterviewSTT:
                 "Realtime speech output audio is invalid.",
                 status_code=502,
             ) from exc
-        stored = self.expression_audio.store_pcm(
+        stored = await self.expression_audio.store_pcm_async(
             organization_id=self.organization_id,
             interview_id=self.interview_id,
             turn_id=self.turn_id,

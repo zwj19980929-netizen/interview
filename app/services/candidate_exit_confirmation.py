@@ -4,6 +4,7 @@ import hashlib
 
 from app.core.errors import ApiError
 from app.core.prompt.candidate_exit import EXIT_CONFIRMATION_SPEECH, EXIT_CONFIRMATION_SPEECH_VERSION
+from app.services.conversation_delivery import selected_events
 
 
 def text_hash(text):
@@ -23,7 +24,7 @@ def validated_exit_context(session, turn, transcript, context):
         reply_end = len(transcript) - len(fresh) + len(reply)
         acts = [act for act in turn.get("conversation_acts", [])
                 if act.get("act_id") == context["question_act_id"] and act.get("turn_id") == turn["id"]]
-        selected = [event for event in session.get("agent_events", [])
+        selected = [event for event in selected_events(session, turn)
                     if event.get("type") == "conversation.act.selected" and event.get("turn_id") == turn["id"]
                     and (event.get("payload") or {}).get("act_id") == context["question_act_id"]
                     and (event.get("payload") or {}).get("approved") is True

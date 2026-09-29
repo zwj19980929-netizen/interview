@@ -74,7 +74,7 @@ async def test_semantic_schema_does_not_fabricate_the_separate_completion_permis
         snapshot_ref="private-file://synthetic_prefix", semantic_first=True, completion_confirmed=confirmed)
     assert prepared.semantic_first and prepared.completion_confirmed is confirmed
     assert prepared.understanding.completion_basis is None
-    assert prepared.understanding.prompt_version == ("interview_turn_understanding.v53" if confirmed else "interview_turn_understanding.v52")
+    assert prepared.understanding.prompt_version == ("interview_turn_understanding.v65" if confirmed else "interview_turn_understanding.v64")
     if confirmed:
         service.assert_prepared_streaming_decision(prepared, final, "org_default")
         with pytest.raises(ApiError, match="no longer matches"):

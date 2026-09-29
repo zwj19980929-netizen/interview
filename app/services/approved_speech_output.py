@@ -7,6 +7,7 @@ Nothing in this module creates an answer or grants a client decision authority.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from time import monotonic
 from typing import Any, Awaitable, Callable, Optional
 
@@ -19,17 +20,21 @@ from app.domain.interview_agent import LiveSpeechBinding
 class ApprovedSpeechOutput:
     def __init__(
         self, *, performance_id: str, stream: Any, publisher: Any,
-        assert_current: Callable[[], None], archive: Callable[..., dict],
+        assert_current: Callable[[], None], archive: Callable[..., Any],
         ready_timeout: float = 5.0, drain_timeout: float = 5.0,
         total_timeout: float = 300.0, max_bytes: int = 20 * 1024 * 1024 - 44,
+        first_audio_deadline: Optional[float] = None,
+        output_id: Optional[str] = None, publication: Any = None,
     ) -> None:
         self.performance_id = performance_id
-        self.output_id = new_id("speech_output")
+        self.output_id = output_id or new_id("speech_output")
+        self._prepared_publication = publication
         self.stream, self.publisher = stream, publisher
         self._fence, self._archive = assert_current, archive
         self._ready_timeout, self._drain_timeout = ready_timeout, drain_timeout
         self._deadline = monotonic() + total_timeout
         self._created_at = monotonic()
+        self._first_audio_deadline = first_audio_deadline
         self._max_bytes = max_bytes
         self._ready, self._drained = asyncio.Event(), asyncio.Event()
         self._closed = False
@@ -44,8 +49,10 @@ class ApprovedSpeechOutput:
             if (self.stream.sample_rate_hz != 24_000 or self.stream.channels != 1
                     or self.stream.ready_event.provider.provider_id == "mock"):
                 raise ApiError("AGENT_STREAM_AUDIO_INVALID", "Formal streamed speech requires real mono 24 kHz PCM.", status_code=503)
-            self.publisher.bind_output(self.output_id)
-            publication = await self.publisher.open()
+            publication = self._prepared_publication
+            if publication is None:
+                self.publisher.bind_output(self.output_id)
+                publication = await self.publisher.open()
             self._assert_current()
             return LiveSpeechBinding(
                 output_id=self.output_id,
@@ -77,6 +84,10 @@ class ApprovedSpeechOutput:
     @property
     def playback_drained(self) -> bool:
         return self._drained.is_set()
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
     async def run(self, on_producer_finished: Callable[[dict], Awaitable[None]]) -> None:
         if self._running:
@@ -115,6 +126,9 @@ class ApprovedSpeechOutput:
             # events or playback, and interrupted bytes never masquerade as final.
             with measure_interview_agent_stage("tts_asset_import_ms"):
                 stored = self._archive(pcm_s16le=bytes(pcm), sample_rate_hz=24_000, channels=1)
+                if inspect.isawaitable(stored):
+                    stored = await asyncio.wait_for(stored, timeout=max(0.001, self._deadline - monotonic()))
+            self._assert_current()
             self.archive_reference = stored["audio_uri"]
             pcm.clear()
             await asyncio.wait_for(self.publisher.finish(), timeout=max(0.001, self._deadline - monotonic()))
@@ -194,6 +208,10 @@ class ApprovedSpeechOutput:
         if self._closed:
             raise ApiError("AGENT_SPEECH_OUTPUT_STALE", "Approved speech output is no longer current.", status_code=409)
         self._fence()
+        if (self.total_samples == 0 and getattr(self.publisher, "total_samples", 0) == 0
+                and self._first_audio_deadline is not None
+                and monotonic() >= self._first_audio_deadline):
+            raise ApiError("AGENT_AUDIO_FIRST_PCM_TIMEOUT", "Approved speech did not start within its time budget.", status_code=504)
         if monotonic() >= self._deadline:
             raise ApiError("AGENT_AUDIO_OUTPUT_TIMEOUT", "Approved speech exceeded its time budget.", status_code=504)
 

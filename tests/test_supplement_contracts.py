@@ -52,9 +52,9 @@ def test_confirmation_reply_has_strict_nonempty_bounded_contract(change):
 def test_confirmation_understanding_has_traceable_version_and_ignores_old_control_intents():
     context = {"transcript": "我还没有说完。有补充。用探针核验状态。没有补充了。", "capability_points": ["探针"], "completion_confirmed": True}
     contract = prompt_contract("interview_turn_understanding", context)
-    assert contract.version == "interview_turn_understanding.v59"
+    assert contract.version == "interview_turn_understanding.v71"
     assert "不作为能力主张或评分证据" in "".join(m.content for m in contract.messages)
-    assert prompt_contract("interview_turn_decision", context).version == "interview_turn_decision.v90"
+    assert prompt_contract("interview_turn_decision", context).version == "interview_turn_decision.v102"
 
 
 def test_reply_evidence_cannot_be_invented_even_after_valid_json():

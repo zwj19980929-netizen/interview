@@ -4,6 +4,7 @@ Selected events establish an interviewer exchange, not proof of audible playback
 or answer evidence. Reused acts can appear several times, with each event's time.
 """
 from typing import Any, Dict, List
+from app.services.conversation_delivery import selected_events
 
 
 def recent_turn_dialogue(
@@ -16,7 +17,7 @@ def recent_turn_dialogue(
             if item.get("act_id") and item.get("turn_id") in {None, turn_id}}
     selected = []
     live_requests = {}
-    for event in session.get("agent_events") or []:
+    for event in selected_events(session, turn):
         if event.get("type") != "conversation.act.selected" or event.get("turn_id") != turn_id:
             continue
         payload = event.get("payload") or {}
@@ -41,6 +42,7 @@ def recent_turn_dialogue(
                 "created_at": occurred_at}
         selected.append((sequence, {"speaker": "interviewer", "turn_id": turn_id,
             "act_id": act["act_id"], "text": act["text"][-interviewer_limit:],
+            "delivery_status": (event.get("delivery") or {}).get("status", "unknown"),
             "created_at": occurred_at}))
     selected.sort(key=lambda item: item[0])
     interviewer = selected[-max_acts:] if max_acts > 0 else []

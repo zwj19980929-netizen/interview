@@ -80,7 +80,7 @@ async def test_specialist_has_no_side_effects_and_shares_three_call_budget():
     result = await supervisor(gateway).propose_next(source_session())
     assert result.model_calls == 3
     assert [request.metadata["prompt_version"] for request in gateway.calls] == [
-        "interviewer_supervisor.v3", "interviewer_evidence_expert.v1", "interviewer_supervisor.v3"]
+        "interviewer_supervisor.v4", "interviewer_evidence_expert.v2", "interviewer_supervisor.v4"]
     assert gateway.calls[-1].json_schema["properties"]["tool_name"]["enum"] == [None]
 
 
@@ -137,7 +137,7 @@ async def test_service_selects_exactly_one_root_and_rejects_changed_session():
     assert len(selected["turns"]) == 1 and selected["decision_revision"] == 1
     again = await service.advance_adaptive_interview(session["id"])
     assert len(again["turns"]) == 1
-    assert selected["agent_runtime"]["last_planning"]["prompt_version"] == "interviewer_supervisor.v3"
+    assert selected["agent_runtime"]["last_planning"]["prompt_version"] == "interviewer_supervisor.v4"
 
     store = InMemoryStore()
     session = source_session(store)

@@ -10,13 +10,14 @@ import time
 from typing import Any, Dict, Optional, Tuple
 
 from app.core.errors import ApiError
+from app.core.interaction_budget import remaining_interaction_seconds
 from app.core.prompt.interviewer_supervisor import supervisor_contract, evidence_expert_contract
 from app.core.prompt.validation import validate_structured_response
 from app.model_gateway import capabilities as cap
 from app.model_gateway.schemas import ChatJSONRequest, InvocationExecutionBudget
 from app.domain.adaptive_interview import coverage_summary, budget_summary
 from app.core.time import utc_now
-from .context import assessment_contract, context_fingerprint, conversation_memory
+from .context import assessment_contract, context_fingerprint, conversation_memory, planning_memory, planning_request_size
 from .tools import InterviewerTools, COMPANY_CONTEXT_REFERENCE, company_context
 
 
@@ -65,7 +66,8 @@ class InterviewerSupervisor:
     async def prepare_turn(self, utterance: Any, turn: Dict[str, Any], session: Dict[str, Any]):
         from app.services.conversation_input_context import conversation_input_context
         context = conversation_memory(session)
-        context["input_context"] = conversation_input_context(session, turn, utterance.text)
+        context["input_context"] = conversation_input_context(session, turn, utterance.text,
+            segments=utterance.stt_segments, source_capture=utterance.audio_uri)
         self._add_content_clarification(context, session, utterance.text)
         self._add_exit_context(context, session, utterance.text)
         context["skill"] = self._skill_context(self.load_skill(session))
@@ -75,10 +77,13 @@ class InterviewerSupervisor:
 
     async def prepare_preview(self, preview: Any, turn: Dict[str, Any], session: Dict[str, Any], *, snapshot_ref: str):
         from app.services.conversation_input_context import conversation_input_context
+        from app.domain.speech_quality import transcript_confidence_segments
         context = conversation_memory(session)
-        context["input_context"] = conversation_input_context(session, turn, preview.text)
-        self._add_content_clarification(context, session, preview.text)
-        self._add_exit_context(context, session, preview.text)
+        text = preview.text.strip()
+        context["input_context"] = conversation_input_context(session, turn, text,
+            segments=transcript_confidence_segments(text, preview.segments), source_capture=snapshot_ref)
+        self._add_content_clarification(context, session, text)
+        self._add_exit_context(context, session, text)
         context["skill"] = self._skill_context(self.load_skill(session))
         context["company_context"] = self._company_context(session)
         return await self.conversation.prepare_preview(preview, turn,
@@ -114,35 +119,44 @@ class InterviewerSupervisor:
     async def propose_next(self, session: Dict[str, Any]) -> NextInterviewDecision:
         if session.get("status") != "in_progress" or session.get("candidate_input_completed_at") or session.get("current_turn_id"):
             raise ApiError("INTERVIEW_DECISION_NOT_EXPECTED", "The interview is not waiting for a new question.", status_code=409)
+        remaining_interaction = remaining_interaction_seconds()
+        deadline = time.monotonic() + min(15.0, remaining_interaction if remaining_interaction is not None else 15.0)
         skill = self.load_skill(session)
-        tools = InterviewerTools(session, skill)
+        budget = budget_summary(session, utc_now())
+        tools = InterviewerTools(session, skill, remaining_seconds=budget["remaining_seconds"])
+        catalog = tools.catalog_page()
         fingerprint = context_fingerprint(session)
         revision = int(session.get("decision_revision", 0))
         decision_id = "decision_" + hashlib.sha256((session["id"] + ":" + str(revision) + ":" + fingerprint).encode()).hexdigest()[:32]
         context = {"assessment": {k: deepcopy(v) for k, v in assessment_contract(session).items() if k != "candidate_questions"},
-                   "memory": conversation_memory(session), "eligible_questions": tools.catalog(),
+                   "memory": planning_memory(session), "eligible_questions": catalog["items"],
+                   "catalog": {key: value for key, value in catalog.items() if key not in {"status", "items"}},
                    "skill": self._skill_context(skill), "company_context": self._company_context(session),
                    "tools": list(tools.allowed),
                    "questions_asked": len([t for t in session.get("turns", []) if not t.get("is_followup")]),
-                   "coverage": coverage_summary(session), "budget": budget_summary(session, utc_now()),
+                   "coverage": coverage_summary(session), "budget": budget,
                    "remaining_seconds": self._remaining_seconds(session)}
         observations = []
         calls = 0
         tools_used = []
-        deadline = time.monotonic() + 15.0
+        observed_requests = set()
 
         async def invoke(contract):
             nonlocal calls
+            size = planning_request_size(contract)
             remaining = deadline - time.monotonic()
             if calls >= 3 or remaining <= 0:
                 raise ApiError("INTERVIEW_DECISION_BUDGET_EXHAUSTED", "Interview planning reached its bounded budget.", status_code=503)
             calls += 1
-            response = await asyncio.wait_for(self.gateway.invoke(cap.LLM_CHAT_JSON, ChatJSONRequest(
-                organization_id=session["organization_id"], purpose="interview_turn_understanding",
-                messages=contract.messages, json_schema=contract.response_schema, max_output_tokens=600, temperature=0.0,
-                execution_budget=InvocationExecutionBudget(timeout_s=remaining, max_provider_retries=0, max_provider_attempts=1),
-                metadata={"prompt_version": contract.version},
-            )), timeout=remaining)
+            try:
+                response = await asyncio.wait_for(self.gateway.invoke(cap.LLM_CHAT_JSON, ChatJSONRequest(
+                    organization_id=session["organization_id"], purpose="interview_turn_understanding",
+                    messages=contract.messages, json_schema=contract.response_schema, max_output_tokens=600, temperature=0.0,
+                    execution_budget=InvocationExecutionBudget(timeout_s=remaining, max_provider_retries=0, max_provider_attempts=1),
+                    metadata={"prompt_version": contract.version, "planning_input_size": size},
+                )), timeout=remaining)
+            except asyncio.TimeoutError:
+                raise ApiError("INTERVIEW_DECISION_BUDGET_EXHAUSTED", "Interview planning reached its bounded budget.", status_code=503) from None
             data = response.data
             validate_structured_response(data, contract.response_schema)
             return data
@@ -150,7 +164,7 @@ class InterviewerSupervisor:
         try:
             while calls < 3:
                 usable = [name for name in tools.allowed if not (name == "specialists.consult" and (calls > 0 or name in tools_used))]
-                data = await invoke(supervisor_contract(context, observations, tools=usable if calls < 2 else [], question_ids=list(tools.candidates), unit_ids=[unit["id"] for q in tools.candidates.values() for unit in q.get("inquiry_units", [])]))
+                data = await invoke(supervisor_contract(context, observations, tools=usable if calls < 2 else []))
                 action = data["action"]
                 if action == "use_tool":
                     if data["question_id"] is not None or data["inquiry_unit_id"] is not None or not data["tool_name"] or data["reason_code"] != "inspect_context":
@@ -159,13 +173,19 @@ class InterviewerSupervisor:
                     if name not in usable or len(tools_used) >= 3:
                         raise ValueError("tool budget exceeded")
                     tools_used.append(name)
+                    request_key = (name, data["argument"])
+                    if request_key in observed_requests:
+                        continue
                     if name == "specialists.consult":
                         if data["argument"] is not None:
                             raise ValueError("specialist takes the frozen context only")
-                        result = await invoke(evidence_expert_contract(context, list(tools.candidates)))
+                        result = await invoke(evidence_expert_contract(context))
+                        if any(question_id not in tools.candidates for question_id in result["question_ids"]):
+                            raise ValueError("specialist question outside frozen scope")
                     else:
                         result = tools.execute(name, data["argument"])
-                    observations.append({"tool_name": name, "result": result})
+                    observations.append({"tool_name": name, "argument": data["argument"], "result": result})
+                    observed_requests.add(request_key)
                     continue
                 if data["tool_name"] is not None or data["argument"] is not None:
                     raise ValueError("unexpected tool payload")

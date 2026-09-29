@@ -63,3 +63,16 @@ def _evidence_quotes(ids, references):
     # each quote once in selection order. Do not change occurrence IDs/offsets:
     # company-question exclusion still needs the exact selected source span.
     return list(dict.fromkeys(references["evidence"][key] for key in ids))
+
+
+def completion_reference_ranges(data, references):
+    """Keep exact occurrence identity for acoustic quality of ending evidence.
+
+    Call only after the wire and complete semantic/current-speech contracts
+    pass. These offsets locate evidence; they do not authorize completion.
+    """
+    basis = data.get("completion_basis")
+    if not isinstance(basis, dict) or not isinstance(basis.get("evidence_ids"), list):
+        return []
+    return [(references["offsets"][key], references["offsets"][key] + len(references["evidence"][key]))
+            for key in basis["evidence_ids"]]

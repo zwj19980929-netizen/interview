@@ -18,6 +18,6 @@ async def test_current_supervisor_dispatch_does_not_fall_through_to_understandin
         json_schema=contract.response_schema, metadata={"prompt_version": SUPERVISOR_VERSION})
     response = await MockProvider().invoke(LLM_CHAT_JSON, request, SimpleNamespace(model="synthetic_dispatch"))
     validate_structured_response(response.data, contract.response_schema)
-    assert contract.version == "interviewer_supervisor.v3"
+    assert contract.version == "interviewer_supervisor.v4"
     assert response.data["action"] == "select_question" and response.data["question_id"] == "q_synthetic"
     assert "understanding" not in response.data and "intent" not in response.data

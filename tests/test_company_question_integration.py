@@ -21,7 +21,7 @@ def provider(monkeypatch, *, blocked_reply=None):
     calls = []
     async def invoke(instance, capability, request, context):
         version = request.metadata.get("prompt_version")
-        if version == "conversation_reception.v6":
+        if version == "conversation_reception.v7":
             return await original(instance, capability, request, context)
         if version == "company_question_reply.v1":
             calls.append(("company", json.loads(request.messages[-1].content)))

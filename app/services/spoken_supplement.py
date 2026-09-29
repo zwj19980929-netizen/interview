@@ -140,6 +140,44 @@ class SpokenSupplementConfirmation:
         self._content_request_final = None
         self._content_question_delivered = False
         self._content_delivery_pending = False
+        self._unplayed_speech_checkpoint = None
+
+    def begin_unplayed_speech(self) -> Any:
+        """Remember delivered input cursors before one exact output is selected."""
+        checkpoint = {name: getattr(self, name) for name in (
+            "_handled_final", "_handled_trace_revision", "_reception_seen_text", "_reception_seen_final",
+            "_failure_spoken_identity", "_idle_check_allowed", "_idle_check_sent")}
+        checkpoint["failed"] = False
+        self._unplayed_speech_checkpoint = checkpoint
+        return checkpoint
+
+    def restore_unplayed_speech(self, checkpoint: Any) -> bool:
+        """Undo only the unheard attempt; never treat its question as delivered."""
+        if checkpoint is None or checkpoint is not self._unplayed_speech_checkpoint or checkpoint["failed"]:
+            return False
+        checkpoint["failed"] = True
+        for name, value in checkpoint.items():
+            if name != "failed":
+                setattr(self, name, value)
+        self.phase = "listening"
+        self._after_speech = "listening"
+        self.confirmed = self.reply_seen = False
+        self._confirmed_final = self._confirmation_origin = None
+        self.boundary = ""
+        self._boundary_final = self._missing_reply_since = None
+        self._semantic_wait_identity = self._reception_review = self._clarification_revision = None
+        self._reply_question = ""
+        self._exit_waiting = self._exit_question_delivered = False
+        self._exit_request_final = self._exit_question_act_id = self._exit_delivery_revision = None
+        self._exit_context = self._exit_context_final = self._exit_evidence_identity = None
+        self._content_question_act_id = self._content_question_focus = self._content_request_final = None
+        self._content_question_delivered = self._content_delivery_pending = False
+        return True
+
+    def _speech_result_current(self) -> bool:
+        # A zero-audio task can fail between selection and its caller resuming.
+        # That late successful selection result must not re-advance the cursors.
+        return not (self._unplayed_speech_checkpoint or {}).get("failed", False)
 
     def content_clarification_context(self, final: Any) -> Any:
         if not self._content_question_delivered or self._content_request_final is None:
@@ -217,6 +255,8 @@ class SpokenSupplementConfirmation:
             selected = await endpoint._infer(self.speak(
                 "exit_clarify" if clarify else "exit_check", endpoint.assert_current), timeout=45)
             endpoint.assert_current()
+            if not self._speech_result_current():
+                selected = None
             act_id = selected.get("act_id") if isinstance(selected, dict) else None
             if isinstance(act_id, str) and act_id:
                 self._exit_question_act_id = act_id
@@ -493,6 +533,8 @@ class SpokenSupplementConfirmation:
             spoken = await endpoint._infer(self.speak(kind, endpoint.assert_current,
                                       **({"reply_text": reply_text} if reply_text else {}),
                                       **({"repeat_target": repeat_target} if repeat_target else {})), timeout=45)
+            if not self._speech_result_current():
+                spoken = False
             if spoken:
                 self.playback_selected(endpoint)
                 if kind in {"check", "clarify"}:
@@ -584,7 +626,7 @@ class SpokenSupplementConfirmation:
                 # reception call while the recognizer keeps accepting speech.
                 # It cannot speak or submit; a matching final is still needed.
                 if not endpoint._understanding_recovery_active and self._exit_context is None:
-                    endpoint.preparation.start(preview)
+                    endpoint.prepare_stable_preview(preview)
             if early:
                 # Do not cut ordinary answers into new STT streams just to
                 # inspect a social request. A preview can only precompute.
@@ -663,6 +705,8 @@ class SpokenSupplementConfirmation:
             return False
         if not prepare_only and (getattr(final, "type", None) != "transcript.final" or not getattr(final, "is_final", False)):
             raise ValueError("Reception requires a complete server final")
+        if prepare_only and getattr(final, "has_unstable_tail", True):
+            return False
         identity = None if prepare_only else endpoint._identity(final)
         if not prepare_only and self._semantic_wait_identity == identity:
             endpoint._blocked_revision = endpoint.revision
@@ -675,6 +719,7 @@ class SpokenSupplementConfirmation:
         new_text = _speech_since(final, self._reception_seen_final, previous)
         if not new_text:
             return False
+        endpoint._begin_interaction(text)
         cache_key = (text, phase, previous)
         if self._reception_cache and self._reception_cache[0] == cache_key:
             decision = self._reception_cache[1]
@@ -837,6 +882,8 @@ class SpokenSupplementConfirmation:
             # service's synthesis budget instead of cutting both off at 15s.
             spoken = await endpoint._infer(self.respond_company(prepared, final, endpoint.assert_current), timeout=45)
             endpoint.assert_current()
+            if not self._speech_result_current():
+                spoken = False
             self._semantic_wait_identity = identity if spoken else None
             self._clarification_revision = endpoint.revision
             if spoken:
@@ -871,6 +918,8 @@ class SpokenSupplementConfirmation:
         try:
             spoken = await endpoint._infer(self.speak("answer_clarify", endpoint.assert_current,
                                       focus_quote=target.focus_quote if target else ""), timeout=45)
+            if not self._speech_result_current():
+                spoken = False
             if spoken:
                 if isinstance(spoken, dict) and spoken.get("act_id") and target:
                     self._content_question_act_id = spoken["act_id"]

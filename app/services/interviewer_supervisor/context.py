@@ -10,6 +10,57 @@ from app.core.errors import ApiError
 from app.domain.adaptive_interview import closed_source_question_ids
 from app.services.dialogue_history import recent_turn_dialogue
 
+PLANNING_MEMORY_MAX_CHARS = 8_000
+PLANNING_REQUEST_MAX_CHARS = 32_000
+PLANNING_REQUEST_MAX_ESTIMATED_TOKENS = 16_000
+
+
+def planning_memory(session: Dict[str, Any]) -> Dict[str, Any]:
+    """Bound a planning projection without modifying source-linked Evidence.
+
+    Remove whole old observations rather than inventing shorter claims. The
+    exact coverage/budget facts are supplied separately, and committed-turn
+    reads can still retrieve any old answer in the current frozen session.
+    """
+    result = conversation_memory(session)
+    result["projection_truncated"] = False
+
+    def over_budget():
+        return len(json.dumps(result, ensure_ascii=False, separators=(",", ":"))) > PLANNING_MEMORY_MAX_CHARS
+
+    for key in ("recent_dialogue", "company_question_exchanges", "topic_preferences"):
+        while result[key] and over_budget():
+            result[key].pop(0)
+            result["projection_truncated"] = True
+    for ledger in result["competency_evidence"].values():
+        while ledger["observations"] and over_budget():
+            ledger["observations"].pop(0)
+            result["projection_truncated"] = True
+    while result["agenda"] and over_budget():
+        result["agenda"].pop(0)
+        result["projection_truncated"] = True
+    if over_budget():
+        # Coverage remains complete in the separate authoritative projection.
+        # Keep a bounded index for explicit historical reads, never infer a lack
+        # of evidence from this last-resort omission of the verbose ledger.
+        result["competency_evidence"] = {}
+        result["projection_truncated"] = True
+        result["recent_turn_ids"] = [turn["id"] for turn in session.get("turns", [])[-8:]]
+    return result
+
+
+def planning_request_size(contract) -> Dict[str, int]:
+    serialized = json.dumps({"messages": [message.model_dump() for message in contract.messages],
+                             "response_schema": contract.response_schema},
+                            ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    # A provider-neutral estimate, not a claim about a particular tokenizer.
+    result = {"characters": len(serialized), "estimated_tokens": (len(serialized.encode("utf-8")) + 2) // 3}
+    if (result["characters"] > PLANNING_REQUEST_MAX_CHARS
+            or result["estimated_tokens"] > PLANNING_REQUEST_MAX_ESTIMATED_TOKENS):
+        raise ApiError("INTERVIEW_PLANNING_CONTEXT_TOO_LARGE",
+                       "Interview planning context exceeds its bounded input budget.", status_code=503)
+    return result
+
 
 def assessment_contract(session: Dict[str, Any]) -> Dict[str, Any]:
     return (session.get("plan_snapshot") or {}).get("assessment_contract") or {}

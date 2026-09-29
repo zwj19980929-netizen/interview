@@ -1,5 +1,9 @@
 # 数据库与向量存储设计
 
+## 067：耐久交流收据
+
+InterviewSession 聚合内每个已审批 ConversationAct 增加内部 `selection_receipts`，最多保留该 act 最近 8 次选择；每条存 event/turn/act/sequence/时间/文字 SHA256 及绑定 performance 的送达状态。与选中事件同一事务写入，独立于 1000 条客户端重放窗口。向 ApprovedConversationAct 表达合同投影时去掉内部收据，其余额外字段仍严格拒绝；旧聚合可从原 selected event 读取，不能伪造已送达。没有新表或迁移，组织隔离、CAS 与媒体逐帧权限守卫保留。详见[067说明](agent-chain-improvements-067.md)。
+
 ## 056：实时媒体守卫最小投影
 
 `InterviewSessionRepository.realtime_state(interview_id)` 每次读取当前持久化记录，只返回组织/版本/状态/当前题目、输入完成标记、播放守卫需要的 runtime 字段、完整 Skill 身份快照，以及数组中最后一个 `conversation.act.selected` 的事件 ID、act ID 和原始 approved 布尔值。它不是完整会话，不得用于保存或生命周期变更。SQLite/PostgreSQL 在数据库内投影后才交给 Python 解码，Memory 保持相同字段与隔离语义；不读取答案、简历、题库、对话正文或整个历史对象。没有新增持久化字段、授权缓存或迁移。

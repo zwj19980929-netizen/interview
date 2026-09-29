@@ -848,6 +848,8 @@ class AgentChannel:
             return
         if kind == "avatar.performance.stopped":
             self.runtime._require_candidate(self.principal)
+            if self._evidence_session is not None:
+                self._evidence_session.assert_controller(self)
             session = self.runtime.interviews.get_interview(
                 self.interview_id, self.organization_id
             )
@@ -861,8 +863,6 @@ class AgentChannel:
             if not stopped_performance_id:
                 return
             if runtime_state.get("active_output_id"):
-                if self._evidence_session is not None:
-                    self._evidence_session.assert_controller(self)
                 if self._speech_output is None or not self._speech_output.acknowledge_drained(
                     stopped_performance_id, str(signal.payload.get("output_id") or ""),
                     str(signal.payload.get("reason") or ""),
@@ -873,6 +873,7 @@ class AgentChannel:
                 self.interview_id,
                 stopped_performance_id,
                 self.organization_id,
+                delivery_status="delivered",
             ):
                 # Browser media callbacks may arrive after a replacement
                 # performance has started.  A stale stop must have no effect on
@@ -1985,6 +1986,11 @@ class AgentChannel:
         from app.services.evidence_coordination import assert_current_evidence_fence
 
         evidence_session = self._evidence_session
+        preparation_endpoint = getattr(evidence_session, "_answer_endpoint", None)
+        preparation_capture_id = getattr(evidence_session, "_capture_id", None)
+        preparation_revision = getattr(preparation_endpoint, "revision", None)
+        preparation_confirmation = getattr(preparation_endpoint, "confirmation", None)
+        preparation_checkpoint = None
         if (self._closed or self._terminating
                 or (evidence_session is not None and evidence_session._stopped)):
             return None
@@ -2023,6 +2029,8 @@ class AgentChannel:
         expected_performance_id = None
         if approval_guard is not None:
             approval_guard()
+        if preparation_confirmation is not None:
+            preparation_checkpoint = preparation_confirmation.begin_unplayed_speech()
 
         def expression_is_current() -> bool:
             if (self._closed or self._terminating
@@ -2083,6 +2091,81 @@ class AgentChannel:
             causation_id=causation_id,
             replayability=Replayability.REPLAYABLE,
         )
+
+        async def restore_unplayed_preparation(*, retry_required: bool, selected_output=None) -> bool:
+            # A cancelled provider preparation may have an obsolete input
+            # guard, while still owning the selected act and empty agent floor.
+            # Restore only that exact capture/selection in one fenced write.
+            endpoint = preparation_endpoint
+            if selected_output is not None and (
+                    self._speech_output is not selected_output
+                    or selected_output.total_samples != 0
+                    or getattr(selected_output.publisher, "total_samples", 0) != 0
+                    or getattr(selected_output.publisher, "pcm_delivery_started", False)
+                    or not selected_output.closed):
+                return False
+            if (endpoint is None or evidence_session is not self._evidence_session
+                    or getattr(evidence_session, "_stopped", False)
+                    or endpoint is not getattr(evidence_session, "_answer_endpoint", None)
+                    or preparation_capture_id != getattr(evidence_session, "_capture_id", None)
+                    or not getattr(endpoint.capture, "is_open", False)):
+                return False
+            try:
+                with self.runtime.persistence.transaction(self.organization_id) as transaction:
+                    if owner_fence is not None:
+                        assert_current_evidence_fence(transaction, owner_fence)
+                    current = transaction.interview_sessions.get(self.interview_id)
+                    state = (current or {}).get("agent_runtime") or {}
+                    latest = next((event for event in reversed((current or {}).get("agent_events", []))
+                                   if event.get("type") == "conversation.act.selected"), None)
+                    if (not current or current.get("status") != "in_progress"
+                            or current.get("current_turn_id") != expected_turn_id
+                            or state.get("floor") != FloorOwner.AGENT.value
+                            or state.get("active_performance_id") != (
+                                selected_output.performance_id if selected_output is not None else None)
+                            or (selected_output is not None and (
+                                state.get("active_output_id") != selected_output.output_id
+                                or state.get("active_expression_act_event_id") != selected_event.event_id))
+                            or not latest or latest.get("event_id") != selected_event.event_id):
+                        return False
+                    self.runtime.interviews.assert_skill_authorized(transaction, current)
+                    from app.services.conversation_delivery import mark_unplayed_selection, update_delivery
+                    if selected_output is None:
+                        mark_unplayed_selection(current, event_id=selected_event.event_id,
+                                                status="failed" if retry_required else "interrupted", updated_at=utc_now())
+                    else:
+                        # run() has already closed/revoked both transports.
+                        # Clear this exact output before yielding to any late ACK.
+                        update_delivery(current, event_id=selected_event.event_id,
+                                        performance_id=selected_output.performance_id,
+                                        status="failed" if retry_required else "interrupted", updated_at=utc_now())
+                        state.update(active_performance_id=None, active_output_id=None,
+                                     active_expression_act_event_id=None, expression_replay_act_event_id=None,
+                                     performance_cleared_at=utc_now())
+                    state.update(floor=FloorOwner.CANDIDATE.value, floor_reason="expression_preparation_unavailable",
+                                 floor_changed_at=utc_now())
+                    transaction.interview_sessions.update(current, expected_version=current["version"])
+            except ApiError:
+                return False
+            if (preparation_confirmation is not None
+                    and preparation_confirmation is getattr(endpoint, "confirmation", None)):
+                preparation_confirmation.restore_unplayed_speech(preparation_checkpoint)
+            if selected_output is not None:
+                await notify_performance_interrupted(self, selected_output.performance_id,
+                    reason="expression_preparation_unavailable", turn_id=turn_id, causation_id=causation_id)
+            await self._emit("floor.changed", {"owner": "candidate", "reason": "expression_preparation_unavailable"},
+                             turn_id=turn_id, causation_id=causation_id, replayability=Replayability.REPLAYABLE)
+            if retry_required:
+                await self._problem(ApiError("AGENT_SPEECH_PREPARATION_RETRY_REQUIRED",
+                    "语音回应未能及时准备，回答已保留，请重试处理。", status_code=409),
+                    turn_id=turn_id, causation_id=causation_id)
+            if (endpoint is getattr(evidence_session, "_answer_endpoint", None)
+                    and preparation_capture_id == getattr(evidence_session, "_capture_id", None)):
+                endpoint.candidate_floor_returned()
+                if retry_required and endpoint.revision == preparation_revision:
+                    await endpoint.expression_preparation_failed()
+            return True
+
         try:
             if not expression_is_current():
                 return None
@@ -2143,11 +2226,20 @@ class AgentChannel:
                         )
                         assert_stream_current()
                         self._speech_output_task = asyncio.create_task(
-                            self._run_speech_output(output, expression_is_current, turn_id, causation_id)
+                            self._run_speech_output(output, expression_is_current, turn_id, causation_id,
+                                                    recover_unplayed=restore_unplayed_preparation)
                         )
                         return performance
-                    except BaseException:
+                    except BaseException as exc:
                         await output.abort()
+                        from app.core.interaction_budget import remaining_interaction_seconds
+                        remaining = remaining_interaction_seconds()
+                        if isinstance(exc, asyncio.CancelledError):
+                            await restore_unplayed_preparation(
+                                retry_required=remaining is not None and remaining <= 0, selected_output=output)
+                        elif (isinstance(exc, asyncio.TimeoutError) or getattr(exc, "code", None) in {
+                                "provider_timeout", "AGENT_AUDIO_FIRST_PCM_TIMEOUT", "LIVEKIT_AUDIO_OUTPUT_TIMEOUT"}):
+                            await restore_unplayed_preparation(retry_required=True, selected_output=output)
                         if self._speech_output is output:
                             self._speech_output = None
                         raise
@@ -2183,7 +2275,16 @@ class AgentChannel:
                 gesture=gesture,
                 delivery=delivery,
             )
+        except asyncio.CancelledError:
+            from app.core.interaction_budget import remaining_interaction_seconds
+            remaining = remaining_interaction_seconds()
+            await restore_unplayed_preparation(retry_required=remaining is not None and remaining <= 0)
+            raise
         except Exception as exc:
+            if (isinstance(exc, asyncio.TimeoutError) or getattr(exc, "code", None) in {
+                    "provider_timeout", "AGENT_AUDIO_FIRST_PCM_TIMEOUT", "LIVEKIT_AUDIO_OUTPUT_TIMEOUT"}):
+                if await restore_unplayed_preparation(retry_required=True):
+                    return None
             if not expression_is_current():
                 return None
             if act_type == "closing" and (
@@ -2211,6 +2312,7 @@ class AgentChannel:
             return None
         self.runtime._set_active_performance(
             self.interview_id, performance.performance_id, self.organization_id,
+            act_event_id=selected_event.event_id,
             dialogue_act_id=act.act_id if dialogue_question or act_type == "clarification" else None,
         )
         if on_playback_selected is not None:
@@ -2224,7 +2326,7 @@ class AgentChannel:
         )
         return performance
 
-    async def _run_speech_output(self, output, is_current, turn_id, causation_id) -> None:
+    async def _run_speech_output(self, output, is_current, turn_id, causation_id, *, recover_unplayed=None) -> None:
         async def finished(payload):
             await self._emit(
                 "avatar.performance.producer_finished", payload,
@@ -2237,6 +2339,12 @@ class AgentChannel:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if (recover_unplayed is not None and (
+                    isinstance(exc, asyncio.TimeoutError) or getattr(exc, "code", None) in {
+                        "provider_timeout", "AGENT_AUDIO_FIRST_PCM_TIMEOUT", "AGENT_AUDIO_SUBSCRIPTION_TIMEOUT",
+                        "LIVEKIT_AUDIO_OUTPUT_TIMEOUT"})):
+                if await recover_unplayed(retry_required=True, selected_output=output):
+                    return
             if is_current():
                 await self._problem(exc, turn_id=turn_id, causation_id=causation_id)
                 if is_current():
@@ -3171,6 +3279,14 @@ class InterviewAgentRuntime:
                 replayability=replayability,
                 payload=deepcopy(payload),
             )
+            from app.services.conversation_delivery import record_selection, update_delivery
+            record_selection(session, event.model_dump(mode="json"))
+            if (event_type == "avatar.performance.playback"
+                    and payload.get("performance_id") == state.get("active_performance_id")):
+                status = {"playing": "playing", "failed": "failed"}.get(payload.get("status"))
+                if status:
+                    update_delivery(session, event_id=state.get("active_expression_act_event_id"),
+                                    performance_id=payload["performance_id"], status=status, updated_at=utc_now())
             if replayability == Replayability.REPLAYABLE:
                 history = session.setdefault("agent_events", [])
                 history.append(event.model_dump(mode="json"))
@@ -3235,6 +3351,9 @@ class InterviewAgentRuntime:
             session["agent_runtime"]["active_output_id"] = output_id
             session["agent_runtime"]["active_expression_act_event_id"] = act_event_id
             session["agent_runtime"]["expression_replay_act_event_id"] = None
+            from app.services.conversation_delivery import update_delivery
+            update_delivery(session, event_id=act_event_id, performance_id=performance_id,
+                            status="selected", updated_at=utc_now())
             if dialogue_act_id and performance_id and session.get("status") == "in_progress":
                 turn = next((item for item in session.get("turns", [])
                              if item["id"] == session.get("current_turn_id")), None)
@@ -3249,6 +3368,7 @@ class InterviewAgentRuntime:
         interview_id: str,
         expected_performance_id: Optional[str],
         organization_id: str,
+        *, delivery_status: str = "interrupted",
     ) -> bool:
         with self.persistence.transaction(organization_id) as transaction:
             session = self._required(
@@ -3260,6 +3380,9 @@ class InterviewAgentRuntime:
                 return False
             if active is None:
                 return False
+            from app.services.conversation_delivery import update_delivery
+            update_delivery(session, event_id=state.get("active_expression_act_event_id"),
+                            performance_id=active, status=delivery_status, updated_at=utc_now())
             state["active_performance_id"] = None
             state["active_output_id"] = None
             state["active_expression_act_event_id"] = None
@@ -3285,6 +3408,9 @@ class InterviewAgentRuntime:
                 if session.get("status") == "in_progress" and state.get("floor") == FloorOwner.AGENT.value
                 else None
             )
+            from app.services.conversation_delivery import update_delivery
+            update_delivery(session, event_id=state.get("active_expression_act_event_id"),
+                            performance_id=performance_id, status="interrupted", updated_at=utc_now())
             state["active_performance_id"] = None
             state["active_output_id"] = None
             state["active_expression_act_event_id"] = None
@@ -3479,7 +3605,11 @@ class InterviewAgentRuntime:
                     transaction.interview_sessions.update(
                         session, expected_version=session["version"]
                     )
-                return ApprovedConversationAct.model_validate(existing)
+                # Delivery receipts belong to persisted history, not the
+                # approved speech contract projected to an expression.
+                return ApprovedConversationAct.model_validate({
+                    key: value for key, value in existing.items() if key != "selection_receipts"
+                })
 
             if act_type == "followup":
                 raise ApiError(
@@ -3894,39 +4024,70 @@ class InterviewAgentRuntime:
                 and text.strip() == str(current.get("question_spoken_text") or "").strip()):
             return None
         assert_current()
-        try:
+        from time import monotonic
+        from app.core.interaction_budget import remaining_interaction_seconds
+        remaining = remaining_interaction_seconds()
+        first_budget = min(12.0, remaining) if remaining is not None else 12.0
+        if first_budget <= 0:
+            raise ApiError("AGENT_AUDIO_FIRST_PCM_TIMEOUT", "Speech preparation budget exhausted.", status_code=504)
+        deadline = monotonic() + first_budget
+        output_id = new_id("speech_output")
+        publisher = LiveKitApprovedAudioPublisher(
+            self.media_plane, room_name=interview_room_name(organization_id, interview_id),
+            performance_id=performance_id, assert_current=assert_current,
+            before_abort=before_abort, first_audio_deadline=deadline,
+        )
+        publisher.bind_output(output_id)
+
+        async def open_tts():
             with measure_interview_agent_stage("tts_stream_open_ms"):
-                stream = await self.gateway.open_tts_stream(TTSSynthesizeRequest(
+                return await self.gateway.open_tts_stream(TTSSynthesizeRequest(
                     organization_id=organization_id, purpose="interview_agent_expression",
                     text=text, language=session.get("settings", {}).get("language", "zh-CN"),
                     voice_profile_id=session.get("settings", {}).get("voice_profile_id") or "voice_default_cn",
                     format="audio/wav",
                     metadata={"interview_id": interview_id, "turn_id": turn_id, "approved": True},
-                ))
-        except ProviderError as exc:
-            assert_current()
-            if exc.code in {"provider_streaming_not_supported", "provider_bad_request"}:
-                # Transport-only unsupported cases use the existing managed
-                # asset path before any PCM escapes. Never replay spoken bytes.
-                return None
-            raise
+                ), first_audio_deadline=deadline)
+
+        tts_task = asyncio.create_task(open_tts())
+        publication_task = asyncio.create_task(publisher.open())
+        async def prepare_transports():
+            await asyncio.wait({tts_task, publication_task}, return_when=asyncio.FIRST_EXCEPTION)
+            # Streaming support is the compatibility decision. A concurrent
+            # media-open failure must not hide an explicit unsupported TTS
+            # result and disable the existing complete-asset delivery path.
+            stream = await tts_task
+            publication = await publication_task
+            return stream, publication
         try:
-            assert_current()
-            publisher = LiveKitApprovedAudioPublisher(
-                self.media_plane, room_name=interview_room_name(organization_id, interview_id),
-                performance_id=performance_id, assert_current=assert_current,
-                before_abort=before_abort,
+            # Both transports prepare concurrently; neither publishes PCM.
+            stream, publication = await asyncio.wait_for(
+                prepare_transports(), timeout=first_budget,
             )
+            assert_current()
             return ApprovedSpeechOutput(
                 performance_id=performance_id, stream=stream, publisher=publisher,
-                assert_current=assert_current,
-                archive=lambda **audio: self.expression_audio.store_pcm(
+                assert_current=assert_current, first_audio_deadline=deadline,
+                output_id=output_id, publication=publication,
+                archive=lambda **audio: self.expression_audio.store_pcm_async(
                     organization_id=organization_id, interview_id=interview_id,
                     turn_id=turn_id, source_type="approved_streaming_tts", **audio,
                 ),
             )
-        except BaseException:
-            await stream.abort()
+        except BaseException as exc:
+            for task in (tts_task, publication_task):
+                if not task.done():
+                    task.cancel()
+            results = await asyncio.gather(tts_task, publication_task, return_exceptions=True)
+            try:
+                if not isinstance(results[0], BaseException):
+                    await results[0].abort()
+            finally:
+                await publisher.abort()
+            if isinstance(exc, ProviderError):
+                assert_current()
+                if exc.code in {"provider_streaming_not_supported", "provider_bad_request"}:
+                    return None
             raise
 
     async def _expression_audio(

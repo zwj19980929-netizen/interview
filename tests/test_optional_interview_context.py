@@ -82,7 +82,7 @@ async def test_real_plan_context_is_optional_frozen_and_read_on_demand(monkeypat
     assert ("company.read_reference" in exposed) is has_company
     if has_company:
         observations = json.loads(gateway.calls[1].messages[-1].content)["tool_observations"]
-        assert observations == [{"tool_name": "company.read_reference", "result": {
+        assert observations == [{"tool_name": "company.read_reference", "argument": "company:context", "result": {
             "status": "ok", "reference": {"id": "company:context", "title": "本场提供的企业资料", "content": COMPANY_CONTEXT}}}]
         assert result.model_calls == 2
     else:

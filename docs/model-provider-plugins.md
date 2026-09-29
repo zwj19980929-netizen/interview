@@ -1,5 +1,7 @@
 # 模型供应商插件化设计
 
+067：理解 v62–73、组合决策 v93–104、接话 v7 升级送达说明与服务端动作投影；规划 v4、证据专家 v2 改为有界引用 Schema、工具分页与完整冻结池领域校验。为保持厂商 strict JSON Schema 兼容，wire 仍包含 `followup_allowed`/`suggested_action`，统一校验后由已验证语义派生，业务不接受模型的冗余权限声明。TTS 打开/重试/首 PCM、媒体连接/订阅共用最多 12 秒首音期限，并受当前整轮剩余预算限制；首音后单次读取最多 8 秒，播放仍有总期限且不切换到另一供应商重播。无新增供应商凭据或路由配置；详见[067说明](agent-chain-improvements-067.md)。
+
 066：当前语义指令v17/v18、理解v50–61、组合v81–92、固定接话v3；增加来源绑定的未核实内容收尾及具体安全诊断。DashScope/网关/ContinuousSTT新增进程内可信撤回事实：仅同流有身份的临时词全部明确撤回、音频排空且服务端完成才接纳empty；已暴露稳定词及旧失败流遗失保护保持。wire Schema不变。详见[066说明](interaction-recovery-066.md)。
 
 065：新增candidate_exit_reply.v1、candidate_exit_confirmation.v1；退出上下文专用理解v46–49/组合v77–80，旧模式版本保持。回复分类8秒/0供应商内部重试，经统一Schema、原文及否定/引用校验，规则只能拒绝而不能授予退出。复用原理解路由及提供方，不改凭据，详见[065说明](candidate-exit-confirmation-065.md)。

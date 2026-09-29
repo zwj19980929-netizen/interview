@@ -114,7 +114,7 @@ def test_semantic_schema_forms_current_intent_before_selecting_action(purpose, c
 @pytest.mark.anyio
 @pytest.mark.parametrize("composite", [False, True])
 @pytest.mark.parametrize("violation", ["next", "followup"])
-async def test_thinking_control_retry_receives_exact_reason_and_keeps_claims(composite, violation, caplog):
+async def test_thinking_controls_are_derived_once_and_keep_claims_without_completion(composite, violation, caplog):
     utterance, turn, interview = _input()
     utterance = utterance.model_copy(update={"text": utterance.text + "等一下，我还需要考虑失败情况。"})
     interview["_semantic_first"] = True
@@ -124,16 +124,7 @@ async def test_thinking_control_retry_receives_exact_reason_and_keeps_claims(com
     invalid = deepcopy(corrected)
     invalid["understanding"].update({"suggested_action": "next"} if violation == "next" else {"followup_allowed": True})
 
-    class CorrectingGateway(Gateway):
-        async def invoke(self, capability, request):
-            if self.requests:
-                text = "\n".join(message.content for message in request.messages)
-                assert "semantic_control_contract_invalid" in text
-                assert "本次需纠正语义控制字段" in text
-                assert "不能从intent=answer推导为next" in text
-            return await super().invoke(capability, request)
-
-    gateway = CorrectingGateway(*(value if composite else value["understanding"] for value in (invalid, corrected)))
+    gateway = Gateway(invalid if composite else invalid["understanding"])
     service = _service(gateway)
     with caplog.at_level("WARNING", logger="app.services.conversation_understanding"):
         if composite:
@@ -145,20 +136,22 @@ async def test_thinking_control_retry_receives_exact_reason_and_keeps_claims(com
     assert understanding.turn_intent == "thinking" and understanding.suggested_action == "continue_listening"
     assert not understanding.followup_allowed and understanding.completion_basis is None
     assert understanding.claims[0].evidence_quote == _input()[0].text
-    assert len(gateway.requests) == 2
-    assert "reason=semantic_control_contract_invalid" in caplog.text
+    assert not service.can_complete_without_confirmation(understanding, utterance.text)
+    assert len(gateway.requests) == 1
+    assert "reason=semantic_control_contract_invalid" not in caplog.text
     assert utterance.text not in caplog.text
 
 
 @pytest.mark.anyio
-async def test_repeated_control_violation_stays_rejected_with_precise_reason():
+async def test_derived_thinking_action_preserves_claims_without_accepting_wire_next():
     utterance, turn, interview = _input()
     interview["_semantic_first"] = True
     data = completed_answer(selected=False)
     data["understanding"].update(turn_intent="thinking", completion_basis=None, followup_allowed=False)
     gateway = Gateway(data, data)
-    understanding, followup = await _service(gateway).prepare_decision(utterance, turn, interview)
-    assert understanding.problem and understanding.problem.reason_code == "semantic_control_contract_invalid"
-    assert understanding.suggested_action == "pause" and not understanding.claims
-    assert followup["reason"] == "understanding_unavailable" and not followup["selected"]
-    assert len(gateway.requests) == 2
+    service = _service(gateway)
+    understanding, followup = await service.prepare_decision(utterance, turn, interview)
+    assert understanding.problem is None and understanding.claims
+    assert understanding.suggested_action == "continue_listening" and not understanding.followup_allowed
+    assert understanding.completion_basis is None and not service.can_complete_without_confirmation(understanding, utterance.text)
+    assert not followup["selected"] and len(gateway.requests) == 1

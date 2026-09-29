@@ -54,14 +54,14 @@ async def test_company_question_semantics_select_exact_span_and_never_prepare_pr
     assert understood.company_question.start == (len(TECH) if mixed else 0)
     assert bool(understood.claims) is mixed
     assert not followup["selected"] and not service.can_complete_without_confirmation(understood, text)
-    assert understood.prompt_version == "interview_turn_decision.v83"
+    assert understood.prompt_version == "interview_turn_decision.v95"
 
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("change", [
     {"company_question": {"evidence_id": "E999", "quote": QUESTION}},
     {"company_question": {"evidence_id": "E1", "quote": "编造的问题"}},
-    {"company_question": None}, {"followup_allowed": True}, {"suggested_action": "next"},
+    {"company_question": None},
     {"confidence": .7}, {"company_question": {"evidence_id": "E1", "quote": QUESTION, "company": "invented"}},
 ])
 async def test_invalid_question_cannot_authorize_reply_or_answer(change):
@@ -73,6 +73,26 @@ async def test_invalid_question_cannot_authorize_reply_or_answer(change):
     data["understanding"].update(deepcopy(change))
     understood, followup = await _service(Gateway(data, data)).prepare_decision(utterance, turn, session)
     assert understood.problem is not None and not followup["selected"]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("change", [{"followup_allowed": True}, {"suggested_action": "next"}])
+async def test_server_derived_company_controls_cannot_finish_or_invent_company_material(change):
+    utterance, turn, session = _input()
+    utterance = utterance.model_copy(update={"text": QUESTION})
+    session.update(_semantic_first=True, _interviewer_context={"company_context": {"available": False}})
+    data = _data()
+    data["understanding"] = company_understanding(QUESTION, ["幂等键", "确认序号"])
+    data["understanding"].update(change)
+    gateway = Gateway(data)
+    service = _service(gateway)
+    understood, followup = await service.prepare_decision(utterance, turn, session)
+    assert understood.problem is None and understood.company_question.quote == QUESTION
+    assert understood.suggested_action == "respond_company" and not understood.followup_allowed
+    assert understood.completion_basis is None and not service.can_complete_without_confirmation(understood, QUESTION)
+    assert not followup["selected"] and len(gateway.requests) == 1
+    reply = await prepare_company_reply(gateway, organization_id="org_default", company_context=None, question=QUESTION)
+    assert reply["status"] == "not_found" and not reply["citations"] and len(gateway.requests) == 1
 
 
 @pytest.mark.anyio

@@ -63,6 +63,7 @@ class ValidatedTTSStream:
         max_total_bytes: int = 20 * 1024 * 1024,
         max_audio_seconds: float = 180.0,
         max_wall_seconds: float = 300.0,
+        first_audio_deadline: Optional[float] = None,
         on_terminal: Optional[Callable[[str, Optional[TTSStreamEvent], Optional[ProviderError]], None]] = None,
     ) -> None:
         if (
@@ -81,6 +82,7 @@ class ValidatedTTSStream:
         self._max_total_bytes = max_total_bytes
         self._max_audio_seconds = max_audio_seconds
         self._deadline = monotonic() + max_wall_seconds
+        self._first_audio_deadline = first_audio_deadline
         self._on_terminal = on_terminal
         self._notified = False
         self._closed = False
@@ -164,6 +166,8 @@ class ValidatedTTSStream:
 
     async def _next(self, iterator: AsyncIterator[TTSStreamEvent]) -> TTSStreamEvent:
         remaining = self._deadline - monotonic()
+        if not self.audio_started and self._first_audio_deadline is not None:
+            remaining = min(remaining, self._first_audio_deadline - monotonic())
         if remaining <= 0:
             raise tts_stream_error("provider_timeout", "TTS stream exceeded the wall-clock limit.")
         task = asyncio.ensure_future(iterator.__anext__())
