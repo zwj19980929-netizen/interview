@@ -7,10 +7,18 @@ from app.domain.adaptive_interview import adaptive_score_summary, interrupted_fi
 
 DISPUTE_FLAGS = {"transcription_ambiguity", "low_stt_confidence"}
 RECOGNITION_NOTICE = "部分转写存在识别不确定性，已按可理解的回答内容评分；可按需回听或修正，不影响报告生成。"
+UNRESOLVED_ANSWER_NOTICE = "部分回答的技术转写仍无法核实，已保留原始证据；相关题目暂不计分，待人工回听核验后重评。"
+CANDIDATE_WITHDRAWAL_NOTICE = "候选人主动提前退出；待人工复核。已取得的评分证据保留，未考察范围不计零分。"
+CANDIDATE_CONFIRMED_WITHDRAWAL_NOTICE = "候选人确认提前退出；待人工复核。已取得的评分证据保留，未考察范围不计零分。"
 
 
 def valid_score(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and isfinite(value) and 0 <= value <= 100
+
+
+def is_unresolved_evaluation(evaluation):
+    info = evaluation.get("model_info") or {}
+    return info.get("scoring_rule_version") == "unresolved_answer.v1" and bool(info.get("unresolved_answers"))
 
 
 def recognition_context(answers):
@@ -42,7 +50,14 @@ def project_evaluation(evaluation, answers=(), *, capture_verification=False):
         source = item.get("stt_confidence_source", "legacy_unverified")
         if source in {"unavailable", "partial", "legacy_unverified"}:
             warnings.add("stt_confidence_" + source)
-    if not valid_score(result.get("score")) and valid_score(result.get("provisional_score")):
+    unresolved = is_unresolved_evaluation(result)
+    if unresolved:
+        # An old unscored revision cannot acquire a score merely because a
+        # later answer revision was verified. A new evaluation must score it.
+        result["score"] = None
+        result["manual_review_required"] = True
+        flags.update({"answer_content_unresolved", "transcription_ambiguity"})
+    if not unresolved and not valid_score(result.get("score")) and valid_score(result.get("provisional_score")):
         result["score"] = result["provisional_score"]
         result["dimension_scores"] = deepcopy(result.get("provisional_dimension_scores", {}))
     available = valid_score(result.get("score"))
@@ -78,6 +93,7 @@ def project_report(report, session):
     result = deepcopy(report)
     evaluations = {item["id"]: item for item in session.get("evaluation_revisions", [])}
     warning_ids = []
+    unresolved_ids = []
     unavailable = False
     restored = False
     for item in result.get("question_evaluations", []):
@@ -86,6 +102,8 @@ def project_report(report, session):
             unavailable = unavailable or not valid_score(item.get("score"))
             continue
         checked = project_evaluation(original, evaluation_answers(session, original))
+        if is_unresolved_evaluation(checked):
+            unresolved_ids.extend(entry["answer_id"] for entry in checked["model_info"]["unresolved_answers"])
         item["score_status"] = checked["score_status"]
         item["review_flags"] = checked["review_flags"]
         restored = restored or item.get("score") != checked["score"]
@@ -96,9 +114,9 @@ def project_report(report, session):
         unavailable = unavailable or checked["score"] is None
         if checked["recognition_warning"]:
             warning_ids.append(item["answer_id"])
-    result["pending_verification_answer_ids"] = []
+    result["pending_verification_answer_ids"] = list(dict.fromkeys(unresolved_ids))
     result["recognition_warning_answer_ids"] = warning_ids
-    result["recognition_notice"] = RECOGNITION_NOTICE if warning_ids else None
+    result["recognition_notice"] = UNRESOLVED_ANSWER_NOTICE if unresolved_ids else RECOGNITION_NOTICE if warning_ids else None
     # 026 may have stored a null total. Rebuild only from actual retained scores
     # and the frozen plan's weights; never drop a missing question or assume 0.
     if not unavailable and is_adaptive(session):
@@ -136,6 +154,21 @@ def project_report(report, session):
     ):
         result.update(score_status="processing", overall_score=None, dimension_scores=[], strengths=[],
                       job_fit_level="manual_review", recommendation="manual_review")
+    if unresolved_ids:
+        result.update(job_fit_level="manual_review", recommendation="manual_review", strengths=[],
+                      human_decision_required=True, manual_review_required=True)
+        if UNRESOLVED_ANSWER_NOTICE not in result["risks"]:
+            result["risks"].append(UNRESOLVED_ANSWER_NOTICE)
+    if session.get("candidate_input_completion_reason") == "candidate_requested":
+        notice = (CANDIDATE_CONFIRMED_WITHDRAWAL_NOTICE if session.get("candidate_exit_confirmed_at")
+                  else CANDIDATE_WITHDRAWAL_NOTICE)
+        result["candidate_input_completion_reason"] = "candidate_requested"
+        scope_notice = result.get("scope_notice") or ""
+        if notice not in scope_notice:
+            result["scope_notice"] = " ".join(value for value in (scope_notice, notice) if value)
+        if notice not in result["risks"]:
+            result["risks"].append(notice)
+        result["human_decision_required"] = True
     return result
 
 

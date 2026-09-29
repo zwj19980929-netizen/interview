@@ -41,7 +41,7 @@ export function CandidateQuestionHistory({ history, currentQuestion, error, retr
   const missingAnswerText = flattenQuestions(tree).some(node => node.answer && !answerTranscript(node.answer));
   if (!tree.length && !error) return null;
   return <section className="question-history" aria-label="本场问答记录">
-    <div className="question-history-heading"><h2>本场问答</h2><span>每个问题与回答分别保留</span></div>
+    <div className="question-history-heading"><h2>本场问答</h2><span>按题保留完整发言，包含作答、提问与交流</span></div>
     {(error || missingAnswerText) && <p role="status">
       {error ? "问答记录暂未同步，你可以继续面试。" : "部分已提交回答的文字记录暂未同步。"}
       {retry && <button className="button button-ghost button-small" onClick={retry}>重新同步</button>}
@@ -64,7 +64,7 @@ function QuestionRecord({ node, currentTurnId, root = false }) {
   const current = node.id === currentTurnId;
   return <div className={`question-record${current ? " is-current" : ""}`} data-turn-id={node.id}>
     {!root && <div className="question-record-title"><span>{node.label}</span><strong>{node.text}</strong>{current && <small>当前追问</small>}</div>}
-    <div className="question-record-answer"><span>你的回答</span>
+    <div className="question-record-answer"><span>本题完整发言</span>
       <p>{node.answer
         ? answerTranscript(node.answer) || "回答已提交，文字记录暂未同步。"
         : current ? "正在交流，当前字幕显示在上方。" : "尚未形成已提交回答。"}</p></div>

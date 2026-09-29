@@ -21,14 +21,14 @@ def provider(monkeypatch, *, blocked_reply=None):
     calls = []
     async def invoke(instance, capability, request, context):
         version = request.metadata.get("prompt_version")
-        if version == "conversation_reception.v3":
+        if version == "conversation_reception.v6":
             return await original(instance, capability, request, context)
         if version == "company_question_reply.v1":
             calls.append(("company", json.loads(request.messages[-1].content)))
             if blocked_reply is not None:
                 await blocked_reply.wait()
             data = {"status": "supported", "citations": [{"reference_id": "company:context", "quote": FACT}]}
-        elif version == "supplement_reply.v4":
+        elif version == "supplement_reply.v5":
             value = json.loads(request.messages[-1].content)
             calls.append(("supplement", value))
             data = {"intent": "company_question" if QUESTION in value["reply"] else "finish", "confidence": .99, "evidence_id": "E1"}
@@ -134,11 +134,12 @@ def test_real_company_reply_keeps_capture_question_and_scoring_unchanged(tmp_pat
             assert (FACT in exchanges[0]["reply"]["text"]) is has_company
             await _finish_playback(channel, runtime, managed)
             assert endpoint.confirmation.phase == "listening"
-            # More silence and the same final cannot trigger another reply.
+            # Silence can check presence once, never repeat the company reply.
             clock.value += 30
-            await asyncio.sleep(.12)
+            await _wait_until(lambda: endpoint.confirmation.speaking)
             assert len([e for e in acts(runtime) if e["payload"]["act_type"] == "company_answer"]) == 1
             assert managed._capture_id == capture and not _current(runtime)["answers"]
+            await _finish_playback(channel, runtime, managed)
             await _feed(managed._ingress, _CONTINUATION, 5)
             clock.value += 5
             await _wait_until(lambda: len(_current(runtime)["answers"]) == 1, timeout=5)

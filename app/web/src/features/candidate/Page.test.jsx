@@ -2,9 +2,47 @@ import React, { act } from "react";
 import { createRoot } from "react-dom/client";
 import { describe, expect, it, vi } from "vitest";
 
-import { AnswerRecoveryAction, CandidateProgress, CandidateSignalList, ConversationState, SpeechPlaybackState, WarmupPanel } from "./Page.jsx";
+import { AnswerRecoveryAction, CandidateProgress, CandidateSignalList, CaptionPanel, ConversationState, SpeechPlaybackState, WarmupPanel } from "./Page.jsx";
+
+describe("candidate tentative transcript", () => {
+  it("keeps a stopped partial tentative and visible when expanded until the server replaces it", async () => {
+    const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+    const tentative = { text: "合成临时识别。对。", final: false };
+    try {
+      for (const forming of [true, false]) {
+        for (const expanded of [false, true]) {
+          await act(async () => root.render(<CaptionPanel captions={{ forming, recent: [tentative], full: [] }} expanded={expanded} />));
+          expect(host.querySelector(".transcript-toolbar").textContent).toContain("暂定转写");
+          expect(host.querySelector(".transcript-toolbar").textContent).not.toContain("完整回答");
+          expect(host.querySelector(".candidate-live-captions .is-partial").textContent).toBe(tentative.text);
+        }
+      }
+      const final = { text: "合成最终识别。", final: true };
+      await act(async () => root.render(<CaptionPanel captions={{ forming: false, recent: [tentative], full: [final] }} expanded />));
+      expect([...host.querySelectorAll(".candidate-live-captions p")].map(row => row.textContent)).toEqual([tentative.text]);
+      await act(async () => root.render(<CaptionPanel captions={{ forming: false, recent: [final], full: [final] }} expanded />));
+      expect(host.querySelector(".transcript-toolbar").textContent).toContain("完整回答");
+      expect(host.textContent).not.toContain("暂定转写");
+      expect(host.textContent).not.toContain(tentative.text);
+      expect(host.querySelector(".candidate-live-captions .is-final").textContent).toBe(final.text);
+    } finally { await act(async () => root.unmount()); host.remove(); }
+  });
+});
 
 describe("candidate automatic answer completion", () => {
+  it("asks about leaving the whole interview while continuing to receive a spoken reply", async () => {
+    const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+    try {
+      await act(async () => root.render(<ConversationState phase="awaiting_exit_confirmation"
+        endpoint={{ active: false }} speechDetected formal />));
+      expect(host.textContent).toContain("请确认是否结束本次面试");
+      expect(host.textContent).toContain("确认退出，或告诉面试官继续面试");
+      expect(host.textContent).toContain("确认前不会结束本次面试");
+      expect(host.textContent).not.toContain("还有什么需要补充");
+      expect(host.textContent).not.toContain("面试已完成");
+    } finally { await act(async () => root.unmount()); host.remove(); }
+  });
+
   it("offers replay of only the current blocked speech and distinguishes listening from detected speech", async () => {
     const host = document.createElement("div"); document.body.append(host);
     const root = createRoot(host);

@@ -54,7 +54,7 @@ async def test_company_question_semantics_select_exact_span_and_never_prepare_pr
     assert understood.company_question.start == (len(TECH) if mixed else 0)
     assert bool(understood.claims) is mixed
     assert not followup["selected"] and not service.can_complete_without_confirmation(understood, text)
-    assert understood.prompt_version == "interview_turn_decision.v21"
+    assert understood.prompt_version == "interview_turn_decision.v83"
 
 
 @pytest.mark.anyio

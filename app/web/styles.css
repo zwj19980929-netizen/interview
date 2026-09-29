@@ -4967,32 +4967,34 @@ body.candidate-mode .content {
 .question-record.is-current { background: #f0f7f3; }
 .question-record-title { line-height: 1.7; overflow-wrap: anywhere; }
 .question-record-answer { margin-top: 10px; }
-.question-record-answer p, .review-outline-answer p { margin: 5px 0 0; line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; }
+.question-record-answer p { margin: 5px 0 0; line-height: 1.8; white-space: pre-wrap; overflow-wrap: anywhere; }
 .question-record-children { list-style: none; margin: 16px 0 0; padding: 0 0 0 16px; border-left: 2px solid #d9e8df; }
 .question-record-children > li + li { margin-top: 12px; }
 .question-record-children .question-record-children { padding-left: 8px; }
 .review-question-tree { display: grid; gap: 14px; margin: 20px 0; }
-.review-question-node { border: 1px solid #dce3df; padding: 16px; border-radius: 10px; background: #fcfdfc; }
-.review-question-node.is-selected { border-color: #8eb29e; }
+.review-question-node { min-width: 0; border: 1px solid #dce3df; padding: 16px; border-radius: 10px; background: #fcfdfc; }
+.review-question-node.is-selected { border-color: #8eb29e; background: #fff; }
+.review-question-node > .button { max-width: 100%; white-space: normal; text-align: left; }
+.review-question-open-label { font-weight: 500; }
 .review-question-text { margin: 12px 0 0; line-height: 1.7; overflow-wrap: anywhere; }
-.review-outline-answer { margin-top: 12px; color: var(--ink-muted); }
-.review-outline-answer summary { cursor: pointer; font-size: 13px; }
 @media (max-width: 600px) {
   .question-record, .review-question-node { padding: 12px; }
   .question-record-children { padding-left: 8px; }
   .question-history-topic > summary { padding: 12px; }
 }
-.review-answer { border-top: 1px solid var(--border, #dce3df); padding-top: 20px; }
+.review-answer { margin-top: 16px; border-top: 1px solid var(--border, #dce3df); padding-top: 20px; }
+.review-answer > h3 { margin-top: 0; overflow-wrap: anywhere; }
 .review-transcript { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.8; }
 .review-dimensions { display: flex; flex-wrap: wrap; gap: 24px; }
 .review-dimensions dd { margin: 6px 0; font-weight: 700; }
 .review-player-panel video { display: block; width: 100%; max-height: 65vh; background: #17231e; border-radius: 12px; }
 .review-player-panel audio { width: 100%; }
+.review-player-panel { min-width: 0; margin-top: 20px; padding: 16px; border: 1px solid var(--line, #dce3df); border-radius: 10px; background: #f8faf8; }
+.review-player-panel h3 { margin: 0 0 12px; }
+.interview-review > .review-player-panel { margin-top: 0; padding: 24px; background: var(--surface, #fff); }
 .review-report-summary { margin-top: 24px; border-top: 1px solid #dce3df; padding-top: 24px; }
 .review-report-summary .score-value small { font-size: 16px; font-weight: 400; }
 
-.review-player-panel { order: 1; }
-.review-question-panel { order: 2; }
 .review-verification { margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--border, #d9e1dc); }
 .review-verification summary { cursor: pointer; font-weight: 650; }
 .review-verification form { display: grid; gap: .85rem; margin-top: .85rem; }

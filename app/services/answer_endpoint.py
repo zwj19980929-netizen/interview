@@ -67,6 +67,7 @@ class AnswerEndpoint:
         self._blocked_revision: Optional[int] = None
         self._blocked_preview: Any = None
         self._closed = False
+        self._started_at = self.clock()
         self._task: Optional[asyncio.Task] = None
         self._proposal_revision: Optional[int] = None
         self._inference_task: Optional[asyncio.Task] = None
@@ -74,6 +75,9 @@ class AnswerEndpoint:
         self._uncertain_revision: Optional[int] = None
         self._retry_at = 0.0
         self._prepare_failures = 0
+        self._preparation_terminal = False
+        self._understanding_recovery_active = False
+        self._manual_retry_notice_pending = False
         self._preparation_budget_text = ""
         self._preparation_budget_epoch = 0
         self._preparation_budget_key = ""
@@ -81,6 +85,9 @@ class AnswerEndpoint:
         self._preparation_failure_notice_pending = False
         self._last_server_transcript = ""
         self._covered_server_transcript = ""
+        self._missing_final_attempts = 0
+        self._awaiting_fresh_audio = False
+        self._missing_final_notice_sent = False
         self._confirmed_preparation: Optional[asyncio.Task] = None
         self._confirmed_preparation_identity: Any = None
         self._confirmed_preparation_capture: Any = None
@@ -95,7 +102,15 @@ class AnswerEndpoint:
         self.preparation = SpeculativeTurnPreparation(capture.prepare_decision, self._identity)
 
     def start(self) -> None:
+        self._started_at = self.clock()
         self._task = asyncio.create_task(self._run())
+
+    def candidate_floor_returned(self) -> None:
+        """Question playback time is not candidate silence."""
+        if self._last_voice is None:
+            self._started_at = self.clock()
+        else:
+            self._last_voice = self.clock()
 
     def observe_audio(self, pcm: bytes) -> None:
         if self._closed or not pcm:
@@ -114,6 +129,8 @@ class AnswerEndpoint:
     def speech_started(self, *, source: str = "client") -> None:
         if self._closed:
             return
+        if source in {"audio", "client"}:
+            self._refresh_missing_final_origin()
         self.preparation.cancel()
         if source == "transcript":
             self._discard_confirmed_preparation()
@@ -147,6 +164,8 @@ class AnswerEndpoint:
         if text and text != self._last_server_transcript:
             self._last_server_transcript = text
             self._use_preparation_budget(text)
+            if self.confirmation is not None:
+                self.confirmation.transcript_changed()
             self.speech_started(source="transcript")
 
     def cover_transcript(self, final: Any) -> None:
@@ -164,6 +183,8 @@ class AnswerEndpoint:
             self._last_server_transcript = self._covered_server_transcript
 
     def request_finish(self) -> None:
+        self._manual_retry_notice_pending = self._understanding_recovery_active
+        self._reset_missing_final_budget()
         self._explicit_revision = self.revision
         self._blocked_revision = None
         self._blocked_preview = None
@@ -174,10 +195,13 @@ class AnswerEndpoint:
     def continue_speaking(self) -> None:
         """An explicit user action renews retries; microphone noise does not."""
         retrying = self._prepare_failures > 0
+        self._manual_retry_notice_pending = self._understanding_recovery_active
+        self._reset_missing_final_budget()
         self._reset_preparation_budget()
         self.speech_started()
         if self.confirmation is not None and not self.confirmation.speaking:
-            if not (retrying and self.confirmation.phase == "awaiting_reply"):
+            if (not getattr(self.confirmation, "_exit_waiting", False)
+                    and not (retrying and self.confirmation.phase == "awaiting_reply")):
                 self.confirmation.phase = "listening"
 
     def assert_current(self) -> None:
@@ -193,6 +217,7 @@ class AnswerEndpoint:
         """
         try:
             final = await self.capture.transcript_snapshot(resume=False)
+            self._observe_final_snapshot(final)
             self.assert_current()
             self.cover_transcript(final)
             if final is not None and self.on_snapshot is not None:
@@ -201,6 +226,42 @@ class AnswerEndpoint:
         finally:
             if not self._closed and self.capture.is_open:
                 await self.capture.resume_capture()
+
+    def _reset_missing_final_budget(self) -> None:
+        self._missing_final_attempts = 0
+        self._awaiting_fresh_audio = False
+        self._missing_final_notice_sent = False
+
+    def _refresh_missing_final_origin(self) -> None:
+        origin = getattr(self.capture, "recovery_origin", None)
+        if origin is not None and origin != getattr(self, "_missing_final_origin", None):
+            self._missing_final_origin = origin
+            self._reset_missing_final_budget()
+
+    @property
+    def awaiting_transcript(self) -> bool:
+        return bool(not self._closed and self.capture.is_open and self._awaiting_fresh_audio)
+
+    async def replay_waiting_notice(self) -> None:
+        """Restore a lost control notice without reopening or finalizing audio."""
+        if self.awaiting_transcript:
+            self._missing_final_notice_sent = True
+            await self._notify("transcript_retry_required")
+
+    def _observe_final_snapshot(self, final: Any) -> None:
+        """Bound unresolved cuts independently of changing ASR hypotheses.
+
+        Keep the existing recognizer and recorder open. A partial cannot buy
+        another replay of the same unresolved audio; actual acoustic speech or
+        an explicit retry may renew attempts, but never completion permission.
+        """
+        if final is not None:
+            self._reset_missing_final_budget()
+            return
+        self._refresh_missing_final_origin()
+        self._missing_final_attempts += 1
+        if self._missing_final_attempts >= 3:
+            self._awaiting_fresh_audio = True
 
     async def _run(self) -> None:
         try:
@@ -212,15 +273,22 @@ class AnswerEndpoint:
                     await self._recover_capture(self.capture.recovery_error, "send")
                     continue
                 await self._publish_preparation_failure()
-                if self._last_voice is None:
+                if self._awaiting_fresh_audio:
+                    if not self._missing_final_notice_sent:
+                        self._missing_final_notice_sent = True
+                        await self._notify("transcript_retry_required")
                     continue
-                quiet = self.clock() - self._last_voice
+                if self._last_voice is None and self.confirmation is None:
+                    continue
+                quiet = self.clock() - (self._last_voice if self._last_voice is not None else self._started_at)
                 if self.confirmation is not None:
                     if (self.confirmation.phase == "listening" or (
                             self.confirmation.speaking
                             and self.confirmation._after_speech == "listening")):
                         self._discard_confirmed_preparation()
-                    if self._blocked_revision == self.revision or self.clock() < self._retry_at:
+                    if (self._blocked_revision == self.revision
+                            and not (not self.preparation_blocked and self.confirmation.idle_check_due(quiet))
+                            or self.clock() < self._retry_at):
                         continue
                     try:
                         await self.confirmation.step(self, quiet)
@@ -318,6 +386,8 @@ class AnswerEndpoint:
                 # sentences retain the existing authoritative-final path.
                 final = await self.capture.transcript_snapshot()
             self.assert_current()
+            if not nonclosing and not already_finalized:
+                self._observe_final_snapshot(final)
             if already_finalized:
                 self.cover_transcript(final)
             if final is None or (nonclosing and not already_finalized and final.has_unstable_tail):
@@ -331,7 +401,7 @@ class AnswerEndpoint:
             if nonclosing and not already_finalized and preview_key == self._blocked_preview:
                 return
             self._use_preparation_budget(final.text)
-            if self._prepare_failures >= 3:
+            if self.preparation_blocked:
                 self._blocked_revision = self.revision
                 await self._understanding_failed(record_failure=False)
                 return
@@ -347,6 +417,7 @@ class AnswerEndpoint:
             if prepared.understanding.problem is not None:
                 await self._understanding_failed(record_failure=False)
                 return
+            await self._understanding_succeeded()
             if prepared.understanding.suggested_action == "continue_listening":
                 if nonclosing:
                     self._blocked_preview = preview_key
@@ -368,6 +439,8 @@ class AnswerEndpoint:
             confirmed = (final if already_finalized and not recognition_resumed
                          else await self.capture.transcript_snapshot(resume=False))
             self.assert_current()
+            if not (already_finalized and not recognition_resumed):
+                self._observe_final_snapshot(confirmed)
             if confirmed is None:
                 self._blocked_revision = None
                 return
@@ -399,19 +472,31 @@ class AnswerEndpoint:
                 if prepared.understanding.problem is not None:
                     await self._understanding_failed(record_failure=False)
                     return
+                await self._understanding_succeeded()
                 if prepared.understanding.suggested_action == "continue_listening":
                     return
                 if (semantic_first and self._explicit_revision != self.revision
                         and prepared.understanding.suggested_action not in {"clarify", "repeat", "pause", "respond_company"}):
                     from app.services.conversation_understanding import ConversationUnderstandingService
-                    if not ConversationUnderstandingService.can_complete_without_confirmation(
-                            prepared.understanding, confirmed.text):
+                    if (getattr(prepared.understanding, "turn_intent", None) != "stop_interview"
+                            and not ConversationUnderstandingService.can_complete_without_confirmation(
+                                prepared.understanding, confirmed.text)):
                         return
                 latest = await self.capture.transcript_snapshot(resume=False)
                 self.assert_current()
+                self._observe_final_snapshot(latest)
                 if latest is None or self._identity(latest) != self._identity(confirmed):
                     return
                 confirmed = latest
+            if self.confirmation is not None:
+                if await self.confirmation.gate_exit(self, prepared, confirmed):
+                    return
+            elif getattr(prepared.understanding, "turn_intent", None) == "stop_interview":
+                # A stream without a spoken handshake cannot grant permission
+                # to leave the whole interview, even from a clear first request.
+                self._blocked_revision = self.revision
+                await self._notify("endpoint_uncertain")
+                return
             if self.confirmation is not None and prepared.understanding.suggested_action == "respond_company":
                 await self.confirmation.company_answer(self, prepared, confirmed)
                 return
@@ -468,18 +553,37 @@ class AnswerEndpoint:
                     await self._notify(self._listening_notice())
 
     def _listening_notice(self) -> str:
+        if (self.confirmation and self.confirmation.phase in
+                {"awaiting_exit_reply", "exit_classifying", "exit_confirmed"}):
+            return "exit_awaiting_reply"
         return ("supplement_awaiting_reply" if self.confirmation and
-                self.confirmation.phase in {"awaiting_reply", "classifying"} else "answer_listening")
+                self.confirmation.phase in {"awaiting_reply", "classifying"}
+                else "answer_listening")
 
     async def _prepare_transcript(self, transcript: Any, *, semantic_first: bool = False) -> Any:
         with measure_interview_agent_stage("understanding_prepare_ms"):
             self._use_preparation_budget(transcript.text)
-            if self._prepare_failures >= 3:
+            if self.preparation_blocked:
+                self._blocked_revision = self.revision
                 raise ApiError("UNDERSTANDING_RETRY_EXHAUSTED", "New server words or an explicit retry are required.",
                                status_code=503)
             kwargs = ({"semantic_first": True} if semantic_first else
                       {"completion_confirmed": True} if self.confirmation and self.confirmation.confirmed else {})
-            if semantic_first and self.preparation.matching(transcript):
+            if kwargs.get("completion_confirmed") and getattr(self.confirmation, "semantic_first", False):
+                # Explicit completion can prepare a stable preview before the
+                # final cut. Keep the same semantic schema as the final path.
+                kwargs["semantic_first"] = True
+            exit_context = (self.confirmation.exit_context(transcript)
+                            if callable(getattr(self.confirmation, "exit_context", None)) else None)
+            if exit_context is not None:
+                kwargs["exit_confirmation"] = exit_context
+                kwargs["semantic_first"] = True
+            content_context = (self.confirmation.content_clarification_context(transcript)
+                               if callable(getattr(self.confirmation, "content_clarification_context", None)) else None)
+            if content_context is not None:
+                kwargs["content_clarification"] = content_context
+                kwargs["semantic_first"] = True
+            if semantic_first and exit_context is None and content_context is None and self.preparation.matching(transcript):
                 try:
                     prepared = await self._infer(self.preparation.take(transcript), timeout=16)
                     self.assert_current()
@@ -556,6 +660,14 @@ class AnswerEndpoint:
         kwargs = {"completion_confirmed": True}
         if getattr(self.confirmation, "semantic_first", False):
             kwargs["semantic_first"] = True
+        exit_context = (self.confirmation.exit_context(transcript)
+                        if callable(getattr(self.confirmation, "exit_context", None)) else None)
+        if exit_context is not None:
+            kwargs["exit_confirmation"] = exit_context
+        content_context = (self.confirmation.content_clarification_context(transcript)
+                           if callable(getattr(self.confirmation, "content_clarification_context", None)) else None)
+        if content_context is not None:
+            kwargs["content_clarification"] = content_context
         return await asyncio.wait_for(
             self.capture.prepare_decision(transcript, **kwargs),
             timeout=_CONFIRMED_PREPARATION_TIMEOUT,
@@ -579,7 +691,7 @@ class AnswerEndpoint:
         error = task.exception()
         failed = error is not None or task.result().understanding.problem is not None
         if failed and not (isinstance(error, ApiError) and error.code == "TURN_DECISION_STALE"):
-            self._record_preparation_failure(attempt)
+            self._record_preparation_failure(attempt, problem=task.result().understanding.problem if error is None else None)
         return failed
 
     def _discard_confirmed_preparation(self) -> None:
@@ -616,9 +728,14 @@ class AnswerEndpoint:
                 raise ApiError("TURN_DECISION_STALE", "New input cancelled preparation.", status_code=409)
             return self._inference_task.result()
         finally:
-            if self._inference_task is not None and not self._inference_task.done():
-                self._inference_task.cancel()
-                await asyncio.gather(self._inference_task, return_exceptions=True)
+            if self._inference_task is not None:
+                if not self._inference_task.done():
+                    self._inference_task.cancel()
+                    await asyncio.gather(self._inference_task, return_exceptions=True)
+                # Cancellation can win just after the child has failed. The
+                # finished child still needs its exception consumed by us.
+                elif not self._inference_task.cancelled():
+                    self._inference_task.exception()
             self._inference_task = None
 
     async def _recover_capture(self, exc: BaseException, stage: str) -> None:
@@ -681,22 +798,28 @@ class AnswerEndpoint:
         if text and text != self._preparation_budget_text:
             self._preparation_budget_text = text
             self._preparation_budget_key = hashlib.sha256(text.encode("utf-8")).hexdigest()
-            self._prepare_failures = self._preparation_failures_by_evidence.get(self._preparation_budget_key, 0)
-            self._preparation_failure_notice_pending = self._prepare_failures >= 3
-            self._retry_at = 0
+            # Fresh speech may make one new request, but does not replenish
+            # the continuous failure episode's automatic retry budget.
+            self._preparation_failure_notice_pending = self._preparation_failure_notice_pending or self.preparation_blocked
             self._blocked_revision = None
             self._blocked_preview = None
+
+    @property
+    def preparation_blocked(self) -> bool:
+        tried = self._preparation_failures_by_evidence.get(self._preparation_budget_key, 0)
+        return bool(tried and (self._preparation_terminal or self._prepare_failures >= 3))
 
     def _reset_preparation_budget(self) -> None:
         self._preparation_budget_epoch += 1
         self._preparation_failures_by_evidence.clear()
         self._prepare_failures = 0
+        self._preparation_terminal = False
         self._preparation_failure_notice_pending = False
         self._retry_at = 0
         self._blocked_revision = None
         self._blocked_preview = None
 
-    def _record_preparation_failure(self, attempt: Optional[_PreparationAttempt] = None) -> None:
+    def _record_preparation_failure(self, attempt: Optional[_PreparationAttempt] = None, *, problem: Any = None) -> None:
         evidence_key = self._preparation_budget_key
         if attempt is not None:
             if attempt.failure_recorded:
@@ -707,20 +830,36 @@ class AnswerEndpoint:
             evidence_key = attempt.evidence_key
         failures = self._preparation_failures_by_evidence.get(evidence_key, 0) + 1
         self._preparation_failures_by_evidence[evidence_key] = failures
+        self._prepare_failures += 1
+        self._understanding_recovery_active = True
+        if problem is not None and not problem.retryable:
+            self._preparation_terminal = True
         if evidence_key != self._preparation_budget_key:
             return
-        self._prepare_failures = failures
         self._retry_at = self.clock() + min(4, self._prepare_failures)
         self._preparation_failure_notice_pending = True
-        if self._prepare_failures >= 3:
+        if self.preparation_blocked:
             self._blocked_revision = self.revision
         self.trace("understanding_retry_budget", failures=self._prepare_failures,
-                   exhausted=self._prepare_failures >= 3, revision=self.revision)
+                   exhausted=self.preparation_blocked, revision=self.revision)
+
+    async def _understanding_succeeded(self) -> None:
+        recovering = self._understanding_recovery_active
+        self._understanding_recovery_active = False
+        self._reset_preparation_budget()
+        if self.confirmation is not None:
+            self.confirmation._failure_spoken_identity = None
+        if recovering:
+            await self._notify("understanding_recovered")
 
     async def _publish_preparation_failure(self) -> None:
+        if self._manual_retry_notice_pending and not (self.confirmation and self.confirmation.speaking):
+            self._manual_retry_notice_pending = False
+            await self._notify("understanding_retrying")
         if self._preparation_failure_notice_pending:
             self._preparation_failure_notice_pending = False
-            await self._notify("understanding_retry_exhausted" if self._prepare_failures >= 3
+            await self._notify("understanding_result_rejected" if self._preparation_terminal else
+                               "understanding_retry_exhausted" if self._prepare_failures >= 3
                                else "understanding_unavailable")
 
     async def _understanding_failed(self, *, record_failure: bool = True) -> None:

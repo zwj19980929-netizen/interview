@@ -63,18 +63,53 @@ class InterviewerSupervisor:
                 if company_context(session) else {"available": False})
 
     async def prepare_turn(self, utterance: Any, turn: Dict[str, Any], session: Dict[str, Any]):
+        from app.services.conversation_input_context import conversation_input_context
         context = conversation_memory(session)
+        context["input_context"] = conversation_input_context(session, turn, utterance.text)
+        self._add_content_clarification(context, session, utterance.text)
+        self._add_exit_context(context, session, utterance.text)
         context["skill"] = self._skill_context(self.load_skill(session))
         context["company_context"] = self._company_context(session)
         enriched = {**session, "_interviewer_context": context}
         return await self.conversation.prepare_decision(utterance, turn, enriched)
 
     async def prepare_preview(self, preview: Any, turn: Dict[str, Any], session: Dict[str, Any], *, snapshot_ref: str):
+        from app.services.conversation_input_context import conversation_input_context
         context = conversation_memory(session)
+        context["input_context"] = conversation_input_context(session, turn, preview.text)
+        self._add_content_clarification(context, session, preview.text)
+        self._add_exit_context(context, session, preview.text)
         context["skill"] = self._skill_context(self.load_skill(session))
         context["company_context"] = self._company_context(session)
         return await self.conversation.prepare_preview(preview, turn,
             {**session, "_interviewer_context": context}, snapshot_ref=snapshot_ref)
+
+    @staticmethod
+    def _add_content_clarification(context, session, text):
+        exchange = session.get("_content_clarification")
+        if not exchange:
+            return
+        context["content_clarification"] = deepcopy(exchange)
+        start = len(exchange["request_text"])
+        while start < len(text) and text[start].isspace():
+            start += 1
+        context["input_context"] = {**context["input_context"],
+                                    "current_speech_start": start, "current_speech": text[start:]}
+
+    @staticmethod
+    def _add_exit_context(context, session, text):
+        exchange = session.get("_candidate_exit_confirmation")
+        if not exchange:
+            return
+        context["exit_confirmation"] = deepcopy(exchange)
+        start = len(exchange["request_text"])
+        while start < len(text) and text[start].isspace():
+            start += 1
+        # The separate question resolves the old withdrawal request. Current
+        # intent uses only the reply and later speech; technical evidence stays
+        # in the unmodified full transcript.
+        context["input_context"] = {**context["input_context"],
+                                    "current_speech_start": start, "current_speech": text[start:]}
 
     async def propose_next(self, session: Dict[str, Any]) -> NextInterviewDecision:
         if session.get("status") != "in_progress" or session.get("candidate_input_completed_at") or session.get("current_turn_id"):

@@ -31,14 +31,31 @@ def _streaming_harness(monkeypatch, *, gate_before_first=False, gate_eof=False):
 
     managed.pause_capture = pause_capture
     outputs = []
+    emitted = []
+    emit = channel._emit
+    async def record_emit(*args, **kwargs):
+        event = await emit(*args, **kwargs)
+        emitted.append(event.model_dump(mode="json"))
+        return event
+    channel._emit = record_emit
 
-    async def open_streamed(_interview_id, _turn_id, _text, _org, *, performance_id, assert_current):
+    async def open_streamed(_interview_id, _turn_id, _text, _org, *, performance_id, assert_current, before_abort=None):
         raw = _RawTTS([b"\1\0" * 480, b"\2\0" * 480])
         if gate_before_first:
             raw.read_gate = asyncio.Event()
         if gate_eof:
             raw.eof_gate = asyncio.Event()
         publisher = _Publisher()
+        publisher.interruption_before_abort = False
+        abort = publisher.abort
+        async def abort_with_notice():
+            if before_abort is not None and not publisher.abort_calls and not publisher.close_calls:
+                await before_abort()
+            publisher.interruption_before_abort = any(
+                event["type"] == "avatar.performance.interrupted" and event["payload"].get("performance_id") == performance_id
+                for event in emitted)
+            await abort()
+        publisher.abort = abort_with_notice
         publisher.publication = replace(
             publisher.publication, performance_id=performance_id,
             participant_identity="expression:" + performance_id,
@@ -60,7 +77,7 @@ def _streaming_harness(monkeypatch, *, gate_before_first=False, gate_eof=False):
         return output
 
     monkeypatch.setattr(runtime, "_open_streamed_expression", open_streamed)
-    return SimpleNamespace(runtime=runtime, channel=channel, coordinator=coordinator, grant=grant, outputs=outputs)
+    return SimpleNamespace(runtime=runtime, channel=channel, coordinator=coordinator, grant=grant, outputs=outputs, emitted=emitted)
 
 
 async def _select(h, turn_id="turn_1", text="请说明测试方案。"):
@@ -313,7 +330,13 @@ def test_owner_loss_while_provider_read_is_stalled_aborts_without_new_pcm_or_lat
             assert item.raw.read_cancelled and item.publisher.abort_calls >= 1
             after = _session(h)
             assert after["status"] == before["status"] == "in_progress"
-            assert after["agent_runtime"] == before["agent_runtime"]
+            assert {key: value for key, value in after["agent_runtime"].items()
+                    if key not in {"last_sequence", "last_event_at"}} == {
+                        key: value for key, value in before["agent_runtime"].items()
+                        if key not in {"last_sequence", "last_event_at"}}
+            notices = [event for event in h.emitted if event["type"] == "avatar.performance.interrupted"]
+            assert len(notices) == 1 and notices[0]["payload"]["performance_id"] == performance.performance_id
+            assert after["agent_runtime"]["last_sequence"] == before["agent_runtime"]["last_sequence"] + 1
             assert after["agent_events"] == before["agent_events"]
             assert h.channel._speech_output is None and h.channel._speech_output_task is None
         finally:

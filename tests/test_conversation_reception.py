@@ -9,7 +9,14 @@ from app.services.spoken_supplement import SpokenSupplementConfirmation
 from test_answer_endpoint import _Capture, _endpoint, _final, _until
 from test_semantic_turn_endpoint import SemanticCapture
 from test_stable_preview_preparation import _preview
-from test_prepared_turn_decision import Gateway, _service
+from test_prepared_turn_decision import Gateway, _input, _service
+from test_semantic_turn_policy import semantic_response
+
+
+def test_idle_check_is_versioned_speech_without_submission_or_new_assessment():
+    from app.core.prompt.conversation_reception import RECEPTION_SPEECH, RECEPTION_SPEECH_VERSION
+    assert RECEPTION_SPEECH_VERSION == "conversation_reception_speech.v3"
+    assert RECEPTION_SPEECH["idle_check"] == "我还在听。需要一点时间，或希望我再解释一下题目，都可以告诉我。"
 
 
 @pytest.mark.anyio
@@ -21,7 +28,7 @@ async def test_reception_uses_small_grounded_schema_and_no_answer_preparation():
     assert request.max_output_tokens == 320
     assert request.execution_budget.timeout_s == 4
     assert request.execution_budget.max_provider_retries == 0
-    assert request.metadata == {'prompt_version': 'conversation_reception.v3'}
+    assert request.metadata == {'prompt_version': 'conversation_reception.v6'}
     assert 'standard_answer' not in str(request.messages)
 
 
@@ -44,7 +51,7 @@ class ReceptionCapture(SemanticCapture):
 
     def __init__(self, kind='wait'):
         super().__init__()
-        self.current_final = _final('稍等。')
+        self.current_final = _final('我继续回答。' if kind == 'continue' else '稍等。')
         self.kind = kind
         self.requests = []
         self.release = None
@@ -60,6 +67,26 @@ class ReceptionCapture(SemanticCapture):
         if self.release:
             await self.release.wait()
         return {'kind': self.kind, 'confidence': .95, 'evidence_quote': text}
+
+    async def prepare_decision(self, final, **kwargs):
+        if self.kind not in {'wait', 'continue'}:
+            return await super().prepare_decision(final, **kwargs)
+        self.flags.append((kwargs.get('semantic_first', False), kwargs.get('completion_confirmed', False)))
+        self.prepares.append(final)
+        utterance, turn, interview = _input()
+        utterance = utterance.model_copy(update={'text': final.text})
+        interview['_semantic_first'] = True
+        data = semantic_response(content='none', intent='thinking', technical=False)
+        if self.kind == 'continue':
+            data['understanding']['turn_intent'] = 'answering'
+        class SemanticGateway(Gateway):
+            async def invoke(self, capability, request):
+                self.responses.append(data['understanding'] if request.metadata['prompt_version'].startswith('interview_turn_understanding.') else data)
+                return await super().invoke(capability, request)
+        understanding, followup = await _service(SemanticGateway()).prepare_decision(utterance, turn, interview)
+        assert understanding.problem is None, 'The full semantic fixture must remain a valid response'
+        return SimpleNamespace(text=final.text, final=final.model_copy(deep=True),
+                               understanding=understanding, followup=followup)
 
 
 def setup(kind='wait'):
@@ -85,6 +112,7 @@ def setup(kind='wait'):
 def test_social_requests_speak_after_current_final_before_full_answer_analysis(kind):
     async def scenario():
         endpoint, clock, notices, commits, spoken = setup(kind)
+        initial_text = endpoint.capture.current_final.text
         try:
             await _until(lambda: spoken)
             assert spoken == ['reception_' + kind]
@@ -93,11 +121,34 @@ def test_social_requests_speak_after_current_final_before_full_answer_analysis(k
             assert len(endpoint.capture.requests) == 1, 'Reuse the validated result for identical final words'
             endpoint.confirmation.floor_returned(endpoint)
             clock.value = 60
+            expected = ['reception_' + kind]
+            if kind != 'wait':
+                await _until(lambda: len(spoken) == 2)
+                expected.append('reception_idle_check')
+                assert endpoint.confirmation.speaking
+                endpoint.confirmation.floor_returned(endpoint)
+            clock.value = 600
             await asyncio.sleep(.15)
-            assert spoken == ['reception_' + kind] and not commits
+            assert spoken == expected and not commits, 'Ordinary silence gets one check; explicit waiting gets none'
             assert endpoint.capture.snapshots == [False], 'Long waiting must not rotate the next STT stream'
+            assert len(endpoint.capture.requests) == 1, 'The idle check must not repeatedly classify handled words'
             assert endpoint.capture.is_open
             assert 'answer_preparing' not in notices
+            if kind in {'wait', 'continue'}:
+                assert len(endpoint.capture.prepares) == 1, 'Reuse the original full review after fast reception'
+                assert endpoint.confirmation._reception_review is None
+                assert endpoint.confirmation._idle_check_allowed is (kind == 'continue')
+                assert not endpoint._prepare_failures
+
+            endpoint.capture.current_final = _final(initial_text + '你还在吗？')
+            endpoint.capture.kind = 'presence'
+            endpoint.observe_transcript(endpoint.capture.current_final.text)
+            clock.value += 1.1
+            await _until(lambda: len(spoken) == len(expected) + 1)
+            assert spoken == expected + ['reception_presence'] and not commits
+            assert endpoint.capture.requests[-1][0] == '你还在吗？'
+            assert endpoint.capture.requests[-1][1]['preceding_text'] == initial_text
+            assert endpoint.capture.is_open
         finally:
             await endpoint.close()
     asyncio.run(scenario())

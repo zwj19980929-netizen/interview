@@ -91,6 +91,7 @@ const CANDIDATE_SNAPSHOT_KEYS = Object.freeze([
   "capture_recovery",
   "supplement_confirmation",
   "answer_preparation",
+  "completion",
   "execution_schema_version", "dialogue_state", "planning_problem", "runtime_problem_code",
 ]);
 
@@ -339,6 +340,11 @@ function validatePayload(type, payload, audience) {
 }
 
 function validateSnapshot(payload, audience) {
+  if (payload.completion != null && (
+    !isPlainObject(payload.completion)
+    || !validatePayload("completed", payload.completion, audience).ok
+    || payload.completion.interview_id !== payload.interview_id
+  )) return invalidPayload("session.snapshot");
   const allowed = audience === "candidate" ? CANDIDATE_SNAPSHOT_KEYS : ENTERPRISE_SNAPSHOT_KEYS;
   if (!hasOnlyKeys(payload, allowed)) return invalid("AGENT_EVENT_ROLE_PROJECTION_INVALID", "snapshot contains fields outside its audience projection");
   if (!boundedString(payload.interview_id, 1, 128)
@@ -393,7 +399,7 @@ function scopeId(value) {
 function validateSupplementConfirmation(value, snapshot) {
   if (value == null) return true;
   return isPlainObject(value) && hasExactKeys(value, ["status", "turn_id", "capture_id"])
-    && ["listening", "awaiting_reply"].includes(value.status)
+    && ["listening", "awaiting_reply", "awaiting_exit_reply"].includes(value.status)
     && scopeId(value.turn_id) && scopeId(value.capture_id)
     && value.turn_id === snapshot.current_turn_id;
 }
@@ -401,9 +407,9 @@ function validateSupplementConfirmation(value, snapshot) {
 function validateAnswerPreparation(value, snapshot) {
   if (value == null) return true;
   return isPlainObject(value) && hasExactKeys(value, ["status", "turn_id", "capture_id"])
-    && value.status === "preparing" && scopeId(value.turn_id) && scopeId(value.capture_id)
+    && ["preparing", "retrying", "retry_required"].includes(value.status) && scopeId(value.turn_id) && scopeId(value.capture_id)
     && value.turn_id === snapshot.current_turn_id
-    && snapshot.status === "in_progress" && snapshot.floor === "candidate"
+    && snapshot.status === "in_progress" && (value.status !== "preparing" || snapshot.floor === "candidate")
     && snapshot.calibration_status === "completed" && !snapshot.capture_recovery;
 }
 

@@ -571,13 +571,15 @@ async def test_dashscope_final_error_survives_cleanup_error_and_later_abort_expo
     socket = FinalCloseHandshakeSocket(empty_final=True, broken_transport=True)
     raw = await open_socket(socket)
     # A normal empty task is now valid recognition completion. Keep the
-    # original error-precedence scenario by leaving a vendor hypothesis open.
-    socket.received.put_nowait(json.dumps({
-        "header": {"event": "result-generated", "task_id": socket.task_id},
-        "payload": {"output": {"sentence": {
-            "text": "", "sentence_begin": True, "sentence_end": False, "sentence_id": 1,
-        }}},
-    }))
+    # original error-precedence scenario by losing previously observed words.
+    # A nonempty hypothesis followed by the normal ACK can itself be finalized.
+    for text in ("尚未定稿的合成文字", ""):
+        socket.received.put_nowait(json.dumps({
+            "header": {"event": "result-generated", "task_id": socket.task_id},
+            "payload": {"output": {"sentence": {
+                "text": text, "sentence_begin": True, "sentence_end": False, "sentence_id": 1,
+            }}},
+        }))
     with pytest.raises(ProviderError) as original:
         await asyncio.wait_for(raw.finish(), timeout=0.3)
     assert original.value.code == "provider_final_transcript_missing"

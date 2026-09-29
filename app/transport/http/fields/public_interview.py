@@ -26,6 +26,10 @@ PUBLIC_ANSWER_FIELDS = {
 PUBLIC_INTERVIEW_FIELDS = {
     "id": string(),
     "status": string(),
+    "completion": nested({
+        "interview_id": string(), "status": string(), "submitted_at": raw(default=None),
+        "recording_retention_notice": string(), "human_review_required": raw(default=True),
+    }, default=None, allow_none=True),
     "phase": raw(default=None),
     "avatar_mode": string(default="local"),
     "record_audio": raw(default=True),

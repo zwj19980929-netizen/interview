@@ -1,5 +1,32 @@
 # 领域模型
 
+### INTERACTION-RECOVERY-066（仓库与本机验证完成）
+
+- `TurnUnderstanding.intent=answer_unresolved` 表示候选人已结束本题，但在一次已实际播放的内容澄清后仍存在无法核实的转写；允许 `turn_intent=finish_answer`、禁止自动追问，保留已核实 claims，不等于 `answer_declined`。明确整场退出可用 `stop_interview` 进入065独立确认，无须强迫先完成技术澄清；提交必须校验独立退出收据。
+- 私有 `content_clarification.v1` 证明包含 request_text、focus_quote、reply_text、question_act_id、delivered；实际播放后的权威 final 固定前缀，只有之后的新话语可构成回复。准备及提交均校验当前 capture、批准话术、原文前缀及完整上下文指纹。
+- 回答处理失败属于当前 capture 的恢复状态。自动重试有界，连续失败只提示一次；新文字不会无限重置失败预算。显式重试开始新预算，成功理解清除失败状态。
+- 未核实内容的评分结果不输出数值及能力淘汰结论；报告可正常形成，但标明人工复核。正常低 STT 置信度告警的既有评分规则不变。
+
+065恢复提示：既有agent_runtime.supplement_confirmation.status增加awaiting_exit_reply，仅投影当前场、当前题和capture的等待状态；它不持久化确认许可或代替问题送达证据，owner重建后仍须重新确认。
+
+065：PreparedTurnDecision.exit_confirmation为服务器私有来源绑定语境，包含当前session/turn/capture、question_act_id、确认问题播完时已收到的完整原文、新回复与全文SHA256。确认提交后Turn.candidate_exit_confirmation保存confirmed_at和来源哈希；END_CANDIDATE_INPUT成功后Session.candidate_exit_confirmed_at记录事实。它与普通completion_confirmed独立；缺省字段安全兼容、不需DDL。
+
+064：`reception_exchanges.kind`为可选、受限接话类别；`conversation_input_context.v1`仅是从当前题已选交流及原文位置派生的临时投影，不是新答案或结束授权。准备指纹包括交流回执、关联act内容与选中事件。公共`completion`是既有输入完成事实的安全派生回执，支持评分尚未完成时刷新，非新状态字段。`candidate_input_completed_at`已存在时媒体失败不能重新暂停输入，评分和录制失败各自留存。无DDL迁移；详见[064说明](conversation-intent-and-end-064.md)。
+
+062新增可选 `InterviewTurn.reception_exchanges`：最多六组 `{exchange_id, request_text, request_sha256, act_id, selected_event_id, session_sequence, created_at, source_stream_id}`。`request_text`为经权威final验证的新请求尾部，最多1600字符；只关联同capture/owner/turn的真实选中回应。它是交流上下文，不是CandidateAnswer、评分证据或可听完成证明；旧记录缺字段按空读，不需表迁移。`dialogue_focus`仅供重说解释，不能覆盖当前冻结题目。详见[062说明](multiturn-context-062.md)。
+
+## 060 · 复核和历史来源边界
+
+接话复核是进程内一份`final/revision/capture/kind`记录，不是答案或完成授权；新输入和清理撤销。追问修复只允许替换未批准提案的问句，不能替换理解、目标、理由、原文引用或已有父子题关系。修复结果再次通过当前范围、预算和证据校验后才批准；失败保留理解。
+
+按题历史读取仅选择当前会话内唯一已提交Turn/Answer，返回理解revision及最多12条仍可绑定原文的主张；引用重复时次数保留、位置null，不伪造精确定位。答案来源哈希加入总控提案指纹；后台分数变化不参与该指纹。控制连接代次的等待提示去重属于进程内恢复信息，不增字段或迁移。父子答案、根题一次权重及现有录音事实不变，详见[060说明](agent-autonomy-improvements-060.md)。
+
+## 057 对话状态边界
+
+回答内容与控制意图独立：一句可理解的实际做法即使尚未覆盖rubric也可构成partial claim；后续明确关闭话题不删除该内容。不连贯语音和术语疑问不构成拒答。转场的安抚前缀只根据紧邻的已提交回答，不向更早的拒答或未来轮次寻找依据。
+
+一次静音提醒资格属于当前`SpokenSupplementConfirmation`进程内状态，不是新领域表或答案事实；普通等待与明确thinking/wait分离。候选话语、主读题播放完毕和输入revision共同约束提醒；没有新增数据库字段、迁移或对历史问答的改写。正式追问继续独立子Turn/Answer并关联root/parent。
+
 ## 053 · 候选端播放故障与暂停诊断
 
 候选端白名单运行故障通过内部 `PAUSE.runtime_problem_code` 在一个生命周期事务内记录暂停与 `agent_runtime.problems`。首次故障暂停的 `interruption.kind=runtime`；已经手动暂停时不改原始 interruption。每项受限诊断仅保存固定 code/message/action、发生时间、`pause_occurred_at` 和 `pause_epoch`；epoch 使用当前暂停生命周期事件 ID，区分同一秒内恢复后再次暂停。同次暂停同码报告不重复保存，恢复后新的暂停仍可记录同码；记录最多 20 项，无新表或迁移。候选快照只投影当前暂停的单个 `runtime_problem_code`，不给诊断历史或原始错误文本。
@@ -1112,3 +1139,9 @@ stateDiagram-v2
 `TurnUnderstanding.turn_intent=finish_answer` 表示候选人明确完成了当前这一次回答，已有技术内容与逐字结束证据保留，`followup_allowed=true`；不再重复询问是否补充。`finish_topic/decline_topic/stop_interview` 分别表示关闭当前话题、拒答、结束整场，继续令 `followup_allowed=false`。按钮确认没有口头结束证据时不伪造 `completion_basis`。此扩展无需迁移旧理解记录，不能把历史 `finish_topic` 猜测改成新意图或补造追问。
 
 正式子问题可以核实已提及能力点的具体做法与依据，`claim_detail_verification` 记录这种选择原因；覆盖某点不等于其细节已经充分。是否选择由有证据约束的模型决定，受冻结范围、既有追问次数与深度、剩余时间和候选边界约束。
+
+## 2026-09-22 · 059 会话上下文与识别假设
+
+新增信息均是当前采集周期内的短期交流状态，无表或迁移：补充确认保存实际确认问题、前次已确认原文及对应来源；未定稿识别保存重试额度与等待新输入标记。前次确认仅供理解当前短尾，不能恢复旧完成许可；capture 更换、owner 变更或输入修订时继续检查并拒绝陈旧决定。空识别段不形成 Answer，暂定字幕不属于已提交证据。父子题/独立回答/评分引用不变，见[059改进计划](agent-conversation-improvement-plan-059.md)。
+
+`UnderstandingProblem.reason_code` 增加固定诊断枚举 `semantic_control_contract_invalid`，表示已判断的交流意图与动作/追问许可冲突，例如 thinking 却要求 next。它不携带候选正文，不形成结束授权；托管实时会话仍按原有保留音频、有限纠正、提示重试的失败路径处理。旧理解快照与合同版本保留。

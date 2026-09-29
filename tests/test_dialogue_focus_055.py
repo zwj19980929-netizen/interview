@@ -5,7 +5,7 @@ import pytest
 
 from app.core.prompt.contracts import prompt_contract
 from app.core.prompt.validation import StructuredResponseValidationError
-from app.services.dialogue_focus import question_for_repeat
+from app.services.dialogue_focus import question_for_repeat, clarification_for_repeat
 from app.services.interviewer_supervisor.context import conversation_memory
 from app.services.interviews import InterviewService
 from app.repositories.memory import InMemoryStore
@@ -21,21 +21,23 @@ def test_repeat_uses_current_child_and_ignores_confirmation_and_repeats():
     assert question_for_repeat(turn) == "缓存如何失效？"
 
 
-def test_persisted_focus_survives_refresh_and_legacy_untracked_question_can_be_repeated():
+def test_persisted_explanation_never_replaces_formal_question_after_refresh():
     turn = {"id": "root", "question_spoken_text": "请介绍项目。", "conversation_acts": [
         {"act_id": "q", "act_type": "question", "text": "请介绍项目。"},
         {"act_id": "detail", "turn_id": "root", "act_type": "conversation_acknowledgement",
          "prompt_version": "conversation_reception.v2", "text": "缓存如何失效？"},
         {"act_id": "c", "act_type": "supplement_check", "text": "还有补充吗？"},
     ]}
-    assert question_for_repeat(json.loads(json.dumps(turn))) == "缓存如何失效？"
+    assert question_for_repeat(json.loads(json.dumps(turn))) == "请介绍项目。"
     turn["dialogue_focus"] = {"act_id": "clarified"}
     turn["conversation_acts"].append({"act_id": "clarified", "turn_id": "root",
         "act_type": "conversation_acknowledgement", "text": "这里是在问更新后缓存的处理方式。"})
-    assert question_for_repeat(json.loads(json.dumps(turn))) == "这里是在问更新后缓存的处理方式。"
+    assert question_for_repeat(json.loads(json.dumps(turn))) == "请介绍项目。"
+    assert clarification_for_repeat(json.loads(json.dumps(turn))) == "这里是在问更新后缓存的处理方式。"
     # Focus from another turn is never eligible.
     turn["conversation_acts"][-1]["turn_id"] = "other"
-    assert question_for_repeat(turn) == "缓存如何失效？"
+    assert question_for_repeat(turn) == "请介绍项目。"
+    assert clarification_for_repeat(turn) == ""
 
 
 def test_reused_clarification_focus_wins_over_list_insertion_order():
@@ -44,7 +46,8 @@ def test_reused_clarification_focus_wins_over_list_insertion_order():
                 {"act_id": "a", "turn_id": "root", "act_type": "clarification", "text": "澄清A"},
                 {"act_id": "b", "turn_id": "root", "act_type": "clarification", "text": "澄清B"},
             ]}
-    assert question_for_repeat(turn) == "澄清A"
+    assert question_for_repeat(turn) == "主问题"
+    assert clarification_for_repeat(turn) == "澄清A"
 
 
 @pytest.mark.anyio
@@ -55,7 +58,7 @@ async def test_social_reply_cannot_smuggle_an_untracked_technical_question(kind)
     with pytest.raises(StructuredResponseValidationError, match="Reception") as err:
         await _service(gateway).classify_reception("这一部分讲完了。", "org_default")
     assert err.value.reason_code == "reception_cannot_ask_question"
-    assert gateway.requests[0].metadata["prompt_version"] == "conversation_reception.v3"
+    assert gateway.requests[0].metadata["prompt_version"] == "conversation_reception.v6"
 
 
 def test_reception_routes_completion_and_repeat_to_server_without_a_new_probe():

@@ -124,11 +124,16 @@ async def test_targeted_clarification_keeps_capture_and_complete_answer_until_co
     endpoint.confirmation.floor_returned(endpoint)
     clock.value += 100
     await endpoint.confirmation.step(endpoint, 100)
-    assert len(spoken) == 1 and not commits, "Silence after a clarification cannot accept or endlessly re-ask it"
+    assert spoken == [("answer_clarify", {"focus_quote": "redios"}), ("reception_idle_check", {})]
+    assert endpoint.confirmation.speaking and capture.is_open and not commits
+    endpoint.confirmation.floor_returned(endpoint)
+    clock.value += 600
+    await endpoint.confirmation.step(endpoint, 600)
+    assert len(spoken) == 2 and not commits, "Silence may get one presence check, never acceptance or endless clarification"
     corrected = _final(original.text + "我说的是 Redis，作为缓存，R E D I S。没有了。", confidence=None)
     capture.current_final = corrected
     capture.prepare_impl = None
-    endpoint.speech_started()
+    endpoint.observe_transcript(corrected.text)
     endpoint.confirmation.confirmed = True
     endpoint._proposal_revision = endpoint.revision
     await endpoint._propose(final_snapshot=corrected)

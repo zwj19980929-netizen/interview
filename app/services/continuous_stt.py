@@ -59,6 +59,9 @@ class ContinuousSTT:
         self._segment_audio: list[bytes] = []
         self._unresolved = False
         self._segment_text_seen = False
+        # A replacement recognizer cannot withdraw an earlier failed task's
+        # words. Keep that veto separate from this stream's interim words.
+        self._prior_stream_text_seen = False
         self._missing_final_logged = False
         self._forward_idle = asyncio.Event()
         self._inflight_has_speech = False
@@ -140,6 +143,11 @@ class ContinuousSTT:
     @property
     def forwarded_bytes(self) -> int:
         return self._forwarded_bytes
+
+    @property
+    def recovery_origin(self) -> int:
+        """First unconfirmed PCM byte; only accepted completion advances it."""
+        return self._segment_start_bytes
 
     @property
     def recovery_required(self) -> bool:
@@ -296,8 +304,11 @@ class ContinuousSTT:
                     # not an inference from local VAD or a missing result.
                     # Earlier text from a failed attempt still needs a final;
                     # a replacement stream cannot erase that evidence.
+                    reconciled_empty = (empty and stream.empty_completion_reconciled
+                                        and not self._prior_stream_text_seen)
                     self._unresolved = final is None and (
-                        self._segment_text_seen or (not empty and self._segment_has_speech())
+                        (self._segment_text_seen and not reconciled_empty)
+                        or (not empty and self._segment_has_speech())
                     )
                     if self._unresolved and not self._missing_final_logged:
                         _LOG.warning("stt_snapshot_unresolved prior_final=%s segment_bytes=%d",
@@ -320,9 +331,12 @@ class ContinuousSTT:
                             "confidence": minimum_reported_confidence(previous.confidence, final.confidence) if previous else final.confidence,
                         })
                     if not self._unresolved:
+                        if empty:
+                            self._pending_update = None
                         self._segment_start_bytes = end_bytes
                         self._segment_audio.clear()
                         self._segment_text_seen = False
+                        self._prior_stream_text_seen = False
                         segment_finalized = True
                 result = self._final.model_copy(deep=True) if self._final and not self._unresolved else None
                 if resume:
@@ -361,6 +375,7 @@ class ContinuousSTT:
             if self._closed:
                 await stream.abort()
                 self._assert_open()
+            self._prior_stream_text_seen = self._segment_text_seen
             self._stream = stream
             record_stt_audio_origin(stream, start_byte=self._segment_start_bytes,
                                     bytes_per_second=self._bytes_per_second)

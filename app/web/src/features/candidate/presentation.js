@@ -1,6 +1,19 @@
 // Candidate-facing copy is deliberately separate from diagnostic messages.
 // Never render provider text or technical exception messages in the interview.
-export function candidateNotice(problem, pauseConfirmed = false) {
+const UNDERSTANDING_RECOVERY_CODES = new Set([
+  "UNDERSTANDING_UNAVAILABLE", "SUPPLEMENT_REPLY_UNAVAILABLE",
+]);
+const UNDERSTANDING_RETRY_CODES = new Set([
+  "UNDERSTANDING_RESULT_REJECTED", "UNDERSTANDING_RETRY_EXHAUSTED", "SUPPLEMENT_REPLY_RETRY_EXHAUSTED",
+]);
+
+export function understandingRecoveryState(problem) {
+  if (problem?.recoverable !== true) return null;
+  if (UNDERSTANDING_RETRY_CODES.has(problem.code)) return "retry_required";
+  return UNDERSTANDING_RECOVERY_CODES.has(problem.code) ? "retrying" : null;
+}
+
+export function candidateNotice(problem, pauseConfirmed = false, phase = null) {
   if (!problem) return null;
   if (problem.recoverable === false) {
     if (problem.pausePending) return { title: "正在暂停面试", detail: "请先停止作答，稍等片刻。", urgent: true };
@@ -18,13 +31,22 @@ export function candidateNotice(problem, pauseConfirmed = false) {
   if (problem.action === "retry_planning") {
     return { title: "下一话题暂时没准备好", detail: "你的回答已保留，可以重试继续面试。", retry: true, action: "planning.retry" };
   }
-  if (["UNDERSTANDING_UNAVAILABLE", "SUPPLEMENT_REPLY_UNAVAILABLE"].includes(problem.code)) {
-    return { title: "正在整理你的回答", detail: "稍等片刻，也可以继续补充。" };
+  if (understandingRecoveryState(problem) === "retrying") {
+    return { title: "回答处理暂时遇到问题", detail: "录音和已识别内容已保留，系统正在有限重试。无需重说整题；想补充仍可直接开口。"
+      + (phase === "awaiting_exit_confirmation" ? "本次面试尚未结束。" : "") };
   }
-  if (["UNDERSTANDING_RETRY_EXHAUSTED", "SUPPLEMENT_REPLY_RETRY_EXHAUSTED"].includes(problem.code)) {
-    return { title: "刚才的回答暂时没处理好", detail: "请重试，或继续补充。", retry: true };
+  if (understandingRecoveryState(problem) === "retry_required") {
+    return { title: "回答处理需要重试", detail: "录音和已识别内容已保留。点击“重试处理”继续处理已有回答，无需重说整题。"
+      + (phase === "awaiting_exit_confirmation" ? "本次面试尚未结束。" : ""),
+      retry: true, action: "continue_speaking", retryLabel: "重试处理" };
   }
-  if (["TRANSCRIPT_UNAVAILABLE", "ENDPOINT_UNCERTAIN"].includes(problem.code)) {
+  if (problem.code === "TRANSCRIPT_RETRY_REQUIRED") {
+    return { title: "这段语音暂未识别完成", detail: "录音和已识别内容已保留。请点击“重试处理”继续处理，无需重说整题。", retry: true, retryLabel: "重试处理" };
+  }
+  if (problem.code === "TRANSCRIPT_UNAVAILABLE") {
+    return { title: "正在确认转写", detail: "音频已收到，正在等待识别完成；暂定字幕还可能修正。" };
+  }
+  if (problem.code === "ENDPOINT_UNCERTAIN") {
     return { title: "还在听你说", detail: "可以继续回答，讲完后告诉我。" };
   }
   if (["CAPTURE_RECOVERING", "AGENT_EVENT_RESYNC_REQUIRED"].includes(problem.code)) {

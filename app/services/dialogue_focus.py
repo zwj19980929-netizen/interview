@@ -1,26 +1,36 @@
-"""Resolve the last question actually addressed to the candidate, within one turn.
+"""Separate the active assessment question from conversational explanations.
 
-This is presentation context, never answer evidence or permission to add a probe.
-Formal probes remain separate InterviewTurns with their own capture and answer.
+An explanation is useful memory, but cannot replace the frozen parent/child
+question or create assessment evidence. Explicitly repeating that explanation
+uses a separate target; the repeat button always reads the current question.
 """
 from typing import Any, Dict
 
 
 def question_for_repeat(turn: Dict[str, Any]) -> str:
-    acts = turn.get("conversation_acts") or []
-    focus = turn.get("dialogue_focus") or {}
-    for act in reversed(acts):
-        if (act.get("act_id") == focus.get("act_id")
-                and act.get("turn_id") == turn.get("id")):
+    """Read the current turn's question, including a formal child question."""
+    frozen = str(turn.get("question_spoken_text") or "").strip()
+    if frozen:
+        return frozen
+    for act in reversed(turn.get("conversation_acts") or []):
+        if (act.get("act_type") in {"question", "followup"}
+                and act.get("turn_id") in {None, turn.get("id")}):
             return str(act.get("text") or "")
-    for act in reversed(acts):
-        if act.get("act_type") in {"question", "followup"}:
+    return str((turn.get("question_snapshot") or {}).get("question_text") or "")
+
+
+def clarification_for_repeat(turn: Dict[str, Any]) -> str:
+    """Return only the clarification selected for this turn, never another turn."""
+    focus_id = (turn.get("dialogue_focus") or {}).get("act_id")
+    for act in reversed(turn.get("conversation_acts") or []):
+        if (focus_id and act.get("act_id") == focus_id
+                and act.get("turn_id") == turn.get("id")
+                and act.get("act_type") in {"clarification", "conversation_acknowledgement"}):
             return str(act.get("text") or "")
-        # v2 could accidentally ask substantive questions on the reception
-        # channel. Repeating its actual words is safe; inventing historical
-        # child turns/answers from that mixed recording would not be.
-        if (act.get("act_type") == "conversation_acknowledgement"
-                and act.get("prompt_version") == "conversation_reception.v2"
-                and any(mark in str(act.get("text") or "") for mark in ("?", "？"))):
-            return str(act["text"])
-    return str(turn.get("question_spoken_text") or turn.get("question_snapshot", {}).get("question_text") or "")
+    return ""
+
+
+def text_for_repeat(turn: Dict[str, Any], *, target: str = "current_question") -> str:
+    if target == "last_clarification":
+        return clarification_for_repeat(turn) or question_for_repeat(turn)
+    return question_for_repeat(turn)

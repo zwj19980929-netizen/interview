@@ -151,6 +151,7 @@ class ManagedLiveKitEvidenceSession:
         self._stopped = False
         self.last_ingress_state = "not_started"
         self._answer_endpoint: Optional[AnswerEndpoint] = None
+        self._transcript_wait_notice_key: Optional[tuple] = None
         self._prepared_finish: Any = None
         self._presentation_task: Optional[asyncio.Task] = None
 
@@ -244,6 +245,33 @@ class ManagedLiveKitEvidenceSession:
                 self.supervisor.coordinator.release(self.ownership)
             self.supervisor._remove(self)
             raise
+        if self._channel is channel:
+            # A surviving capture can enter a bounded wait while its control
+            # socket is absent. Restore its current notice after attachment;
+            # the callback rechecks the endpoint, turn, capture and owner.
+            await self._replay_transcript_wait()
+
+    def _current_transcript_wait_key(self) -> Optional[tuple]:
+        """Read only on control recovery, never from the PCM intake path."""
+        endpoint = self._answer_endpoint
+        if (self._stopped or endpoint is None or endpoint.capture is not self.chain
+                or not endpoint.awaiting_transcript or not self._capture_id
+                or not self.chain.turn_id or self.ownership is None):
+            return None
+        with self.persistence.transaction(self.organization_id, read_only=True) as transaction:
+            assert_current_evidence_fence(transaction, self.ownership.commit_fence())
+            current = transaction.interview_sessions.get(self.interview_id)
+            if (not current or current.get("status") != "in_progress"
+                    or current.get("current_turn_id") != self.chain.turn_id
+                    or ((current.get("agent_runtime") or {}).get("takeover") or {}).get("status") == "active"):
+                return None
+            ownership = transaction.evidence_ownerships.get(self.ownership.ownership_id)
+            return (endpoint, self._capture_id, self.chain.turn_id, ownership["control_generation"])
+
+    async def _replay_transcript_wait(self) -> None:
+        key = self._current_transcript_wait_key()
+        if key is not None and key != self._transcript_wait_notice_key:
+            await key[0].replay_waiting_notice()
 
     async def detach(self, channel: "AgentChannel") -> None:
         grant = self._control_grants.pop(id(channel), None)
@@ -514,20 +542,36 @@ class ManagedLiveKitEvidenceSession:
             if self.ownership is not None:
                 assert_current_evidence_fence(transaction, self.ownership.commit_fence())
             session = transaction.interview_sessions.get(self.interview_id)
-            if session and any((session.get("agent_runtime") or {}).get(key)
-                               for key in ("supplement_confirmation", "answer_preparation")):
-                session["agent_runtime"].pop("supplement_confirmation", None)
-                session["agent_runtime"].pop("answer_preparation", None)
+            if session:
+                state = session.setdefault("agent_runtime", {})
+                state.pop("supplement_confirmation", None)
+                state.pop("answer_preparation", None)
+                for turn in session.get("turns", []):
+                    if turn.get("id") == turn_id:
+                        turn.pop("content_clarification", None)
                 transaction.interview_sessions.update(session, expected_version=session["version"])
 
         async def notify(reason: str) -> None:
             if self._stopped or self._capture_id != capture_id or not self.chain.is_open:
                 return
+            wait_notice_key = None
+            if reason == "transcript_retry_required":
+                # _notify schedules this callback separately. New audio or a
+                # replacement capture can win before it runs, so revalidate
+                # at delivery rather than replaying a cached problem event.
+                wait_notice_key = self._current_transcript_wait_key()
+                if (wait_notice_key is None or wait_notice_key[:3] != (endpoint, capture_id, turn_id)):
+                    return
             if reason == "answer_preparing":
                 self._persist_answer_preparation(capture_id, turn_id, preparing=True)
-            elif reason in {"answer_listening", "supplement_awaiting_reply", "understanding_unavailable",
-                            "understanding_retry_exhausted", "transcript_unavailable", "capture_failed"}:
+            elif reason in {"understanding_unavailable", "understanding_retry_exhausted", "understanding_result_rejected", "understanding_retrying"}:
+                self._persist_answer_preparation(capture_id, turn_id, preparing=True,
+                    status="retrying" if reason in {"understanding_unavailable", "understanding_retrying"} else "retry_required")
+            elif reason == "understanding_recovered":
                 self._persist_answer_preparation(capture_id, turn_id, preparing=False)
+            elif reason in {"answer_listening", "supplement_awaiting_reply", "exit_awaiting_reply",
+                            "transcript_unavailable", "transcript_retry_required", "capture_failed"}:
+                self._persist_answer_preparation(capture_id, turn_id, preparing=False, preserve_recovery=True)
             source = self._channel or self._event_source
             if reason in {"capture_recovering", "capture_recovered", "capture_retry_required"}:
                 await self._capture_recovery_notice(reason, capture_id, turn_id, source)
@@ -547,22 +591,30 @@ class ManagedLiveKitEvidenceSession:
                 if source is not None:
                     await source._emit_snapshot(None)
                 return
-            if reason in {"understanding_unavailable", "understanding_retry_exhausted", "transcript_unavailable", "detector_unavailable", "endpoint_uncertain"}:
+            if reason in {"understanding_unavailable", "understanding_retry_exhausted", "understanding_result_rejected", "transcript_unavailable", "transcript_retry_required", "detector_unavailable", "endpoint_uncertain"}:
                 if source is None:
                     return
                 message = {
                     "understanding_unavailable": "已收到语音，暂时无法完成回答理解；正在重试，你也可以继续补充。",
-                    "understanding_retry_exhausted": "语音已保留，但回答理解暂时不可用。恢复后请说话或点击提前结束回答重试。",
+                    "understanding_retry_exhausted": "回答处理暂时失败，录音和转写已保留；请点击重试处理，无需重复整段回答。",
+                    "understanding_result_rejected": "回答处理结果未通过校验，录音和转写已保留；请点击重试处理。",
                     "transcript_unavailable": "已收到音频，仍在等待本段最终转写；已有字幕和回答会保留。",
+                    "transcript_retry_required": "这段语音暂未识别完成，录音和已识别内容仍保留；请点击重试。",
                     "detector_unavailable": "自动接话暂时不可用，仍在收音；可以继续说或点击提前结束回答。",
                     "endpoint_uncertain": "我还在听。你可以继续补充；如果已说完，也可以点击提前结束回答。",
                 }[reason]
                 await source._emit("problem", {
                     "code": reason.upper(), "message": message,
-                    "recoverable": True, "action": "continue_listening", "capture_id": capture_id,
+                    "recoverable": True,
+                    "action": "retry" if reason in {"understanding_result_rejected", "understanding_retry_exhausted"} else "continue_listening",
+                    "capture_id": capture_id,
                 }, turn_id=turn_id, causation_id=None, replayability=Replayability.TRANSIENT)
+                if wait_notice_key is not None:
+                    # Mark successful publication only. A failed emit may be
+                    # retried by the next ready handshake in this generation.
+                    self._transcript_wait_notice_key = wait_notice_key
                 return
-            if reason in {"supplement_awaiting_reply", "answer_listening"}:
+            if reason in {"supplement_awaiting_reply", "exit_awaiting_reply", "answer_listening"}:
                 with self.persistence.transaction(self.organization_id) as transaction:
                     if self.ownership is not None:
                         assert_current_evidence_fence(transaction, self.ownership.commit_fence())
@@ -570,7 +622,8 @@ class ManagedLiveKitEvidenceSession:
                     if not session or session.get("status") != "in_progress" or session.get("current_turn_id") != turn_id:
                         return
                     session.setdefault("agent_runtime", {})["supplement_confirmation"] = {
-                        "status": "awaiting_reply" if reason == "supplement_awaiting_reply" else "listening",
+                        "status": ("awaiting_exit_reply" if reason == "exit_awaiting_reply" else
+                                   "awaiting_reply" if reason == "supplement_awaiting_reply" else "listening"),
                         "turn_id": turn_id, "capture_id": capture_id,
                     }
                     transaction.interview_sessions.update(session, expected_version=session["version"])
@@ -630,13 +683,23 @@ class ManagedLiveKitEvidenceSession:
                 "confidence": final.confidence,
             }, turn_id))
 
-        async def speak(kind: str, guard: Any, *, focus_quote: str = "", reply_text: str = "") -> bool:
+        async def speak(kind: str, guard: Any, *, focus_quote: str = "", reply_text: str = "",
+                        repeat_target: str = "current_question") -> bool:
             guard()
             if self._capture_id != capture_id or self._stopped:
                 raise ApiError("TURN_DECISION_STALE", "Capture changed.", status_code=409)
             source = self._channel or self._event_source
             if source is None:
                 return False
+            if kind == "reception_idle_check":
+                # Evidence may already be open while the main question is
+                # speaking. A silence reminder cannot interrupt that output.
+                self._assert_owner()
+                current = self.supervisor.interviews.get_realtime_state(self.interview_id, self.organization_id)
+                state = current.get("agent_runtime") or {}
+                if (current.get("status") != "in_progress" or current.get("current_turn_id") != turn_id
+                        or state.get("floor") != "candidate"):
+                    return False
             if kind == "playback_timeout":
                 self._assert_owner()
                 session = self.supervisor.interviews.get_interview(self.interview_id, self.organization_id)
@@ -660,6 +723,30 @@ class ManagedLiveKitEvidenceSession:
                 await source._set_floor(FloorOwner.NONE, "candidate_pause", None)
                 await source._emit_snapshot(None)
                 return True
+            if kind in {"exit_check", "exit_clarify"}:
+                from app.core.prompt.candidate_exit import EXIT_CONFIRMATION_SPEECH, EXIT_CONFIRMATION_SPEECH_VERSION
+                performance = await source._select_act(
+                    act_type="supplement_check", text=EXIT_CONFIRMATION_SPEECH,
+                    turn_id=turn_id, causation_id=None, evidence_refs=[], gesture="listen",
+                    approval_guard=guard, prompt_version=EXIT_CONFIRMATION_SPEECH_VERSION,
+                    on_playback_selected=lambda: self._answer_endpoint.confirmation.playback_selected(self._answer_endpoint),
+                )
+                self._supplement_performance_id = performance.performance_id if performance else None
+                if performance is None:
+                    return False
+                guard()
+                session = self.supervisor.interviews.get_interview(self.interview_id, self.organization_id)
+                state = session.get("agent_runtime") or {}
+                selected = next((event for event in reversed(session.get("agent_events", []))
+                    if event.get("type") == "conversation.act.selected"), None)
+                if (state.get("active_performance_id") != performance.performance_id or not selected
+                        or selected.get("turn_id") != turn_id
+                        or (state.get("active_expression_act_event_id") is not None
+                            and selected.get("event_id") != state["active_expression_act_event_id"])
+                        or (selected.get("payload") or {}).get("text") != EXIT_CONFIRMATION_SPEECH
+                        or (selected.get("payload") or {}).get("approved") is not True):
+                    return False
+                return {"act_id": selected["payload"]["act_id"]}
             from app.core.prompt.contracts import clarification_speech, CLARIFICATION_SPEECH_VERSION
             if kind.startswith("reception_"):
                 from app.core.prompt.conversation_reception import RECEPTION_SPEECH, RECEPTION_SPEECH_VERSION, RECEPTION_VERSION, reception_repeat
@@ -667,8 +754,8 @@ class ManagedLiveKitEvidenceSession:
                 if request_kind == "repeat":
                     session = self.supervisor.interviews.get_interview(self.interview_id, self.organization_id)
                     turn = next(item for item in session["turns"] if item["id"] == turn_id)
-                    from app.services.dialogue_focus import question_for_repeat
-                    question = question_for_repeat(turn)
+                    from app.services.dialogue_focus import text_for_repeat
+                    question = text_for_repeat(turn, target=repeat_target)
                     text = reception_repeat(question)
                 else:
                     text = reply_text or RECEPTION_SPEECH.get(request_kind, RECEPTION_SPEECH["unclear"])
@@ -680,6 +767,8 @@ class ManagedLiveKitEvidenceSession:
                     on_playback_selected=lambda: self._answer_endpoint.confirmation.playback_selected(self._answer_endpoint),
                 )
                 self._supplement_performance_id = performance.performance_id if performance else None
+                if performance is not None:
+                    self.chain.record_reception_exchange(performance_id=performance.performance_id, guard=guard)
                 return performance is not None
             performance = await source._select_act(
                 act_type="clarification" if kind == "answer_clarify" else "supplement_" + kind,
@@ -690,6 +779,20 @@ class ManagedLiveKitEvidenceSession:
                 **({"prompt_version": CLARIFICATION_SPEECH_VERSION} if kind == "answer_clarify" else {}),
             )
             self._supplement_performance_id = performance.performance_id if performance else None
+            if performance is not None and kind == "answer_clarify":
+                guard()
+                session = self.supervisor.interviews.get_interview(self.interview_id, self.organization_id)
+                state = session.get("agent_runtime") or {}
+                selected = next((event for event in reversed(session.get("agent_events", []))
+                    if event.get("type") == "conversation.act.selected"), None)
+                if (state.get("active_performance_id") != performance.performance_id or not selected
+                        or selected.get("turn_id") != turn_id
+                        or (state.get("active_expression_act_event_id") is not None
+                            and selected.get("event_id") != state["active_expression_act_event_id"])
+                        or (selected.get("payload") or {}).get("text") != clarification_speech(focus_quote)
+                        or (selected.get("payload") or {}).get("approved") is not True):
+                    return False
+                return {"act_id": selected["payload"]["act_id"]}
             return performance is not None
 
         async def respond_company(prepared: Any, final: Any, guard: Any) -> bool:
@@ -758,21 +861,25 @@ class ManagedLiveKitEvidenceSession:
                 self._company_reply_performance = (exchange["id"], performance.performance_id)
             return performance is not None
 
-        self._answer_endpoint = AnswerEndpoint(
+        endpoint = AnswerEndpoint(
             detector=self.supervisor.turn_detector, capture=self.chain, commit=commit, notify=notify,
             on_failure=on_failure,
             on_snapshot=on_snapshot,
             trace=trace,
-            confirmation=SpokenSupplementConfirmation(speak=speak, respond_company=respond_company),
+            confirmation=SpokenSupplementConfirmation(speak=speak, respond_company=respond_company,
+                interview_id=self.interview_id, turn_id=turn_id, capture_id=capture_id),
             speech_activity=ServerSpeechActivity(),
             threshold=float(os.getenv("INTERVIEWER_TURN_END_THRESHOLD", "0.6")),
             rms_threshold=float(os.getenv("INTERVIEWER_TURN_VOICE_RMS", "0.006")),
             min_silence_seconds=float(os.getenv("INTERVIEWER_TURN_MIN_SILENCE_SECONDS", "0.7")),
         )
-        self._answer_endpoint.start()
+        self._answer_endpoint = endpoint
+        endpoint.start()
 
     async def confirmation_floor_returned(self, reason: str) -> None:
         endpoint = self._answer_endpoint
+        if endpoint is not None:
+            endpoint.candidate_floor_returned()
         confirmation = endpoint.confirmation if endpoint else None
         if confirmation is None or not confirmation.speaking:
             return
@@ -786,11 +893,30 @@ class ManagedLiveKitEvidenceSession:
             self._company_reply_performance = None
             if reason != "agent_finished":
                 confirmation._semantic_wait_identity = None
-        if reason == "candidate_continues" or (reason == "barge_in" and confirmation._after_speech != "awaiting_reply") or (
+        if (not confirmation._exit_waiting and reason == "candidate_continues") or (reason == "barge_in" and confirmation._after_speech not in {"awaiting_reply", "awaiting_exit_reply"}) or (
                 confirmation._after_speech == "pause_requested" and reason != "agent_finished"):
             confirmation._after_speech = "listening"
             confirmation._semantic_wait_identity = None
-        confirmation.floor_returned(endpoint)
+        await confirmation.complete_playback(endpoint, reason=reason)
+        if endpoint is not self._answer_endpoint or self._stopped:
+            return
+        if confirmation._content_question_delivered and confirmation._content_request_final is not None:
+            from app.services.content_clarification import text_hash
+            with self.persistence.transaction(self.organization_id) as transaction:
+                if self.ownership is not None:
+                    assert_current_evidence_fence(transaction, self.ownership.commit_fence())
+                session = transaction.interview_sessions.get(self.interview_id)
+                if (session and session.get("status") == "in_progress"
+                        and session.get("current_turn_id") == confirmation._exit_identity["turn_id"]
+                        and self._capture_id == confirmation._exit_identity["capture_id"]):
+                    turn = next(item for item in session["turns"] if item["id"] == session["current_turn_id"])
+                    turn["content_clarification"] = {
+                        "status": "delivered", "capture_id": self._capture_id,
+                        "question_act_id": confirmation._content_question_act_id,
+                        "request_sha256": text_hash(confirmation._content_request_final.text.strip()),
+                        "focus_sha256": text_hash(confirmation._content_question_focus),
+                    }
+                    transaction.interview_sessions.update(session, expected_version=session["version"])
         preroll = getattr(self, "_supplement_preroll", [])
         self._supplement_preroll = []
         if reason == "barge_in":
@@ -798,9 +924,10 @@ class ManagedLiveKitEvidenceSession:
                 endpoint.observe_audio(pcm)
                 await self.chain.send_audio(pcm)
             endpoint.speech_started()
-        await endpoint._notify("supplement_awaiting_reply" if confirmation.phase == "awaiting_reply" else "answer_listening")
+        await endpoint._notify(endpoint._listening_notice())
 
-    def _persist_answer_preparation(self, capture_id: Optional[str], turn_id: Optional[str], *, preparing: bool) -> None:
+    def _persist_answer_preparation(self, capture_id: Optional[str], turn_id: Optional[str], *, preparing: bool,
+                                    status: str = "preparing", preserve_recovery: bool = False) -> None:
         """Persist the active wait before lossy UI delivery; never change capture readiness."""
         if not capture_id:
             return
@@ -813,13 +940,17 @@ class ManagedLiveKitEvidenceSession:
                     return
                 state = session.setdefault("agent_runtime", {})
                 previous = state.get("answer_preparation") or {}
+                same = previous.get("capture_id") == capture_id and previous.get("turn_id") == turn_id
+                recovering = same and previous.get("status") in {"retrying", "retry_required"}
+                if recovering and ((preparing and status == "preparing") or preserve_recovery):
+                    return
                 if preparing:
                     if (self._stopped or self._capture_id != capture_id or not self.chain.is_open
                             or not turn_id or session.get("status") != "in_progress"
                             or session.get("current_turn_id") != turn_id
                             or (state.get("takeover") or {}).get("status") == "active"):
                         return
-                    value = {"status": "preparing", "turn_id": turn_id, "capture_id": capture_id}
+                    value = {"status": status, "turn_id": turn_id, "capture_id": capture_id}
                     if previous == value:
                         return
                     state["answer_preparation"] = value
@@ -877,9 +1008,7 @@ class ManagedLiveKitEvidenceSession:
                     "capture_revision": (checkpoint or {}).get("capture_revision"),
                 }
             owner = "none" if status == "retry_required" else "candidate"
-            resumed_reason = ("supplement_awaiting_reply"
-                if endpoint.confirmation and endpoint.confirmation.phase in {"awaiting_reply", "classifying"}
-                else "answer_listening")
+            resumed_reason = endpoint._listening_notice()
             floor_reason = (resumed_reason if reason == "capture_recovered" else
                             "answer_retry_required" if status == "retry_required" else "answer_recovering")
             state.update(floor=owner, floor_reason=floor_reason)
@@ -970,6 +1099,12 @@ class ManagedLiveKitEvidenceSession:
         if result.kind == "warmup":
             await channel._complete_warmup_evidence(result, signal)
             return
+        if prepared is not None and (result.interview_result or {}).get("accepted") is True:
+            from app.services.conversation_understanding import ConversationUnderstandingService
+            ConversationUnderstandingService._record_followup_decision(
+                prepared[1].followup, {"id": self.interview_id}, {"id": result.turn_id},
+                phase="committed", prompt_version=prepared[1].understanding.prompt_version,
+            )
         if prepared is not None:
             # Domain commit is complete; expression network work must not hold
             # up the durable control executor or the next barge-in signal.
@@ -1263,7 +1398,7 @@ class ManagedLiveKitEvidenceSession:
         if claimed.command_type == "speech.stopped":
             return await self._apply_speech_stopped(source, signal)
         if claimed.command_type == "evidence.continue":
-            return await self._apply_continue(source, signal)
+            return await self._apply_continue(source, signal, control_generation=claimed.control_generation)
         if claimed.command_type == "evidence.backfill":
             if not claimed.turn_id or self.turn_id != claimed.turn_id or not self.chain.is_open:
                 raise ApiError(
@@ -1485,10 +1620,28 @@ class ManagedLiveKitEvidenceSession:
             await self._project_repaired_disconnect(outcome, source)
             return effective_turn_id
         if claimed.command_type == "evidence.reset":
+            current = source.runtime.interviews.get_interview(self.interview_id, self.organization_id)
+            performance_id = (current.get("agent_runtime") or {}).get("active_performance_id")
+            guard = None
+            if performance_id:
+                if current.get("current_turn_id") is not None or (current.get("agent_runtime") or {}).get("calibration_status") == "completed":
+                    raise ApiError("WARMUP_NOT_ACTIVE", "Warm-up is no longer current.", status_code=409)
+                guard = self._output_transition_guard(current, control_generation=claimed.control_generation)
+                await revoke_active_performance(source, performance_id, reason="warmup_retry",
+                    turn_id=signal.turn_id, causation_id=signal.causation_id)
+                guard()
+                await source._cancel_speech_output(expected_performance_id=performance_id)
+                guard()
             await self.chain.abort_warmup()
+            if guard is not None:
+                guard()
             await self._deactivate_partial_projection("warmup", None)
+            if guard is not None:
+                guard()
             if self._warmup_ingress_restart_required:
                 await self._restore_ingress_for_warmup_retry(source)
+                if guard is not None:
+                    guard()
                 self._warmup_ingress_restart_required = False
             self._active_warmup_epoch = None
             source.runtime._set_calibration(
@@ -1766,6 +1919,10 @@ class ManagedLiveKitEvidenceSession:
                     kind=str(self.chain.kind or "formal"),
                     causation_id=signal.causation_id,
                 )
+                # Remote control attachment never runs on this owner. Its
+                # scoped open command restores the same capture and any wait
+                # that was lost before the new controller became reachable.
+                await self._replay_transcript_wait()
                 return self.chain.turn_id
             raise ApiError(
                 "AGENT_EVIDENCE_ALREADY_OPEN",
@@ -1924,8 +2081,49 @@ class ManagedLiveKitEvidenceSession:
             await self.cancel_endpoint()
         return effective_turn_id
 
+    def _output_transition_guard(self, current: Dict[str, Any], *, control_generation: Optional[int] = None):
+        """Freeze this owner/capture while awaiting cancellation of its output."""
+        if self.ownership is None:
+            raise ApiError("EVIDENCE_OWNER_UNAVAILABLE", "No current Evidence owner.", status_code=503)
+        fence = self.ownership.commit_fence()
+        chain, capture_id = self.chain, self._capture_id
+        endpoint, warmup_epoch = self._answer_endpoint, self._active_warmup_epoch
+        turn_id = current.get("current_turn_id")
+        calibration = (current.get("agent_runtime") or {}).get("calibration_status")
+        performance_id = (current.get("agent_runtime") or {}).get("active_performance_id")
+        selection_id = next((event.get("event_id") for event in reversed(current.get("agent_events") or [])
+                             if event.get("type") == "conversation.act.selected"), None)
+        with self.persistence.transaction(self.organization_id, read_only=True) as transaction:
+            assert_current_evidence_fence(transaction, fence)
+            owner = transaction.evidence_ownerships.get(fence.ownership_id)
+            generation = control_generation if control_generation is not None else owner.get("control_generation")
+
+        def guard():
+            if (self._stopped or self.chain is not chain or self._capture_id != capture_id
+                    or self._answer_endpoint is not endpoint or self._active_warmup_epoch != warmup_epoch):
+                raise ApiError("TURN_DECISION_STALE", "Evidence capture changed during output cancellation.", status_code=409)
+            with self.persistence.transaction(self.organization_id, read_only=True) as transaction:
+                assert_current_evidence_fence(transaction, fence)
+                owner = transaction.evidence_ownerships.get(fence.ownership_id)
+                if owner.get("control_generation") != generation:
+                    raise ApiError("EVIDENCE_CONTROL_STALE", "Evidence controller changed during output cancellation.", status_code=409)
+                # This is an infrequent control transition. The per-frame
+                # realtime projection intentionally omits calibration/history.
+                latest = transaction.interview_sessions.get(self.interview_id)
+                state = (latest or {}).get("agent_runtime") or {}
+                latest_selection_id = next((event.get("event_id") for event in reversed((latest or {}).get("agent_events") or [])
+                                            if event.get("type") == "conversation.act.selected"), None)
+                if (not latest or latest.get("status") != "in_progress" or latest.get("current_turn_id") != turn_id
+                        or state.get("calibration_status") != calibration or state.get("floor") == FloorOwner.HUMAN.value
+                        or state.get("active_performance_id") not in {None, performance_id}
+                        or latest_selection_id != selection_id
+                        or (state.get("takeover") or {}).get("status") == "active"):
+                    raise ApiError("TURN_DECISION_STALE", "Interview state changed during output cancellation.", status_code=409)
+        guard()
+        return guard
+
     async def _apply_continue(
-        self, source: "AgentChannel", signal: ClientSignal
+        self, source: "AgentChannel", signal: ClientSignal, *, control_generation: Optional[int] = None,
     ) -> Optional[str]:
         current = self.supervisor.interviews.get_interview(self.interview_id, self.organization_id)
         recovery = (current.get("agent_runtime") or {}).get("capture_recovery") or {}
@@ -1985,13 +2183,28 @@ class ManagedLiveKitEvidenceSession:
                 return signal.turn_id
         if not self._matches_capture(signal):
             return signal.turn_id
+        performance_id = (current.get("agent_runtime") or {}).get("active_performance_id")
+        guard = None
+        if performance_id:
+            if current.get("current_turn_id") != self.turn_id:
+                raise ApiError("TURN_DECISION_STALE", "Current interview turn changed.", status_code=409)
+            guard = self._output_transition_guard(current, control_generation=control_generation)
+            await revoke_active_performance(source, performance_id, reason="candidate_continues",
+                turn_id=signal.turn_id or self.turn_id, causation_id=signal.causation_id)
+            guard()
+            await source._cancel_speech_output(expected_performance_id=performance_id)
+            guard()
         await self.cancel_endpoint()
+        if guard is not None:
+            guard()
         self._capture_speech_started = True
         if self._answer_endpoint is not None:
             self._answer_endpoint.continue_speaking()
         await source._set_floor(
             FloorOwner.CANDIDATE, "candidate_continues", signal.causation_id
         )
+        if guard is not None:
+            guard()
         await source._emit(
             "speech.started",
             {"speaker": "candidate", "continued": True, "local_detected": True},

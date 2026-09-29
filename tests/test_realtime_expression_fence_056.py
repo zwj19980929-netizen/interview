@@ -72,7 +72,15 @@ def test_held_stream_sees_durable_revocation_without_local_cancel(monkeypatch, t
             after = _session(h)
             assert after["status"] == before["status"]
             assert after["current_turn_id"] == before["current_turn_id"]
-            assert after["agent_runtime"] == before["agent_runtime"]
+            # Revoked media now emits one exact transient interruption before
+            # teardown. Only the shared event cursor/timestamp may advance;
+            # the replacement floor, performance and authority stay intact.
+            for key in set(before["agent_runtime"]) | set(after["agent_runtime"]):
+                if key not in {"last_sequence", "last_event_at"}:
+                    assert after["agent_runtime"].get(key) == before["agent_runtime"].get(key)
+            notices = [event for event in h.emitted if event["type"] == "avatar.performance.interrupted"]
+            assert len(notices) == 1 and notices[0]["payload"]["performance_id"] == performance.performance_id
+            assert after["agent_runtime"]["last_sequence"] == before["agent_runtime"]["last_sequence"] + 1
             assert after["agent_events"] == before["agent_events"]
         finally:
             await h.channel.close("synthetic_test_finished")

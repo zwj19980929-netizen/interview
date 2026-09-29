@@ -11,10 +11,13 @@ from test_automatic_turn_integration import (
     _VOICE, _CONTINUATION, _PREFIX,
 )
 from test_evidence_owner_recovery_integration import _wait_until
-from test_spoken_supplement_integration import _synthetic_tts, _speaking, _finish_playback
+from test_spoken_supplement_integration import (
+    _synthetic_tts, _speaking, _finish_playback, _synthetic_confirmed_understanding,
+)
 
 
 def test_no_word_noise_after_finish_does_not_reask_or_recompute_or_duplicate_recording(tmp_path, monkeypatch):
+    _synthetic_confirmed_understanding(monkeypatch)
     original_finish = MockSTTStream.finish
     empty_completions, replies = [], []
     async def finish(stream):
@@ -25,7 +28,7 @@ def test_no_word_noise_after_finish_does_not_reask_or_recompute_or_duplicate_rec
         empty_completions.append(stream.stream_id)
         return [StreamingSTTEvent(stream_id=stream.stream_id, sequence=stream.sequence,
             type="transcript.empty", is_final=True, provider=stream.provider)]
-    async def classify(self, reply, organization_id):
+    async def classify(self, reply, organization_id, **context):
         replies.append(reply)
         return {"intent": "finish", "confidence": .98, "evidence_quote": reply}
     monkeypatch.setattr(MockSTTStream, "finish", finish)

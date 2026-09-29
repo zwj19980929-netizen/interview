@@ -9,6 +9,7 @@ import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from app.core.errors import ApiError
+from app.core.prompt.interviewer_supervisor import SUPERVISOR_VERSION
 from app.model_gateway.errors import ProviderError
 from app.domain.speech_quality import confidence_source, minimum_reported_confidence, transcript_identity
 from app.core.ids import new_id
@@ -61,6 +62,8 @@ class PreparedTurnDecision:
     context_fingerprint: str
     semantic_first: bool = False
     completion_confirmed: bool = False
+    exit_confirmation: Optional[Dict[str, Any]] = None
+    content_clarification: Optional[Dict[str, Any]] = None
 
 
 class InterviewService:
@@ -794,6 +797,7 @@ class InterviewService:
         return {
             "id": session["id"],
             "status": session["status"],
+            "completion": self.candidate_completion_receipt(session),
             "phase": session.get("phase"),
             "avatar_mode": session.get("settings", {}).get("avatar_mode", "cloud"),
             "record_audio": bool(
@@ -817,6 +821,20 @@ class InterviewService:
             ],
             "created_at": session.get("created_at"),
             "updated_at": session.get("updated_at"),
+        }
+
+    @staticmethod
+    def candidate_completion_receipt(session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        terminal = session.get("status") in {"completed", "report_generating", "report_ready"}
+        submitted_at = session.get("candidate_input_completed_at")
+        if not terminal and not submitted_at:
+            return None
+        return {
+            "interview_id": session["id"],
+            "status": session["status"] if terminal else "submitted_for_human_review",
+            "submitted_at": submitted_at or session.get("completed_at") or session.get("updated_at"),
+            "recording_retention_notice": "录音录像按邀请页同意范围和企业保留策略保存。",
+            "human_review_required": True,
         }
 
     def list_lifecycle_events(
@@ -954,10 +972,24 @@ class InterviewService:
                 update={"utterance_id": utterance.utterance_id}, deep=True,
             )
         else:
+            from app.services.conversation_input_context import conversation_input_context
+            # Batch and other non-prepared evidence still need to distinguish
+            # selected conversational responses from the candidate's new words.
+            # Preserve this path's existing semantic/confirmation permissions.
+            understanding_session = {**source_session, "_interviewer_context": {
+                **(source_session.get("_interviewer_context") or {}),
+                "input_context": conversation_input_context(source_session, source_turn, utterance.text),
+            }}
             understanding = await self.conversation.understand(
-                utterance, source_turn, source_session
+                utterance, source_turn, understanding_session
             )
-        if understanding.intent not in {"answer", "answer_declined"} or understanding.suggested_action in {
+        if understanding.turn_intent == "stop_interview":
+            from app.services.candidate_exit_confirmation import confirmed_exit_receipt
+            confirmed_exit_receipt(
+                prepared_decision.exit_confirmation if prepared_decision is not None else None,
+                utterance.text, confirmed_at=now,
+            )
+        if understanding.intent not in {"answer", "answer_declined", "answer_unresolved"} or understanding.suggested_action in {
             "clarify", "repeat", "continue_listening", "pause", "respond_company"
         }:
             understanding_problem = (
@@ -1090,6 +1122,12 @@ class InterviewService:
             mutable = self._turn_by_id(session, turn["id"])
             mutable.setdefault("utterances", []).append(utterance.model_dump(mode="json"))
             mutable["current_understanding"] = understanding.model_dump(mode="json")
+            if understanding.turn_intent == "stop_interview":
+                from app.services.candidate_exit_confirmation import confirmed_exit_receipt
+                mutable["candidate_exit_confirmation"] = confirmed_exit_receipt(
+                    prepared_decision.exit_confirmation if prepared_decision is not None else None,
+                    utterance.text, confirmed_at=now,
+                )
             if mutable.get("company_question_exchanges"):
                 from app.services.company_questions import scoring_projection
                 scoring_text, excluded = scoring_projection(answer["final_transcript"], mutable,
@@ -1339,6 +1377,13 @@ class InterviewService:
             understanding = (previous or {}).get("current_understanding") or {}
             if understanding.get("turn_intent") != "stop_interview":
                 return session
+            from app.services.candidate_exit_confirmation import text_hash
+            receipt = previous.get("candidate_exit_confirmation") or {}
+            answer = next((item for item in session.get("answers", []) if item.get("turn_id") == previous["id"]), {})
+            if (receipt.get("state") != "confirmed" or not receipt.get("confirmed_at")
+                    or receipt.get("transcript_sha256") != text_hash(str(answer.get("final_transcript") or "").strip())):
+                return session
+            session["candidate_exit_confirmed_at"] = receipt["confirmed_at"]
             decision, _ = self._decide_and_persist(transaction, session, LifecycleCommand(
                 LifecycleCommandType.END_CANDIDATE_INPUT, {
                     "decision_id": "candidate_stop_" + previous["id"],
@@ -1409,7 +1454,7 @@ class InterviewService:
             session["agent_runtime"]["last_planning"] = {
                 "decision_id": proposal.decision_id, "reason_code": proposal.reason_code,
                 "tools_used": list(proposal.tools_used), "model_calls": proposal.model_calls,
-                "prompt_version": "interviewer_supervisor.v2", "context_hash": proposal.context_fingerprint,
+                "prompt_version": SUPERVISOR_VERSION, "context_hash": proposal.context_fingerprint,
             }
             decision, _ = self._decide_and_persist(transaction, session, command, organization_id)
             return decision.session
@@ -1420,6 +1465,8 @@ class InterviewService:
         organization_id: str = "org_default", *, snapshot_ref: str,
         completion_confirmed: bool = False,
         semantic_first: bool = False,
+        exit_confirmation: Optional[Dict[str, Any]] = None,
+        content_clarification: Optional[Dict[str, Any]] = None,
     ) -> PreparedTurnDecision:
         """Prepare from a stable server prefix or final; neither commits an answer."""
         is_preview = isinstance(final, StableTranscriptPreview)
@@ -1447,6 +1494,14 @@ class InterviewService:
             "transcript_source": "server_streaming",
         })
         context_fingerprint = self._prepared_context_fingerprint(session, turn)
+        if content_clarification is not None:
+            from app.services.content_clarification import validated_content_clarification
+            content_clarification = validated_content_clarification(session, turn, final.text.strip(), content_clarification)
+            session = {**session, "_content_clarification": content_clarification}
+        if exit_confirmation is not None:
+            from app.services.candidate_exit_confirmation import validated_exit_context
+            exit_confirmation = validated_exit_context(session, turn, final.text.strip(), exit_confirmation)
+            session = {**session, "_candidate_exit_confirmation": exit_confirmation}
         if completion_confirmed:
             session = {**session, "_answer_completion_confirmed": True}
         if semantic_first:
@@ -1467,6 +1522,8 @@ class InterviewService:
             stt_fingerprint=stt_fingerprint, context_fingerprint=context_fingerprint,
             semantic_first=semantic_first,
             completion_confirmed=completion_confirmed,
+            exit_confirmation=exit_confirmation,
+            content_clarification=content_clarification,
         )
 
     @staticmethod
@@ -1522,6 +1579,19 @@ class InterviewService:
             "interview_id": session["id"],
             "current_turn_id": session.get("current_turn_id"),
             "turn": {key: turn.get(key) for key in question_fields},
+            "reception_exchanges": turn.get("reception_exchanges") or [],
+            "content_clarification": turn.get("content_clarification"),
+            "content_clarification_acts": [act for act in turn.get("conversation_acts", [])
+                                            if act.get("prompt_version") == "answer_clarification.v1"],
+            "exit_confirmation_acts": [act for act in turn.get("conversation_acts", [])
+                                       if act.get("prompt_version") == "candidate_exit_confirmation.v1"],
+            "reception_selections": [event for event in session.get("agent_events", [])
+                                     if event.get("event_id") in {
+                                         item.get("selected_event_id") for item in turn.get("reception_exchanges", [])}],
+            "reception_acts": [{key: act.get(key) for key in ("act_id", "turn_id", "text")}
+                               for act in turn.get("conversation_acts", [])
+                               if act.get("act_id") in {
+                                   item.get("act_id") for item in (turn.get("reception_exchanges") or [])[-6:]}],
             "root": {key: root.get(key) for key in question_fields},
             "understanding_revision": {
                 "understanding_id": current_understanding.get("understanding_id"),
@@ -1559,6 +1629,16 @@ class InterviewService:
         turn: Dict[str, Any], payload: Dict[str, Any],
     ) -> None:
         try:
+            from app.services.content_clarification import validated_content_clarification
+            clarification = validated_content_clarification(session, turn, str(payload["final_transcript"]).strip(), prepared.content_clarification)
+            if prepared.understanding.intent == "answer_unresolved":
+                from app.core.prompt.semantic_turn import validate_unresolved_completion
+                validate_unresolved_completion(prepared.understanding.model_dump(mode="json"),
+                    str(payload["final_transcript"]).strip(), clarification)
+            from app.services.candidate_exit_confirmation import validated_exit_context, confirmed_exit_receipt
+            exit_context = validated_exit_context(session, turn, str(payload["final_transcript"]).strip(), prepared.exit_confirmation)
+            if prepared.understanding.turn_intent == "stop_interview":
+                confirmed_exit_receipt(exit_context, str(payload["final_transcript"]).strip(), confirmed_at=utc_now())
             matches = (
                 prepared.interview_id == session["id"]
                 and prepared.turn_id == turn["id"]
@@ -1575,7 +1655,7 @@ class InterviewService:
                     session, int(policy["min_remaining_seconds"]), now=self.clock(),
                 )
             if (matches and prepared.semantic_first and not prepared.completion_confirmed
-                    and prepared.understanding.intent in {"answer", "answer_declined"}
+                    and prepared.understanding.intent in {"answer", "answer_declined", "answer_unresolved"}
                     and prepared.understanding.suggested_action not in {"clarify", "repeat", "continue_listening", "pause", "respond_company"}):
                 matches = self.conversation.can_complete_without_confirmation(
                     prepared.understanding, str(payload["final_transcript"]).strip())
@@ -1917,10 +1997,15 @@ class InterviewService:
                 "root_with_followups" if len(evidence_answer_ids) > 1 else "single_answer"
             )
         except Exception as exc:
+            failure_message = (
+                "评分模型供应商账户计费或额度需要处理，请管理员处理后重试评分。"
+                if isinstance(exc, ProviderError) and exc.code == "provider_billing_required"
+                else "评分服务未完成，请检查模型配置后重试。"
+            )
             with self.persistence.transaction(organization_id) as transaction:
                 failed = transaction.outbox.fail(
                     work_item_id,
-                    "评分服务未完成，请检查模型配置后重试。",
+                    failure_message,
                     lease_token=running_work["lease_token"],
                     error_code=exc.code if isinstance(exc, ProviderError) else "evaluation_failed",
                     retryable=exc.retryable if isinstance(exc, ProviderError) else True,
@@ -1933,7 +2018,7 @@ class InterviewService:
                         session,
                         LifecycleCommand(
                             LifecycleCommandType.EVALUATION_FAILED,
-                            {"answer_id": answer_id, "error": "评分服务未完成，请检查模型配置后重试。",
+                            {"answer_id": answer_id, "error": failure_message,
                              "error_code": exc.code if isinstance(exc, ProviderError) else "evaluation_failed"},
                         ),
                         organization_id,

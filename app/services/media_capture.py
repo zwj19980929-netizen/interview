@@ -857,7 +857,7 @@ class InterviewMediaCaptureService:
                     },
                 )
             session = self.interviews.get_interview(binding.interview_id, organization_id)
-            if session.get("status") == "in_progress":
+            if session.get("status") == "in_progress" and not session.get("candidate_input_completed_at"):
                 self.interviews.pause_interview(
                     binding.interview_id,
                     reason="required_media_capture_failed",
@@ -1105,7 +1105,7 @@ class InterviewMediaCaptureService:
                     {"failure_code": code, "failure_type": type(exc).__name__},
                 )
         session = self.interviews.get_interview(interview_id, organization_id)
-        if session.get("status") == "in_progress":
+        if session.get("status") == "in_progress" and not session.get("candidate_input_completed_at"):
             self.interviews.pause_interview(
                 interview_id,
                 reason="required_media_capture_failed",

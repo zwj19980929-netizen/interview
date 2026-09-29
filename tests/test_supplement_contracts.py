@@ -44,7 +44,7 @@ def test_new_supplement_approval_uses_central_version_and_keeps_frozen_history(k
 ])
 def test_confirmation_reply_has_strict_nonempty_bounded_contract(change):
     contract = prompt_contract("supplement_reply", {"reply": "没有补充"})
-    assert contract.version == "supplement_reply.v4"
+    assert contract.version == "supplement_reply.v5"
     with pytest.raises(StructuredResponseValidationError):
         validate_structured_response({"intent": "finish", "confidence": 0.9, "evidence_id": "E1", **change}, contract.response_schema)
 
@@ -52,9 +52,9 @@ def test_confirmation_reply_has_strict_nonempty_bounded_contract(change):
 def test_confirmation_understanding_has_traceable_version_and_ignores_old_control_intents():
     context = {"transcript": "我还没有说完。有补充。用探针核验状态。没有补充了。", "capability_points": ["探针"], "completion_confirmed": True}
     contract = prompt_contract("interview_turn_understanding", context)
-    assert contract.version == "interview_turn_understanding.v9"
+    assert contract.version == "interview_turn_understanding.v59"
     assert "不作为能力主张或评分证据" in "".join(m.content for m in contract.messages)
-    assert prompt_contract("interview_turn_decision", context).version == "interview_turn_decision.v24"
+    assert prompt_contract("interview_turn_decision", context).version == "interview_turn_decision.v90"
 
 
 def test_reply_evidence_cannot_be_invented_even_after_valid_json():
@@ -69,13 +69,13 @@ def test_reply_evidence_cannot_be_invented_even_after_valid_json():
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("version", ["supplement_reply.v1", "supplement_reply.v2", "supplement_reply.v3", "supplement_reply.v4"])
+@pytest.mark.parametrize("version", ["supplement_reply.v1", "supplement_reply.v2", "supplement_reply.v3", "supplement_reply.v4", "supplement_reply.v5"])
 def test_supplement_versions_remain_readable_in_mock_and_invocation_audit(version):
     from app.providers.mock.provider import MockProvider
 
     async def scenario():
         contract = prompt_contract("supplement_reply", {"reply": "我说的内容和字幕不一样。"})
-        schema = contract.response_schema if version in {"supplement_reply.v3", "supplement_reply.v4"} else supplement_reply_canonical_schema()
+        schema = contract.response_schema if version in {"supplement_reply.v3", "supplement_reply.v4", "supplement_reply.v5"} else supplement_reply_canonical_schema()
         request = ChatJSONRequest(purpose="interview_turn_understanding", messages=contract.messages,
             json_schema=schema, metadata={"prompt_version": version})
         response = await MockProvider().invoke("llm.chat_json", request, context("llm.chat_json", "mock-json"))
@@ -109,7 +109,7 @@ def test_transcription_dispute_uses_versioned_contract_without_relaxing_evidence
 
     result = asyncio.run(ConversationUnderstandingService(InMemoryStore(), gateway=Gateway()).classify_supplement_reply(reply, "org_default"))
     assert result["intent"] == "unclear" and result["evidence_quote"] in reply
-    assert seen[0].metadata["prompt_version"] == "supplement_reply.v4"
+    assert seen[0].metadata["prompt_version"] == "supplement_reply.v5"
     assert set(seen[0].json_schema["required"]) == {"intent", "confidence", "evidence_id"}
     assert seen[0].json_schema["additionalProperties"] is False
     system = "".join(message.content for message in seen[0].messages if message.role == "system")

@@ -74,6 +74,10 @@ class ApprovedSpeechOutput:
     def matches(self, performance_id: str, output_id: str) -> bool:
         return not self._closed and performance_id == self.performance_id and output_id == self.output_id
 
+    @property
+    def playback_drained(self) -> bool:
+        return self._drained.is_set()
+
     async def run(self, on_producer_finished: Callable[[dict], Awaitable[None]]) -> None:
         if self._running:
             raise ApiError("AGENT_STREAM_ALREADY_RUNNING", "Approved speech permits one producer.", status_code=409)

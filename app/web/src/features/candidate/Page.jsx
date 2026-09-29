@@ -8,7 +8,7 @@ import {
   useState,
 } from "react";
 
-import { candidateNotice, candidateEntryMessage, candidateEntryFailure } from "./presentation.js";
+import { candidateNotice, candidateEntryMessage, candidateEntryFailure, understandingRecoveryState } from "./presentation.js";
 import { CandidateQuestionContext, CandidateQuestionHistory, useCandidateQuestionHistory } from "./QuestionHistory.jsx";
 
 import { useWorkbench } from "../../core/WorkbenchProvider.jsx";
@@ -407,6 +407,8 @@ function InvitationPage() {
 function CandidateRoom({ interview, token }) {
   const { API, request } = useWorkbench();
   const [experience, setExperience] = useState(EMPTY_EXPERIENCE);
+  const completion = experience.completion || interview?.completion || null;
+  const inputEnded = Boolean(completion) || ["completed", "report_generating", "report_ready"].includes(interview?.status);
   const [avatarReady, setAvatarReady] = useState(false);
   const [expandedTranscript, setExpandedTranscript] = useState(false);
   const [startingProblem, setStartingProblem] = useState(null);
@@ -424,10 +426,10 @@ function CandidateRoom({ interview, token }) {
   );
   const lastAvatarMetricAt = useRef(0);
   const avatarLoaded = useCallback((details) => {
-    if (!mounted.current || runtimeBlocked.current) return;
+    if (!mounted.current || runtimeBlocked.current || inputEnded) return;
     recordPreparedAvatarFps(details?.fps);
     setAvatarReady(true);
-  }, []);
+  }, [inputEnded]);
   const avatarFpsObserved = useCallback((fps) => {
     const now = Date.now();
     if (now - lastAvatarMetricAt.current < 10_000) return;
@@ -439,7 +441,7 @@ function CandidateRoom({ interview, token }) {
     }).catch(() => {});
   }, []);
   const pauseForFatalProblem = useCallback(async (error, fallbackCode = "CANDIDATE_RUNTIME_FAILED") => {
-    if (!mounted.current) return { pauseConfirmed: false };
+    if (!mounted.current || inputEnded) return { pauseConfirmed: false };
     runtimeBlocked.current = true;
     openingController.current?.abort();
     const problemCode = error?.candidateProblemCode || fallbackCode;
@@ -484,7 +486,7 @@ function CandidateRoom({ interview, token }) {
       });
       return { pauseConfirmed: false };
     }
-  }, [API, interview?.id, request, token]);
+  }, [API, inputEnded, interview?.id, request, token]);
 
   const fatalAvatarProblem = useCallback(
     (error) => pauseForFatalProblem(error, "AVATAR_RENDERER_FAILED"),
@@ -492,6 +494,7 @@ function CandidateRoom({ interview, token }) {
   );
 
   useEffect(() => {
+    if (inputEnded) { discardPreparedCandidateMedia(); return undefined; }
     if (!interview?.id || !token || !avatarReady) return undefined;
     let active = true;
     let unsubscribe = () => {};
@@ -518,7 +521,7 @@ function CandidateRoom({ interview, token }) {
       runRef.current = null;
       run?.close();
     };
-  }, [avatarReady, candidateInterview, interview?.id, pauseForFatalProblem, token]);
+  }, [avatarReady, candidateInterview, inputEnded, interview?.id, pauseForFatalProblem, token]);
 
   useEffect(() => {
     const stream = experience.mediaStream || previewStream;
@@ -546,7 +549,6 @@ function CandidateRoom({ interview, token }) {
 
   const problem = experience.problem || startingProblem;
   const session = experience.session || {};
-  const completion = experience.completion;
   const calibration = experience.calibration || EMPTY_EXPERIENCE.calibration;
   const currentQuestion = experience.currentQuestion;
   const questionHistory = useCandidateQuestionHistory({ apiBase: API, request, interview, token,
@@ -560,7 +562,7 @@ function CandidateRoom({ interview, token }) {
   const totalQuestions = adaptive ? null : Number(session.total_primary_questions ?? interview?.turns?.filter((item) => !item.is_followup).length ?? 0);
   const answered = Number(session.completed_answers ?? interview?.answers?.length ?? 0);
   const pauseConfirmed = problem?.pauseConfirmed === true || session.status === "paused";
-  const notice = candidateNotice(problem, pauseConfirmed);
+  const notice = candidateNotice(problem, pauseConfirmed, experience.phase);
   const visibleExperience = problem?.recoverable === false ? {
     ...experience, phase: "paused", floor: "none",
     avatar: { ...experience.avatar, status: "idle", viseme: "sil", visemeWeight: 0, gesture: "idle" },
@@ -569,7 +571,7 @@ function CandidateRoom({ interview, token }) {
   if (!interview || !token) {
     return <div className="candidate-room"><PublicHeader /><div className="candidate-loading" role="status">正在进入面试…</div></div>;
   }
-  if (completion || ["completed", "report_generating", "report_ready"].includes(interview.status)) {
+  if (inputEnded) {
     const receipt = completion || {
       interview_id: interview.id,
       submitted_at: interview.updated_at,
@@ -633,8 +635,10 @@ function CandidateRoom({ interview, token }) {
       <section className="candidate-question-band">
         {notice && <div className={notice.urgent ? "candidate-problem is-fatal" : "candidate-waiting-row"} role={notice.urgent ? "alert" : "status"}>
           <span><strong>{notice.title}</strong><small>{notice.detail}</small></span>
-          {notice.retry && <button className="button button-secondary" type="button" disabled={experience.planningRetryPending}
-            onClick={() => act(notice.action || "continue_speaking")}>{experience.planningRetryPending ? "正在重试…" : "重试"}</button>}
+          {notice.retry && <button className="button button-secondary" type="button"
+            disabled={experience.planningRetryPending || experience.understandingRetryPending
+              || Boolean(understandingRecoveryState(problem) && !experience.evidence?.ready)}
+            onClick={() => act(notice.action || "continue_speaking")}>{experience.planningRetryPending || experience.understandingRetryPending ? "正在重试…" : notice.retryLabel || "重试"}</button>}
         </div>}
 
         <SpeechPlaybackState playback={problem?.recoverable === false ? null : experience.speechPlayback} act={act} />
@@ -647,8 +651,8 @@ function CandidateRoom({ interview, token }) {
             </div>
             <CandidateProgress answered={answered} totalQuestions={totalQuestions} adaptive={adaptive} />
           </div>
-          <ConversationState phase={visibleExperience.phase} endpoint={experience.endpoint} formal
-            speechDetected={experience.microphone.localDetected || experience.captions.forming} />
+          {!notice && <ConversationState phase={visibleExperience.phase} endpoint={experience.endpoint} formal
+            speechDetected={experience.microphone.localDetected || experience.captions.forming} />}
           <CaptionPanel
             captions={experience.captions}
             expanded={expandedTranscript}
@@ -711,12 +715,13 @@ export function WarmupPanel({ calibration, experience, act }) {
   </div>;
 }
 
-function CaptionPanel({ captions, expanded, onToggle }) {
-  const rows = expanded ? captions.full : captions.recent;
+export function CaptionPanel({ captions, expanded, onToggle }) {
+  const tentative = captions.recent.filter((row) => row.final === false);
+  const rows = expanded ? tentative.length ? tentative : captions.full : captions.recent;
   return <div className="candidate-transcript-wrap" aria-live="polite">
     <div className="transcript-toolbar">
-      <span>{captions.forming
-        ? "字幕更新中"
+      <span>{tentative.length
+        ? captions.forming ? "暂定转写 · 正在识别" : "暂定转写 · 可能修正"
         : expanded ? "完整回答" : "你的回答"}</span>
       {onToggle && <button className="button button-ghost button-small" type="button" onClick={onToggle}>
         {expanded ? "收起完整转写" : "展开完整转写"}
@@ -775,20 +780,24 @@ export function AnswerRecoveryAction({ recovery, act, disabled = false }) {
 }
 
 export function CandidateSignalList({ experience, blocked = false }) {
-  const stopped = blocked || ["paused", "completed", "answer_retry_required", "understanding", "planning"].includes(experience.phase);
+  const processingFailure = understandingRecoveryState(experience.problem);
+  const stopped = blocked || ["paused", "completed", "answer_retry_required", "planning"].includes(experience.phase)
+    || (experience.phase === "understanding" && (!processingFailure || experience.evidence?.ready !== true));
   const recovering = experience.captureRecovery?.status === "recovering" && !stopped;
   const local = !stopped && experience.microphone.localDetected;
   const stoppedDetail = blocked ? "收音已停止，请查看页面提示"
     : experience.phase === "paused" ? "面试已暂停"
     : experience.phase === "completed" ? "面试已结束"
     : experience.phase === "answer_retry_required" ? "本题收音已停止，请重试本题"
+    : processingFailure ? "录音已保留，输入通道暂未就绪"
     : experience.calibration?.status === "awaiting_confirmation" ? "试音已收好，请确认下方字幕"
     : experience.calibration?.status === "confirming" ? "正在进入正式面试"
     : experience.phase === "planning" ? "面试官正在准备下一话题"
     : "这段回答已收好，面试官正在整理";
   return <div className="candidate-signal-list">
     <SignalState label={recovering ? "连接有些慢，正在恢复" : "麦克风"} active={local && !recovering}
-      detail={stopped ? stoppedDetail : recovering ? "请稍等，已收到的回答会保留" : local ? "正在收到你的声音" : "等待你开口"}>
+      detail={stopped ? stoppedDetail : recovering ? "请稍等，已收到的回答会保留" : local ? "正在收到你的声音"
+        : experience.evidence?.ready === false ? "麦克风正在连接" : "麦克风已开启，可随时说话"}>
       <span className="microphone-level" aria-hidden="true"><i style={{ width: `${stopped ? 0 : Math.round(experience.microphone.level * 100)}%` }} /></span>
     </SignalState>
   </div>;
@@ -858,6 +867,7 @@ function phaseText(phase) {
     preparing: "准备听你回答",
     listening: "正在听你说",
     awaiting_supplement: "还有什么需要补充的吗？",
+    awaiting_exit_confirmation: "请确认是否结束本次面试",
     answer_preparing: "正在整理你的回答",
     answer_recovering: "连接有些慢，正在恢复",
     answer_retry_required: "这段回答需要重试",
@@ -875,6 +885,7 @@ function phaseDetail(phase, formal) {
     preparing: "准备好后就可以开口了。",
     listening: formal ? "自然表达即可。需要思考、想换个话题或已经讲完，都可以直接告诉面试官。" : "正在识别试音，停止说话后将自动形成试音字幕。",
     awaiting_supplement: "还有想说的可以直接补充，已经讲完也请告诉我；没听清可以让我再问一遍。",
+    awaiting_exit_confirmation: "请明确说出确认退出，或告诉面试官继续面试。确认前不会结束本次面试。",
     answer_preparing: "不需要重复确认。若想补充，仍可直接开口，面试官会重新整理后再回应。",
     answer_recovering: "请稍等，已收到的回答会保留。",
     answer_retry_required: "点击“重试本题”后，再回答一次。",

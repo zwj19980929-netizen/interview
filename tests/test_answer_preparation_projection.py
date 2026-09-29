@@ -68,7 +68,7 @@ def test_preparation_and_exit_survive_lost_transient_notices(tmp_path, monkeypat
 @pytest.mark.parametrize("reason", [
     "understanding_unavailable", "understanding_retry_exhausted", "transcript_unavailable",
 ])
-def test_failed_preparation_clears_truth_even_when_problem_notice_is_lost(tmp_path, monkeypatch, reason):
+def test_failed_preparation_persists_recovery_even_when_problem_notice_is_lost(tmp_path, monkeypatch, reason):
     async def scenario():
         async with _automatic_session(tmp_path, monkeypatch, [""], spoken_confirmation=True) as (_, runtime, channel, managed):
             await managed._answer_endpoint._notify("answer_preparing")
@@ -78,8 +78,12 @@ def test_failed_preparation_clears_truth_even_when_problem_notice_is_lost(tmp_pa
 
             monkeypatch.setattr(channel, "_emit", unavailable_delivery)
             await managed._answer_endpoint._notify(reason)
-            assert _snapshot(runtime, channel)["answer_preparation"] is None
-            assert "answer_preparation" not in _current(runtime)["agent_runtime"]
+            expected = None if reason == "transcript_unavailable" else {
+                "status": "retry_required" if reason == "understanding_retry_exhausted" else "retrying",
+                "turn_id": TURN_ID, "capture_id": managed._capture_id,
+            }
+            assert _snapshot(runtime, channel)["answer_preparation"] == expected
+            assert _current(runtime)["agent_runtime"].get("answer_preparation") == expected
             assert managed.evidence_open and _current(runtime)["answers"] == []
 
     asyncio.run(scenario())

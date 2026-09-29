@@ -1,5 +1,11 @@
 # Interviewer Domain
 
+066领域补充：**ContentClarification** 是具体疑点的实际送达与后续新语音事实；**UnresolvedAnswer** 是已结束但技术转写仍待核实的回答，保留证据且不计零分；**UnderstandingRecovery** 是当前 capture 的有限恢复状态，不是候选人没回答，也不授予退出许可。详见[066说明](docs/interaction-recovery-066.md)。
+
+065领域补充：**CandidateExitConfirmation**是独立问题实际送达后、当前权威新语音明确确认整场退出的事实，与补充确认或本题完成不同。**CandidateWithdrawal**客观记录候选人主动退出，报告交由人工复核，不自动作出淘汰决定。详见[065说明](docs/candidate-exit-confirmation-065.md)。
+
+064领域补充：**CurrentSpeech**是最后已回应交流之后可追溯的新发言范围，只约束当前意图；**AccumulatedAnswerEvidence**是完整服务端转写中的实际技术陈述，交流范围变化不能删除它。**CandidateInputCompleted**是候选人输入结束，评分与录制封存可以继续；媒体错误不能撤销此事实。详见[064说明](docs/conversation-intent-and-end-064.md)。
+
 ## 当前补充：面试定制（044）
 
 **InterviewCustomization**：组织保存的可选面试偏好与公司介绍，含相互独立的Skill正文和CompanyProfile。保存后新生成的计划默认使用已填写部分；空项略过，不要求用户再次选用，也不要求两项同时存在。

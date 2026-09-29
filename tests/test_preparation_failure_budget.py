@@ -1,11 +1,17 @@
-"""Failed understanding retries belong to server words, not VAD revisions."""
+"""Transient failures have one bounded episode; new words permit one request."""
 
 import asyncio
 
 import pytest
 
+from app.domain.interview_agent import UnderstandingProblem
 from test_answer_endpoint import _final, _until
 from test_spoken_supplement import ask, setup
+
+
+def _retryable_problem():
+    return UnderstandingProblem(code="UNDERSTANDING_PROVIDER_UNAVAILABLE", source="provider",
+        recoverable=True, action="clarify", retryable=True)
 
 
 async def _attempt(endpoint, final):
@@ -16,7 +22,7 @@ async def _attempt(endpoint, final):
 def test_noise_and_provider_metadata_changes_cannot_restart_exhausted_word_budget():
     async def scenario():
         endpoint, clock, notices, commits, _ = setup()
-        endpoint.capture.problem = {"code": "UNDERSTANDING_RESULT_REJECTED"}
+        endpoint.capture.problem = _retryable_problem()
         final = _final("合成回答。没有需要补充了。")
         for index in range(43):
             if index:
@@ -39,7 +45,7 @@ def test_noise_and_provider_metadata_changes_cannot_restart_exhausted_word_budge
 def test_cancelled_waiters_do_not_hide_or_double_count_background_failures(failure):
     async def scenario():
         endpoint, clock, notices, commits, _ = setup()
-        endpoint.capture.problem = {"code": "UNDERSTANDING_RESULT_REJECTED"}
+        endpoint.capture.problem = _retryable_problem()
         final = _final("合成回答。已经讲完了。")
         for attempt in range(3):
             release = asyncio.Event()
@@ -73,10 +79,10 @@ def test_cancelled_waiters_do_not_hide_or_double_count_background_failures(failu
 
 
 @pytest.mark.parametrize("reset", ["server_words", "final_only_words", "explicit_retry"])
-def test_real_new_words_or_explicit_retry_restore_exhausted_preparation(reset):
+def test_real_new_words_or_explicit_retry_allow_a_successful_fresh_preparation(reset):
     async def scenario():
         endpoint, _, _, commits, _ = setup()
-        endpoint.capture.problem = {"code": "UNDERSTANDING_RESULT_REJECTED"}
+        endpoint.capture.problem = _retryable_problem()
         final = _final("合成回答。没有了。")
         for _ in range(3):
             await _attempt(endpoint, final)
@@ -84,10 +90,15 @@ def test_real_new_words_or_explicit_retry_restore_exhausted_preparation(reset):
         endpoint.capture.problem = None
         if reset == "explicit_retry":
             endpoint.request_finish()
+            assert endpoint._prepare_failures == 0
         else:
             final = _final(final.text + "补充说明，失败任务还需要幂等重试。现在讲完了。")
             if reset == "server_words":
                 endpoint.observe_transcript(final.text)
+            # New authoritative words permit one fresh request. They do not
+            # renew the failed episode's automatic retry allowance.
+            assert endpoint._prepare_failures == 3
+        assert not commits
         await _attempt(endpoint, final)
         assert len(endpoint.capture.prepares) == 4
         assert len(commits) == 1 and commits[0].text == final.text
@@ -110,7 +121,7 @@ def test_background_failure_from_superseded_words_cannot_charge_new_evidence():
                 await release.wait()
             return endpoint.capture.prepared(transcript)
 
-        endpoint.capture.problem = {"code": "UNDERSTANDING_RESULT_REJECTED"}
+        endpoint.capture.problem = _retryable_problem()
         endpoint.capture.prepare_impl = prepare
         task = asyncio.create_task(_attempt(endpoint, old))
         await _until(lambda: endpoint.capture.prepares)
@@ -127,7 +138,7 @@ def test_background_failure_from_superseded_words_cannot_charge_new_evidence():
 def test_switching_back_to_previously_failed_server_words_keeps_their_budget():
     async def scenario():
         endpoint, _, _, commits, _ = setup()
-        endpoint.capture.problem = {"code": "UNDERSTANDING_RESULT_REJECTED"}
+        endpoint.capture.problem = _retryable_problem()
         final = _final("合成回答。没有了。")
         for _ in range(3):
             await _attempt(endpoint, final)
@@ -145,7 +156,7 @@ def test_running_endpoint_publishes_orphan_failure_exhaustion_and_keeps_recordin
     async def scenario():
         endpoint, clock, notices, commits, spoken = setup()
         await ask(endpoint, clock, spoken)
-        endpoint.capture.problem = {"code": "UNDERSTANDING_RESULT_REJECTED"}
+        endpoint.capture.problem = _retryable_problem()
         releases = [asyncio.Event() for _ in range(3)]
 
         async def prepare(transcript):

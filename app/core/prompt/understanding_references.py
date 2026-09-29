@@ -7,6 +7,8 @@ Resolution is exact and occurs only after the full wire schema was validated.
 import re
 from copy import deepcopy
 
+from app.core.prompt.semantic_turn import SemanticContractError
+
 
 def understanding_references(transcript, capability_points):
     spans = []
@@ -34,7 +36,7 @@ def resolve_understanding_references(data, references):
         key, quote = company["evidence_id"], company["quote"]
         evidence = references["evidence"][key]
         if not quote.strip() or evidence.count(quote) != 1:
-            raise ValueError("Company question must select an unambiguous verbatim span")
+            raise SemanticContractError("company_question_span_invalid", "$.company_question.quote")
         start = references["offsets"][key] + evidence.index(quote)
         result["company_question"] = {"start": start, "end": start + len(quote), "quote": quote}
     basis = result.get("completion_basis")
@@ -44,7 +46,7 @@ def resolve_understanding_references(data, references):
     if target:
         target["evidence_quote"] = references["evidence"][target.pop("evidence_id")]
         if target["focus_quote"] not in target["evidence_quote"]:
-            raise ValueError("Clarification focus is not verbatim")
+            raise SemanticContractError("clarification_focus_not_verbatim", "$.clarification_target.focus_quote")
     result["evidence_quotes"] = _evidence_quotes(result.pop("evidence_ids"), references)
     for claim in result["claims"]:
         claim["evidence_quote"] = references["evidence"][claim.pop("evidence_id")]

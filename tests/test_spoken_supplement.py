@@ -16,7 +16,7 @@ class Capture(_Capture):
         self.confidence = 0.95
         self.classify_impl = None
 
-    async def classify_supplement_reply(self, reply):
+    async def classify_supplement_reply(self, reply, **context):
         self.replies.append(reply)
         if self.classify_impl:
             return await self.classify_impl(reply)

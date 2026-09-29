@@ -80,7 +80,7 @@ async def test_specialist_has_no_side_effects_and_shares_three_call_budget():
     result = await supervisor(gateway).propose_next(source_session())
     assert result.model_calls == 3
     assert [request.metadata["prompt_version"] for request in gateway.calls] == [
-        "interviewer_supervisor.v2", "interviewer_evidence_expert.v1", "interviewer_supervisor.v2"]
+        "interviewer_supervisor.v3", "interviewer_evidence_expert.v1", "interviewer_supervisor.v3"]
     assert gateway.calls[-1].json_schema["properties"]["tool_name"]["enum"] == [None]
 
 
@@ -137,7 +137,7 @@ async def test_service_selects_exactly_one_root_and_rejects_changed_session():
     assert len(selected["turns"]) == 1 and selected["decision_revision"] == 1
     again = await service.advance_adaptive_interview(session["id"])
     assert len(again["turns"]) == 1
-    assert selected["agent_runtime"]["last_planning"]["prompt_version"] == "interviewer_supervisor.v2"
+    assert selected["agent_runtime"]["last_planning"]["prompt_version"] == "interviewer_supervisor.v3"
 
     store = InMemoryStore()
     session = source_session(store)
@@ -256,13 +256,30 @@ def test_next_context_ignores_background_scoring_but_tracks_new_evidence():
     assert context_fingerprint(session) != initial
 
 
-def test_committed_candidate_stop_intent_ends_input_without_selecting_new_question():
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_committed_candidate_stop_requires_exit_receipt_before_ending_input(confirmed):
+    from app.services.candidate_exit_confirmation import confirmed_exit_receipt, text_hash
+
     store = InMemoryStore()
     session = submit(select(make_session(), "q1").session).session
     session["turns"][0]["current_understanding"] = {"turn_intent": "stop_interview"}
+    transcript = "我不想面了。确定结束。"
+    session["answers"][0]["final_transcript"] = transcript
+    if confirmed:
+        session["turns"][0]["candidate_exit_confirmation"] = confirmed_exit_receipt({
+            "version": "candidate_exit_confirmation.v1", "decision": "confirm",
+            "question_act_id": "exit_question", "capture_id": "capture",
+            "request_text": "我不想面了。", "reply_text": "确定结束。",
+            "transcript_sha256": text_hash(transcript),
+        }, transcript, confirmed_at=utc_now())
     with persistence_for(store).transaction("org_default") as tx:
         tx.interview_sessions.add(session)
     service = InterviewService(store)
     stopped = service.finish_on_candidate_intent(session["id"])
-    assert stopped["candidate_input_completion_reason"] == "candidate_requested"
+    if confirmed:
+        assert stopped["candidate_input_completion_reason"] == "candidate_requested"
+        assert stopped["candidate_exit_confirmed_at"]
+    else:
+        assert not stopped.get("candidate_input_completed_at")
+        assert not stopped.get("candidate_exit_confirmed_at")
     assert len(stopped["answers"]) == 1 and len(stopped["turns"]) == 1

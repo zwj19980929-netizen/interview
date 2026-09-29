@@ -372,6 +372,10 @@ class StreamingInterviewSTT:
         return isinstance(self.stream, ContinuousSTT) and self.stream.recovery_required
 
     @property
+    def recovery_origin(self) -> Optional[int]:
+        return self.stream.recovery_origin if isinstance(self.stream, ContinuousSTT) else None
+
+    @property
     def recovery_error(self) -> Any:
         return self.stream.recovery_error if isinstance(self.stream, ContinuousSTT) else None
 

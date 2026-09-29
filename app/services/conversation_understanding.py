@@ -13,7 +13,9 @@ from app.domain.speech_quality import limit_semantic_confidence
 from app.domain.adaptive_interview import is_adaptive, assessment_contract
 from app.core.ids import new_id
 from app.core.prompt.contracts import prompt_contract, understanding_canonical_schema, supplement_reply_canonical_schema
-from app.core.prompt.semantic_turn import with_semantic_turn_schema, validate_semantic_turn
+from app.core.prompt.semantic_turn import (
+    with_semantic_turn_schema, validate_semantic_turn, validate_current_speech, validate_unresolved_completion, SemanticContractError,
+)
 from app.core.prompt.understanding_references import (
     understanding_references,
     resolve_understanding_references,
@@ -23,6 +25,7 @@ from app.core.prompt.validation import (
     validate_structured_response,
 )
 from app.core.time import utc_now
+from app.core.speech_diagnostics import record_turn_control
 from app.domain.interview_agent import (
     ApprovedConversationAct,
     ConversationUtterance,
@@ -39,11 +42,15 @@ from app.services.meta_intent import MetaIntentDetector
 
 _SENSITIVE = re.compile(
     r"年龄|岁数|出生|性别|男生|女生|婚姻|结婚|未婚|生育|怀孕|民族|种族|宗教|信仰|"
-    r"政治|党派|残疾|疾病|病史|健康状况|家庭住址|户籍|籍贯|sexual|gender|age|religion|disability",
+    r"政治|党派|残疾|疾病|病史|健康状况|家庭住址|户籍|籍贯|"
+    r"(?<![A-Za-z0-9])(?:sexual|gender|age|religion|disability)(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
 
 _LOGGER = logging.getLogger(__name__)
+_DECISION_TIMEOUT = 15.0
+_FOLLOWUP_REPAIR_TIMEOUT = 3.0
+_DEADLINE_RESERVE = .02
 
 
 class UnderstandingContentError(ValueError):
@@ -72,7 +79,7 @@ def _log_validation_rejection(
     if isinstance(exc, StructuredResponseValidationError):
         reason = exc.reason_code
         path += exc.schema_path[1:]
-    elif isinstance(exc, (UnderstandingContentError, FollowupProposalError)):
+    elif isinstance(exc, (UnderstandingContentError, FollowupProposalError, SemanticContractError)):
         reason = exc.reason_code
         path = getattr(exc, "schema_path", path)
     elif isinstance(exc, ProviderError):
@@ -213,7 +220,10 @@ class ConversationUnderstandingService:
                     stage = "understanding_canonical"
                     validate_structured_response(data, self._canonical_schema(semantic_first))
                     stage = "understanding_content"
-                    self._validate_understanding_content(data, utterance.text, capability_points)
+                    self._validate_understanding_content(data, utterance.text, capability_points,
+                        input_context=context["interviewer_context"].get("input_context"),
+                        exit_confirmation=context["interviewer_context"].get("exit_confirmation"),
+                        content_clarification=context["interviewer_context"].get("content_clarification"))
                     provider = response.provider.model_dump()
                     confidence = limit_semantic_confidence(float(data["confidence"]), utterance.stt_confidence)
                     break
@@ -231,7 +241,7 @@ class ConversationUnderstandingService:
                         interview_id=interview.get("id"), turn_id=turn.get("id"), provider_request_id=request_id,
                     )
                 except (StructuredResponseValidationError, ValueError, KeyError, TypeError) as exc:
-                    reason = exc.reason_code if isinstance(exc, UnderstandingContentError) else "wire_schema_invalid"
+                    reason = exc.reason_code if isinstance(exc, (UnderstandingContentError, SemanticContractError)) else "wire_schema_invalid"
                     _log_validation_rejection(
                         "understanding_contract_rejected", exc, stage=stage, attempt=attempt,
                         interview_id=interview.get("id"), turn_id=turn.get("id"), provider_request_id=request_id,
@@ -256,6 +266,7 @@ class ConversationUnderstandingService:
         if (
             deterministic is None
             and confidence < float(self.DEFAULT_POLICY["low_confidence_threshold"])
+            and data.get("turn_intent") != "thinking"
         ):
             data["suggested_action"] = "clarify"
         confidence = self._apply_ambiguity_policy(data, confidence)
@@ -276,7 +287,7 @@ class ConversationUnderstandingService:
         turn: Dict[str, Any],
         interview: Dict[str, Any],
     ) -> tuple[TurnUnderstanding, Dict[str, Any]]:
-        """Prepare a revocable understanding/probe pair with one inference.
+        """Prepare a revocable understanding/probe pair within one deadline.
 
         Nothing is persisted, submitted or spoken here. The caller must fence
         the input revision and current interview state again at commit time.
@@ -284,14 +295,17 @@ class ConversationUnderstandingService:
         """
 
         self._require_authoritative_final(utterance)
-        if interview.get("_semantic_first") is True:
-            # The correction attempt shares the initial decision's deadline;
-            # two individually bounded invocations must not double latency.
-            return await asyncio.wait_for(self._prepare_decision(utterance, turn, interview), timeout=15.0)
-        return await self._prepare_decision(utterance, turn, interview)
+        deadline = asyncio.get_running_loop().time() + _DECISION_TIMEOUT
+        result = await asyncio.wait_for(self._prepare_decision(utterance, turn, interview, deadline=deadline),
+                                        timeout=_DECISION_TIMEOUT)
+        self._record_followup_decision(result[1], interview, turn, phase="prepared", prompt_version=result[0].prompt_version)
+        return result
 
     async def classify_reception(self, text: str, organization_id: str, *, phase: str = "listening",
                                  question: str = "", preceding_text: str = "",
+                                 current_question: Optional[str] = None, root_question: str = "",
+                                 last_clarification: str = "", current_turn_id: Optional[str] = None,
+                                 root_turn_id: Optional[str] = None, parent_turn_id: Optional[str] = None,
                                  history: Optional[List[Dict[str, Any]]] = None,
                                  process_facts: Optional[Dict[str, Any]] = None,
                                  skill_instructions: str = "") -> Dict[str, Any]:
@@ -306,6 +320,9 @@ class ConversationUnderstandingService:
             raise ValueError("Unknown conversational phase")
         contract = prompt_contract("conversation_reception", {
             "text": text, "phase": phase, "question": question[:2000], "preceding_text": preceding_text[-1000:],
+            "current_question": current_question, "root_question": root_question,
+            "last_clarification": last_clarification, "current_turn_id": current_turn_id,
+            "root_turn_id": root_turn_id, "parent_turn_id": parent_turn_id,
             "history": history, "process_facts": process_facts, "skill_instructions": skill_instructions,
         })
         response = await asyncio.wait_for(self.gateway.invoke(cap.LLM_CHAT_JSON, ChatJSONRequest(
@@ -315,17 +332,28 @@ class ConversationUnderstandingService:
             execution_budget=InvocationExecutionBudget(timeout_s=4, max_provider_retries=0),
             metadata={"prompt_version": contract.version},
         )), timeout=5)
-        from app.core.prompt.conversation_reception import validate_reception_response
-        validate_reception_response(response.data, contract.response_schema)
+        from app.core.prompt.conversation_reception import validate_reception_response, resolve_reception_repeat_target
+        validate_reception_response(response.data, contract.response_schema, current_speech=text)
         data = response.data
-        return {"kind": data["kind"], "confidence": data["confidence"],
+        result = {"kind": data["kind"], "confidence": data["confidence"],
                 "evidence_quote": understanding_references(text, [])["evidence"][data["evidence_id"]],
                 "reply_text": data["reply_text"].strip()}
+        if data["kind"] == "repeat":
+            result["repeat_target"] = resolve_reception_repeat_target(text, data.get("repeat_target"))
+        elif "repeat_target" in data:
+            result["repeat_target"] = data["repeat_target"]
+        return result
 
-    async def classify_supplement_reply(self, reply: str, organization_id: str) -> Dict[str, Any]:
+    async def classify_supplement_reply(
+        self, reply: str, organization_id: str, *, prior_confirmation: bool = False,
+        preceding_text: str = "", question: str = "",
+    ) -> Dict[str, Any]:
         if not isinstance(reply, str) or not reply.strip() or len(reply) > 100000:
             raise ValueError("A bounded nonempty server reply is required")
-        contract = prompt_contract("supplement_reply", {"reply": reply})
+        contract = prompt_contract("supplement_reply", {
+            "reply": reply, "prior_confirmation": prior_confirmation,
+            "preceding_text": preceding_text, "question": question,
+        })
         response = await self.gateway.invoke(cap.LLM_CHAT_JSON, ChatJSONRequest(
             organization_id=organization_id, purpose="interview_turn_understanding",
             messages=contract.messages, json_schema=contract.response_schema,
@@ -339,6 +367,25 @@ class ConversationUnderstandingService:
                 "evidence_quote": references["evidence"][response.data["evidence_id"]]}
         validate_structured_response(data, supplement_reply_canonical_schema())
         return data
+
+    async def classify_exit_reply(self, reply: str, organization_id: str) -> Dict[str, Any]:
+        """Classify fresh authoritative speech after a delivered exit question.
+
+        The caller owns delivery, capture, owner and freshness checks. A model
+        result alone is never permission to complete the interview.
+        """
+        from app.core.prompt.candidate_exit import exit_reply_contract, validate_exit_reply_response
+
+        contract = exit_reply_contract({"reply": reply})
+        response = await asyncio.wait_for(self.gateway.invoke(cap.LLM_CHAT_JSON, ChatJSONRequest(
+            organization_id=organization_id, purpose="interview_turn_understanding",
+            messages=contract.messages, json_schema=contract.response_schema,
+            temperature=0, max_output_tokens=400,
+            execution_budget=InvocationExecutionBudget(timeout_s=8, max_provider_retries=0),
+            metadata={"prompt_version": contract.version},
+        )), timeout=8)
+        validate_exit_reply_response(response.data, reply, contract.response_schema)
+        return dict(response.data)
 
     async def prepare_preview(
         self,
@@ -376,11 +423,23 @@ class ConversationUnderstandingService:
         utterance: ConversationUtterance,
         turn: Dict[str, Any],
         interview: Dict[str, Any],
+        *, deadline: Optional[float] = None,
     ) -> tuple[TurnUnderstanding, Dict[str, Any]]:
+        deadline = deadline or (asyncio.get_running_loop().time() + _DECISION_TIMEOUT)
         scope = self._followup_scope(interview, turn, utterance)
+        if len(utterance.text) > int(scope["policy"]["max_answer_chars"]):
+            # Full authoritative text still goes to the existing understanding
+            # contract. Only verified, bounded evidence goes to the probe call.
+            understanding = await asyncio.wait_for(self._understand(utterance, turn, interview),
+                timeout=max(.001, deadline - asyncio.get_running_loop().time() - _DEADLINE_RESERVE))
+            if understanding.problem is not None:
+                return understanding, self._no_followup("understanding_unavailable", scope["policy"])
+            decision, _ = await self._select_followup(interview, turn, utterance, understanding, deadline=deadline)
+            return understanding, decision
         if (not interview.get("_answer_completion_confirmed") and not interview.get("_semantic_first")
                 and self.meta_intents.detect(utterance.text)) or scope.get("selected") is False:
-            understanding = await self._understand(utterance, turn, interview)
+            understanding = await asyncio.wait_for(self._understand(utterance, turn, interview),
+                timeout=max(.001, deadline - asyncio.get_running_loop().time() - _DEADLINE_RESERVE))
             # No second invocation when the budget or acoustic confidence
             # already rules out a probe. Deterministic controls invoke none.
             decision = self._followup_scope(interview, turn, utterance, understanding)
@@ -435,7 +494,7 @@ class ConversationUnderstandingService:
                             },
                         ),
                     ),
-                    timeout=20.0,
+                    timeout=max(.001, deadline - asyncio.get_running_loop().time() - _DEADLINE_RESERVE),
                 )
                 request_id = response.provider.request_id
                 # Validate the entire composite response before indexing or
@@ -447,9 +506,12 @@ class ConversationUnderstandingService:
                 stage = "understanding_canonical"
                 validate_structured_response(data, self._canonical_schema(context["semantic_first"]))
                 stage = "understanding_content"
-                self._validate_understanding_content(data, utterance.text, capability_points)
+                self._validate_understanding_content(data, utterance.text, capability_points,
+                    input_context=context["interviewer_context"].get("input_context"),
+                    exit_confirmation=context["interviewer_context"].get("exit_confirmation"),
+                        content_clarification=context["interviewer_context"].get("content_clarification"))
                 confidence = limit_semantic_confidence(float(data["confidence"]), utterance.stt_confidence)
-                if confidence < float(self.DEFAULT_POLICY["low_confidence_threshold"]):
+                if confidence < float(self.DEFAULT_POLICY["low_confidence_threshold"]) and data.get("turn_intent") != "thinking":
                     data["suggested_action"] = "clarify"
                 confidence = self._apply_ambiguity_policy(data, confidence)
                 current = turn.get("current_understanding") or {}
@@ -468,10 +530,10 @@ class ConversationUnderstandingService:
                     return understanding, approved_scope
                 if understanding.suggested_action not in {"accept", "followup", "next"}:
                     return understanding, self._no_followup("understanding_not_accepted", scope["policy"])
-                return understanding, self._resolve_optional_followup(
+                return understanding, await self._resolve_optional_followup(
                     response.data["followup"], references, utterance, turn, approved_scope,
                     provider=response.provider.model_dump(), prompt_version=contract.version,
-                    attempt=attempt, interview_id=interview.get("id"),
+                    attempt=attempt, interview=interview, understanding=understanding, deadline=deadline,
                 )
             except (ProviderError, asyncio.TimeoutError) as exc:
                 if getattr(exc, "code", None) != "provider_schema_invalid":
@@ -488,7 +550,7 @@ class ConversationUnderstandingService:
                     interview_id=interview.get("id"), turn_id=turn.get("id"), provider_request_id=request_id,
                 )
             except (StructuredResponseValidationError, ValueError, KeyError, TypeError) as exc:
-                reason = exc.reason_code if isinstance(exc, UnderstandingContentError) else "wire_schema_invalid"
+                reason = exc.reason_code if isinstance(exc, (UnderstandingContentError, SemanticContractError)) else "wire_schema_invalid"
                 _log_validation_rejection(
                     "turn_decision_contract_rejected", exc, stage=stage, attempt=attempt,
                     path="$.understanding" if stage.startswith("understanding_") else "$",
@@ -504,10 +566,11 @@ class ConversationUnderstandingService:
             contract = prompt_contract("interview_turn_decision", {**context, "correction_reason": reason})
         raise AssertionError("bounded decision preparation exhausted without a result")
 
-    def _resolve_optional_followup(
+    async def _resolve_optional_followup(
         self, proposal: Dict[str, Any], references: Dict[str, Any],
         utterance: ConversationUtterance, turn: Dict[str, Any], scope: Dict[str, Any],
-        *, provider: Dict[str, Any], prompt_version: str, attempt: int, interview_id: Optional[str] = None,
+        *, provider: Dict[str, Any], prompt_version: str, attempt: int, interview: Dict[str, Any],
+        understanding: TurnUnderstanding, deadline: float,
     ) -> Dict[str, Any]:
         # Called only after the complete wire response and canonical/business
         # understanding have passed validation. A bad optional probe may not
@@ -539,8 +602,11 @@ class ConversationUnderstandingService:
         except (ValueError, KeyError, TypeError) as exc:
             _log_validation_rejection(
                 "turn_followup_proposal_rejected", exc, stage=stage, attempt=attempt, path="$.followup",
-                interview_id=interview_id, turn_id=turn.get("id"), provider_request_id=provider.get("request_id"),
+                interview_id=interview.get("id"), turn_id=turn.get("id"), provider_request_id=provider.get("request_id"),
             )
+            if isinstance(exc, FollowupProposalError) and exc.reason_code == "question_shape_invalid":
+                return await self._repair_followup(candidate, utterance, turn, interview, understanding,
+                                                   deadline=deadline)
             # No unapproved/model-authored act and no invented fallback probe.
             return self._no_followup("followup_proposal_rejected", scope["policy"])
 
@@ -553,9 +619,23 @@ class ConversationUnderstandingService:
         *,
         now: Optional[datetime] = None,
     ) -> Dict[str, Any]:
+        decision, source_version = await self._select_followup(interview, turn, utterance, understanding, now=now,
+            deadline=asyncio.get_running_loop().time() + _DECISION_TIMEOUT)
+        self._record_followup_decision(decision, interview, turn, phase="selected",
+                                      prompt_version=source_version)
+        return decision
+
+    async def _select_followup(
+        self, interview: Dict[str, Any], turn: Dict[str, Any], utterance: ConversationUtterance,
+        understanding: TurnUnderstanding, *, now: Optional[datetime] = None, deadline: Optional[float] = None,
+    ) -> tuple[Dict[str, Any], Optional[str]]:
+        deadline = deadline or (asyncio.get_running_loop().time() + _DECISION_TIMEOUT)
         scope = self._followup_scope(interview, turn, utterance, understanding, now=now)
         if scope.get("selected") is False:
-            return scope
+            return scope, None
+        remaining = deadline - asyncio.get_running_loop().time() - _DEADLINE_RESERVE
+        if remaining <= 0:
+            return self._no_followup("followup_deadline_exhausted", scope["policy"]), None
         policy, targets, evidence = scope["policy"], scope["targets"], scope["evidence"]
         root, difficulty = scope["root"], scope["difficulty"]
         root_turn_id = scope["root_turn_id"]
@@ -571,7 +651,7 @@ class ConversationUnderstandingService:
             },
         )
         try:
-            response = await self.gateway.invoke(
+            response = await asyncio.wait_for(self.gateway.invoke(
                 cap.LLM_CHAT_JSON,
                 ChatJSONRequest(
                     organization_id=interview.get("organization_id", "org_default"),
@@ -580,6 +660,8 @@ class ConversationUnderstandingService:
                     json_schema=contract.response_schema,
                     temperature=0.0,
                     max_output_tokens=800,
+                    execution_budget=InvocationExecutionBudget(timeout_s=remaining, max_provider_retries=0,
+                                                               max_provider_attempts=1),
                     metadata={
                         "prompt_version": contract.version,
                         "interview_id": interview["id"],
@@ -589,9 +671,13 @@ class ConversationUnderstandingService:
                         "difficulty": difficulty,
                     },
                 ),
-            )
+            ), timeout=remaining)
             data = deepcopy(response.data)
             validate_structured_response(data, contract.response_schema)
+            scope = self._followup_scope(interview, turn, utterance, understanding, now=now)
+            if scope.get("selected") is False:
+                return scope, contract.version
+            evidence, targets = scope["evidence"], scope["targets"]
             self._gate_followup(
                 data,
                 transcript=utterance.text,
@@ -604,15 +690,81 @@ class ConversationUnderstandingService:
                 max_chars=int(policy["max_probe_chars"]),
             )
             provider = response.provider.model_dump()
-        except (ProviderError, ValueError, KeyError):
+        except asyncio.TimeoutError:
+            return self._no_followup("followup_deadline_exhausted", policy), contract.version
+        except (ProviderError, ValueError, KeyError) as exc:
+            # A failed invocation may outlive the question's remaining budget
+            # or permission just as a successful one can. Never approve an
+            # existing fallback using the scope captured before that wait.
+            scope = self._followup_scope(interview, turn, utterance, understanding, now=now)
+            if scope.get("selected") is False:
+                return scope, contract.version
+            policy, targets, evidence = scope["policy"], scope["targets"], scope["evidence"]
+            if isinstance(exc, FollowupProposalError) and exc.reason_code == "question_shape_invalid":
+                repaired = await self._repair_followup(data, utterance, turn, interview, understanding,
+                                                       deadline=deadline, now=now)
+                return repaired, "controlled_followup_repair.v1"
             if not scope["missing_targets"]:
-                return self._no_followup("optional_detail_probe_unavailable", policy)
+                return self._no_followup("optional_detail_probe_unavailable", policy), contract.version
             return self._fallback_probe(
                 turn, scope["missing_targets"], evidence, "model_unavailable_or_rejected", policy,
-            )
+            ), contract.version
         return self._approved_followup_selection(
             turn, data, scope, provider=provider, prompt_version=contract.version,
-        )
+        ), contract.version
+
+    async def _repair_followup(self, candidate, utterance, turn, interview, understanding, *, deadline, now=None):
+        """Repair only wording after every other proposal gate already passed.
+
+        The caller owns cancellation and the commit fence. No understanding,
+        evidence binding, rationale or target may be replaced by this response.
+        """
+        scope = self._followup_scope(interview, turn, utterance, understanding, now=now)
+        if scope.get("selected") is False:
+            return scope
+        remaining = min(_FOLLOWUP_REPAIR_TIMEOUT,
+                        deadline - asyncio.get_running_loop().time() - _DEADLINE_RESERVE)
+        if remaining <= 0:
+            return self._no_followup("followup_deadline_exhausted", scope["policy"])
+        contract = prompt_contract("controlled_followup_repair", {
+            "question_text": scope["root"].get("question_spoken_text", ""),
+            "evidence_quote": candidate["evidence_quote"],
+            "target_capability_points": candidate["target_capability_points"],
+            "rationale": candidate["rationale"], "draft": candidate["question_text"],
+            "difficulty": scope["difficulty"], "max_probe_chars": int(scope["policy"]["max_probe_chars"]),
+        })
+        request_id = None
+        try:
+            response = await asyncio.wait_for(self.gateway.invoke(cap.LLM_CHAT_JSON, ChatJSONRequest(
+                organization_id=interview.get("organization_id", "org_default"), purpose="controlled_followup",
+                messages=contract.messages, json_schema=contract.response_schema, temperature=0,
+                max_output_tokens=180,
+                execution_budget=InvocationExecutionBudget(timeout_s=remaining, max_provider_retries=0,
+                                                           max_provider_attempts=1),
+                metadata={"prompt_version": contract.version, "interview_id": interview["id"],
+                          "turn_id": turn["id"], "repair_reason": "question_shape_invalid"},
+            )), timeout=remaining)
+            request_id = response.provider.request_id
+            validate_structured_response(response.data, contract.response_schema)
+            if not response.data["selected"]:
+                return {**self._no_followup("model_declined", scope["policy"]), "probe_source": contract.version}
+            repaired = {**deepcopy(candidate), "question_text": response.data["question_text"]}
+            scope = self._followup_scope(interview, turn, utterance, understanding, now=now)
+            if scope.get("selected") is False:
+                return {**scope, "probe_source": contract.version}
+            self._gate_followup(repaired, transcript=utterance.text, allowed_evidence=scope["evidence"],
+                allowed_targets=scope["targets"], missing_targets=scope["missing_targets"],
+                claim_evidence=scope["claim_evidence"], difficulty=scope["difficulty"], root=scope["root"],
+                max_chars=int(scope["policy"]["max_probe_chars"]))
+            return self._approved_followup_selection(turn, repaired, scope,
+                provider=response.provider.model_dump(), prompt_version=contract.version)
+        except asyncio.TimeoutError:
+            return {**self._no_followup("followup_repair_timeout", scope["policy"]), "probe_source": contract.version}
+        except (ProviderError, ValueError, KeyError, TypeError) as exc:
+            _log_validation_rejection("turn_followup_repair_rejected", exc, stage="followup_repair", attempt=1,
+                path="$.followup", interview_id=interview.get("id"), turn_id=turn.get("id"),
+                provider_request_id=request_id)
+            return {**self._no_followup("followup_repair_rejected", scope["policy"]), "probe_source": contract.version}
 
     def _followup_scope(
         self,
@@ -650,6 +802,9 @@ class ConversationUnderstandingService:
         confidence = understanding.confidence if understanding is not None else utterance.stt_confidence
         if confidence is not None and confidence < float(policy["low_confidence_threshold"]):
             return self._no_followup("low_confidence_clarification_required", policy)
+        if understanding is not None and (understanding.problem is not None or
+                understanding.suggested_action not in {"accept", "followup", "next"}):
+            return self._no_followup("understanding_not_accepted", policy)
         if not bool(turn.get("allow_followup", False)):
             return self._no_followup("followup_disabled", policy)
         if depth >= int(policy["max_depth"]):
@@ -660,11 +815,7 @@ class ConversationUnderstandingService:
             return self._no_followup("root_budget_exhausted", policy)
         if not self._within_time_budget(interview, int(policy["min_remaining_seconds"]), now=now):
             return self._no_followup("time_budget_exhausted", policy)
-        if not (
-            int(policy["min_answer_chars"])
-            <= len(utterance.text)
-            <= int(policy["max_answer_chars"])
-        ):
+        if len(utterance.text) < int(policy["min_answer_chars"]):
             return self._no_followup("answer_length_outside_budget", policy)
 
         previously_probed = {
@@ -695,7 +846,7 @@ class ConversationUnderstandingService:
         )
         evidence = [
             quote
-            for quote in evidence_quotes[:4]
+            for quote in evidence_quotes
             if not _SENSITIVE.search(quote)
         ]
         if not evidence:
@@ -847,9 +998,15 @@ class ConversationUnderstandingService:
 
     @staticmethod
     def _validate_understanding_content(
-        data: Dict[str, Any], transcript: str, capability_points: Sequence[str]
+        data: Dict[str, Any], transcript: str, capability_points: Sequence[str], *, input_context=None,
+        exit_confirmation=None, content_clarification=None,
     ) -> None:
+        from app.core.prompt.candidate_exit import validate_exit_understanding
+
         validate_semantic_turn(data, transcript)
+        validate_current_speech(data, transcript, input_context)
+        validate_exit_understanding(data, transcript, exit_confirmation)
+        validate_unresolved_completion(data, transcript, content_clarification)
         allowed = set(capability_points)
         covered_values = list(data["covered_capability_points"])
         missing_values = list(data["missing_capability_points"])
@@ -869,10 +1026,14 @@ class ConversationUnderstandingService:
         if any(str(quote).strip() not in transcript for quote in quotes):
             raise UnderstandingContentError("evidence_not_verbatim")
         target = data.get("clarification_target")
-        if target and (target["evidence_quote"] not in transcript
-                       or target["focus_quote"] not in target["evidence_quote"]
-                       or not data["ambiguities"] or data["intent"] not in {"answer", "clarification_request"}):
-            raise UnderstandingContentError("evidence_not_verbatim")
+        if target:
+            if target["evidence_quote"] not in transcript or target["focus_quote"] not in target["evidence_quote"]:
+                raise UnderstandingContentError("evidence_not_verbatim")
+            allowed_target_intents = {"answer", "clarification_request", "answer_unresolved"}
+            if data.get("turn_intent") == "thinking":
+                allowed_target_intents.add("not_finished")
+            if not data["ambiguities"] or data["intent"] not in allowed_target_intents:
+                raise UnderstandingContentError("clarification_target_contract_invalid")
         if data.get("intent") == "answer_declined":
             if (
                 data.get("suggested_action") != "next"
@@ -884,7 +1045,14 @@ class ConversationUnderstandingService:
                 or data["ambiguities"] or data["contradictions"]
             ):
                 raise UnderstandingContentError("answer_declined_contract_invalid")
-        if data.get("intent") == "answer":
+        if data.get("intent") == "answer_unresolved":
+            if (not str(data.get("answer_summary") or "").strip() or not data["evidence_quotes"]
+                    or data["contradictions"]
+                    or (data["answer_content"] == "none" and (covered or missing != allowed))):
+                raise UnderstandingContentError("unresolved_answer_contract_invalid")
+        preserving_claims = (data.get("intent") == "answer_unresolved" or (
+            data.get("intent") == "clarification_request" and data.get("turn_intent") == "finish_answer"))
+        if data.get("intent") == "answer" or (preserving_claims and data["answer_content"] != "none"):
             evidence_quotes = [str(item).strip() for item in data["evidence_quotes"]]
             claims = list(data["claims"])
             if (
@@ -910,14 +1078,15 @@ class ConversationUnderstandingService:
         if data.get("turn_intent") == "ask_company" and confidence < .75:
             data.update(company_question=None, turn_intent="clarify", intent="clarification_request",
                         suggested_action="clarify", followup_allowed=False)
-        if data["intent"] == "answer_declined" and confidence < .75:
+        if data["intent"] in {"answer_declined", "answer_unresolved"} and confidence < .75:
             # A clear lack of technical knowledge can be understood with high
             # confidence. Unreliable speech evidence is a separate limitation;
             # it must not authorize advancement as a high-confidence decline.
             data["intent"] = "clarification_request"
             data["suggested_action"] = "clarify"
             return min(confidence, .64)
-        if data["ambiguities"] and data["intent"] in {"answer", "clarification_request"}:
+        if (data["ambiguities"] and data["intent"] in {"answer", "clarification_request"}
+                and data.get("turn_intent") != "thinking"):
             data["suggested_action"] = "clarify"
             return min(confidence, 0.64)
         return confidence
@@ -925,12 +1094,16 @@ class ConversationUnderstandingService:
     @staticmethod
     def _canonical_schema(semantic_first: bool) -> Dict[str, Any]:
         schema = understanding_canonical_schema()
-        return with_semantic_turn_schema(schema, company_questions=True) if semantic_first else schema
+        if semantic_first:
+            schema["properties"]["intent"]["enum"].append("answer_unresolved")
+            return with_semantic_turn_schema(schema, company_questions=True)
+        return schema
 
     @staticmethod
     def can_complete_without_confirmation(understanding: TurnUnderstanding, transcript: str) -> bool:
-        """Recheck semantic authorization at the current final/commit fence."""
-        if understanding.problem is not None or understanding.completion_basis is None:
+        """Authorize answer/topic completion; full withdrawal needs its own receipt."""
+        if (understanding.problem is not None or understanding.completion_basis is None
+                or understanding.turn_intent == "stop_interview"):
             return False
         data = understanding.model_dump(mode="json")
         validate_semantic_turn(data, transcript)
@@ -985,8 +1158,6 @@ class ConversationUnderstandingService:
         text = str(data.get("question_text") or "").strip()
         quote = str(data.get("evidence_quote") or "").strip()
         targets = list(data.get("target_capability_points") or [])
-        if not text or len(text) > max_chars or text.count("?") + text.count("？") > 1:
-            raise FollowupProposalError("question_shape_invalid", "$.followup.question_text")
         if quote not in transcript or quote not in allowed_evidence:
             raise FollowupProposalError("evidence_binding_invalid", "$.followup.evidence_id")
         if not targets or not set(targets).issubset(set(allowed_targets)):
@@ -1012,6 +1183,11 @@ class ConversationUnderstandingService:
         leaked = [term for term in answer_terms if term.casefold() in text.casefold()]
         if len(leaked) >= 2:
             raise FollowupProposalError("answer_leakage_heuristic", "$.followup.question_text")
+        # Shape is repairable only after evidence, target, difficulty and all
+        # safety checks have passed. Mixed unsafe+malformed proposals cannot
+        # use wording repair to reopen an otherwise rejected question.
+        if not text or len(text) > max_chars or text.count("?") + text.count("？") > 1:
+            raise FollowupProposalError("question_shape_invalid", "$.followup.question_text")
 
     def _fallback_probe(
         self,
@@ -1123,6 +1299,33 @@ class ConversationUnderstandingService:
         }
         leaked = [term for term in answer_terms if term in text.casefold()]
         return len(leaked) < 2
+
+    @staticmethod
+    def _record_followup_decision(decision, interview, turn, *, phase, prompt_version):
+        # A proposal is not a committed child turn. Keep its phase explicit and
+        # emit only server-owned categories/counts, never evidence or rationale.
+        reasons = {
+            "meta_or_non_answer", "candidate_topic_boundary", "low_confidence_clarification_required",
+            "followup_disabled", "depth_budget_exhausted", "session_budget_exhausted", "root_budget_exhausted",
+            "time_budget_exhausted", "answer_length_outside_budget", "capability_points_already_probed",
+            "sensitive_capability_target", "model_evidence_unavailable", "preflight_followup_disabled",
+            "understanding_not_accepted", "understanding_unavailable", "followup_proposal_rejected",
+            "optional_detail_probe_unavailable", "model_declined", "missing_capability_evidence",
+            "claim_detail_verification", "model_unavailable_or_rejected", "approved_fallback_unavailable",
+            "followup_deadline_exhausted", "followup_repair_timeout", "followup_repair_rejected",
+        }
+        reason = decision.get("reason")
+        policy = decision.get("policy") or {}
+        prompt_version = decision.get("probe_source") or prompt_version
+        version = prompt_version if isinstance(prompt_version, str) and re.fullmatch(
+            r"(?:interview_turn_understanding|interview_turn_decision|controlled_followup|controlled_followup_repair)\.v[0-9]{1,3}", prompt_version
+        ) else None
+        record_turn_control("followup_decided", interview_id=interview["id"], turn_id=turn["id"],
+            phase=phase, selected=decision.get("selected") is True,
+            reason=reason if reason in reasons else "unclassified", prompt_version=version,
+            target_count=len(decision.get("target_key_points") or []),
+            **{key: int(policy[key]) for key in ("max_depth", "max_per_root", "max_total", "min_remaining_seconds")
+               if isinstance(policy.get(key), (int, float))})
 
     @staticmethod
     def _no_followup(reason: str, policy: Dict[str, Any]) -> Dict[str, Any]:

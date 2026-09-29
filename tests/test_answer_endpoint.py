@@ -255,7 +255,7 @@ def test_preparation_failures_keep_listening_without_repeated_calls_or_commit(fa
         if fault == "no_final":
             capture.current_final = None
         elif fault == "problem":
-            capture.problem = SimpleNamespace(code="schema_invalid")
+            capture.problem = SimpleNamespace(code="provider_unavailable", retryable=True)
         elif fault == "continue":
             capture.action = "continue_listening"
         else:

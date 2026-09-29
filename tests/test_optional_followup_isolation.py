@@ -83,7 +83,7 @@ class ValidatingGateway:
     ({"question_text": "recoverable_checkpoint 和 fenced_epoch 如何使用？"}, "answer_leakage_heuristic", "$.followup.question_text"),
 ])
 @pytest.mark.anyio
-async def test_wire_valid_optional_gate_rejection_preserves_answer_with_one_call(patch, reason, path, caplog):
+async def test_wire_valid_optional_gate_rejection_keeps_single_understanding(patch, reason, path, caplog):
     data = response()
     data["followup"].update(patch)
     gateway = ValidatingGateway(data)
@@ -93,11 +93,14 @@ async def test_wire_valid_optional_gate_rejection_preserves_answer_with_one_call
 
     understanding, decision = await service.prepare_decision(*args)
 
-    assert len(gateway.requests) == 1
+    repairable = reason == "question_shape_invalid"
+    assert len(gateway.requests) == (2 if repairable else 1)
+    assert sum(request.purpose == "interview_turn_understanding" for request in gateway.requests) == 1
     assert understanding.problem is None and understanding.suggested_action == "accept"
     assert understanding.claims[0].evidence_quote == "我会保存处理序号，断线后从已确认位置重放。"
     assert understanding.missing_capability_points == ["幂等键"]
-    assert decision["selected"] is False and decision["reason"] == "followup_proposal_rejected"
+    assert decision["selected"] is False
+    assert decision["reason"] == ("followup_repair_rejected" if repairable else "followup_proposal_rejected")
     assert "conversation_act" not in decision
     assert args[2] == before
     assert "validation_stage=followup_gate" in caplog.text

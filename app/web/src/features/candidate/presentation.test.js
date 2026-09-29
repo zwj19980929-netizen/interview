@@ -2,6 +2,36 @@ import { describe, expect, it } from "vitest";
 import { candidateEntryMessage, candidateEntryFailure, candidateNotice } from "./presentation.js";
 
 describe("candidate copy separates actions from diagnostics", () => {
+  it.each(["UNDERSTANDING_UNAVAILABLE", "SUPPLEMENT_REPLY_UNAVAILABLE"])("explains %s as a service retry without asking for the answer again", (code) => {
+    const notice = candidateNotice({ code, recoverable: true, message: "secret provider output" });
+    expect(notice.title).toBe("回答处理暂时遇到问题");
+    expect(notice.detail).toContain("录音和已识别内容已保留");
+    expect(notice.detail).toContain("有限重试");
+    expect(notice.detail).toContain("无需重说整题");
+    expect(notice.retry).not.toBe(true);
+    expect(JSON.stringify(notice)).not.toMatch(/正在整理|secret|provider/);
+  });
+  it.each(["UNDERSTANDING_RESULT_REJECTED", "UNDERSTANDING_RETRY_EXHAUSTED", "SUPPLEMENT_REPLY_RETRY_EXHAUSTED"])("offers an explicit retained-answer retry for %s", code => {
+    const notice = candidateNotice({ code, recoverable: true });
+    expect(notice).toMatchObject({ title: "回答处理需要重试", retry: true, retryLabel: "重试处理", action: "continue_speaking" });
+    expect(notice.detail).toContain("处理已有回答");
+    expect(notice.detail).toContain("无需重说整题");
+  });
+  it("does not claim a pending withdrawal was completed after a processing failure", () => {
+    const notice = candidateNotice({ code: "SUPPLEMENT_REPLY_UNAVAILABLE", recoverable: true }, false, "awaiting_exit_confirmation");
+    expect(notice.detail).toContain("本次面试尚未结束");
+  });
+  it("distinguishes unfinished recognition from ordinary listening with a safe retry", () => {
+    const pending = candidateNotice({ code: "TRANSCRIPT_UNAVAILABLE", recoverable: true });
+    expect(pending.title).toBe("正在确认转写");
+    expect(pending.detail).toContain("暂定");
+    const retry = candidateNotice({ code: "TRANSCRIPT_RETRY_REQUIRED", recoverable: true, message: "secret provider" });
+    expect(retry).toMatchObject({ title: "这段语音暂未识别完成", retry: true });
+    expect(retry.detail).toContain("保留");
+    expect(retry.detail).toContain("点击“重试处理”");
+    expect(retry.detail).not.toContain("再说一句");
+    expect(JSON.stringify(retry)).not.toMatch(/secret|provider/);
+  });
   it.each(["AUDIO_TRACK_LOST", "AUDIO_STREAM_INVALID", "AUDIO_PLAYBACK_FAILED", "AUDIO_PLAYBACK_TIMEOUT", "AUDIO_OUTPUT_UNAVAILABLE"])("explains the persisted %s using safe copy", code => {
     const notice = candidateNotice({ code, recoverable: false, message: "secret provider diagnostics" }, true);
     expect(notice.detail).toContain("语音"); expect(notice.detail).toContain("协助恢复");

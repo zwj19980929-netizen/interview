@@ -8,7 +8,7 @@ from app.core.errors import ApiError
 from app.core.prompt.interviewer_supervisor import TOOLS
 from app.domain.adaptive_interview import closed_source_question_ids
 from .context import assessment_contract
-from .context import conversation_memory
+from .context import conversation_memory, committed_turn_evidence
 
 COMPANY_CONTEXT_REFERENCE = "company:context"
 
@@ -81,7 +81,7 @@ class InterviewerTools:
             return {"status": "ok", "items": items[:40], "total": len(items)}
         if name == "interview.read_context":
             if argument is not None:
-                raise ApiError("INTERVIEW_TOOL_REFERENCE_INVALID", "This tool is already scoped to the current interview.", status_code=409)
+                return {"status": "ok", "evidence": committed_turn_evidence(self.session, argument)}
             return {"status": "ok", "context": conversation_memory(self.session)}
         if name in {"questions.read", "resume.read_evidence"}:
             q = self.candidates.get(argument or "")

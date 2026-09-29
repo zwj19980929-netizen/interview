@@ -1,5 +1,31 @@
 # 接口设计
 
+### INTERACTION-RECOVERY-066（仓库与本机验证完成）
+
+当前 capture 的 `answer_preparation` 投影增加 `retrying` / `retry_required`，与 `preparing` 共用 `turn_id`、`capture_id`。失败在重连 snapshot 中保留；普通 listening/preparing 事件不得擦除。只有同 capture 的 `understanding_recovered`、有效答案提交、换题或终态清除。失败 problem 与恢复事件都携带 turn/capture 归属。重试复用 `continue_speaking` 控制，不授予完成回答或退出面试的权限。
+
+私有 PreparedTurnDecision 可携带 `content_clarification`：服务端已实际播完、绑定当前 turn/capture 的内容澄清证据与后续新话语；不接受客户端提供该对象。首次遇到不可解释的回答应问具体澄清问题；已澄清后仍明确结束时可返回 `answer_unresolved`，保留原始音频、文字、可核实事实与歧义，交人工复核，不能按不会计零分。
+
+065控制事件补充：服务端在退出确认等待或分类期间发送既有floor.changed的reason=exit_awaiting_reply，并附当前turn/capture标识；候选页面映射为awaiting_exit_confirmation，显示明确退出确认提示。该通知不授予完成许可，旧capture或其它题事件丢弃；普通supplement_awaiting_reply保留补充语义。
+
+065：首次语音退出请求只进入独立口头确认；确认问题必须先获准播放，只有其后新权威语音确认才可提交退出。既有提前结束回答按钮不能代替退出确认。无新REST或客户端文本权限，当前题目/录音保持至确认；断线/更换owner不能凭旧确认退出。确认收据内部存储，候选仍沿既有completed回执。
+
+064：无新增REST端点或客户端文本授权。沿既有语音结束命令与`completed`事件闭环，输入结束后即停止采集；评分可继续，录制/告别失败不阻止结束回执。候选问答历史仍返回完整`final_transcript`，页面明确标为完整发言。协议和验证见[064说明](conversation-intent-and-end-064.md)。
+
+064结束恢复补充：公共候选GET和`session.snapshot`新增安全`completion`字段（未结束为null；结束后仅含interview_id、status、submitted_at、recording_retention_notice、human_review_required，与既有completed回执一致）。以服务端candidate_input_completed_at或completed/report_generating/report_ready状态生成，即使评分仍pending，刷新也直接显示结束回执，不重新申请设备或发布音视频。输入已结束拒绝签发候选发布ticket（409 CANDIDATE_INPUT_COMPLETED），控制连接恢复只读取快照/历史、不重新attach收音owner。客户端收到完成后撤销启动与重连续行、心跳和控制连接；任何媒体关闭异常均不能跳过麦克风/摄像头轨道释放。初次启动或重连遇CANDIDATE_INPUT_COMPLETED时只读拉取公共GET的completion恢复结束页面；旧ticket的ready和媒体命令也不能重开输入。
+
+## 062 · 多轮交流与供应商账单错误
+
+接话内部合同升级 `conversation_reception.v5`：独立传递当前正式题、根题、最近解释、父子题身份与带角色的交流历史；可选 `repeat_target=current_question|last_clarification|null` 仅允许 repeat 非空，缺省重读当前正式题。无新增候选文本提交入口，交流记忆不形成答案。
+
+OpenAI-compatible 供应商返回 HTTP 402 时统一报告 `provider_billing_required`，`retryable=false`，对外沿用供应商不可用的 HTTP 503；中文提示明确账单或额度需检查，日志只保留安全原因和 `http_status=402`，不返回原始供应商响应。异步评分失败保留该错误码和已有答案，由管理员处理账单/配置后按现有重试入口重评，不自动充值、切换路由或重评。
+
+061补充：试音确认、试音重试与继续补充同样遵守精确输出撤销顺序。授权失效的旧输出在底层清空队列后、撤轨前发布`avatar.performance.interrupted`；显式撤销与后台失效共享有界通知，不取消后继输出。等待后重新复核状态与控制权。正常drained不发取消；真实传输故障仍暂停。接口形状与350ms前端异常检测不变，详见[061说明](first-question-audio-061.md)。
+
+## 060 · 按本场已提交题目补查交流证据
+
+只读工具 `interview.read_context` 保留 `argument=null` 的有界记忆摘要；`argument` 为本场已提交的 `turn_id` 时，可补查该题的已验证技术主张与原文引用。返回仅包含题目/父子身份、answer_id、回答摘要及至多12条实际属于对应final_transcript的claim，不返回评分、标准答案、媒体地址、Prompt或其他会话数据。引用重复时明确位置不唯一，不捏造对应某一次发言。未知、未提交或歧义引用继续返回 `INTERVIEW_TOOL_REFERENCE_INVALID`；Skill工具权限与会话绑定保持。没有新增REST入口、数据库字段或候选文本提交权限。
+
 ## 052：连续字幕与批准 PCM 播放合同
 
 无新增 REST 路由。权威快照完成后先覆盖已确认转写、将 final 修正按现有 `transcript.partial` 显示，再恢复识别并继续处理后续字幕；显示更新不生成 CandidateAnswer 或结束许可。`conversation_reception.v2` 的自然回应沿既有 `conversation_acknowledgement`、`avatar.performance.*` 和 `floor.changed` 表达，候选端不能提交模型回复或任意执行动作。
@@ -983,6 +1009,12 @@ ProviderConnection 与 ModelConfiguration 响应增加单调递增的 `configura
 
 候选人GET仍鉴权并隐藏未来题、标准答案、评分依据和内部提示；已呈现的主题/追问（含evaluating）提供question_spoken_text和parent_turn_id/root_turn_id/followup_depth。answers新增final_transcript，仅返回该会话已落库的服务端权威回答（含已审计的人工更正），不能通过此接口提交文本答案。复核turn新增同样的父子关系和实际question_spoken_text。报告question_evaluations按根题附带独立answer与followups问答链，各子节点说明考察范围及是否纳入该根题证据；追问无第二份总分权重。
 
+## CONVERSATION-RELIABILITY-057：实时快照与静音响应
+
+沿用现有REST、AgentEvent及角色投影，不新增候选人信号。新连接的fresh `session.snapshot`占用共享序号时，也按各接收者权限同步已有连接；Redis启用时广播同一最小快照事件。本地总线没有跨进程能力且当前进程没有本场订阅者时，worker不为无法投递的评分快照分配序号；业务状态已持久化，API心跳继续刷新。真实断线仍按既有恢复协议播放获批表达，显式重读继续有效。
+
+正式候选话轮首次无发言，或普通澄清/接话后等待约15秒，允许一次非评分`conversation_acknowledgement`温和确认。候选明确请求思考/等待时不触发该提示；新服务端话语才重新获得一次提醒机会。主问题播放不计候选静音，输出前复核当前题目、运行状态与candidate floor；新输入撤销旧提醒。该提示不形成答案、不换题、不代替补充确认。错误、重试、所有权恢复仍沿原端点合同。
+
 ## INTERVIEW-REGRESSIONS-056：候选人回答历史交付
 
 `GET /api/v1/public/interviews/{interview_id}` 的最终 HTTP 字段白名单保留 `answers[].final_transcript`，与服务层候选人投影一致。每条回答只交付 `id`、`turn_id`、`evaluation_status` 和服务端已持久化的 `final_transcript`；仍必须校验 `X-Candidate-Session-Token` 与部署租户，不能返回其他场次回答、未来题目文字、音频地址、供应商片段、评分依据、标准答案或内部提示。
@@ -992,3 +1024,13 @@ ProviderConnection 与 ModelConfiguration 响应增加单调递增的 `configura
 056 音频诊断补充：候选端流式输出结束、打断或取消时，若已有有效消费统计，仅发送一次 `audio_playback_underflow_count` 与 `audio_playback_underflow_ms` 数值摘要，包含播放中发生并已恢复的欠载；没有首声、未知统计或已关闭连接不补报。沿用 `telemetry.observe` 的进程内固定词汇及非权威属性，不写问答、不触发暂停、不充当播放完成确认；遥测异常不能阻断播放清理。启动缓冲不计欠载，终止时仍未恢复的断供可能没有包含在此统计中，不能据零值推断任何环境下均无卡顿。
 
 问答树展示时按持久turn的order排序，主题编号扣除已知的前置追问，子题在父题内独立编号；稀疏历史记录仍保留既有order信息。该编号仅供展示，不更改turn_id、父子引用或评分归属。
+
+## 2026-09-22 · 059 会话上下文与识别假设
+
+本轮没有新增 REST 入口或客户端文本提交权限。既有候选字幕事件仍为当前题目的累计投影，partial 允许替换或撤回，final 替换同题旧稿；界面把暂定转写与最终回答明确区分。源 capture、turn 与 owner 检查继续生效；候选页面只展示安全的收音/识别状态，不返回内部 Prompt 或模型响应。参见[059改进计划](agent-conversation-improvement-plan-059.md)。
+
+059新增可恢复problem码`TRANSCRIPT_RETRY_REQUIRED`（`action=continue_listening`）：同一输入的完整final获取连续三次无结果，当前采集保持开启；候选人可继续说话或点击既有continue_speaking动作重试。它不是提交命令。恢复后的同题同capture正式状态/final才清除提示，旧题或旧capture不得清除。`TRANSCRIPT_UNAVAILABLE`仅表示正在等待识别完成，不再向候选人描述成普通倾听。
+
+控制连接重新绑定到同一仍在等待的采集时，重发一次当前提示；公共投影保留安全固定文案、turn_id 与 capture_id。发送前重新检查当前题目/采集/所有权及等待状态，新声音已解除等待则不补发。只恢复状态说明，不重新执行收尾、播报或提交。
+
+内部理解诊断 `reason_code=semantic_control_contract_invalid` 精确区分意图/动作矛盾与 JSON 结构错误；候选人继续收到原有可恢复理解提示，不暴露原始模型响应或校验正文，也不因该 reason 自动切题。

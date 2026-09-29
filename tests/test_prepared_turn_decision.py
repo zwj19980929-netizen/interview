@@ -91,14 +91,14 @@ async def test_one_inference_prepares_understanding_and_fenced_evidence_bound_fo
 
     assert len(gateway.requests) == 1
     assert gateway.requests[0].purpose == "interview_turn_understanding"
-    assert gateway.requests[0].metadata["prompt_version"] == "interview_turn_decision.v23"
-    assert understanding.prompt_version == "interview_turn_decision.v23"
+    assert gateway.requests[0].metadata["prompt_version"] == "interview_turn_decision.v89"
+    assert understanding.prompt_version == "interview_turn_decision.v89"
     assert understanding.evidence_quotes == [TRANSCRIPT]
     assert understanding.claims[0].evidence_quote == TRANSCRIPT
     assert decision["selected"] is True
     assert decision["target_key_points"] == ["幂等键"]
     assert decision["conversation_act"]["approved_by"] == "controlled_followup_gate"
-    assert decision["conversation_act"]["prompt_version"] == "interview_turn_decision.v23"
+    assert decision["conversation_act"]["prompt_version"] == "interview_turn_decision.v89"
     assert decision["conversation_act"]["evaluative"] is False
     assert decision["followup_depth"] == 1
     assert decision["evidence_quotes"] == [TRANSCRIPT]
@@ -160,7 +160,7 @@ async def test_preflight_ineligible_cases_only_run_existing_understanding(case, 
     gateway = Gateway(_data()["understanding"])
     understanding, decision = await _service(gateway).prepare_decision(utterance, turn, interview)
     assert len(gateway.requests) == 1
-    assert gateway.requests[0].metadata["prompt_version"] == "interview_turn_understanding.v8"
+    assert gateway.requests[0].metadata["prompt_version"] == "interview_turn_understanding.v58"
     assert decision["selected"] is False
     assert decision["reason"] == reason
     if case == "confidence":
@@ -205,13 +205,16 @@ async def test_entire_wire_and_understanding_evidence_must_pass_before_approval(
 async def test_optional_probe_safety_rejection_preserves_validated_answer(mutate, caplog):
     data = _data()
     mutate(data)
-    gateway = Gateway(data)
+    repairable = data["followup"]["question_text"].count("？") > 1
+    gateway = Gateway(data, *([{"selected": True, "question_text": data["followup"]["question_text"]}]
+                              if repairable else []))
     understanding, decision = await _service(gateway).prepare_decision(*_input())
-    assert len(gateway.requests) == 1
+    assert len(gateway.requests) == (2 if repairable else 1)
+    assert sum(request.purpose == "interview_turn_understanding" for request in gateway.requests) == 1
     assert understanding.problem is None
     assert understanding.claims and understanding.evidence_quotes == [TRANSCRIPT]
     assert decision["selected"] is False
-    assert decision["reason"] == "followup_proposal_rejected"
+    assert decision["reason"] == ("followup_repair_rejected" if repairable else "followup_proposal_rejected")
     assert "conversation_act" not in decision
     assert TRANSCRIPT not in caplog.text and "婚姻情况" not in caplog.text
 
@@ -289,7 +292,7 @@ async def test_root_budget_preflight_does_not_start_composite_inference():
     gateway = Gateway(_data()["understanding"])
     _, decision = await _service(gateway).prepare_decision(utterance, turn, interview)
     assert decision["reason"] == "root_budget_exhausted"
-    assert gateway.requests[0].metadata["prompt_version"] == "interview_turn_understanding.v8"
+    assert gateway.requests[0].metadata["prompt_version"] == "interview_turn_understanding.v58"
 
 
 @pytest.mark.parametrize("confidence,action", [(0.1, "followup"), (0.9, "continue_listening")])
@@ -330,7 +333,7 @@ async def test_non_authoritative_transcript_rejected_before_model_invocation():
 def test_composite_prompt_enforces_reference_schema_without_loosening_existing_contract():
     context = {"transcript": TRANSCRIPT, "capability_points": ["幂等键", "确认序号"], "difficulty": "mid"}
     contract = prompt_contract("interview_turn_decision", context)
-    assert contract.version == "interview_turn_decision.v23"
+    assert contract.version == "interview_turn_decision.v89"
     validate_structured_response(_data(), contract.response_schema)
     assert contract.response_schema["properties"]["understanding"] == prompt_contract(
         "interview_turn_understanding", context,
@@ -345,5 +348,5 @@ def test_composite_prompt_enforces_reference_schema_without_loosening_existing_c
 async def test_mock_gateway_returns_composite_contract_through_same_service_interface():
     understanding, decision = await ConversationUnderstandingService(InMemoryStore()).prepare_decision(*_input())
     assert understanding.problem is None
-    assert understanding.prompt_version == "interview_turn_decision.v23"
+    assert understanding.prompt_version == "interview_turn_decision.v89"
     assert decision["selected"] is True

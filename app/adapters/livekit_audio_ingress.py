@@ -18,6 +18,7 @@ from typing import Any, Awaitable, Callable, Optional
 from livekit import rtc
 
 from app.adapters.livekit_media import LiveKitMediaPlane
+from app.adapters.livekit_connection import connect_room
 from app.core.errors import ApiError
 
 
@@ -287,11 +288,17 @@ class LiveKitCandidateAudioIngress:
             ttl_seconds=3600,
         )
         try:
-            await room.connect(
+            await connect_room(room,
                 self.media_plane.url,
                 token,
                 rtc.RoomOptions(auto_subscribe=False),
             )
+            if self._closing or self._room is not room:
+                # close() can run before the native join completes. Its early
+                # disconnect then has no connected room to release; reclaim
+                # this late connection before subscribing to any microphone.
+                await room.disconnect()
+                raise ApiError("LIVEKIT_INGRESS_CLOSED", "LiveKit evidence ingress was closed during connection.", status_code=409)
             # Publications that existed before this receive-only participant
             # joined are not guaranteed to emit track_published again.
             for participant in getattr(room, "remote_participants", {}).values():

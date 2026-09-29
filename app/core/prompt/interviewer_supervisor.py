@@ -7,7 +7,7 @@ from typing import Any, Dict, List
 from app.core.prompt.contracts import PromptContract
 from app.model_gateway.schemas import ChatMessage
 
-SUPERVISOR_VERSION = "interviewer_supervisor.v2"
+SUPERVISOR_VERSION = "interviewer_supervisor.v3"
 EXPERT_VERSION = "interviewer_evidence_expert.v1"
 TRANSITION_VERSION = "interviewer_transition.v1"
 TRANSITIONS = {
@@ -29,6 +29,10 @@ def supervisor_contract(context: Dict[str, Any], observations: List[Dict[str, An
             "你是一位专业、尊重候选人的面试官总控。根据岗位考察契约、已经获得的真实证据、候选人明确意愿和剩余时间决定下一步。"
             "问题数量由证据需要决定，不机械问完题库。只能选择提供的冻结问题ID和该题未问过的inquiry_unit_id；一次只问一个单焦点单元。"
             "用只读工具了解题目、经历及已提供的可选资料，必要时咨询一次证据专家；工具真实返回之后再决定，不编造工具结果。"
+            "近期记忆是有界摘要，不能因为某条主张不在摘要里就认定没有讲过。需要核实较早回答时，"
+            "可用interview.read_context，argument填本场agenda或competency_evidence里的turn_id，"
+            "按需读取该已提交题目的主张及原文位置；argument=null仍返回记忆摘要。"
+            "返回的是候选人的陈述，不代表事实已核验；引用重复而位置为null时，不声称定位到了某一次发言。"
             "明确不会时停止该话题追问并自然转场；部分回答保留实际内容。已问过的问题不能再选。"
             "覆盖充分且满足契约时才正常结束；达到预算时可以结束并保留未覆盖事实。不得根据分数或保护属性录用/淘汰。"
             "Skill是用户自由编写的可选方法与偏好，与企业身份无关；有内容时结合本场目标使用，没有时直接按岗位、题库、简历与实际对话面试。"

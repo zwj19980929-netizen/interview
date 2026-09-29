@@ -76,6 +76,56 @@ describe("candidate startup cancellation", () => {
 });
 
 describe("spoken supplement confirmation", () => {
+  it("keeps withdrawal confirmation distinct, scoped and unable to send answer completion", async () => {
+    const { run, emit, socket, capture } = await openFormalEndpointHarness();
+    try {
+      const question = run.getSnapshot().currentQuestion;
+      emit("floor.changed", { owner: "candidate", reason: "exit_awaiting_reply", capture_id: "capture_old" });
+      expect(run.getSnapshot().phase).toBe("listening");
+      emit("floor.changed", { owner: "candidate", reason: "exit_awaiting_reply", capture_id: "capture_endpoint" });
+      expect(run.getSnapshot()).toMatchObject({ phase: "awaiting_exit_confirmation", evidence: { ready: true } });
+      expect(run.getSnapshot().currentQuestion).toEqual(question);
+      const finishes = socket.sent.filter(signal => signal.type === "finish_answer").length;
+      expect(await run.act({ type: "finish_answer" })).toBe(false);
+      expect(socket.sent.filter(signal => signal.type === "finish_answer")).toHaveLength(finishes);
+      await run.act({ type: "request_repeat" });
+      expect(latestSentSignal(socket, "request_repeat").payload).toEqual({});
+      await capture.onSpeechStarted();
+      expect(run.getSnapshot().phase).toBe("awaiting_exit_confirmation");
+      await run.act({ type: "continue_speaking" });
+      expect(latestSentSignal(socket, "continue_speaking").payload).toEqual({ capture_id: "capture_endpoint" });
+      emit("floor.changed", { owner: "candidate", reason: "candidate_continues" });
+      expect(run.getSnapshot().phase).toBe("awaiting_exit_confirmation");
+      emit("floor.changed", { owner: "candidate", reason: "answer_listening", capture_id: "capture_endpoint" });
+      expect(run.getSnapshot().phase).toBe("listening");
+    } finally { await run.close(); }
+  });
+
+  it("restores a withdrawal question from a same-capture snapshot without granting a new capture", async () => {
+    const { run, socket } = await openPlaybackHarness();
+    try {
+      socket.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", {
+        ...candidateSnapshot(), floor: "candidate", current_turn_id: "turn_1",
+        supplement_confirmation: { status: "awaiting_exit_reply", turn_id: "turn_1", capture_id: "capture_exit" },
+      })) });
+      expect(run.getSnapshot()).toMatchObject({ phase: "preparing", evidence: { ready: false } });
+      socket.emit("message", { data: JSON.stringify({ ...correlatedCandidateEvent(2, "floor.changed", {
+        owner: "candidate", reason: "evidence_stream_open", capture_id: "capture_exit",
+      }, latestSentSignal(socket, "evidence.stream.open")), turn_id: "turn_1" }) });
+      expect(run.getSnapshot()).toMatchObject({ phase: "awaiting_exit_confirmation", evidence: { ready: true } });
+      socket.emit("message", { data: JSON.stringify(candidateEvent(3, "session.snapshot", {
+        ...candidateSnapshot(), floor: "candidate", current_turn_id: "turn_1",
+        supplement_confirmation: { status: "awaiting_exit_reply", turn_id: "turn_1", capture_id: "capture_exit" },
+      })) });
+      expect(run.getSnapshot().phase).toBe("awaiting_exit_confirmation");
+      socket.emit("message", { data: JSON.stringify(candidateEvent(4, "session.snapshot", {
+        ...candidateSnapshot(), floor: "candidate", current_turn_id: "turn_1",
+        supplement_confirmation: { status: "awaiting_exit_reply", turn_id: "turn_1", capture_id: "capture_old" },
+      })) });
+      expect(run.getSnapshot().phase).toBe("listening");
+    } finally { await run.close(); }
+  });
+
   it("keeps the real question visible and restores a scoped voice reply state", async () => {
     const { run, socket } = await openPlaybackHarness();
     socket.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", { ...candidateSnapshot(), floor: "candidate" })) });
@@ -103,7 +153,7 @@ describe("spoken supplement confirmation", () => {
     await run.close();
   });
 
-  it("leaves preparing on an understanding error and clears the warning on a new attempt", async () => {
+  it("keeps an understanding error visible through preparation until scoped recovery succeeds", async () => {
     const { run, socket } = await openPlaybackHarness();
     socket.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", { ...candidateSnapshot(), floor: "candidate" })) });
     socket.emit("message", { data: JSON.stringify({
@@ -119,6 +169,10 @@ describe("spoken supplement confirmation", () => {
     }), turn_id: "turn_1" }) });
     expect(run.getSnapshot()).toMatchObject({ phase: "listening", evidence: { ready: true }, problem: { code: "UNDERSTANDING_UNAVAILABLE" } });
     preparing(5);
+    expect(run.getSnapshot().problem.code).toBe("UNDERSTANDING_UNAVAILABLE");
+    socket.emit("message", { data: JSON.stringify({ ...candidateEvent(6, "floor.changed", {
+      owner: "candidate", reason: "understanding_recovered", capture_id: "capture_spoken",
+    }), turn_id: "turn_1" }) });
     expect(run.getSnapshot().problem).toBeNull();
     await run.close();
   });
@@ -188,6 +242,38 @@ describe("audible supplement playback and honest activity", () => {
 });
 
 describe("captions belong to the current question", () => {
+  it("replaces and withdraws cumulative hypotheses without submitting candidate text", async () => {
+    const { run, socket } = await openPlaybackHarness();
+    let sequence = 0;
+    const emit = (type, payload) => socket.emit("message", {
+      data: JSON.stringify({ ...candidateEvent(++sequence, type, payload), turn_id: "turn_1" }),
+    });
+    vi.useFakeTimers();
+    try {
+      emit("session.snapshot", candidateSnapshot());
+      const initialSignals = socket.sent.length;
+      emit("transcript.partial", { text: "合成回答。对。", server_received: true });
+      await vi.advanceTimersByTimeAsync(2001);
+      expect(run.getSnapshot().captions).toMatchObject({ forming: false, recent: [{ final: false }], full: [] });
+      emit("transcript.partial", { text: "", server_received: true });
+      expect(run.getSnapshot().captions).toEqual({ forming: false, recent: [], full: [] });
+      emit("transcript.partial", { text: "合成回答。对。", server_received: true });
+      emit("transcript.partial", { text: "合成回答。", server_received: true });
+      expect(run.getSnapshot().captions.recent.map(row => row.text)).toEqual(["合成回答。"]);
+      emit("transcript.final", { text: "合成回答。", authoritative: true });
+      emit("transcript.final", { text: "修正后的合成回答。", authoritative: true });
+      expect(run.getSnapshot().captions.full.map(row => row.text)).toEqual(["修正后的合成回答。"]);
+      expect(run.getSnapshot().captions.recent).toEqual(run.getSnapshot().captions.full);
+      emit("transcript.partial", { text: "修正后的合成回答。临时尾句。", server_received: true });
+      expect(run.getSnapshot().captions.recent.map(row => row.text)).toEqual(["修正后的合成回答。临时尾句。"]);
+      emit("transcript.partial", { text: "", server_received: true });
+      expect(run.getSnapshot().captions.recent.map(row => row.text)).toEqual(["修正后的合成回答。"]);
+      emit("transcript.final", { text: "", authoritative: true });
+      expect(run.getSnapshot().captions).toEqual({ forming: false, recent: [], full: [] });
+      expect(socket.sent.slice(initialSignals).filter(signal => ["finish_answer", "answer.submit"].includes(signal.type))).toEqual([]);
+    } finally { await run.close(); vi.useRealTimers(); }
+  });
+
   it("starts a follow-up with empty captions instead of showing the previous answer above its partial", async () => {
     const { run, socket } = await openPlaybackHarness();
     let sequence = 0;
@@ -233,7 +319,7 @@ describe("captions belong to the current question", () => {
       emit("floor.changed", { owner: "candidate", reason: "evidence_stream_open", capture_id: "capture_followup" },
         "turn_followup", latestSentSignal(socket, "evidence.stream.open").causation_id);
       emit("transcript.partial", { text: "当前追问的独立回答。", server_received: true });
-      emit("problem", { code: "UNDERSTANDING_UNAVAILABLE", message: "稍后继续整理", recoverable: true, action: "continue_listening" });
+      emit("problem", { code: "UNDERSTANDING_UNAVAILABLE", message: "稍后继续整理", recoverable: true, action: "continue_listening", capture_id: "capture_followup" });
       const current = run.getSnapshot();
       expect(current.evidence.ready).toBe(true);
       for (const turnId of ["turn_1", null]) {
@@ -952,7 +1038,8 @@ describe("candidate real-time experience contracts", () => {
     } finally { await run.close(); }
   });
 
-  it.each(["interrupt", "snapshot"])("does not pause when media unpublication precedes the authoritative %s", async control => {
+  it.each([["interrupt", "media first"], ["snapshot", "media first"], ["interrupt", "control first"]])(
+    "does not pause for authoritative %s and unpublication (%s)", async (control, order) => {
     const { run, socket, mediaCallbacks, request, liveSink } = await openPlaybackHarness();
     const performance = livePerformance(); const track = liveTrack(performance);
     try {
@@ -961,13 +1048,61 @@ describe("candidate real-time experience contracts", () => {
       mediaCallbacks.onRemoteAudioTrack(track, { trackSid: track.sid, trackName: performance.live_audio.track_name },
         { identity: performance.live_audio.publisher_identity });
       await flushPlaybackEvents(); vi.useFakeTimers();
-      mediaCallbacks.onRemoteAudioTrackRemoved(track);
-      expect(liveSink.close).toHaveBeenCalledOnce(); expect(runtimeProblemCalls(request)).toHaveLength(0);
-      await vi.advanceTimersByTimeAsync(300);
+      if (order === "media first") {
+        mediaCallbacks.onRemoteAudioTrackRemoved(track);
+        expect(liveSink.close).toHaveBeenCalledOnce(); expect(runtimeProblemCalls(request)).toHaveLength(0);
+        await vi.advanceTimersByTimeAsync(300);
+      }
       socket.emit("message", { data: JSON.stringify(control === "interrupt"
         ? { ...candidateEvent(3, "avatar.performance.interrupted", { performance_id: performance.performance_id, reason: "barge_in", deadline_ms: 200 }), replayability: "transient" }
         : candidateEvent(3, "session.snapshot", { ...candidateSnapshot(), active_performance_id: null })) });
+      if (order === "control first") mediaCallbacks.onRemoteAudioTrackRemoved(track);
       await vi.advanceTimersByTimeAsync(1000);
+      expect(liveSink.close).toHaveBeenCalledOnce();
+      expect(runtimeProblemCalls(request)).toHaveLength(0);
+      expect(socket.sent.filter(item => item.type === "pause" || item.type === "avatar.performance.stopped")).toHaveLength(0);
+    } finally { await run.close(); vi.useRealTimers(); }
+  });
+
+  it("keeps a replacement PCM output alive when the old output is interrupted and unpublished late", async () => {
+    const { run, socket, mediaCallbacks, request, liveSink } = await openPlaybackHarness();
+    const first = livePerformance();
+    const second = { ...first, performance_id: "performance_2", live_audio: {
+      ...first.live_audio, output_id: "output_2", track_sid: "TR_second", track_name: "speech_output_2",
+    } };
+    const firstTrack = liveTrack(first), secondTrack = liveTrack(second);
+    const participant = { identity: first.live_audio.publisher_identity, metadata: '{"role":"approved_expression"}' };
+    const subscribe = (track, performance) => mediaCallbacks.onRemoteAudioTrack(track,
+      { trackSid: track.sid, trackName: performance.live_audio.track_name }, participant);
+    const emit = (sequence, type, payload) => socket.emit("message", {
+      data: JSON.stringify({ ...candidateEvent(sequence, type, payload), replayability: "transient" }),
+    });
+    try {
+      emit(1, "session.snapshot", candidateSnapshot());
+      emit(2, "avatar.performance.started", first); subscribe(firstTrack, first);
+      await flushPlaybackEvents();
+      const staleProgress = liveSink.progress;
+      emit(3, "avatar.performance.started", second); subscribe(secondTrack, second);
+      await flushPlaybackEvents();
+      expect(liveSink.close).toHaveBeenCalledOnce();
+      expect(socket.sent.filter(item => item.type === "avatar.performance.ready").map(item => item.payload.output_id))
+        .toEqual(["output_1", "output_2"]);
+      vi.useFakeTimers();
+      emit(4, "avatar.performance.interrupted", { performance_id: first.performance_id, reason: "stale_output", deadline_ms: 200 });
+      mediaCallbacks.onRemoteAudioTrackRemoved(firstTrack);
+      staleProgress({ consumed: 480, renderedUntil: 1, firstRenderStart: 0, producing: true, drained: true });
+      emit(5, "avatar.performance.producer_finished", { performance_id: first.performance_id,
+        output_id: first.live_audio.output_id, total_samples: 480, sample_rate_hz: 24000 });
+      await vi.advanceTimersByTimeAsync(1000);
+      const packet = new Uint8Array(976), view = new DataView(packet.buffer);
+      view.setUint32(0, 0x49415331); view.setUint32(4, 1); view.setUint32(8, 0); view.setUint32(12, 24000);
+      mediaCallbacks.onApprovedAudioData(packet, participant, "interviewer.approved-pcm.output_1");
+      expect(liveSink.append).not.toHaveBeenCalled();
+      mediaCallbacks.onApprovedAudioData(packet, participant, "interviewer.approved-pcm.output_2");
+      liveSink.progress({ consumed: 480, renderedUntil: 1, firstRenderStart: 0, producing: true, drained: false });
+      expect(liveSink.append).toHaveBeenCalledOnce();
+      expect(run.getSnapshot().avatar).toMatchObject({ status: "speaking", performanceId: second.performance_id });
+      expect(liveSink.close).toHaveBeenCalledOnce();
       expect(runtimeProblemCalls(request)).toHaveLength(0);
       expect(socket.sent.filter(item => item.type === "pause" || item.type === "avatar.performance.stopped")).toHaveLength(0);
     } finally { await run.close(); vi.useRealTimers(); }
@@ -1456,9 +1591,11 @@ describe("candidate real-time experience contracts", () => {
   it.each([
     ["UNDERSTANDING_UNAVAILABLE", "transcript.final"],
     ["TRANSCRIPT_UNAVAILABLE", "transcript.final"],
+    ["TRANSCRIPT_RETRY_REQUIRED", "transcript.final"],
     ["ENDPOINT_UNCERTAIN", "transcript.final"],
     ["UNDERSTANDING_UNAVAILABLE", "floor.changed"],
     ["TRANSCRIPT_UNAVAILABLE", "floor.changed"],
+    ["TRANSCRIPT_RETRY_REQUIRED", "floor.changed"],
     ["ENDPOINT_UNCERTAIN", "floor.changed"],
   ])("clears %s after the same formal answer reaches %s", async (code, completionEvent) => {
     const { run, socket } = await openPlaybackHarness();
@@ -1474,7 +1611,7 @@ describe("candidate real-time experience contracts", () => {
       socket.emit("message", { data: JSON.stringify({
         ...candidateEvent(3, "problem", {
           code, message: "暂时无法整理回答", recoverable: true,
-          action: "continue_listening",
+          action: "continue_listening", capture_id: "capture_recovered_prepare",
         }), turn_id: "turn_1",
       }) });
       expect(run.getSnapshot().evidence.ready).toBe(true);
@@ -1502,7 +1639,7 @@ describe("candidate real-time experience contracts", () => {
   it.each(["turn_old", null])("does not clear an endpoint warning from an unscoped or different-turn final (%s)", async (turnId) => {
     const { run, emit } = await openFormalEndpointHarness();
     try {
-      emit("problem", { code: "UNDERSTANDING_UNAVAILABLE", message: "暂时无法整理回答", recoverable: true, action: "continue_listening" });
+      emit("problem", { code: "UNDERSTANDING_UNAVAILABLE", message: "暂时无法整理回答", recoverable: true, action: "continue_listening", capture_id: "capture_endpoint" });
       emit("transcript.final", { text: "旧轮次回答。", confidence: 0.9, authoritative: true, persisted_audio: true }, turnId);
       expect(run.getSnapshot().problem.code).toBe("UNDERSTANDING_UNAVAILABLE");
     } finally {
@@ -1548,7 +1685,7 @@ describe("candidate real-time experience contracts", () => {
   it("does not reopen a committed capture or clear an unrelated warning on detector recovery", async () => {
     const { run, emit, capture } = await openFormalEndpointHarness();
     try {
-      emit("problem", { code: "UNDERSTANDING_UNAVAILABLE", message: "暂时无法整理回答", recoverable: true, action: "continue_listening" });
+      emit("problem", { code: "UNDERSTANDING_UNAVAILABLE", message: "暂时无法整理回答", recoverable: true, action: "continue_listening", capture_id: "capture_endpoint" });
       emit("floor.changed", { owner: "candidate", reason: "answer_detector_ready", capture_id: "capture_endpoint" });
       expect(run.getSnapshot().problem.code).toBe("UNDERSTANDING_UNAVAILABLE");
       emit("problem", { code: "DETECTOR_UNAVAILABLE", message: "自动接话暂不可用", recoverable: true, action: "continue_listening" });
@@ -2242,6 +2379,114 @@ class CandidateFakeSocket {
   }
 }
 
+describe("understanding failure recovery", () => {
+  const failure = (code = "UNDERSTANDING_UNAVAILABLE", captureId = "capture_endpoint") => ({
+    code, message: "synthetic internal diagnostics", recoverable: true, action: "continue_listening", capture_id: captureId,
+  });
+  const durable = (status, captureId = "capture_endpoint") => ({
+    ...candidateSnapshot(), floor: "candidate", current_turn_id: "turn_1",
+    answer_preparation: status ? { status, turn_id: "turn_1", capture_id: captureId } : null,
+  });
+
+  it("preserves failure through ordinary activity and snapshots while accepting only scoped successful recovery", async () => {
+    const { run, emit, capture, socket } = await openFormalEndpointHarness();
+    try {
+      emit("problem", failure());
+      for (const reason of ["answer_preparing", "answer_listening", "supplement_awaiting_reply"]) {
+        emit("floor.changed", { owner: "candidate", reason, capture_id: "capture_endpoint" });
+        expect(run.getSnapshot().problem.code).toBe("UNDERSTANDING_UNAVAILABLE");
+      }
+      emit("session.snapshot", durable("preparing"));
+      emit("session.snapshot", durable(null));
+      emit("transcript.partial", { text: "合成补充内容", server_received: true });
+      await capture.onSpeechStarted();
+      capture.onSpeechStopped();
+      expect(latestSentSignal(socket, "speech.started").payload.capture_id).toBe("capture_endpoint");
+      expect(run.getSnapshot().problem.code).toBe("UNDERSTANDING_UNAVAILABLE");
+      for (const [turnId, captureId] of [["turn_old", "capture_endpoint"], ["turn_1", "capture_old"], [null, "capture_endpoint"]]) {
+        emit("floor.changed", { owner: "candidate", reason: "understanding_recovered", capture_id: captureId }, turnId);
+        expect(run.getSnapshot().problem.code).toBe("UNDERSTANDING_UNAVAILABLE");
+      }
+      emit("floor.changed", { owner: "candidate", reason: "understanding_recovered", capture_id: "capture_endpoint" });
+      expect(run.getSnapshot()).toMatchObject({ problem: null, evidence: { ready: true } });
+    } finally { await run.close(); }
+  });
+
+  it("ignores unscoped failures and preserves exit confirmation until an authoritative reply", async () => {
+    const { run, emit } = await openFormalEndpointHarness();
+    try {
+      emit("floor.changed", { owner: "candidate", reason: "exit_awaiting_reply", capture_id: "capture_endpoint" });
+      for (const [turnId, captureId] of [["turn_old", "capture_endpoint"], ["turn_1", "capture_old"]]) {
+        emit("problem", failure("UNDERSTANDING_RESULT_REJECTED", captureId), turnId);
+        expect(run.getSnapshot().problem).toBeNull();
+      }
+      emit("problem", { ...failure(), capture_id: undefined });
+      emit("problem", failure("UNDERSTANDING_RESULT_REJECTED"));
+      expect(run.getSnapshot()).toMatchObject({ phase: "awaiting_exit_confirmation", problem: { code: "UNDERSTANDING_RESULT_REJECTED" } });
+      expect(await run.act({ type: "finish_answer" })).toBe(false);
+      emit("floor.changed", { owner: "candidate", reason: "understanding_recovered", capture_id: "capture_endpoint" });
+      expect(run.getSnapshot()).toMatchObject({ phase: "awaiting_exit_confirmation", problem: null });
+    } finally { await run.close(); }
+  });
+
+  it("scopes and deduplicates manual retry, preserving failure until durable recovery succeeds", async () => {
+    const { run, emit, socket } = await openFormalEndpointHarness();
+    try {
+      emit("problem", failure("UNDERSTANDING_RESULT_REJECTED"));
+      expect(await run.act({ type: "continue_speaking", turnId: "turn_old" })).toBe(false);
+      expect(await run.act({ type: "continue_speaking", payload: { capture_id: "capture_old" } })).toBe(false);
+      await run.act({ type: "continue_speaking" });
+      expect(await run.act({ type: "continue_speaking" })).toBe(false);
+      expect(latestSentSignal(socket, "continue_speaking")).toMatchObject({ turn_id: "turn_1", payload: { capture_id: "capture_endpoint" } });
+      expect(run.getSnapshot()).toMatchObject({ understandingRetryPending: true, problem: { code: "UNDERSTANDING_RESULT_REJECTED" } });
+      emit("session.snapshot", durable("retry_required"));
+      expect(run.getSnapshot().understandingRetryPending).toBe(true);
+      emit("floor.changed", { owner: "candidate", reason: "understanding_retrying", capture_id: "capture_old" });
+      expect(run.getSnapshot().understandingRetryPending).toBe(true);
+      emit("floor.changed", { owner: "candidate", reason: "understanding_retrying", capture_id: "capture_endpoint" });
+      expect(run.getSnapshot()).toMatchObject({ understandingRetryPending: false, problem: { code: "UNDERSTANDING_UNAVAILABLE" } });
+      emit("session.snapshot", durable("retrying"));
+      emit("session.snapshot", durable("retry_required", "capture_old"));
+      expect(run.getSnapshot().problem.code).toBe("UNDERSTANDING_UNAVAILABLE");
+      emit("floor.changed", { owner: "candidate", reason: "understanding_recovered", capture_id: "capture_endpoint" });
+      expect(run.getSnapshot().problem).toBeNull();
+    } finally { await run.close(); }
+  });
+
+  it("unlocks a failed or disconnected manual retry and drops recovery when the turn changes", async () => {
+    const { run, emit, socket } = await openFormalEndpointHarness();
+    try {
+      emit("problem", failure("UNDERSTANDING_RETRY_EXHAUSTED"));
+      const send = socket.send;
+      socket.send = () => { throw new Error("synthetic send failure"); };
+      await expect(run.act({ type: "continue_speaking" })).rejects.toThrow("synthetic send failure");
+      expect(run.getSnapshot().understandingRetryPending).toBe(false);
+      socket.send = send;
+      await run.act({ type: "continue_speaking" });
+      socket.emit("close", {});
+      expect(run.getSnapshot()).toMatchObject({ understandingRetryPending: false, problem: { code: "UNDERSTANDING_RETRY_EXHAUSTED" } });
+      emit("session.snapshot", { ...candidateSnapshot(), current_turn_id: "turn_2", floor: "agent",
+        current_question: { ...candidateSnapshot().current_question, turn_id: "turn_2" } });
+      expect(run.getSnapshot().problem).toBeNull();
+    } finally { await run.close(); }
+  });
+
+  it.each(["retrying", "retry_required"])("restores %s before capture acknowledgement without opening audio on an agent floor", async status => {
+    const { run, socket } = await openPlaybackHarness();
+    try {
+      socket.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", { ...durable(status), floor: "agent" })) });
+      expect(run.getSnapshot()).toMatchObject({ evidence: { ready: false }, problem: { code: status === "retrying" ? "UNDERSTANDING_UNAVAILABLE" : "UNDERSTANDING_RETRY_EXHAUSTED" } });
+      expect(socket.sent.filter(item => item.type === "evidence.stream.open")).toHaveLength(0);
+      expect(await run.act({ type: "continue_speaking" })).toBe(false);
+      socket.emit("message", { data: JSON.stringify(candidateEvent(2, "session.snapshot", durable(status))) });
+      socket.emit("message", { data: JSON.stringify({ ...correlatedCandidateEvent(3, "floor.changed", {
+        owner: "candidate", reason: "evidence_stream_open", capture_id: "capture_endpoint",
+      }, latestSentSignal(socket, "evidence.stream.open")), turn_id: "turn_1" }) });
+      expect(run.getSnapshot()).toMatchObject({ evidence: { ready: true }, problem: { code: status === "retrying" ? "UNDERSTANDING_UNAVAILABLE" : "UNDERSTANDING_RETRY_EXHAUSTED" } });
+    } finally { await run.close(); }
+  });
+});
+
 describe("candidate continuous capture recovery", () => {
   const recovery = (status = "recovering", captureId = "capture_endpoint") => ({
     status, turn_id: "turn_1", capture_id: captureId, attempt: status === "recovering" ? 1 : 3, max_attempts: 3,
@@ -2629,11 +2874,11 @@ class CandidateFakeAudio {
   }
 }
 
-async function openPlaybackHarness({ audios = [], sockets = null, clock, runtimeReport } = {}) {
+async function openPlaybackHarness({ audios = [], sockets = null, clock, runtimeReport, captureFactory, streamOverride, requestOverride } = {}) {
   const liveSink = { append: vi.fn(), finish: vi.fn(), close: vi.fn(), outputTime: () => 100 };
   const socket = sockets?.[0] || new CandidateFakeSocket();
   let socketIndex = 0;
-  const stream = {
+  const stream = streamOverride || {
     getAudioTracks: () => [{ readyState: "live", stop: vi.fn() }],
     getVideoTracks: () => [{ readyState: "live", stop: vi.fn() }],
     getTracks: () => [],
@@ -2649,6 +2894,7 @@ async function openPlaybackHarness({ audios = [], sockets = null, clock, runtime
     avatar_fps: 60,
   });
   const request = vi.fn(async (path) => {
+    if (requestOverride) return requestOverride(path);
     if (path.endsWith("/runtime-problems")) {
       if (runtimeReport) return runtimeReport();
       return { accepted: true, status: "paused" };
@@ -2681,6 +2927,7 @@ async function openPlaybackHarness({ audios = [], sockets = null, clock, runtime
     snapshot: () => ({ retainedFrames: 0, unacknowledgedFrames: 0, encryptedBytes: 0, retentionMs: 30_000 }),
   };
   const media = { publishedSources: ["microphone", "camera"], close: vi.fn(), setRecoveryMute: vi.fn() };
+  const captureResource = { close: vi.fn() };
   const experience = createCandidateInterviewExperience({
     request,
     socketFactory: () => sockets?.[socketIndex++] || socket,
@@ -2690,7 +2937,7 @@ async function openPlaybackHarness({ audios = [], sockets = null, clock, runtime
     },
     audioCaptureFactory: async (_stream, callbacks) => {
       capture = callbacks;
-      return { close: vi.fn() };
+      return captureFactory ? captureFactory() : captureResource;
     },
     ringFactory: () => ring,
     verifyAvatar: async () => ({ ready: true }),
@@ -2699,8 +2946,118 @@ async function openPlaybackHarness({ audios = [], sockets = null, clock, runtime
     clock,
   });
   const run = await experience.open({ interviewId: "iv_test", ticket: "candidate-token" });
-  return { run, socket, capture, request, audioFactory, mediaCallbacks, media, ring, liveSink };
+  return { run, socket, capture, captureResource, stream, request, audioFactory, mediaCallbacks, media, ring, liveSink };
 }
+
+describe("completed candidate media lifecycle", () => {
+  const receipt = { interview_id: "iv_test", status: "submitted_for_human_review", submitted_at: "2026-09-23T00:00:00Z",
+    recording_retention_notice: "已提交", human_review_required: true };
+  const complete = socket => socket.emit("message", { data: JSON.stringify(candidateEvent(1, "completed", receipt)) });
+
+  it("stops every device and control even when playback, capture and media cleanup fail", async () => {
+    const microphone = { readyState: "live", stop: vi.fn() }, camera = { readyState: "live", stop: vi.fn() };
+    const stream = { getAudioTracks: () => [microphone], getVideoTracks: () => [camera], getTracks: () => [microphone, camera] };
+    const { run, socket, media, captureResource, ring, liveSink, mediaCallbacks } = await openPlaybackHarness({ streamOverride: stream });
+    const performance = livePerformance(), track = liveTrack(performance);
+    socket.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", candidateSnapshot())) });
+    socket.emit("message", { data: JSON.stringify({ ...candidateEvent(2, "avatar.performance.started", performance), replayability: "transient" }) });
+    mediaCallbacks.onRemoteAudioTrack(track, { trackSid: track.sid, trackName: performance.live_audio.track_name }, { identity: performance.live_audio.publisher_identity });
+    await flushPlaybackEvents();
+    captureResource.close.mockRejectedValue(new Error("synthetic capture close failed"));
+    media.close.mockRejectedValue(new Error("synthetic media close failed"));
+    liveSink.close.mockImplementation(() => { throw new Error("synthetic playback release failed"); });
+    socket.emit("message", { data: JSON.stringify(candidateEvent(3, "completed", receipt)) });
+    await flushPlaybackEvents();
+    expect(run.getSnapshot()).toMatchObject({ completion: receipt, phase: "completed", mediaStream: null, microphone: { enabled: false } });
+    expect(microphone.stop).toHaveBeenCalledOnce();
+    expect(camera.stop).toHaveBeenCalledOnce();
+    expect(media.close).toHaveBeenCalledOnce();
+    expect(captureResource.close).toHaveBeenCalledOnce();
+    expect(socket.readyState).toBe(WebSocket.CLOSED);
+    expect(ring.clear).toHaveBeenCalledOnce();
+    socket.emit("message", { data: JSON.stringify(candidateEvent(4, "session.snapshot", candidateSnapshot())) });
+    expect(run.getSnapshot().phase).toBe("completed");
+    await run.close();
+  });
+
+  it.each(["initial_open", "reconnect"])("recovers a missed completion receipt on an ended-input ticket during %s", async stage => {
+    vi.useFakeTimers();
+    try {
+      const track = { readyState: "live", stop: vi.fn() };
+      const camera = { readyState: "live", stop: vi.fn() };
+      const stream = { getAudioTracks: () => [track], getVideoTracks: () => [camera], getTracks: () => [track, camera] };
+      const revoked = () => { throw Object.assign(new Error("input ended"), { code: "CANDIDATE_INPUT_COMPLETED", status: 409 }); };
+      const requestOverride = path => path.endsWith("/agent-ticket") ? revoked() : { completion: receipt };
+      const { run, request, socket, media } = await openPlaybackHarness({ streamOverride: stream, ...(stage === "initial_open" ? { requestOverride } : {}) });
+      if (stage === "reconnect") {
+        request.mockImplementation(requestOverride);
+        socket.readyState = WebSocket.CLOSED;
+        socket.emit("close", {});
+        await vi.advanceTimersByTimeAsync(400);
+      }
+      expect(run.getSnapshot()).toMatchObject({ completion: receipt, phase: "completed", mediaStream: null, microphone: { enabled: false } });
+      expect(track.stop).toHaveBeenCalledOnce();
+      expect(request).toHaveBeenLastCalledWith("/api/v1/public/interviews/iv_test", expect.objectContaining({ method: "GET", headers: { "X-Candidate-Session-Token": "candidate-token" } }));
+      expect(media.close).toHaveBeenCalledTimes(stage === "reconnect" ? 1 : 0);
+      const requestsAfterReceipt = request.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(60000);
+      expect(request).toHaveBeenCalledTimes(requestsAfterReceipt);
+      await run.close();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it.each(["queued", "in_flight"])("cancels %s reconnect and heartbeat after completion", async kind => {
+    vi.useFakeTimers();
+    try {
+      const first = new CandidateFakeSocket(), second = new CandidateFakeSocket();
+      const { run, request } = await openPlaybackHarness({ sockets: [first, second] });
+      let release;
+      if (kind === "in_flight") request.mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+      first.readyState = WebSocket.CLOSED;
+      first.emit("close", {});
+      if (kind === "in_flight") await vi.advanceTimersByTimeAsync(400);
+      complete(first);
+      if (release) release({ agent_ticket: "late", agent_ws_url: "/agent" });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(request).toHaveBeenCalledTimes(kind === "in_flight" ? 2 : 1);
+      expect(second.sent).toHaveLength(0);
+      expect(first.sent.filter(value => value.type === "ping")).toHaveLength(0);
+      expect(run.getSnapshot().phase).toBe("completed");
+      await run.close();
+    } finally { vi.useRealTimers(); }
+  });
+
+  it("closes a late capture factory result after a completion received during startup", async () => {
+    const socket = new CandidateFakeSocket();
+    let releaseCapture, reachedCapture;
+    const entered = new Promise(resolve => { reachedCapture = resolve; });
+    const resource = { close: vi.fn() };
+    const opening = openPlaybackHarness({ sockets: [socket], captureFactory: () => {
+      reachedCapture(); return new Promise(resolve => { releaseCapture = resolve; });
+    } });
+    await entered;
+    complete(socket);
+    releaseCapture(resource);
+    const { run } = await opening;
+    expect(run.getSnapshot()).toMatchObject({ completion: receipt, phase: "completed", mediaStream: null });
+    expect(resource.close).toHaveBeenCalledOnce();
+    expect(socket.readyState).toBe(WebSocket.CLOSED);
+    await run.close();
+  });
+
+  it("restores completion from a fresh snapshot without requiring the old completed event", async () => {
+    const { run, socket, media, captureResource } = await openPlaybackHarness();
+    socket.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", {
+      ...candidateSnapshot(), status: "in_progress", current_turn_id: null, current_question: null, completion: receipt,
+    })) });
+    await flushPlaybackEvents();
+    expect(run.getSnapshot()).toMatchObject({ completion: receipt, phase: "completed" });
+    expect(media.close).toHaveBeenCalledOnce();
+    expect(captureResource.close).toHaveBeenCalledOnce();
+    expect(socket.readyState).toBe(WebSocket.CLOSED);
+    await run.close();
+  });
+});
 
 function runtimeProblemCalls(request) {
   return request.mock.calls.filter(([path]) => path.endsWith("/runtime-problems"));

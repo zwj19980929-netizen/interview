@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from app.core.errors import ApiError
+from app.domain.interview_agent import ConversationUtterance
 from app.main import create_app
 from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
@@ -90,8 +91,12 @@ async def test_real_plan_context_is_optional_frozen_and_read_on_demand(monkeypat
             InterviewerTools(session, supervisor.load_skill(session)).execute("company.read_reference", "company:context")
         assert error.value.code == "INTERVIEW_TOOL_FORBIDDEN"
     before = deepcopy(session)
-    assert await supervisor.prepare_turn("utterance", {}, session) == ("understanding", "followup")
+    utterance = ConversationUtterance(utterance_id="synthetic_context", revision=1,
+        speaker="candidate", text="我会使用队列处理任务。", is_final=True, authoritative=True,
+        audio_uri="memory://synthetic.wav", source="server_batch", created_at="2026-09-23T00:00:00Z")
+    assert await supervisor.prepare_turn(utterance, {}, session) == ("understanding", "followup")
     enriched = prepared.prepare_decision.await_args.args[2]["_interviewer_context"]
+    assert enriched["input_context"]["current_speech"] == utterance.text
     assert enriched["company_context"] == context["company_context"]
     assert enriched["skill"] == context["skill"]
     assert COMPANY_CONTEXT not in json.dumps(enriched, ensure_ascii=False)

@@ -12,12 +12,46 @@ from app.model_gateway.schemas import TTSSynthesizeResponse, ProviderMeta
 from app.core.prompt.contracts import SUPPLEMENT_SPEECH, SUPPLEMENT_SPEECH_VERSION
 from app.domain.interview_agent import ClientSignal
 from app.services.conversation_understanding import ConversationUnderstandingService
+from app.core.prompt.understanding_references import understanding_references
+from app.providers.mock.provider import MockProvider
 from test_answer_endpoint import _Clock
 from test_automatic_turn_integration import (
     _automatic_session, _current, _feed, _assert_one_automatic_answer,
     _VOICE, _CONTINUATION, _SILENCE, _PREFIX,
 )
 from test_evidence_owner_recovery_integration import TURN_ID, _wait_until
+
+
+def _synthetic_confirmed_understanding(monkeypatch):
+    """Supply the scripted oral reply's meaning; keep the real commit fences.
+
+    The generic development Mock intentionally never infers completion. These
+    tests instead exercise a known spoken "没有补充了" response, whose validated
+    meaning is finish_answer with technical evidence and probe permission kept.
+    """
+    original = MockProvider.invoke
+
+    async def invoke(provider, capability, request, context):
+        response = await original(provider, capability, request, context)
+        if request.metadata.get("prompt_version") not in {
+            "interview_turn_understanding.v51", "interview_turn_understanding.v53",
+            "interview_turn_decision.v82", "interview_turn_decision.v84",
+        }:
+            return response
+        transcript = request.metadata.get("transcript", "")
+        data = response.data.get("understanding", response.data)
+        if transcript.endswith("没有补充了。") and data.get("turn_intent") == "answering":
+            refs = understanding_references(transcript, request.metadata["capability_points"])
+            data.update(turn_intent="finish_answer", suggested_action="next", followup_allowed=True,
+                completion_basis={"source": "explicit_server_intent", "evidence_ids": list(refs["evidence"])[-1:]})
+        return response
+
+    monkeypatch.setattr(MockProvider, "invoke", invoke)
+
+
+@pytest.fixture(autouse=True)
+def scripted_completion_meaning(monkeypatch):
+    _synthetic_confirmed_understanding(monkeypatch)
 
 
 @pytest.mark.parametrize("payload", [
@@ -133,7 +167,15 @@ def test_playback_status_is_scoped_diagnostic_not_completion(tmp_path, monkeypat
 
 
 def test_five_second_check_then_spoken_no_submits_original_answer_with_no_button(tmp_path, monkeypatch):
-    async def classify(self, reply, organization_id):
+    decision_phases = []
+    original_record = ConversationUnderstandingService._record_followup_decision
+
+    def record(decision, interview, turn, **kwargs):
+        decision_phases.append((kwargs["phase"], interview["id"], turn["id"]))
+        return original_record(decision, interview, turn, **kwargs)
+
+    monkeypatch.setattr(ConversationUnderstandingService, "_record_followup_decision", staticmethod(record))
+    async def classify(self, reply, organization_id, **context):
         assert reply == "没有补充了。"
         return {"intent": "finish", "confidence": 0.96, "evidence_quote": reply}
     monkeypatch.setattr(ConversationUnderstandingService, "classify_supplement_reply", classify)
@@ -159,6 +201,7 @@ def test_five_second_check_then_spoken_no_submits_original_answer_with_no_button
             assert approved["prompt_version"] == SUPPLEMENT_SPEECH_VERSION == "supplement_confirmation.v2"
             assert tts_texts == [SUPPLEMENT_SPEECH["check"]]
             assert not _current(runtime)["answers"]
+            assert not [phase for phase, *_ in decision_phases if phase == "committed"]
             assert managed._capture_id == capture_id
             assert _current(runtime)["agent_runtime"]["supplement_confirmation"]["status"] == "awaiting_reply"
             await _feed(managed._ingress, _CONTINUATION, 5)
@@ -166,15 +209,21 @@ def test_five_second_check_then_spoken_no_submits_original_answer_with_no_button
             await _wait_until(lambda: len(_current(runtime)["answers"]) == 1, timeout=5)
             await _wait_until(lambda: all(c["status"] == "completed" for c in store.evidence_commands.values()))
             _assert_one_automatic_answer(store, runtime, _PREFIX + "没有补充了。", voice_frames=5, continuation_frames=5)
+            assert [row for row in decision_phases if row[0] == "committed"] == [
+                ("committed", _current(runtime)["id"], TURN_ID),
+            ]
             assert _current(runtime)["turns"][0]["current_understanding"]["prompt_version"] in {
-                "interview_turn_understanding.v23", "interview_turn_decision.v22",
+                "interview_turn_understanding.v53", "interview_turn_decision.v84",
             }
+            understanding = _current(runtime)["turns"][0]["current_understanding"]
+            assert understanding["turn_intent"] == "finish_answer" and understanding["followup_allowed"]
+            assert understanding["completion_basis"]["evidence_quotes"] == ["没有补充了。"]
     asyncio.run(scenario())
 
 
 def test_repeated_no_with_continuous_pcm_and_slow_preparation_commits_once_without_reasking(tmp_path, monkeypatch):
     replies = []
-    async def classify(self, reply, organization_id):
+    async def classify(self, reply, organization_id, **context):
         replies.append(reply)
         return {"intent": "finish", "confidence": 0.98, "evidence_quote": reply}
     monkeypatch.setattr(ConversationUnderstandingService, "classify_supplement_reply", classify)
@@ -218,7 +267,7 @@ def test_repeated_no_with_continuous_pcm_and_slow_preparation_commits_once_witho
 
 def test_yes_then_supplement_stays_on_same_capture_until_spoken_no(tmp_path, monkeypatch):
     replies = []
-    async def classify(self, reply, organization_id):
+    async def classify(self, reply, organization_id, **context):
         replies.append(reply)
         return {"intent": "continue" if reply == "有补充。" else "finish", "confidence": 0.96, "evidence_quote": reply}
     monkeypatch.setattr(ConversationUnderstandingService, "classify_supplement_reply", classify)
@@ -256,7 +305,7 @@ def test_yes_then_supplement_stays_on_same_capture_until_spoken_no(tmp_path, mon
 
 def test_prompt_echo_is_excluded_but_scoped_barge_in_restores_onset_once(tmp_path, monkeypatch):
     replies = []
-    async def classify(self, reply, organization_id):
+    async def classify(self, reply, organization_id, **context):
         replies.append(reply)
         return {"intent": "finish", "confidence": 0.96, "evidence_quote": reply}
     monkeypatch.setattr(ConversationUnderstandingService, "classify_supplement_reply", classify)
@@ -309,7 +358,7 @@ def test_nonzero_microphone_frames_and_single_impulse_during_preparation_keep_sp
         entered.set()
         await release.wait()
         return await original(self, *args, **kwargs)
-    async def classify(self, reply, organization_id):
+    async def classify(self, reply, organization_id, **context):
         return {"intent": "finish", "confidence": 0.96, "evidence_quote": reply}
     monkeypatch.setattr(ConversationUnderstandingService, "prepare_decision", slow_prepare)
     monkeypatch.setattr(ConversationUnderstandingService, "classify_supplement_reply", classify)

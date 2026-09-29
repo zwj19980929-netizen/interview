@@ -1196,10 +1196,15 @@ describe("React workbench shell", () => {
   it("exposes question preview, view, edit, and delete actions", async () => {
     window.history.replaceState(null, "", "#questions/kb_1");
     const calls = [];
+    const players = [];
     const profile = { model_configuration_id: "tts_1", voice_profile_id: "voice_a", language: "zh-CN", audio_format: "audio/wav", speaking_rate: 1, revision: 1 };
     const bank = { id: "kb_1", name: "CRUD 题库", job_position_id: "position_1", version: 3, speech_build_status: "ready", speech_profile: profile };
     const question = { id: "q_1", title: "三次握手", question_text: "请解释三次握手", standard_answer: "SYN、SYN-ACK、ACK", key_points: [{ text: "SYN" }], skills: ["网络"], difficulty: "mid", type: "open_ended", validation_status: "valid", speech_status: "ready", speech_asset_id: "speech_1", version: 2 };
-    globalThis.Audio = class { pause() {} play() { return Promise.resolve(); } };
+    globalThis.Audio = class {
+      constructor() { this.currentTime = 0; this.paused = false; players.push(this); }
+      pause() { this.paused = true; }
+      play() { return Promise.resolve(); }
+    };
     globalThis.fetch = async (path, options = {}) => {
       const url = String(path); calls.push({ path: url, method: options.method || "GET" });
       if (url.endsWith("/auth/session")) return new Response(JSON.stringify({ actor_id: "admin_1", organization_id: "org_1", roles: ["admin"], authenticated: true }));
@@ -1221,6 +1226,10 @@ describe("React workbench shell", () => {
     for (const label of ["试听", "查看", "编辑", "删除"]) expect([...host.querySelectorAll("button")].some((node) => node.textContent === label)).toBe(true);
     await act(async () => [...host.querySelectorAll("button")].find((node) => node.textContent === "试听").click());
     expect(calls).toContainEqual({ path: "/api/v1/question-speech-assets/speech_1/content-url", method: "POST" });
+    expect([...host.querySelectorAll("button")].some((node) => node.textContent === "停止试听")).toBe(true);
+    await act(async () => [...host.querySelectorAll("button")].find((node) => node.textContent === "停止试听").click());
+    expect(players[0].paused).toBe(true);
+    expect([...host.querySelectorAll("button")].some((node) => node.textContent === "试听")).toBe(true);
     await act(async () => [...host.querySelectorAll("button")].find((node) => node.textContent === "编辑").click());
     await act(async () => [...document.querySelectorAll("button")].find((node) => node.textContent === "保存修改").click());
     for (let attempt = 0; attempt < 30 && !calls.some((call) => call.method === "PATCH"); attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10));

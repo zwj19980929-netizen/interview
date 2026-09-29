@@ -323,6 +323,8 @@ class InterviewAgentTicketService:
         participant_role: str,
     ) -> Dict[str, Any]:
         settings = session.get("settings") or {}
+        if participant_role == "candidate" and self.interviews.candidate_completion_receipt(session) is not None:
+            raise ApiError("CANDIDATE_INPUT_COMPLETED", "Candidate input has already ended.", status_code=409)
         video_required = bool(settings.get("record_video"))
         consent_scopes = set(
             session.get("candidate", {}).get("media_consent_scopes") or []

@@ -16,7 +16,7 @@ const review = {
     answer: { id: `answer_${n}`, final_transcript: `回答原文${n}`, evaluation_status: "failed", evaluation_failure_code: "provider_output_truncated" },
     playback: { audio_available: true, video_available: true, start_seconds: n * 10, end_seconds: n * 10 + 5, timing_source: "server_turn_window" } })),
 };
-const button = (text) => [...host.querySelectorAll("button")].find((node) => node.textContent === text);
+const button = (text) => [...host.querySelectorAll("button")].find((node) => node.textContent.startsWith(text));
 beforeEach(() => {
   monitorOpen.mockReset();
   host = document.createElement("div"); document.body.append(host); root = createRoot(host);
@@ -43,6 +43,43 @@ it("shows numeric scores and total even when recognition is uncertain", async ()
   expect(host.textContent).not.toContain("null分");
   expect(host.querySelector(".score-value").textContent).toContain("76");
   expect(button("保存核验并重新评分").disabled).toBe(true);
+});
+
+const unresolvedReview = () => {
+  const value = warningReview();
+  value.processing = { ...value.processing, report_status: "pending_verification" };
+  value.report = { ...value.report, overall_score: null, score_status: "pending_verification", manual_review_required: true,
+    job_fit_level: "manual_review", pending_verification_answer_ids: ["answer_1"],
+    recognition_notice: "本场存在未确认的回答内容，请回听录音并核验转写后再评分。" };
+  value.turns[0].evaluation = { ...value.turns[0].evaluation, score: null, manual_review_required: true };
+  return value;
+};
+
+it.each(["manual_review_required", "pending_verification_answer_ids"])("explains %s as human transcript verification instead of automatic scoring", async field => {
+  const value = unresolvedReview();
+  if (field === "manual_review_required") delete value.report.pending_verification_answer_ids;
+  else delete value.report.manual_review_required;
+  await show(value);
+  expect(host.textContent).toContain("回答转写待人工核验");
+  expect(host.textContent).toContain(value.report.recognition_notice);
+  expect(host.textContent).not.toContain("正在等待有效评分");
+  expect(host.textContent).not.toContain("回听和纠错均为可选");
+  expect(host.textContent).toContain("回听并核验转写");
+  expect(button("第 1 题 · 转写待核验")).toBeTruthy();
+  expect(button("播放本题音频").disabled).toBe(false);
+  expect(button("保存核验并重新评分").disabled).toBe(true);
+  expect(host.querySelector(".score-value")).toBeNull();
+  expect(workbench.request).not.toHaveBeenCalled();
+});
+
+it("retains unresolved verification notices for readers without granting transcript editing", async () => {
+  const value = unresolvedReview();
+  await act(async () => root.render(<InterviewReview interviewId="synthetic" review={value} reload={vi.fn()} canManage={false} />));
+  expect(host.textContent).toContain("回答转写待人工核验");
+  expect(host.textContent).toContain(value.report.recognition_notice);
+  expect(button("播放本题音频").disabled).toBe(false);
+  expect(host.querySelector(".review-verification")).toBeNull();
+  expect(workbench.request).not.toHaveBeenCalled();
 });
 
 it("requires explicit audio review and submits the selected revision without a client score", async () => {
@@ -81,6 +118,38 @@ it("shows failure and uses the selected answer's signed recording", async () => 
   await act(async () => button("播放本题音频").click());
   expect(workbench.request).toHaveBeenCalledWith("/api/v1/interviews/synthetic/answers/answer_2/audio-url", { method: "POST" });
   expect(host.querySelector("audio").getAttribute("src")).toContain("synthetic_audio");
+});
+
+it("explains supplier billing failures while preserving the answer and explicit retry", async () => {
+  await show({ ...review, turns: review.turns.map((turn) => ({ ...turn,
+    answer: { ...turn.answer, evaluation_failure_code: "provider_billing_required" },
+  })) });
+  expect(host.textContent).toContain("评分模型供应商账户计费或额度需要处理");
+  expect(host.textContent).toContain("请管理员处理后重试评分");
+  expect(host.textContent).toContain("回答原文1");
+  expect(button("重试未完成处理")).toBeTruthy();
+  expect(workbench.request).not.toHaveBeenCalled();
+});
+
+it("opens each question's review and playback inside that same question card", async () => {
+  workbench.request.mockResolvedValue({ url: "/api/v1/private-media/second_answer" });
+  await show();
+  const first = host.querySelector('[data-turn-id="turn_1"]');
+  const second = host.querySelector('[data-turn-id="turn_2"]');
+  expect(first.querySelector(".review-answer")).not.toBeNull();
+  expect(second.querySelector(".review-answer")).toBeNull();
+  expect(second.textContent).toContain("查看回答与回放");
+  expect(second.textContent).not.toContain("回答原文2");
+  await act(async () => second.querySelector("button").click());
+  expect(first.querySelector(".review-answer")).toBeNull();
+  expect(second.querySelector(".review-transcript").textContent).toBe("回答原文2");
+  expect(second.querySelectorAll(".review-answer button")).toHaveLength(2);
+  await act(async () => button("播放本题音频").click());
+  expect(second.querySelector("audio").getAttribute("src")).toContain("second_answer");
+  expect(first.querySelector("audio")).toBeNull();
+  await act(async () => second.querySelector("button").click());
+  expect(second.querySelector(".review-answer")).toBeNull();
+  expect(host.querySelector("audio")).toBeNull();
 });
 
 it("drops a signed audio response when the reviewer switches questions", async () => {
@@ -181,7 +250,8 @@ it("shows fixed competency weights and unassessed scope without pretending a par
     ] };
   value.turns[0] = { ...value.turns[0], presented_unit_ids: ["complete_question"], assessed_rubric_point_ids: ["p1", "p2"] };
   await show(value);
-  expect(host.textContent).toContain("结束原因：候选人主动结束");
+  expect(host.textContent).toContain("结束原因：候选人主动提前退出");
+  expect(host.textContent).toContain("提前退出待人工复核，最终决定由企业人员完成。");
   expect(host.textContent).toContain("考察覆盖不足，暂不形成总分");
   expect(host.textContent).not.toContain("正在等待有效评分");
   expect(host.textContent).not.toContain("null分");
@@ -192,6 +262,25 @@ it("shows fixed competency weights and unassessed scope without pretending a par
   expect(table.textContent).toContain("90 分");
   expect(table.textContent).toContain("未考察");
   expect(host.textContent).toContain("全部 2 项关键点");
+  expect(host.querySelector(".score-value")).toBeNull();
+});
+
+it("keeps confirmed withdrawal separate from scores and displays the human review notice", async () => {
+  const value = warningReview();
+  value.candidate_input_completion_reason = "candidate_requested";
+  value.report.scope_notice = "候选人确认提前退出；待人工复核。已取得的评分证据保留，未考察范围不计零分。";
+  await show(value);
+  expect(host.textContent).toContain("候选人确认提前退出；待人工复核");
+  expect(host.textContent).toContain("提前退出待人工复核，最终决定由企业人员完成。");
+  expect(host.querySelector(".score-value").textContent).toContain("76");
+  expect(host.textContent).not.toContain("已淘汰");
+});
+
+it("shows withdrawal awaiting human review while the report is still processing", async () => {
+  await show({ ...review, report: null, candidate_input_completion_reason: "candidate_requested",
+    processing: { ...review.processing, failed: 0, pending: 2, report_status: "processing" } });
+  expect(host.textContent).toContain("结束原因：候选人主动提前退出");
+  expect(host.textContent).toContain("提前退出待人工复核，最终决定由企业人员完成。");
   expect(host.querySelector(".score-value")).toBeNull();
 });
 
@@ -247,9 +336,10 @@ it("nests persisted followups under their parent with separate answers and their
   const childNode = host.querySelector('[data-turn-id="turn_1"] [data-turn-id="turn_2"]');
   expect(childNode).not.toBeNull();
   expect(childNode.textContent).toContain("实际追问");
-  expect(childNode.textContent).toContain("只属于追问的回答");
+  expect(childNode.textContent).not.toContain("只属于追问的回答");
   expect(childNode.textContent).not.toContain("回答原文1");
   await act(async () => childNode.querySelector("button").click());
+  expect(childNode.querySelector(".review-answer")).not.toBeNull();
   expect(host.querySelector(".review-answer h3").textContent).toBe("实际追问");
   expect(host.querySelector(".review-answer").textContent).toContain("所属主问题：实际主问题");
   expect(host.querySelector(".review-transcript").textContent).toBe("只属于追问的回答");

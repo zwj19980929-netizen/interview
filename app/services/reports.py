@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from app.core.errors import ApiError
 from app.core.ids import new_id
-from app.domain.scoring_quality import DISPUTE_FLAGS, evaluation_answers, project_evaluation, project_report
+from app.domain.scoring_quality import DISPUTE_FLAGS, evaluation_answers, project_evaluation, project_report, is_unresolved_evaluation
 from app.domain.adaptive_interview import adaptive_score_summary, interrupted_fixed_plan_summary, is_adaptive
 from app.core.time import utc_now
 from app.persistence.interface import Persistence
@@ -60,7 +60,7 @@ class ReportService:
             evaluation = project_evaluation(original, evaluation_answers(interview, original)) if original else None
             if evaluation is None:
                 continue
-            if evaluation["score"] is None:
+            if evaluation["score"] is None and not is_unresolved_evaluation(evaluation):
                 raise ApiError("REPORT_EVALUATION_UNAVAILABLE", "本题尚无有效评分，请重试后台评分。", status_code=409)
             plan_item = item_by_snapshot.get(
                 evaluation["question_snapshot_id"],

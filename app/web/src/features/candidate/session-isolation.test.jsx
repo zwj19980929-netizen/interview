@@ -86,6 +86,21 @@ describe("candidate route isolation with the real workbench loader", () => {
     expect(window.location.hash).toBe("#candidate/new");
   });
 
+  it("renders a persisted completion while scoring is pending without reopening devices or the agent", async () => {
+    const getUserMedia = vi.fn();
+    vi.stubGlobal("navigator", { mediaDevices: { getUserMedia } });
+    await mount("finished", "token-finished");
+    await deliver(0, { ...interview("finished"), completion: {
+      interview_id: "finished", status: "submitted_for_human_review", submitted_at: "2026-09-23T00:00:00Z",
+      recording_retention_notice: "录音按同意范围保留。", human_review_required: true,
+    } });
+    expect(host.textContent).toContain("面试已提交");
+    expect(runtime.avatars).toHaveLength(0);
+    expect(runtime.open).not.toHaveBeenCalled();
+    expect(runtime.report).not.toHaveBeenCalled();
+    expect(getUserMedia).not.toHaveBeenCalled();
+  });
+
   it.each(["success", "failure"])("ignores a previous page's late %s after the new page has loaded", async (outcome) => {
     await mount("old", "token-old");
     await navigate("new", "token-new");
@@ -202,5 +217,85 @@ describe("candidate route isolation with the real workbench loader", () => {
     const answerButtons = [...host.querySelectorAll(".recording-actions button")];
     expect(answerButtons).toHaveLength(3);
     expect(answerButtons.every((button) => button.disabled)).toBe(true);
+  });
+
+  it("requires a spoken withdrawal confirmation and keeps answer controls from authorizing it", async () => {
+    const run = makeRun();
+    run.subscribe.mockImplementation((listener) => {
+      listener({
+        phase: "awaiting_exit_confirmation", floor: "candidate", session: { status: "in_progress" },
+        currentQuestion: { question_text: "合成测试问题", turn_id: "turn-current" },
+        connection: { control: "connected", media: "connected" },
+        microphone: { localDetected: false }, evidence: { ready: true },
+        serverAudio: { received: false }, captions: { full: [], recent: [] }, endpoint: { active: false },
+        calibration: { status: "completed" }, avatar: { status: "idle" },
+      });
+      return () => {};
+    });
+    runtime.open.mockResolvedValueOnce(run);
+    await mount();
+    await deliver(0, interview("new"));
+    await act(async () => avatar().onReady({ fps: 60 }));
+    expect(host.textContent).toContain("请确认是否结束本次面试");
+    const buttons = [...host.querySelectorAll(".recording-actions button")];
+    const finish = buttons.find(button => button.textContent === "提前结束回答");
+    const repeat = buttons.find(button => button.textContent === "请再说一遍");
+    expect(finish.disabled).toBe(true);
+    expect(repeat.disabled).toBe(false);
+    await act(async () => finish.click());
+    expect(run.act).not.toHaveBeenCalled();
+    await act(async () => repeat.click());
+    expect(run.act).toHaveBeenCalledOnce();
+    expect(run.act).toHaveBeenCalledWith(expect.objectContaining({ type: "request_repeat" }));
+  });
+
+  it.each(["listening", "answer_preparing", "understanding"])("shows one failure state despite a stale %s phase and keeps microphone status factual", async phase => {
+    const run = makeRun();
+    run.subscribe.mockImplementation(listener => {
+      listener({ phase, floor: "candidate", session: { status: "in_progress" },
+        currentQuestion: { question_text: "合成测试问题", turn_id: "turn-current" },
+        connection: { control: "connected", media: "connected" },
+        microphone: { localDetected: false, level: 0 }, evidence: { ready: true },
+        serverAudio: { received: false }, captions: { full: [], recent: [] }, endpoint: { active: false },
+        calibration: { status: "completed" }, avatar: { status: "idle" },
+        problem: { code: "UNDERSTANDING_RESULT_REJECTED", recoverable: true, message: "secret model response" },
+      });
+      return () => {};
+    });
+    runtime.open.mockResolvedValueOnce(run);
+    await mount();
+    await deliver(0, interview("new"));
+    await act(async () => avatar().onReady({ fps: 60 }));
+    expect(host.textContent).toContain("回答处理需要重试");
+    expect(host.textContent).toContain("无需重说整题");
+    expect(host.textContent).toContain("麦克风已开启，可随时说话");
+    expect(host.textContent).not.toMatch(/正在整理|等待你开口|还有什么需要补充|secret model/);
+    expect(host.querySelectorAll(".candidate-question-band .candidate-waiting-row")).toHaveLength(1);
+  });
+
+  it.each([[true, false], [true, true], [false, false]])("offers retained-answer retry only for ready=%s and pending=%s", async (ready, pending) => {
+    const run = makeRun();
+    run.subscribe.mockImplementation(listener => {
+      listener({ phase: "listening", floor: "candidate", session: { status: "in_progress" },
+        currentQuestion: { question_text: "合成测试问题", turn_id: "turn-current" },
+        connection: { control: "connected", media: "connected" },
+        microphone: { localDetected: false, level: 0 }, evidence: { ready },
+        serverAudio: { received: false }, captions: { full: [], recent: [] }, endpoint: { active: false },
+        calibration: { status: "completed" }, avatar: { status: "idle" }, understandingRetryPending: pending,
+        problem: { code: "UNDERSTANDING_RETRY_EXHAUSTED", recoverable: true },
+      });
+      return () => {};
+    });
+    runtime.open.mockResolvedValueOnce(run);
+    await mount();
+    await deliver(0, interview("new"));
+    await act(async () => avatar().onReady({ fps: 60 }));
+    const retry = [...host.querySelectorAll("button")].find(button => button.textContent === (pending ? "正在重试…" : "重试处理"));
+    expect(retry.disabled).toBe(pending || !ready);
+    expect(host.textContent).toContain("处理已有回答");
+    if (!retry.disabled) {
+      await act(async () => retry.click());
+      expect(run.act).toHaveBeenCalledWith(expect.objectContaining({ type: "continue_speaking", turnId: "turn-current" }));
+    }
   });
 });

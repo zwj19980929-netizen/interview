@@ -252,7 +252,14 @@ def test_pending_sdk_operation_is_bounded_and_releases_resources(stage, failure)
         if stage == "capture":
             assert len(rtc.sources[0].frames) == 1, "No later frame can be published after invalidation"
         if stage == "connect":
-            assert room.connect_cancelled
+            assert not room.connect_cancelled
+            gate.set()
+            # A late native join completes its handshake, then gets reclaimed;
+            # no source or track may be created for the abandoned expression.
+            for _ in range(20):
+                await asyncio.sleep(0)
+            assert not room.connected and room.disconnected >= 2
+            assert rtc.sources == []
 
     asyncio.run(scenario())
 

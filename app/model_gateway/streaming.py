@@ -32,6 +32,7 @@ class ValidatedSTTStream:
         self._final_received = False
         self._completion_received = False
         self._text_received = False
+        self._empty_completion_reconciled = False
         self._closed = False
         self._preview: Optional[StableTranscriptPreview] = None
         self._provider_identity: Dict[str, str] = {}
@@ -44,7 +45,7 @@ class ValidatedSTTStream:
 
     @property
     def has_observed_text(self) -> bool:
-        """Sticky veto against empty completion, never permission to commit.
+        """Sticky record of observed words, never permission to commit.
 
         An adapter reader can receive words before finish raises or returns
         its queued events. Its optional local fact must survive stream repair.
@@ -58,6 +59,22 @@ class ValidatedSTTStream:
             observed = True
         self._text_received |= observed is not False
         return self._text_received
+
+    @property
+    def empty_completion_reconciled(self) -> bool:
+        """A successfully validated empty completion withdrew this stream's words."""
+        return self._empty_completion_reconciled
+
+    def _adapter_reconciled_empty(self) -> bool:
+        # Optional adapter protocol: only a normal completion with explicit
+        # same-sentence retractions can certify this fact. A stable prefix
+        # already exposed by this gateway cannot subsequently be withdrawn.
+        if self._preview is not None:
+            return False
+        try:
+            return getattr(self._stream, "empty_completion_reconciled", False) is True
+        except Exception:
+            return False
 
     async def preview(self) -> Optional[StableTranscriptPreview]:
         """Read the adapter's local stable prefix, without flushing or closing.
@@ -144,6 +161,10 @@ class ValidatedSTTStream:
                 "STT stream closed without an authoritative final transcript.",
                 retryable=True,
             )
+        self._empty_completion_reconciled = (
+            any(event.type == "transcript.empty" for event in events)
+            and self._adapter_reconciled_empty()
+        )
         return events
 
     async def abort(self) -> None:
@@ -173,7 +194,7 @@ class ValidatedSTTStream:
                 self._completion_received = True
             elif event.type == "transcript.empty":
                 if (not completion_requested or self._completion_received
-                        or self.has_observed_text):
+                        or (self.has_observed_text and not self._adapter_reconciled_empty())):
                     raise ProviderError("provider_schema_invalid", "STT empty completion conflicts with prior recognition.", retryable=True)
                 for name, expected in self._provider_identity.items():
                     if getattr(event.provider, name) != expected:

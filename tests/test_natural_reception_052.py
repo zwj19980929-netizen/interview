@@ -31,7 +31,9 @@ async def test_single_call_returns_natural_reply_without_answer_or_lifecycle_aut
     assert result['kind'] == kind
     assert result['reply_text'] == reply
     assert result['evidence_quote'] in speech
-    assert set(result) == {'kind', 'confidence', 'evidence_quote', 'reply_text'}
+    assert set(result) == {'kind', 'confidence', 'evidence_quote', 'reply_text'} | ({'repeat_target'} if kind == 'repeat' else set())
+    if kind == 'repeat':
+        assert result['repeat_target'] == 'current_question'
     assert len(gateway.requests) == 1
     assert gateway.requests[0].metadata == {'prompt_version': RECEPTION_VERSION}
     assert gateway.requests[0].execution_budget.max_provider_retries == 0
@@ -55,7 +57,7 @@ async def test_context_projection_includes_only_bounded_candidate_visible_values
     payload = json.loads(gateway.requests[0].messages[-1].content)
     assert payload['process_facts'] == {'duration_minutes': 45, 'remaining_seconds': 800, 'completed_topics': 2}
     assert payload['optional_skill'] == '简洁温和，允许思考。'
-    assert len(payload['question']) == 2000 and len(payload['preceding_text']) == 1000
+    assert len(payload['current_question']) == 2000 and len(payload['preceding_text']) == 1000
     assert len(payload['history']) == 3 and len(payload['history'][-1]['text']) == 400
     assert history == original
     serialized = json.dumps(payload)

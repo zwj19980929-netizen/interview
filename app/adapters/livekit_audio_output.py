@@ -13,11 +13,12 @@ import math
 import re
 import struct
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from livekit import rtc
 
 from app.adapters.livekit_media import LiveKitMediaPlane
+from app.adapters.livekit_connection import connect_room
 from app.core.errors import ApiError
 
 
@@ -57,6 +58,7 @@ class LiveKitApprovedAudioPublisher:
         rtc_module: Any = None,
         room_factory: Optional[Callable[[], Any]] = None,
         operation_timeout_seconds: float = 5.0,
+        before_abort: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> None:
         if not isinstance(room_name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,254}", room_name):
             raise ValueError("An exact server-issued room identifier is required")
@@ -64,6 +66,8 @@ class LiveKitApprovedAudioPublisher:
             raise ValueError("A server-issued performance identifier is required")
         if not callable(assert_current) or inspect.iscoroutinefunction(assert_current):
             raise ValueError("A synchronous current-expression fence is required")
+        if before_abort is not None and not callable(before_abort):
+            raise ValueError("Output interruption notification must be callable")
         if type(sample_rate_hz) is not int or sample_rate_hz not in {16_000, 24_000, 48_000}:
             raise ValueError("Approved PCM output supports 16, 24, or 48 kHz mono")
         if (type(operation_timeout_seconds) not in (int, float)
@@ -78,6 +82,7 @@ class LiveKitApprovedAudioPublisher:
         self._output_id: Optional[str] = None
         self._sequence = 0
         self._fence = assert_current
+        self._before_abort = before_abort
         self._rtc = rtc if rtc_module is None else rtc_module
         self._room_factory = room_factory or self._rtc.Room
         self._timeout = float(operation_timeout_seconds)
@@ -163,7 +168,7 @@ class LiveKitApprovedAudioPublisher:
                     room_name=self.room_name, performance_id=self.performance_id,
                 )
                 self._room = self._room_factory()
-                await self._current_operation(self._room.connect(
+                await self._current_operation(connect_room(self._room,
                     self.media_plane.url, token, self._rtc.RoomOptions(auto_subscribe=False),
                 ))
                 if self._room.local_participant.identity != self.participant_identity:
@@ -287,12 +292,27 @@ class LiveKitApprovedAudioPublisher:
         async with self._cleanup_lock:
             source, self._source = self._source, None
             room, self._room = self._room, None
+            cancelled = False
+            cleanup = []
+            if clear_queue and room is not None and self._publication is not None and self._before_abort is not None:
+                async def notify():
+                    await self._before_abort()
+                cleanup.append(notify)
             if room is not None and self._publication is not None:
-                await self._best_effort(room.local_participant.unpublish_track(self._publication.track_sid))
+                cleanup.append(lambda: room.local_participant.unpublish_track(self._publication.track_sid))
             if source is not None:
-                await self._best_effort(source.aclose())
+                cleanup.append(source.aclose)
             if room is not None:
-                await self._best_effort(room.disconnect())
+                cleanup.append(room.disconnect)
+            for operation in cleanup:
+                try:
+                    await self._best_effort(operation())
+                except asyncio.CancelledError:
+                    # Once references are detached, each native resource must
+                    # still receive bounded cleanup before cancellation exits.
+                    cancelled = True
+            if cancelled:
+                raise asyncio.CancelledError
 
     async def _best_effort(self, awaitable: Any) -> None:
         task = asyncio.ensure_future(awaitable)

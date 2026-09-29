@@ -67,9 +67,14 @@ def _semantic_provider(monkeypatch, *, technical=False, probe=False, explicit_fi
     async def invoke(provider, capability, request, context):
         if capability != "llm.chat_json" or request.purpose != "interview_turn_understanding":
             return await original(provider, capability, request, context)
-        if request.metadata.get("prompt_version") == "conversation_reception.v3":
+        if request.metadata.get("prompt_version") == "conversation_reception.v6":
             return await original(provider, capability, request, context)
-        if request.metadata.get("prompt_version") == "supplement_reply.v4":
+        if request.metadata.get("prompt_version") == "candidate_exit_reply.v1":
+            reply = json.loads(request.messages[-1].content)["new_reply"]
+            data = {"intent": "continue" if "继续" in reply else "confirm", "confidence": .98,
+                    "evidence_quote": list(understanding_references(reply, [])["evidence"].values())[-1]}
+            calls.append(("exit_confirmation", reply, data["intent"]))
+        elif request.metadata.get("prompt_version") == "supplement_reply.v5":
             reply = json.loads(request.messages[-1].content)["reply"]
             intent = "continue" if "再想想" in reply else "finish"
             data = {"intent": intent, "confidence": .98, "evidence_id": "E1"}
@@ -95,12 +100,18 @@ def _semantic_provider(monkeypatch, *, technical=False, probe=False, explicit_fi
                 "ambiguities": [], "contradictions": [], "confidence": .96,
                 "suggested_action": "next",
             }
-            if request.metadata["prompt_version"] in {"interview_turn_understanding.v20", "interview_turn_decision.v19", "interview_turn_understanding.v21", "interview_turn_decision.v20", "interview_turn_understanding.v22", "interview_turn_understanding.v23", "interview_turn_decision.v21", "interview_turn_decision.v22"}:
+            output_schema = request.json_schema["properties"].get("understanding", request.json_schema)
+            if "turn_intent" in output_schema["properties"]:
                 thinking = transcript.startswith("我得想一下")
-                ending = (explicit_finish or stop_interview or not technical_response) and not thinking
+                # This provider scripts the confirmed reply used below. A
+                # real spoken "no more" completes an answer and still permits
+                # a probe; it must not masquerade as ordinary ongoing speech.
+                finished_answer = technical_response and transcript.endswith("没有补充了。")
+                ending = (explicit_finish or stop_interview or finished_answer or not technical_response) and not thinking
                 data.update(answer_content="partial" if technical_response else "none",
-                            turn_intent="thinking" if thinking else "stop_interview" if stop_interview else ("finish_topic" if technical_response else "decline_topic") if ending else "answering",
-                            followup_allowed=technical_response and not ending,
+                            turn_intent="thinking" if thinking else "stop_interview" if stop_interview else
+                                "finish_answer" if finished_answer else ("finish_topic" if technical_response else "decline_topic") if ending else "answering",
+                            followup_allowed=technical_response and (finished_answer or not ending),
                             completion_basis=({"source": "explicit_server_intent", "evidence_ids": list(refs["evidence"])[-1:]} if ending else None))
                 if thinking:
                     data.update(intent="not_finished", answer_summary="候选人正在思考。", suggested_action="continue_listening")
@@ -165,6 +176,40 @@ async def _answer_without_confirmation(managed):
     return endpoint, clock
 
 
+async def _answer_and_confirm_exit(runtime, channel, managed):
+    """Send two real synthetic audio turns with a drained question in between."""
+    endpoint, clock = await _answer_without_confirmation(managed)
+    await _confirm_pending_exit(runtime, channel, managed, clock)
+    return endpoint, clock
+
+
+async def _confirm_pending_exit(runtime, channel, managed, clock):
+    from app.core.prompt.candidate_exit import EXIT_CONFIRMATION_SPEECH
+    endpoint = managed._answer_endpoint
+    try:
+        await _wait_until(lambda: endpoint.confirmation.speaking, timeout=5)
+    except AssertionError:
+        current = _current(runtime)
+        raise AssertionError(str({"phase": endpoint.confirmation.phase, "failures": endpoint._prepare_failures,
+            "runtime": current["agent_runtime"], "events": current["agent_events"][-5:]})) from None
+    assert not _current(runtime)["answers"]
+    assert not _current(runtime).get("candidate_input_completed_at")
+    selected = [event for event in _current(runtime)["agent_events"] if event["type"] == "conversation.act.selected"]
+    assert selected[-1]["payload"]["text"] == EXIT_CONFIRMATION_SPEECH
+    capture_id = managed._capture_id
+    # Let the initial proposal finish resuming its empty recognition segment
+    # before reporting playback drained. The fixture allocates one scripted
+    # transcript per opening; real providers do not attach words to an empty
+    # stream before candidate audio arrives.
+    await _wait_until(lambda: bool(endpoint.confirmation._exit_question_act_id)
+        and managed.chain._stt.stream._stream is not None)
+    await _stop_current_playback(runtime, channel)
+    await _wait_until(lambda: endpoint.confirmation._exit_question_delivered)
+    await _feed(managed._ingress, _CONTINUATION, 5)
+    clock.value += 1
+    assert managed._capture_id == capture_id or len(_current(runtime)["answers"]) == 1
+
+
 @pytest.mark.parametrize("body", ["我不知道，这题先到这里吧。", "我现在没有补充了。"])
 def test_first_final_decline_preserves_original_audio_and_advances_once(tmp_path, monkeypatch, body):
     calls = _semantic_provider(monkeypatch)
@@ -195,7 +240,7 @@ def test_first_final_decline_preserves_original_audio_and_advances_once(tmp_path
             assert "supplement_check" not in acts and "question" in acts
             assert SUPPLEMENT_SPEECH["check"] not in spoken
             assert not [c for c in calls if c[0] == "supplement"]
-            assert [c[2] for c in calls if c[0] == "understanding"] == ["interview_turn_decision.v21"]
+            assert [c[2] for c in calls if c[0] == "understanding"] == ["interview_turn_decision.v83"]
             assert understanding["completion_basis"]["source"] == "explicit_server_intent"
 
             # Replay the committed journal command and an additional stale
@@ -248,14 +293,14 @@ def test_explicit_end_of_interview_saves_current_evidence_and_never_delivers_nex
 
     async def scenario():
         body = _TECHNICAL + "我不想继续面试了，请结束整场面试。"
-        async with _automatic_session(tmp_path, monkeypatch, [body, ""], spoken_confirmation=True) as (store, runtime, channel, managed):
+        async with _automatic_session(tmp_path, monkeypatch, [body, "", "", "确定结束面试。", ""], spoken_confirmation=True) as (store, runtime, channel, managed):
             _add_next_question(store)
             _playable_speech(runtime)
-            await _answer_without_confirmation(managed)
+            await _answer_and_confirm_exit(runtime, channel, managed)
             await _wait_until(lambda: bool(_current(runtime).get("candidate_input_completed_at")), timeout=5)
             session = _current(runtime)
             assert len(session["answers"]) == 1
-            assert session["answers"][0]["raw_transcript"] == body
+            assert session["answers"][0]["raw_transcript"] == body + "确定结束面试。"
             assert session["turns"][0]["current_understanding"]["turn_intent"] == "stop_interview"
             assert session["current_turn_id"] is None
             assert not [event for event in session["agent_events"] if event["type"] == "conversation.act.selected"
@@ -271,8 +316,8 @@ def test_end_interview_in_supplement_reply_preserves_answer_and_stops_whole_inte
 
     async def semantic_reply(provider, capability, request, context):
         response = await original(provider, capability, request, context)
-        if (request.purpose == "interview_turn_understanding" and request.metadata.get("transcript", "").endswith(stop)
-                and request.metadata.get("prompt_version") in {"interview_turn_understanding.v21", "interview_turn_decision.v20", "interview_turn_understanding.v23", "interview_turn_decision.v22"}):
+        if (request.purpose == "interview_turn_understanding" and stop in request.metadata.get("transcript", "")
+                and str(request.metadata.get("prompt_version")).startswith(("interview_turn_understanding.", "interview_turn_decision."))):
             data = response.data.get("understanding", response.data)
             refs = understanding_references(request.metadata["transcript"], request.metadata["capability_points"])
             data.update(answer_content="partial", turn_intent="stop_interview", followup_allowed=False,
@@ -282,15 +327,16 @@ def test_end_interview_in_supplement_reply_preserves_answer_and_stops_whole_inte
     monkeypatch.setattr(MockProvider, "invoke", semantic_reply)
 
     async def scenario():
-        async with _automatic_session(tmp_path, monkeypatch, [_TECHNICAL, stop, ""], spoken_confirmation=True) as (store, runtime, channel, managed):
+        async with _automatic_session(tmp_path, monkeypatch, [_TECHNICAL, stop, "", "", "确定结束面试。", ""], spoken_confirmation=True) as (store, runtime, channel, managed):
             _add_next_question(store)
             _playable_speech(runtime)
-            await _answer_and_confirm(runtime, channel, managed)
+            endpoint, clock = await _answer_and_confirm(runtime, channel, managed)
+            await _confirm_pending_exit(runtime, channel, managed, clock)
             await _wait_until(lambda: bool(_current(runtime).get("candidate_input_completed_at")), timeout=5)
             await _wait_until(lambda: all(c["status"] == "completed" for c in store.evidence_commands.values()))
             session = _current(runtime)
-            _assert_one_automatic_answer(store, runtime, _TECHNICAL + stop, voice_frames=5, continuation_frames=5)
-            assert session["turns"][0]["current_understanding"]["prompt_version"] == "interview_turn_decision.v22"
+            _assert_one_automatic_answer(store, runtime, _TECHNICAL + stop + "确定结束面试。", voice_frames=5, continuation_frames=10)
+            assert session["turns"][0]["current_understanding"]["prompt_version"] == "interview_turn_decision.v88"
             assert session["turns"][0]["current_understanding"]["turn_intent"] == "stop_interview"
             assert session.get("candidate_input_completion_reason") == "candidate_requested"
             assert session["turns"][0]["current_understanding"]["claims"][0]["claim"] == _TECHNICAL
@@ -312,6 +358,8 @@ def test_technical_body_is_still_an_answer_after_spoken_no(tmp_path, monkeypatch
             _assert_one_automatic_answer(store, runtime, _TECHNICAL + "没有补充了。", voice_frames=5, continuation_frames=5)
             understanding = _current(runtime)["turns"][0]["current_understanding"]
             assert understanding["intent"] == "answer"
+            assert understanding["turn_intent"] == "finish_answer" and understanding["followup_allowed"]
+            assert understanding["completion_basis"]["evidence_quotes"] == ["没有补充了。"]
             assert [claim["claim"] for claim in understanding["claims"]] == [_TECHNICAL]
             assert understanding["evidence_quotes"] == [_TECHNICAL]
             assert _current(runtime)["current_turn_id"] == _NEXT_TURN_ID

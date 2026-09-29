@@ -1,5 +1,27 @@
 # 模型供应商插件化设计
 
+066：当前语义指令v17/v18、理解v50–61、组合v81–92、固定接话v3；增加来源绑定的未核实内容收尾及具体安全诊断。DashScope/网关/ContinuousSTT新增进程内可信撤回事实：仅同流有身份的临时词全部明确撤回、音频排空且服务端完成才接纳empty；已暴露稳定词及旧失败流遗失保护保持。wire Schema不变。详见[066说明](interaction-recovery-066.md)。
+
+065：新增candidate_exit_reply.v1、candidate_exit_confirmation.v1；退出上下文专用理解v46–49/组合v77–80，旧模式版本保持。回复分类8秒/0供应商内部重试，经统一Schema、原文及否定/引用校验，规则只能拒绝而不能授予退出。复用原理解路由及提供方，不改凭据，详见[065说明](candidate-exit-confirmation-065.md)。
+
+064：当前Prompt升级为语义v15/v16、理解v40–45、组合v71–76及接话v6；当前发言范围与明确控制冲突通过集中校验，最多一次纠正，失败返回`semantic_current_speech_conflict`且无结束权限。LiveKit适配器安全回收被撤销的在途join，厂商协议及凭据保持。详见[064说明](conversation-intent-and-end-064.md)。
+
+062：`conversation_reception.v5`提供独立题目/解释锚点及角色历史，接话响应新增受限可选 `repeat_target`，保持统一schema/cross-field验证。OpenAI-compatible JSON/凭据检查/二进制请求均把HTTP402映射为不可自动重试的 `provider_billing_required`；审计仅记录安全原因与402，对外503。实际语音一次首连30秒超时后重试的证据及优化计划见[062说明](multiturn-context-062.md)。
+
+061未更换供应商或音频协议。LiveKit表达适配器增加可选撤轨前通知回调：停止新写入并清空原生队列后，有界等待精确取消通知，再释放track/source/room；正常drained关闭不调用。业务层仅为已发布且授权失效的旧输出发取消，有效授权下的真实供应商/传输失败继续原错误处理，详见[061说明](first-question-audio-061.md)。
+
+## 060 · 可选追问修复合同
+
+组合决策更新为`interview_turn_decision.v65–v70`，独立追问为`controlled_followup.v6`，新增`controlled_followup_repair.v1`；理解v36–v39、语义v13/v14与接话v4保留。传输Schema将待检提案上限改为600字符以保留已验证理解，业务批准仍不超过180字符且至多一个问号。修复Schema只包含selected/question_text，不准替换证据、目标、理解或安全标记。统一Schema校验与业务门禁均通过才生成act；修复一次、至多3秒、0供应商内部重试/1尝试，共享原决策15秒期限。失败原因保留为固定诊断，不记录敏感模型全文。
+
+总控`interviewer_supervisor.v3`说明按turn_id调用既有只读历史工具，三次总请求预算保持；实际规划审计使用集中版本常量，历史v1/v2仍可读。网关与mock版本矩阵同步，未调整真实路由、供应商凭据、STT或TTS协议。详见[060说明](agent-autonomy-improvements-060.md)。
+
+## 057 理解与追问合同
+
+本轮不增加供应商调用次数或扩大推理预算。语义规则使用`semantic_turn.v9/v10`，当前理解合同`interview_turn_understanding.v28–31`，组合决策`interview_turn_decision.v35–40`，独立追问`controlled_followup.v3`，静音接话文本`conversation_reception_speech.v2`。历史版本白名单和冻结表达继续兼容，不重写已批准act。所有Prompt及Schema仍集中于`app/core/prompt/`。
+
+内容抽取与关闭话题独立；明确技术内容必须保留，即使简短或未覆盖评分点。不可理解的残片先澄清，不能推断拒答。追问提案只聚焦一个缺口，选中与不选中的字段约束分开；仍经统一wire/canonical校验和独立业务门禁，未获批的提案不能播报。静音提示使用集中批准文本，不新开一次LLM推理。
+
 ## 053：有界连续播放
 
 不改变TTS供应商路由或PCM/final合同。服务器每帧并行提交录制音轨与浏览器可靠PCM，共享一次有界授权监视；任一分支异常撤销另一分支，最多一帧在途。浏览器240ms缓冲吸收包抖动并统计欠载；持续慢供给需消除发送瓶颈，不能增加无限缓冲或伪造完成。完整消费者已失败时也回收异常，避免监视器同时撤销造成后台Task异常。详见[053说明](warmup-playback-053.md)。
@@ -931,3 +953,11 @@ conversation_reception.v3明确将考察追问交给正式子题链路；接话�
 ### 056 回答结束语义合同
 
 语义提示升级 `semantic_turn.v5/v6`，对应理解 `interview_turn_understanding.v20–v23` 与组合决策 `interview_turn_decision.v19–v22`；非语义组合决策的细节追问提示升级v23/v24，独立 `controlled_followup.v2`。新枚举 `finish_answer` 仍由集中响应 Schema 与内容校验约束：真实专业回答、置信度门槛、逐字结束证据、允许追问；关闭话题的旧枚举仍禁止追问。补充确认表达升级 `supplement_confirmation.v2`，不再提前承诺“没有补充就进入下一题”。历史版本继续可读，当前调用与诊断使用新版本。
+
+## 2026-09-22 · 059 会话上下文与识别假设
+
+DashScope 的正常 task-finished 在上行音频已排空、从未观察到非空文字时，可以完成一个空识别段，包括空 sentence_begin 占位；一旦曾观察到文字，不能用空结果掩盖丢失。传输失败、缺少正常完成确认和非空假设丢失继续为可恢复错误。只有供应商和统一网关校验通过的结果才能进入后续证据链；空结果不表示答完。协议依据与故障证据见[059改进计划](agent-conversation-improvement-plan-059.md)。
+
+059的`stt.hypothesis_source`是无正文、按句子身份关联的诊断：首次非空假设，以及定稿替换/撤回/任务结束/abort时记录哈希、字符数、版本与区间；中间更新只合并摘要，活跃及近期结束句各最多64条。诊断不作为答案证据，不在PCM帧路径输出，不新增网络等待。缺少稳定句身份的供应商结果不能由日志伪造关联。
+
+最终集中合同为 `semantic_turn.v13/v14`、`interview_turn_understanding.v36–v39`、`interview_turn_decision.v59–v64`、`controlled_followup.v5`、`supplement_reply.v5` 和 `conversation_reception.v4`。输出 Schema 先生成含义再选动作；`semantic_control_contract_invalid` 是固定、无敏感正文的跨字段错误，在日志和既有一次纠正中保持原因，纠正说明仍集中在 Prompt 模块，不增加模型调用次数。历史版本继续可读，非法动作不因重试而绕过校验。

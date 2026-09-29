@@ -386,6 +386,11 @@ class OpenAICompatibleProvider:
 
         if response.status_code == 401 or response.status_code == 403:
             raise ProviderError("provider_auth_failed", "Provider credentials were rejected.", retryable=False)
+        if response.status_code == 402:
+            raise ProviderError(
+                "provider_billing_required", "Provider account billing or quota requires attention.",
+                retryable=False, details={"http_status": 402},
+            )
         if response.status_code == 429:
             raise ProviderError("provider_rate_limited", "Provider rate limited the request.", retryable=True)
         if response.status_code >= 500:
@@ -436,6 +441,11 @@ class OpenAICompatibleProvider:
             raise ProviderError("provider_server_error", "Provider credential validation failed.", retryable=True) from exc
         if response.status_code in {401, 403}:
             raise ProviderError("provider_auth_failed", "Provider credentials were rejected.", retryable=False)
+        if response.status_code == 402:
+            raise ProviderError(
+                "provider_billing_required", "Provider account billing or quota requires attention.",
+                retryable=False, details={"http_status": 402},
+            )
         if response.status_code == 429:
             raise ProviderError("provider_rate_limited", "Provider rate limited credential validation.", retryable=True)
         if response.status_code >= 500:
@@ -480,6 +490,11 @@ class OpenAICompatibleProvider:
             raise ProviderError("provider_server_error", "Provider request failed.", retryable=True) from exc
         if response.status_code in {401, 403}:
             raise ProviderError("provider_auth_failed", "Provider credentials were rejected.", retryable=False)
+        if response.status_code == 402:
+            raise ProviderError(
+                "provider_billing_required", "Provider account billing or quota requires attention.",
+                retryable=False, details={"http_status": 402},
+            )
         if response.status_code == 429:
             raise ProviderError("provider_rate_limited", "Provider rate limited the request.", retryable=True)
         if response.status_code >= 500:

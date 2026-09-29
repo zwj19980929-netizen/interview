@@ -15,13 +15,23 @@ from test_evidence_owner_recovery_integration import ORGANIZATION_ID, TURN_ID, _
 from test_spoken_supplement_integration import _synthetic_tts, _finish_playback
 
 
-def reception_provider(monkeypatch, kind, *, release=None, reply_text=None):
+def reception_provider(monkeypatch, kind, *, release=None, reply_text=None, full_thinking=False):
     original = MockProvider.invoke
     calls = []
 
     async def invoke(provider, capability, request, context):
-        if request.metadata.get("prompt_version") != "conversation_reception.v3":
-            return await original(provider, capability, request, context)
+        if request.metadata.get("prompt_version") != "conversation_reception.v6":
+            response = await original(provider, capability, request, context)
+            version = str(request.metadata.get("prompt_version") or "")
+            if full_thinking and version.startswith(("interview_turn_understanding.", "interview_turn_decision.")):
+                response = response.model_copy(deep=True)
+                data = response.data.get("understanding", response.data)
+                data.update(intent="not_finished", answer_content="none", turn_intent="thinking",
+                            claims=[], covered_point_ids=[], completion_basis=None,
+                            followup_allowed=False, suggested_action="continue_listening")
+                if "followup" in response.data:
+                    response.data["followup"]["selected"] = False
+            return response
         value = json.loads(request.messages[-1].content)
         calls.append(value)
         if release:
@@ -40,12 +50,45 @@ def acts(runtime):
             if event["type"] == "conversation.act.selected"]
 
 
+def test_initial_idle_check_waits_for_main_question_floor_and_never_submits(tmp_path, monkeypatch):
+    from app.domain.interview_agent import FloorOwner
+
+    async def scenario():
+        async with _automatic_session(tmp_path, monkeypatch, [],
+                stable_previews=True, spoken_confirmation=True) as (store, runtime, channel, managed):
+            spoken = _synthetic_tts(runtime)
+            endpoint = managed._answer_endpoint
+            clock = _Clock()
+            endpoint.clock = clock
+            endpoint.candidate_floor_returned()
+            await channel._set_floor(FloorOwner.AGENT, "synthetic_long_question", None)
+            capture_id = managed._capture_id
+            clock.value = 20
+            await asyncio.sleep(.2)
+            assert not acts(runtime) and not spoken
+            await channel._set_floor(FloorOwner.CANDIDATE, "agent_finished", None)
+            clock.value += 14.9
+            await asyncio.sleep(.15)
+            assert not spoken
+            clock.value += .1
+            await _wait_until(lambda: spoken)
+            assert spoken == [RECEPTION_SPEECH["idle_check"]]
+            await _finish_playback(channel, runtime, managed)
+            clock.value += 300
+            await asyncio.sleep(.2)
+            assert len(spoken) == 1 and managed._capture_id == capture_id
+            assert not _current(runtime)["answers"] and managed.chain.is_open
+            assert not [item for item in store.evidence_commands.values() if item["command_type"] == "evidence.seal"]
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("kind,text", [
     ("wait", "稍等。没有。嗯。"), ("presence", "你能听到我说话吗？"),
     ("transcript_correction", "这里的字幕不是我说的。"), ("repeat", "请再说一遍题目。"),
 ])
 def test_request_is_audible_before_answer_review_and_continues_same_capture(tmp_path, monkeypatch, kind, text):
-    calls = reception_provider(monkeypatch, kind)
+    calls = reception_provider(monkeypatch, kind, full_thinking=kind == "wait")
 
     async def scenario():
         async with _automatic_session(tmp_path, monkeypatch, [text, "我继续说。", ""],
@@ -75,16 +118,26 @@ def test_request_is_audible_before_answer_review_and_continues_same_capture(tmp_
             # it must neither delay reception nor commit/switch the question.
             versions = [v["prompt_version"] for v in store.model_invocations
                         if v["purpose"] == "interview_turn_understanding"]
-            assert versions.count("conversation_reception.v3") == 1
+            assert versions.count("conversation_reception.v6") == 1
             await _finish_playback(channel, runtime, managed)
             assert endpoint.confirmation.phase == "listening" and managed.chain.is_open
             clock.value += 30
-            await asyncio.sleep(.2)
-            assert len(spoken) == len(calls) == 1 and not _current(runtime)["answers"]
+            if kind == "wait":
+                await asyncio.sleep(.2)
+                assert len(spoken) == 1
+                assert endpoint.confirmation._reception_review is None
+                assert not endpoint.confirmation._idle_check_allowed
+                assert not endpoint._prepare_failures
+            else:
+                await _wait_until(lambda: len(spoken) == 2, timeout=5)
+                assert spoken[-1] == RECEPTION_SPEECH["idle_check"]
+                await _finish_playback(channel, runtime, managed)
+            assert len(calls) == 1 and not _current(runtime)["answers"]
+            prior_spoken = len(spoken)
             await _feed(managed._ingress, _CONTINUATION, 5)
             clock.value += 1.1
             try:
-                await _wait_until(lambda: len(spoken) == 2, timeout=5)
+                await _wait_until(lambda: len(spoken) == prior_spoken + 1, timeout=5)
             except AssertionError:
                 raise AssertionError(str({"calls": calls, "phase": endpoint.confirmation.phase,
                     "revision": endpoint.revision, "blocked": endpoint._blocked_revision,
@@ -219,7 +272,7 @@ def test_unpreset_interview_request_speaks_generated_reply_while_analysis_is_pen
             spoken = _synthetic_tts(runtime)
             original = MockProvider.invoke
             async def hold_deep_analysis(provider, capability, request, context):
-                if request.purpose == "interview_turn_understanding" and request.metadata.get("prompt_version") != "conversation_reception.v3":
+                if request.purpose == "interview_turn_understanding" and request.metadata.get("prompt_version") != "conversation_reception.v6":
                     analysis_entered.set()
                     await analysis_release.wait()
                 return await original(provider, capability, request, context)
@@ -240,7 +293,7 @@ def test_unpreset_interview_request_speaks_generated_reply_while_analysis_is_pen
                 current = _current(runtime)
                 stored_act = next(item for item in current["turns"][0]["conversation_acts"]
                                   if item["act_id"] == act["act_id"])
-                assert stored_act["prompt_version"] == "conversation_reception.v3"
+                assert stored_act["prompt_version"] == "conversation_reception.v6"
                 assert stored_act["evaluative"] is False
                 assert current["current_turn_id"] == before["current_turn_id"]
                 assert current["turn_ids"] == before["turn_ids"] and not current["answers"]

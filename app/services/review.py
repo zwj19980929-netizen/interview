@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 from app.core.errors import ApiError
 from app.core.ids import new_id
 from app.core.time import utc_now
-from app.domain.scoring_quality import evaluation_answers, project_evaluation, project_report
+from app.domain.scoring_quality import is_unresolved_evaluation, evaluation_answers, project_evaluation, project_report
 from app.domain.speech_quality import transcript_is_verified
 from app.domain.interview_lifecycle import LifecycleCommand, LifecycleCommandType
 from app.file_storage.signing import FileAccessSigner
@@ -384,6 +384,9 @@ class EnterpriseReviewService:
             if interview is None:
                 raise ApiError("INTERVIEW_NOT_FOUND", "Interview does not exist.", status_code=404)
             evaluations = {item["id"]: item for item in interview.get("evaluation_revisions", [])}
+            if any(is_unresolved_evaluation(evaluations.get(answer.get("current_evaluation_id")) or {})
+                   for answer in interview.get("answers", [])):
+                raise ApiError("REVIEW_EVIDENCE_UNRESOLVED", "部分回答的转写仍待核实，请先回听录音、核验转写并完成重评，再完成复核。", status_code=409)
             if any(answer.get("evaluation_status") != "completed"
                 or (evaluation := evaluations.get(answer.get("current_evaluation_id"))) is None
                 or project_evaluation(evaluation, evaluation_answers(interview, evaluation))["score"] is None

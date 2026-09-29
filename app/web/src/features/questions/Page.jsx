@@ -70,9 +70,15 @@ function KnowledgeBaseDetail({ API, data, request, navigate, reloadRoute, openMo
   const [playingId, setPlayingId] = useState("");
   const [speechAction, setSpeechAction] = useState("");
   const playerRef = useRef(null);
+  const previewRequestRef = useRef(0);
   const speechActionRef = useRef("");
   const currentBuild = data.speechBuilds[0];
   const speechBuildActive = currentBuild && ["queued", "pending", "running"].includes(currentBuild.status);
+  useEffect(() => () => {
+    previewRequestRef.current += 1;
+    playerRef.current?.pause();
+    playerRef.current = null;
+  }, []);
   useEffect(() => {
     if (!speechBuildActive) return undefined;
     const timer = window.setTimeout(() => {
@@ -175,18 +181,37 @@ function KnowledgeBaseDetail({ API, data, request, navigate, reloadRoute, openMo
       await finish("题目已删除", "题目已从当前题库移除，历史面试记录和旧语音资产保持不变");
     }}><div className="delete-warning field-full"><strong>从当前题库移除“{item.title}”？</strong><p>该题不会再参与后续面试计划；历史面试快照不会被删除。</p></div></ModalForm>,
   });
+  const stopPreview = () => {
+    previewRequestRef.current += 1;
+    const player = playerRef.current;
+    playerRef.current = null;
+    if (player) {
+      player.onended = null;
+      player.onerror = null;
+      player.pause();
+      player.currentTime = 0;
+    }
+    setPlayingId("");
+  };
   const previewQuestion = async (item) => {
+    if (playingId === item.id) {
+      stopPreview();
+      return;
+    }
+    stopPreview();
+    const requestId = previewRequestRef.current;
+    setPlayingId(item.id);
     try {
-      playerRef.current?.pause();
       const access = await request(`${API}/question-speech-assets/${encodeURIComponent(item.speech_asset_id)}/content-url`, { method: "POST" });
+      if (requestId !== previewRequestRef.current) return;
       const player = new Audio(access.url);
       playerRef.current = player;
-      setPlayingId(item.id);
-      player.onended = () => setPlayingId("");
-      player.onerror = () => { setPlayingId(""); toast("试听失败", "浏览器无法播放该语音格式", "error"); };
+      player.onended = () => { if (playerRef.current === player) stopPreview(); };
+      player.onerror = () => { if (playerRef.current === player) { stopPreview(); toast("试听失败", "浏览器无法播放该语音格式", "error"); } };
       await player.play();
     } catch (error) {
-      setPlayingId("");
+      if (requestId !== previewRequestRef.current) return;
+      stopPreview();
       const message = error.code === "QUESTION_SPEECH_PREVIEW_UNAVAILABLE"
         ? "当前是开发模拟语音，没有实际音频。请点击页面顶部“配置语音”，选择已测试通过的语音模型和声音。"
         : error.code === "QUESTION_SPEECH_ASSET_NOT_PRIVATE"
@@ -247,7 +272,7 @@ function KnowledgeBaseDetail({ API, data, request, navigate, reloadRoute, openMo
       const preview = item.speech_preview || {};
       const canPreview = speechStatus === "ready" && Boolean(item.speech_asset_id) && preview.available !== false;
       const retrying = speechAction === `question:${item.id}`;
-      return <tr key={item.id}><td><strong>{item.title}</strong><small className="cell-subtitle">{item.skills?.join(" · ")}</small></td><td>{item.difficulty}</td><td><Status value={item.validation_status} /></td><td><Status value={speechStatus} />{!canPreview && preview.message && <small className="cell-subtitle">{preview.message}</small>}</td><td><div className="table-actions"><button className="button button-secondary button-small" onClick={() => previewQuestion(item)} disabled={!canPreview} title={canPreview ? "播放读题语音" : preview.message || "语音尚未准备好"}>{playingId === item.id ? "播放中…" : "试听"}</button>{speechStatus === "failed" && <button className="button button-primary button-small button-with-spinner" onClick={() => regenerateQuestion(item)} disabled={Boolean(speechAction)} aria-busy={retrying}>{retrying && <span className="spinner" />}{retrying ? "重新生成中…" : "重新生成"}</button>}<button className="button button-secondary button-small" onClick={() => details(item)}>查看</button><button className="button button-secondary button-small" onClick={() => editQuestion(item)}>编辑</button><button className="button button-danger button-small" onClick={() => deleteQuestion(item)}>删除</button></div></td></tr>;
+      return <tr key={item.id}><td><strong>{item.title}</strong><small className="cell-subtitle">{item.skills?.join(" · ")}</small></td><td>{item.difficulty}</td><td><Status value={item.validation_status} /></td><td><Status value={speechStatus} />{!canPreview && preview.message && <small className="cell-subtitle">{preview.message}</small>}</td><td><div className="table-actions"><button className="button button-secondary button-small" onClick={() => previewQuestion(item)} disabled={!canPreview && playingId !== item.id} title={playingId === item.id ? "停止试听读题语音" : canPreview ? "播放读题语音" : preview.message || "语音尚未准备好"}>{playingId === item.id ? "停止试听" : "试听"}</button>{speechStatus === "failed" && <button className="button button-primary button-small button-with-spinner" onClick={() => regenerateQuestion(item)} disabled={Boolean(speechAction)} aria-busy={retrying}>{retrying && <span className="spinner" />}{retrying ? "重新生成中…" : "重新生成"}</button>}<button className="button button-secondary button-small" onClick={() => details(item)}>查看</button><button className="button button-secondary button-small" onClick={() => editQuestion(item)}>编辑</button><button className="button button-danger button-small" onClick={() => deleteQuestion(item)}>删除</button></div></td></tr>;
     })}</tbody></table></div> : <Empty title={query ? "没有匹配题目" : "题库中还没有题目"} copy={query ? "换一个关键词试试" : "点击“新建题目”建立第一道题"} />}
   </>;
 }

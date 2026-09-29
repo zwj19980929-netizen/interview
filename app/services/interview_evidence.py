@@ -9,6 +9,8 @@ duplicating the candidate's in-flight answer.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
@@ -18,6 +20,8 @@ from app.persistence.interface import Persistence
 from app.persistence.provider import persistence_for
 from app.services.streaming_stt import StreamingInterviewSTT
 from app.services.warmup_calibration import WarmupCalibrationStream
+
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -69,6 +73,7 @@ class InterviewEvidenceChain:
         self._finishing = False
         self._input_revoked = False
         self._lock = asyncio.Lock()
+        self._pending_reception_exchange = None
 
     @property
     def is_open(self) -> bool:
@@ -215,6 +220,10 @@ class InterviewEvidenceChain:
         return self._stt is not None and self._stt.recovery_required
 
     @property
+    def recovery_origin(self) -> Any:
+        return self._stt.recovery_origin if self._stt is not None else None
+
+    @property
     def recovery_error(self) -> Any:
         return self._stt.recovery_error if self._stt is not None else None
 
@@ -229,6 +238,104 @@ class InterviewEvidenceChain:
     def checkpoint_incomplete(self) -> Any:
         return self._stt.checkpoint_incomplete() if self._stt is not None else None
 
+    def stage_reception_exchange(self, final: Any, request_text: str, kind: str) -> Any:
+        """Stage authoritative words; a preview or an approval is not a dialogue receipt."""
+        self._pending_reception_exchange = None
+        stream = self._stt
+        if stream is None or self._input_revoked:
+            raise ApiError("TURN_DECISION_STALE", "Capture changed.", status_code=409)
+        if (getattr(final, "type", None) != "transcript.final" or not getattr(final, "is_final", False)
+                or not request_text.strip() or not final.text.strip().endswith(request_text.strip())):
+            raise ValueError("Reception history requires fresh complete server speech")
+        stream._assert_commit_allowed()
+        try:
+            with self.persistence.transaction(self.organization_id, read_only=True) as tx:
+                session = tx.interview_sessions.get(self.interview_id)
+        except Exception as exc:
+            # Optional memory must not replace the expression's own durable
+            # authorization checks, nor prevent an otherwise valid response.
+            _LOG.warning("Reception memory unavailable: stage=read error_type=%s", type(exc).__name__)
+            return None
+        if not session or session.get("current_turn_id") != self.turn_id or session.get("status") != "in_progress":
+            raise ApiError("TURN_DECISION_STALE", "Interview changed.", status_code=409)
+        sequence = max((event.get("session_sequence", 0) for event in session.get("agent_events", [])
+                        if type(event.get("session_sequence")) is int), default=0)
+        token = {"stream": stream, "turn_id": self.turn_id, "after_sequence": sequence,
+                 "request_text": request_text.strip(), "kind": kind,
+                 "source_stream_id": final.stream_id}
+        self._pending_reception_exchange = token
+        return token
+
+    def discard_reception_exchange(self, token: Any) -> None:
+        if token is self._pending_reception_exchange:
+            self._pending_reception_exchange = None
+
+    def record_reception_exchange(self, *, performance_id: str, guard: Callable[[], None]) -> bool:
+        """Pair a live request with an exact selected response, never with a later output.
+
+        This small memory is not an utterance, an answer, or proof of audible
+        playback. Stale input can safely skip it; it cannot fail the interview.
+        """
+        staged = self._pending_reception_exchange
+        if (staged is None or self._input_revoked or self._stt is not staged["stream"]
+                or self.turn_id != staged["turn_id"]):
+            self.discard_reception_exchange(staged)
+            return False
+        try:
+            guard()
+            self._stt._assert_commit_allowed()
+            with self.persistence.transaction(self.organization_id) as tx:
+                if self.commit_fence is not None:
+                    from app.services.evidence_coordination import assert_current_evidence_fence
+                    assert_current_evidence_fence(tx, self.commit_fence)
+                session = tx.interview_sessions.get(self.interview_id)
+                if not session:
+                    return False
+                state = session.get("agent_runtime") or {}
+                if (session.get("status") != "in_progress" or session.get("current_turn_id") != self.turn_id
+                        or state.get("floor") == "human" or (state.get("takeover") or {}).get("status") == "active"
+                        or state.get("active_performance_id") != performance_id):
+                    return False
+                selected = next((event for event in reversed(session.get("agent_events", []))
+                                 if event.get("type") == "conversation.act.selected"), None)
+                if (selected is None or selected.get("turn_id") != self.turn_id
+                        or type(selected.get("session_sequence")) is not int
+                        or selected["session_sequence"] <= staged["after_sequence"]
+                        or not selected.get("event_id")
+                        or (state.get("active_expression_act_event_id") is not None
+                            and state["active_expression_act_event_id"] != selected["event_id"])):
+                    return False
+                turn = next((item for item in session.get("turns", []) if item.get("id") == self.turn_id), None)
+                payload = selected.get("payload") or {}
+                act = next((item for item in (turn or {}).get("conversation_acts", [])
+                            if item.get("act_id") == payload.get("act_id") and item.get("turn_id") == self.turn_id), None)
+                if (not turn or not act or payload.get("approved") is not True
+                        or not act.get("text") or payload.get("text") != act["text"]):
+                    return False
+                exchanges = turn.setdefault("reception_exchanges", [])
+                if any(item.get("selected_event_id") == selected["event_id"] for item in exchanges):
+                    return False
+                request = staged["request_text"]
+                digest = hashlib.sha256(request.encode("utf-8")).hexdigest()
+                exchanges.append({"exchange_id": "reception_" + hashlib.sha256(
+                    (selected["event_id"] + digest).encode()).hexdigest()[:24],
+                    "request_text": request[-1600:], "request_sha256": digest,
+                    "act_id": act["act_id"], "selected_event_id": selected["event_id"],
+                    "session_sequence": selected["session_sequence"], "created_at": selected.get("occurred_at", ""),
+                    "source_stream_id": staged["source_stream_id"], "kind": staged["kind"]})
+                del exchanges[:-6]
+                tx.interview_sessions.update(session, expected_version=session["version"])
+            return True
+        except ApiError:
+            return False
+        except Exception as exc:
+            # Selection/playback already happened. A failed optional receipt
+            # cannot reopen echo intake or make the endpoint repeat its words.
+            _LOG.warning("Reception memory unavailable: stage=write error_type=%s", type(exc).__name__)
+            return False
+        finally:
+            self.discard_reception_exchange(staged)
+
     async def classify_reception(self, text: str, *, phase: str, preceding_text: str = "") -> Any:
         stream = self._stt
         if stream is None or self._input_revoked:
@@ -240,31 +347,58 @@ class InterviewEvidenceChain:
         # free speech. Never pass whole turns, rubrics or assessment answers.
         from app.services.dialogue_history import recent_turn_dialogue
         history = []
-        for prior in session.get("turns", [])[-2:]:
-            history.extend({"role": item["speaker"], "text": item["text"]}
-                           for item in recent_turn_dialogue(session, prior))
+        turns = session.get("turns", [])
+        current_index = next(index for index, item in enumerate(turns) if item["id"] == self.turn_id)
+        for prior in turns[max(0, current_index - 1):current_index + 1]:
+            history.extend({"role": item["speaker"], **{key: value for key, value in item.items() if key != "speaker"}}
+                           for item in recent_turn_dialogue(session, prior, max_acts=6))
         plan = session.get("plan_snapshot") or {}
         facts = {"duration_minutes": plan.get("duration_minutes"),
                  "completed_topics": len({item.get("root_turn_id") or item.get("id") for item in session.get("turns", [])
                      if any(answer.get("turn_id") == item.get("id") for answer in session.get("answers", []))})}
         skill = stream.interviews.supervisor.load_skill(session)
-        from app.services.dialogue_focus import question_for_repeat
+        from app.services.dialogue_focus import question_for_repeat, clarification_for_repeat
+        root = next((item for item in session.get("turns", []) if item["id"] == turn.get("root_turn_id")), turn)
         result = await stream.interviews.conversation.classify_reception(text, self.organization_id,
             phase=phase, preceding_text=preceding_text,
-            history=history[-4:], process_facts=facts, skill_instructions=skill.get("instructions", ""),
-            question=question_for_repeat(turn))
+            history=history[-16:], process_facts=facts, skill_instructions=skill.get("instructions", ""),
+            question=question_for_repeat(turn), current_question=question_for_repeat(turn),
+            root_question=question_for_repeat(root), last_clarification=clarification_for_repeat(turn),
+            current_turn_id=turn["id"], root_turn_id=root["id"], parent_turn_id=turn.get("parent_turn_id"))
         if stream is not self._stt or self._input_revoked:
             raise ApiError("TURN_DECISION_STALE", "Capture changed.", status_code=409)
         stream._assert_commit_allowed()
         return result
 
-    async def classify_supplement_reply(self, reply: str) -> Any:
-        if self._stt is None or self._input_revoked:
+    async def classify_supplement_reply(self, reply: str, *, prior_confirmation: bool = False,
+                                        preceding_text: str = "", question: str = "") -> Any:
+        stream = self._stt
+        if stream is None or self._input_revoked:
             raise ApiError("AGENT_EVIDENCE_NOT_OPEN", "Evidence is not open.", status_code=409)
-        return await self._stt.interviews.conversation.classify_supplement_reply(reply, self.organization_id)
+        stream._assert_commit_allowed()
+        result = await stream.interviews.conversation.classify_supplement_reply(
+            reply, self.organization_id, prior_confirmation=prior_confirmation,
+            preceding_text=preceding_text, question=question,
+        )
+        if stream is not self._stt or self._input_revoked:
+            raise ApiError("TURN_DECISION_STALE", "Capture changed.", status_code=409)
+        stream._assert_commit_allowed()
+        return result
+
+    async def classify_exit_reply(self, reply: str) -> Any:
+        stream = self._stt
+        if stream is None or self._input_revoked:
+            raise ApiError("AGENT_EVIDENCE_NOT_OPEN", "Evidence is not open.", status_code=409)
+        stream._assert_commit_allowed()
+        result = await stream.interviews.conversation.classify_exit_reply(reply, self.organization_id)
+        if stream is not self._stt or self._input_revoked:
+            raise ApiError("TURN_DECISION_STALE", "Capture changed.", status_code=409)
+        stream._assert_commit_allowed()
+        return result
 
     async def prepare_decision(self, final: Any, *, completion_confirmed: bool = False,
-                               semantic_first: bool = False) -> Any:
+                               semantic_first: bool = False, exit_confirmation: Any = None,
+                               content_clarification: Any = None) -> Any:
         if self._stt is None:
             raise ApiError("AGENT_EVIDENCE_NOT_OPEN", "Evidence is not open.", status_code=409)
         # Preview itself is cheap and read-only; seal a durable, incomplete
@@ -281,6 +415,8 @@ class InterviewEvidenceChain:
             snapshot_ref=snapshot_ref,
             completion_confirmed=completion_confirmed,
             semantic_first=semantic_first,
+            exit_confirmation=exit_confirmation,
+            content_clarification=content_clarification,
         )
 
     async def finish(self, payload: Dict[str, Any], *, prepared_decision: Any = None,

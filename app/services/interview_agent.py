@@ -7,6 +7,7 @@ takeover. WebSocket handlers and React are intentionally thin adapters.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
@@ -59,10 +60,13 @@ from app.services.media_capture import InterviewMediaCaptureService
 from app.services.streaming_stt import StreamingInterviewSTT
 from app.services.warmup_calibration import WarmupCalibrationStream
 from app.domain.candidate_runtime import CANDIDATE_RUNTIME_PROBLEM_REASONS, runtime_pause_epoch
-from app.services.speech_output_interruption import revoke_active_performance
+from app.services.speech_output_interruption import revoke_active_performance, notify_performance_interrupted
 
 
 _CLOSE = object()
+_LOG = logging.getLogger(__name__)
+_COMPLETION_RECORDING_TIMEOUT = 2.0
+_COMPLETION_PREPARATION_TIMEOUT = 4.0
 _AGENT_QUEUE_CAPACITY = 2048
 _DURABLE_EVIDENCE_SIGNALS = {
     "evidence.stream.open",
@@ -112,6 +116,14 @@ class _AgentChannelHub:
         values.discard(channel)
         if not values:
             self._channels.pop(key, None)
+
+    def has_subscribers(self, interview_id: str, organization_id: str) -> bool:
+        return any(
+            not channel._closed and not channel._terminating
+            for (_, tenant, session_id), channels in self._channels.items()
+            if tenant == organization_id and session_id == interview_id
+            for channel in channels
+        )
 
     async def publish(
         self,
@@ -267,6 +279,7 @@ class AgentChannel:
         self._endpoint_task: Optional[asyncio.Task[None]] = None
         self._planning_task: Optional[asyncio.Task[None]] = None
         self._completion_task: Optional[asyncio.Task[None]] = None
+        self._completion_evidence_cleanup_task: Optional[asyncio.Task[None]] = None
         self._stt: Optional[StreamingInterviewSTT] = None
         self._warmup: Optional[WarmupCalibrationStream] = None
         self._evidence_session: Optional[ManagedLiveKitEvidenceSession] = None
@@ -331,11 +344,15 @@ class AgentChannel:
                     interview_id=self.interview_id,
                 )
             )
-        await self._queue_fresh_snapshot()
+        fresh_snapshot = await self._queue_fresh_snapshot()
         # Do not expose the channel to live fan-out until its ordered recovery
         # stream and fresh role-projected snapshot have been queued. None of
         # the operations above yields, so a live event cannot overtake them.
         _AGENT_CHANNEL_HUB.register(self)
+        # The cursor is shared across API/worker instances. Publish this
+        # checkpoint to remote peers too, after local recovery registration so
+        # an awaited Redis write cannot open a local initialization gap.
+        await _AGENT_CHANNEL_HUB.publish_cross_instance(self, fresh_snapshot)
         takeover = runtime_state.get("takeover")
         if takeover:
             self._schedule_takeover_watchdog(takeover)
@@ -343,6 +360,7 @@ class AgentChannel:
             "candidate" in self.principal.roles
             and self.runtime.evidence_ingress.enabled
             and session.get("status") == "in_progress"
+            and not session.get("candidate_input_completed_at")
         ):
             try:
                 self._evidence_session = await self.runtime.evidence_ingress.attach(
@@ -473,6 +491,9 @@ class AgentChannel:
                     if failure is None:
                         failure = exc
         try:
+            cleanup = self._completion_evidence_cleanup_task
+            if cleanup is not None and cleanup is not asyncio.current_task():
+                await asyncio.gather(cleanup, return_exceptions=True)
             if self._evidence_session is not None:
                 evidence_session = self._evidence_session
                 self._evidence_session = None
@@ -601,7 +622,7 @@ class AgentChannel:
             session = self.runtime.interviews.get_interview(
                 self.interview_id, self.organization_id
             )
-            if session.get("status") != "in_progress":
+            if session.get("status") != "in_progress" or session.get("candidate_input_completed_at"):
                 # 暂停或已完成会话仍允许只读重连查看状态，但不能重新触发开场。
                 await self._emit_snapshot(signal.causation_id)
                 return
@@ -1273,27 +1294,44 @@ class AgentChannel:
                     terminal_takeover,
                     self.organization_id,
                 )
-            await self.runtime.media_captures.stop_for_interview(
-                self.interview_id,
-                actor_id=self.principal.actor_id,
-                organization_id=self.organization_id,
-            )
-            if stop_evidence_session and self._evidence_session is not None:
-                await self._evidence_session.stop("interview_completed")
-                self._evidence_session = None
+            try:
+                await asyncio.wait_for(self.runtime.media_captures.stop_for_interview(
+                    self.interview_id,
+                    actor_id=self.principal.actor_id,
+                    organization_id=self.organization_id,
+                ), timeout=_COMPLETION_RECORDING_TIMEOUT)
+            except Exception as exc:
+                # Candidate input is already sealed. Keep recording failures
+                # visible and ensure unsettled captures have durable work;
+                # neither condition can withdraw the completion receipt.
+                _LOG.warning("Completion recording cleanup unavailable: error_type=%s", type(exc).__name__)
+                try:
+                    self.runtime.media_captures.request_finalization(
+                        self.interview_id, actor_id=self.principal.actor_id,
+                        organization_id=self.organization_id,
+                    )
+                except Exception as retry_exc:
+                    _LOG.warning("Completion recording recovery unavailable: error_type=%s", type(retry_exc).__name__)
+            # Keep the original Evidence owner through farewell preparation.
+            # Releasing it here invalidated closing_is_current and prevented
+            # both the farewell and receipt. All callers release it after the
+            # receipt, including managed callers while scoring is still queued.
             if not closing_is_current():
                 return
-            performance = await self._select_act(
-                act_type="closing",
-                text=(
-                    "本次面试已经完成，感谢你的时间。你的回答已按同意范围提交，"
-                    "后续将由企业人员进行最终审核。再见。"
-                ),
-                turn_id=None,
-                causation_id=causation_id,
-                evidence_refs=[],
-                gesture="farewell",
-            )
+            try:
+                performance = await asyncio.wait_for(self._select_act(
+                    act_type="closing",
+                    text=(
+                        "本次面试已经完成，感谢你的时间。你的回答已按同意范围提交，"
+                        "后续将由企业人员进行最终审核。再见。"
+                    ),
+                    turn_id=None,
+                    causation_id=causation_id,
+                    evidence_refs=[],
+                    gesture="farewell",
+                ), timeout=_COMPLETION_PREPARATION_TIMEOUT)
+            except asyncio.TimeoutError:
+                performance = None
             # None can mean lost authority, not merely unavailable TTS. A
             # paused/replaced owner must not mint a completion receipt or arm
             # a timer after its delayed farewell result returns.
@@ -1383,14 +1421,45 @@ class AgentChannel:
         if not self.runtime._mark_completion_emitted(
             self.interview_id, reason, self.organization_id
         ):
+            self._schedule_completion_evidence_cleanup()
             return
-        await self._emit(
-            "completed",
-            self.runtime._completion_receipt(session),
-            causation_id=causation_id,
-            replayability=Replayability.REPLAYABLE,
-        )
-        await self._set_floor(FloorOwner.NONE, "completed", causation_id)
+        # Capture the owner before publishing the receipt: the browser closes
+        # its control connection immediately on receipt, which can detach it.
+        self._schedule_completion_evidence_cleanup()
+        try:
+            await self._emit(
+                "completed",
+                self.runtime._completion_receipt(session),
+                causation_id=causation_id,
+                replayability=Replayability.REPLAYABLE,
+            )
+            await self._set_floor(FloorOwner.NONE, "completed", causation_id)
+        finally:
+            self._schedule_completion_evidence_cleanup()
+
+    def _schedule_completion_evidence_cleanup(self) -> None:
+        evidence = self._evidence_session
+        running = self._completion_evidence_cleanup_task
+        if evidence is None or (running is not None and not running.done()):
+            return
+
+        async def release() -> None:
+            # Completion can be emitted from the presentation task itself.
+            # Wait for it to return before stop() cancels presentation work.
+            presentation = evidence._presentation_task
+            if presentation is not None and not presentation.done():
+                await asyncio.gather(asyncio.shield(presentation), return_exceptions=True)
+            if self._evidence_session is not evidence:
+                return
+            try:
+                await evidence.stop("interview_completed")
+            except Exception as exc:
+                _LOG.warning("Completion Evidence cleanup unavailable: error_type=%s", type(exc).__name__)
+            else:
+                if self._evidence_session is evidence:
+                    self._evidence_session = None
+
+        self._completion_evidence_cleanup_task = asyncio.create_task(release())
 
     async def _project_warmup_event(
         self, raw: Dict[str, Any], causation_id: Optional[str]
@@ -1423,15 +1492,36 @@ class AgentChannel:
 
     async def _confirm_warmup(self, signal: ClientSignal) -> None:
         self.runtime._require_candidate(self.principal)
-        session = self.runtime.interviews.get_interview(
-            self.interview_id, self.organization_id
+        evidence_session = self._evidence_session
+        expected_turn_id = self._require_active_interview().get("current_turn_id")
+
+        def awaiting_confirmation():
+            if self._closed or self._terminating or self._evidence_session is not evidence_session:
+                raise ApiError("EVIDENCE_CONTROL_STALE", "The confirming controller is no longer attached.", status_code=409)
+            current = self._require_active_interview()
+            if evidence_session is not None:
+                evidence_session.assert_controller(self)
+            if (current.get("current_turn_id") != expected_turn_id
+                    or (current.get("agent_runtime") or {}).get("calibration_status") != "awaiting_confirmation"):
+                raise ApiError(
+                    "WARMUP_CONFIRMATION_NOT_EXPECTED",
+                    "There is no warm-up transcript awaiting confirmation.",
+                    status_code=409,
+                )
+            return current
+
+        session = awaiting_confirmation()
+        # Transcript confirmation may arrive before its spoken invitation has
+        # drained. Revoke that exact trial output before recording or planning
+        # changes its authority; otherwise the browser sees an unexplained
+        # removed track and pauses the interview as a connection failure.
+        performance_id = (session.get("agent_runtime") or {}).get("active_performance_id")
+        await revoke_active_performance(
+            self, performance_id, reason="warmup_confirmed", causation_id=signal.causation_id,
         )
-        if (session.get("agent_runtime") or {}).get("calibration_status") != "awaiting_confirmation":
-            raise ApiError(
-                "WARMUP_CONFIRMATION_NOT_EXPECTED",
-                "There is no warm-up transcript awaiting confirmation.",
-                status_code=409,
-            )
+        if performance_id:
+            await self._cancel_speech_output(expected_performance_id=performance_id)
+        session = awaiting_confirmation()
         settings = session.get("settings") or {}
         if bool(settings.get("record_audio", True) or settings.get("record_video", False)):
             # This call is the formal recording boundary. A required capture
@@ -1442,6 +1532,10 @@ class AgentChannel:
                 actor_id=self.principal.actor_id,
                 organization_id=self.organization_id,
             )
+            # Pause, retry, or control replacement can win while the recorder
+            # starts. A stale confirmation must not complete calibration or
+            # schedule a question on behalf of its successor.
+            awaiting_confirmation()
             if capture.get("status") != "recording":
                 self.runtime.interviews.pause_interview(
                     self.interview_id,
@@ -1484,9 +1578,7 @@ class AgentChannel:
 
     async def _retry_warmup(self, signal: ClientSignal) -> None:
         self.runtime._require_candidate(self.principal)
-        session = self.runtime.interviews.get_interview(
-            self.interview_id, self.organization_id
-        )
+        session = self._require_active_interview()
         status = (session.get("agent_runtime") or {}).get("calibration_status")
         if status not in {"awaiting_confirmation", "listening", "retrying"}:
             raise ApiError(
@@ -1497,9 +1589,21 @@ class AgentChannel:
         if self._evidence_session is not None:
             await self._evidence_session.dispatch(self, signal)
             return
-        elif self._warmup:
+        performance_id = (session.get("agent_runtime") or {}).get("active_performance_id")
+        await revoke_active_performance(
+            self, performance_id, reason="warmup_retry", causation_id=signal.causation_id,
+        )
+        if performance_id:
+            await self._cancel_speech_output(expected_performance_id=performance_id)
+        session = self._require_active_interview()
+        if (session.get("agent_runtime") or {}).get("calibration_status") not in {
+            "awaiting_confirmation", "listening", "retrying",
+        }:
+            raise ApiError("WARMUP_RETRY_NOT_ALLOWED", "Warm-up is no longer retryable.", status_code=409)
+        if self._warmup:
             await self._warmup.abort()
             self._warmup = None
+            self._require_active_interview()
         self.runtime._set_calibration(
             self.interview_id,
             "retrying",
@@ -1828,10 +1932,22 @@ class AgentChannel:
         if act_type == "question":
             session = self.runtime.interviews.get_interview(self.interview_id, self.organization_id)
             key = (session.get("agent_runtime") or {}).get("next_transition_key", "none")
-            previous = next((item for item in reversed(session.get("turns", []))
-                             if item["id"] != turn["id"] and item.get("current_understanding")), None)
-            if (previous or {}).get("current_understanding", {}).get("intent") == "answer_declined":
+            turns = session.get("turns", [])
+            current_index = next((index for index, item in enumerate(turns)
+                                  if item["id"] == turn["id"]), 0)
+            answered = {item.get("turn_id") for item in session.get("answers", [])}
+            # A transition acknowledges the immediately preceding submitted
+            # answer. Do not search past an answer with no understanding, or
+            # into future turns retained by a fixed plan, for an old refusal.
+            previous = next((item for item in reversed(turns[:current_index])
+                             if item["id"] in answered), None)
+            if ((previous or {}).get("current_understanding") or {}).get("intent") == "answer_declined":
                 key = "declined"
+            elif key == "declined":
+                # A planner can carry a historical refusal into its proposed
+                # wording even after a substantive answer. Keep the topic
+                # transition without attributing another refusal to the user.
+                key = "change_topic"
             prefix = transition_speech(key)
             if len(prefix + text) <= 1000:
                 text = prefix + text
@@ -1981,12 +2097,23 @@ class AgentChannel:
                         raise ApiError("AGENT_SPEECH_OUTPUT_STALE", "Approved speech is no longer current.", status_code=409)
 
                 output = None
+                async def before_stream_abort() -> None:
+                    # Native SDK errors can abort before _run_speech_output
+                    # observes them. Only revoked, already-selected output is
+                    # a control interruption; current transport failures retain
+                    # their existing fatal/problem handling.
+                    if (output is None or output.playback_drained
+                            or expected_performance_id != stream_performance_id or expression_is_current()):
+                        return
+                    await notify_performance_interrupted(self, stream_performance_id, reason="stale_output",
+                        turn_id=turn_id, causation_id=causation_id)
                 if (isinstance(self._evidence_session, ManagedLiveKitEvidenceSession)
                         and act_type != "closing"):
                     output = await self.runtime._open_streamed_expression(
                         self.interview_id, turn_id, text, self.organization_id,
                         performance_id=stream_performance_id,
                         assert_current=assert_stream_current,
+                        before_abort=before_stream_abort,
                     )
                 if output is not None:
                     try:
@@ -2058,6 +2185,14 @@ class AgentChannel:
             )
         except Exception as exc:
             if not expression_is_current():
+                return None
+            if act_type == "closing" and (
+                initial_session.get("candidate_input_completed_at")
+                or initial_session.get("status") in {"completed", "report_generating", "report_ready"}
+            ):
+                # Failure of optional farewell speech cannot pause an already
+                # completed conversation or suppress its durable receipt.
+                _LOG.warning("Completion speech unavailable: error_type=%s", type(exc).__name__)
                 return None
             await self._problem(exc, turn_id=turn_id, causation_id=causation_id)
             # Publishing the problem can yield to a new act or a takeover.
@@ -2339,6 +2474,12 @@ class AgentChannel:
         session = self.runtime.interviews.get_interview(
             self.interview_id, self.organization_id
         )
+        if session.get("candidate_input_completed_at"):
+            raise ApiError(
+                "CANDIDATE_INPUT_COMPLETED",
+                "Candidate input has already ended.",
+                status_code=409,
+            )
         if session.get("status") != "in_progress":
             raise ApiError(
                 "INTERVIEW_NOT_IN_PROGRESS",
@@ -2371,7 +2512,7 @@ class AgentChannel:
             replayability=Replayability.TRANSIENT,
         )
 
-    async def _queue_fresh_snapshot(self) -> None:
+    async def _queue_fresh_snapshot(self) -> AgentEvent:
         event = self.runtime._append_event(
             self.interview_id,
             "session.snapshot",
@@ -2388,6 +2529,11 @@ class AgentChannel:
                 interview_id=self.interview_id,
             )
         )
+        # A private checkpoint still consumes a shared session sequence.
+        # Existing peers must receive it with their own role projection;
+        # otherwise opening a monitor makes the candidate reconnect and replay.
+        await _AGENT_CHANNEL_HUB.publish(self, event, live_payload={})
+        return event
 
     async def _problem(
         self,
@@ -2475,6 +2621,14 @@ class InterviewAgentRuntime:
         organization_id: str = "org_default",
     ) -> None:
         """Fan out one role-projected state refresh through the Agent seam."""
+
+        if (not realtime_event_bus().enabled
+                and not _AGENT_CHANNEL_HUB.has_subscribers(interview_id, organization_id)):
+            # A local-only worker has no route to an API process. Allocating a
+            # sequence for its undeliverable refresh creates a false gap in the
+            # next live speech event and causes an unnecessary control replay.
+            # Domain state is already committed; the API heartbeat reads it.
+            return
 
         await self._publish_system_event(
             interview_id,
@@ -2693,11 +2847,12 @@ class InterviewAgentRuntime:
         preparation = runtime_state.get("answer_preparation") or {}
         current_preparation = None
         if (session.get("status") == "in_progress" and current
-                and runtime_state.get("floor") == FloorOwner.CANDIDATE.value
+                and (runtime_state.get("floor") == FloorOwner.CANDIDATE.value
+                     or preparation.get("status") in {"retrying", "retry_required"})
                 and runtime_state.get("calibration_status") == "completed"
                 and not runtime_state.get("capture_recovery")
                 and (runtime_state.get("takeover") or {}).get("status") != "active"
-                and preparation.get("status") == "preparing"
+                and preparation.get("status") in {"preparing", "retrying", "retry_required"}
                 and preparation.get("turn_id") == current["id"]
                 and isinstance(preparation.get("capture_id"), str) and preparation["capture_id"]
                 and not any(answer.get("turn_id") == current["id"] for answer in session.get("answers", []))):
@@ -2708,6 +2863,7 @@ class InterviewAgentRuntime:
         candidate_view = {
             "interview_id": session["id"],
             "status": session["status"],
+            "completion": self.interviews.candidate_completion_receipt(session),
             "phase": session.get("phase"),
             "current_turn_id": session.get("current_turn_id"),
             "floor": (session.get("agent_runtime") or {}).get("floor", FloorOwner.NONE.value),
@@ -3726,7 +3882,7 @@ class InterviewAgentRuntime:
 
     async def _open_streamed_expression(
         self, interview_id: str, turn_id: Optional[str], text: str,
-        organization_id: str, *, performance_id: str, assert_current,
+        organization_id: str, *, performance_id: str, assert_current, before_abort=None,
     ) -> Optional[ApprovedSpeechOutput]:
         # The counted PCM worklet excludes underflow silence and checks the
         # device output clock before acknowledging the final source sample.
@@ -3759,6 +3915,7 @@ class InterviewAgentRuntime:
             publisher = LiveKitApprovedAudioPublisher(
                 self.media_plane, room_name=interview_room_name(organization_id, interview_id),
                 performance_id=performance_id, assert_current=assert_current,
+                before_abort=before_abort,
             )
             return ApprovedSpeechOutput(
                 performance_id=performance_id, stream=stream, publisher=publisher,
@@ -3924,7 +4081,7 @@ class InterviewAgentRuntime:
     def _supplement_projection(session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         value = (session.get("agent_runtime") or {}).get("supplement_confirmation") or {}
         if (session.get("status") != "in_progress" or value.get("turn_id") != session.get("current_turn_id")
-                or value.get("status") not in {"listening", "awaiting_reply"}):
+                or value.get("status") not in {"listening", "awaiting_reply", "awaiting_exit_reply"}):
             return None
         return {key: value.get(key) for key in ("status", "turn_id", "capture_id")}
 
@@ -3959,6 +4116,7 @@ class InterviewAgentRuntime:
             "UNDERSTANDING_UNAVAILABLE": "语音已收到，暂时无法完成回答理解；正在重试，你也可以继续补充。",
             "UNDERSTANDING_RETRY_EXHAUSTED": "语音已保留，但回答理解暂时不可用。恢复后请说话或点击提前结束回答重试。",
             "TRANSCRIPT_UNAVAILABLE": "已收到音频，仍在等待本段最终转写；已有字幕和回答会保留。",
+            "TRANSCRIPT_RETRY_REQUIRED": "这段语音暂未识别完成，录音和已识别内容仍保留；请再说一句或点击重试。",
             "DETECTOR_UNAVAILABLE": "自动接话检测暂时不可用，仍在收音。",
             "ENDPOINT_UNCERTAIN": "我还在听，你可以继续补充。",
         }

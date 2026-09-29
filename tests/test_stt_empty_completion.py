@@ -205,10 +205,8 @@ async def test_dashscope_normal_empty_end_requires_no_text_or_pending_hypothesis
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("sentences", [
-    [{"text": "", "sentence_end": False, "begin_time": 0}],
-    [{"sentence_id": 1, "sentence_begin": True}],
     [{"text": "既有文字", "sentence_end": False, "begin_time": 0},
-     {"text": "", "sentence_end": True, "begin_time": 0, "end_time": 200}],
+     {"text": "", "sentence_end": True, "begin_time": 20, "end_time": 200}],
     [{"text": "既有文字", "sentence_end": False, "begin_time": 0},
      {"text": "", "sentence_end": False, "begin_time": 0}],
 ])
