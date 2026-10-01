@@ -991,7 +991,7 @@ class InterviewService:
                 prepared_decision.exit_confirmation if prepared_decision is not None else None,
                 utterance.text, confirmed_at=now,
             )
-        if understanding.intent not in {"answer", "answer_declined", "answer_unresolved"} or understanding.suggested_action in {
+        if not ConversationUnderstandingService.accepts_as_answer(understanding, utterance.text) or understanding.suggested_action in {
             "clarify", "repeat", "continue_listening", "pause", "respond_company"
         }:
             understanding_problem = (
@@ -1663,7 +1663,7 @@ class InterviewService:
                     session, int(policy["min_remaining_seconds"]), now=self.clock(),
                 )
             if (matches and prepared.semantic_first and not prepared.completion_confirmed
-                    and prepared.understanding.intent in {"answer", "answer_declined", "answer_unresolved"}
+                    and prepared.understanding.intent in {"answer", "answer_declined", "answer_unresolved", "off_topic"}
                     and prepared.understanding.suggested_action not in {"clarify", "repeat", "continue_listening", "pause", "respond_company"}):
                 matches = self.conversation.can_complete_without_confirmation(
                     prepared.understanding, str(payload["final_transcript"]).strip())

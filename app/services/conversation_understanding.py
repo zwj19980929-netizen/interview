@@ -15,6 +15,7 @@ from app.core.ids import new_id
 from app.core.prompt.contracts import prompt_contract, understanding_canonical_schema, supplement_reply_canonical_schema
 from app.core.prompt.semantic_turn import (
     with_semantic_turn_schema, validate_semantic_turn, validate_current_speech, validate_unresolved_completion, SemanticContractError,
+    normalize_answer_relevance,
     derive_semantic_controls,
 )
 from app.core.prompt.understanding_references import (
@@ -165,6 +166,8 @@ class ConversationUnderstandingService:
                 data = derive_semantic_controls(data)
             stage = "understanding_canonical"
             validate_structured_response(data, self._canonical_schema(semantic_first))
+            if semantic_first:
+                data = normalize_answer_relevance(data, utterance.text, context["capability_points"])
             stage = "understanding_content"
             dialogue = context.get("interviewer_context") or {}
             self._validate_understanding_content(data, utterance.text, context["capability_points"],
@@ -388,7 +391,12 @@ class ConversationUnderstandingService:
             metadata={"prompt_version": contract.version},
         )), timeout=5)
         from app.core.prompt.conversation_reception import validate_reception_response, resolve_reception_repeat_target
-        validate_reception_response(response.data, contract.response_schema, current_speech=text)
+        try:
+            validate_reception_response(response.data, contract.response_schema, current_speech=text)
+        except StructuredResponseValidationError as exc:
+            _log_validation_rejection("conversation_reception_rejected", exc, stage="reception_content",
+                attempt=1, turn_id=current_turn_id, provider_request_id=response.provider.request_id)
+            raise
         data = response.data
         result = {"kind": data["kind"], "confidence": data["confidence"],
                 "evidence_quote": understanding_references(text, [])["evidence"][data["evidence_id"]],
@@ -1084,9 +1092,14 @@ class ConversationUnderstandingService:
                     or data["contradictions"]
                     or (data["answer_content"] == "none" and (covered or missing != allowed))):
                 raise UnderstandingContentError("unresolved_answer_contract_invalid")
-        preserving_claims = (data.get("intent") == "answer_unresolved" or (
+        if data.get("intent") == "off_topic":
+            if (not str(data.get("answer_summary") or "").strip() or not data["evidence_quotes"]
+                    or covered or missing != allowed or data["ambiguities"] or target
+                    or (data.get("turn_intent") is not None and data["followup_allowed"])):
+                raise UnderstandingContentError("off_topic_contract_invalid")
+        preserving_claims = (data.get("intent") in {"answer_unresolved", "off_topic"} or (
             data.get("intent") == "clarification_request" and data.get("turn_intent") == "finish_answer"))
-        if data.get("intent") == "answer" or (preserving_claims and data["answer_content"] != "none"):
+        if data.get("intent") == "answer" or (preserving_claims and data.get("answer_content") in {"partial", "technical"}):
             evidence_quotes = [str(item).strip() for item in data["evidence_quotes"]]
             claims = list(data["claims"])
             if (
@@ -1142,6 +1155,23 @@ class ConversationUnderstandingService:
         data = understanding.model_dump(mode="json")
         validate_semantic_turn(data, transcript)
         return understanding.confidence >= .75 and understanding.suggested_action == "next"
+
+    @staticmethod
+    def accepts_as_answer(understanding: TurnUnderstanding, transcript: str) -> bool:
+        """Clear irrelevant speech is evidence only after a validated ending.
+
+        Legacy off-topic labels, silence and ordinary ongoing speech cannot
+        acquire completion authority from the broadened answer meaning.
+        Whole-interview withdrawal still needs the caller's separate receipt.
+        """
+        if understanding.intent in {"answer", "answer_declined", "answer_unresolved"}:
+            return True
+        if (understanding.intent != "off_topic" or understanding.problem is not None
+                or understanding.completion_basis is None or understanding.confidence < .75
+                or understanding.suggested_action != "next"):
+            return False
+        validate_semantic_turn(understanding.model_dump(mode="json"), transcript)
+        return understanding.turn_intent in {"finish_answer", "finish_topic", "decline_topic", "stop_interview"}
 
     @staticmethod
     def _capability_points(turn: Dict[str, Any]) -> List[str]:

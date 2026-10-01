@@ -67,7 +67,7 @@ def _semantic_provider(monkeypatch, *, technical=False, probe=False, explicit_fi
     async def invoke(provider, capability, request, context):
         if capability != "llm.chat_json" or request.purpose != "interview_turn_understanding":
             return await original(provider, capability, request, context)
-        if request.metadata.get("prompt_version") == "conversation_reception.v7":
+        if request.metadata.get("prompt_version") == "conversation_reception.v9":
             return await original(provider, capability, request, context)
         if request.metadata.get("prompt_version") == "candidate_exit_reply.v1":
             reply = json.loads(request.messages[-1].content)["new_reply"]
@@ -240,7 +240,7 @@ def test_first_final_decline_preserves_original_audio_and_advances_once(tmp_path
             assert "supplement_check" not in acts and "question" in acts
             assert SUPPLEMENT_SPEECH["check"] not in spoken
             assert not [c for c in calls if c[0] == "supplement"]
-            assert [c[2] for c in calls if c[0] == "understanding"] == ["interview_turn_decision.v95"]
+            assert [c[2] for c in calls if c[0] == "understanding"] == ["interview_turn_decision.v107"]
             assert understanding["completion_basis"]["source"] == "explicit_server_intent"
 
             # Replay the committed journal command and an additional stale
@@ -336,7 +336,7 @@ def test_end_interview_in_supplement_reply_preserves_answer_and_stops_whole_inte
             await _wait_until(lambda: all(c["status"] == "completed" for c in store.evidence_commands.values()))
             session = _current(runtime)
             _assert_one_automatic_answer(store, runtime, _TECHNICAL + stop + "确定结束面试。", voice_frames=5, continuation_frames=10)
-            assert session["turns"][0]["current_understanding"]["prompt_version"] == "interview_turn_decision.v100"
+            assert session["turns"][0]["current_understanding"]["prompt_version"] == "interview_turn_decision.v112"
             assert session["turns"][0]["current_understanding"]["turn_intent"] == "stop_interview"
             assert session.get("candidate_input_completion_reason") == "candidate_requested"
             assert session["turns"][0]["current_understanding"]["claims"][0]["claim"] == _TECHNICAL

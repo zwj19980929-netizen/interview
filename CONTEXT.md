@@ -421,6 +421,8 @@ _Avoid_: BackgroundTask、FireAndForgetJob、QueueMessage
 _Avoid_: DebugLog、RequestBodyLog、MutableHistory
 # 067 新增领域术语
 
+068补充：**OffTopicAnswer**（清楚跑题）表示发言可理解但与当前题意无关；它不是转写歧义、明确不会或整场退出。内容相关性与当前控制意图分开验证；相关技术事实不能被旁支话题抹掉。结束本题仍依赖当前权威来源，结束整场仍须独立确认。详见[068说明](docs/off-topic-and-reconnect-068.md)。
+
 **ConversationSelectionReceipt**:
 一次经过审批的面试官回应被选中表达的事实，关联所属题目、回应及选择次序；它不表示候选人已听到回应。
 _Avoid_: PlaybackCompleted、CandidateAnswer

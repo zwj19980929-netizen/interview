@@ -2453,7 +2453,7 @@ describe("understanding failure recovery", () => {
     } finally { await run.close(); }
   });
 
-  it("unlocks a failed or disconnected manual retry and drops recovery when the turn changes", async () => {
+  it("unlocks a failed or disconnected manual retry while retaining its recovery state", async () => {
     const { run, emit, socket } = await openFormalEndpointHarness();
     try {
       emit("problem", failure("UNDERSTANDING_RETRY_EXHAUSTED"));
@@ -2467,7 +2467,8 @@ describe("understanding failure recovery", () => {
       expect(run.getSnapshot()).toMatchObject({ understandingRetryPending: false, problem: { code: "UNDERSTANDING_RETRY_EXHAUSTED" } });
       emit("session.snapshot", { ...candidateSnapshot(), current_turn_id: "turn_2", floor: "agent",
         current_question: { ...candidateSnapshot().current_question, turn_id: "turn_2" } });
-      expect(run.getSnapshot().problem).toBeNull();
+      expect(run.getSnapshot().problem.code).toBe("UNDERSTANDING_RETRY_EXHAUSTED");
+      expect(run.getSnapshot().currentQuestion.turn_id).toBe("turn_1");
     } finally { await run.close(); }
   });
 
@@ -3182,6 +3183,11 @@ describe("adaptive topic planning", () => {
       }, open)) });
       const { calibration_status, ...partialSnapshot } = accepted;
       socket.emit("message", { data: JSON.stringify(candidateEvent(5, "session.snapshot", partialSnapshot)) });
+      expect(run.getSnapshot()).toMatchObject({ connection: { control: "resyncing" }, problem: { code: "AGENT_EVENT_PAYLOAD_INVALID" } });
+      await capture.onSpeechStarted();
+      capture.onSpeechStopped();
+      expect(socket.sent.filter(signal => signal.type === "speech.stopped")).toHaveLength(0);
+      socket.emit("message", { data: JSON.stringify(candidateEvent(6, "session.snapshot", { ...accepted, calibration_status: "listening" })) });
       await capture.onSpeechStarted();
       capture.onSpeechStopped();
       expect(latestSentSignal(socket, "speech.stopped")).toMatchObject({ payload: { capture_id: "capture_retried_v3" } });
@@ -3227,5 +3233,147 @@ describe("adaptive topic planning", () => {
     expect(run.getSnapshot().problem).toBeNull();
     expect(run.getSnapshot().completion).toBeNull();
     await run.close();
+  });
+});
+
+// Socket opening alone cannot acknowledge the identity or state of an interview.
+describe("current interview control recovery", () => {
+  class HandshakeSocket extends CandidateFakeSocket {
+    close(code, reason) {
+      super.close();
+      this.closeReason = reason;
+      this.emit("close", { code, reason });
+    }
+  }
+  const message = (socket, sequence, type, payload, turnId = "turn_1", causationId = null) => socket.emit("message", {
+    data: JSON.stringify({ ...candidateEvent(sequence, type, payload), turn_id: turnId, causation_id: causationId }),
+  });
+
+  it.each(["listening", "answer_preparing", "awaiting_exit_confirmation", "paused"])("keeps the %s turn and transcript while waiting for a valid current-socket snapshot", async phase => {
+    vi.useFakeTimers();
+    let run;
+    try {
+      const first = new HandshakeSocket(), second = new HandshakeSocket();
+      const harness = await openPlaybackHarness({ sockets: [first, second] });
+      run = harness.run;
+      message(first, 1, "session.snapshot", { ...candidateSnapshot(), floor: "candidate" });
+      message(first, 2, "floor.changed", { owner: "candidate", reason: "evidence_stream_open", capture_id: "capture_current" }, "turn_1", latestSentSignal(first, "evidence.stream.open").causation_id);
+      message(first, 3, "transcript.partial", { text: "合成的当前题回答。", server_received: true });
+      const snapshot = { ...candidateSnapshot(), floor: "candidate", ...(phase === "paused" ? { status: "paused" } : {}),
+        ...(phase === "answer_preparing" ? { answer_preparation: { status: "preparing", turn_id: "turn_1", capture_id: "capture_current" } } : {}),
+        ...(phase === "awaiting_exit_confirmation" ? { supplement_confirmation: { status: "awaiting_exit_reply", turn_id: "turn_1", capture_id: "capture_current" } } : {}),
+      };
+      message(first, 4, "session.snapshot", snapshot);
+      const before = run.getSnapshot();
+      expect(before.phase).toBe(phase);
+      first.close(1006, "synthetic_drop");
+      expect(run.getSnapshot()).toMatchObject({ phase, connection: { control: "recovering" }, currentQuestion: before.currentQuestion, captions: before.captions });
+      for (const type of ["finish_answer", "continue_speaking", "request_repeat", "warmup.confirm"]) expect(await run.act({ type })).toBe(false);
+      await harness.capture.onSpeechStarted();
+      harness.capture.onSpeechStopped();
+      expect(run.getSnapshot().phase).toBe(phase);
+      await vi.advanceTimersByTimeAsync(400);
+      expect(run.getSnapshot().connection.control).toBe("resyncing");
+      expect(second.sent.map(value => value.type)).toEqual(["session.open", "client.ready"]);
+      message(first, 99, "session.snapshot", { ...snapshot, status: "in_progress", current_turn_id: "turn_old", current_question: { ...snapshot.current_question, turn_id: "turn_old" } });
+      first.emit("message", { data: "invalid stale JSON" });
+      expect(run.getSnapshot().currentQuestion).toEqual(before.currentQuestion);
+      message(second, 100, "session.snapshot", { ...snapshot, interview_id: "foreign_interview" });
+      expect(run.getSnapshot().connection.control).toBe("resyncing");
+      message(second, 5, "session.snapshot", snapshot);
+      expect(run.getSnapshot()).toMatchObject({ phase, connection: { control: "connected" }, currentQuestion: before.currentQuestion });
+      expect(second.sent.some(value => ["finish_answer", "continue_speaking", "evidence.stream.open"].includes(value.type))).toBe(false);
+      expect(run.getSnapshot().captions.recent.map(row => row.text)).toEqual(before.captions.recent.map(row => row.text));
+    } finally { await run?.close(); vi.useRealTimers(); }
+  });
+
+  it.each([false, true])("bounds repeated transport opens even with transient snapshots (%s)", async transientSnapshot => {
+    vi.useFakeTimers();
+    let run;
+    try {
+      const sockets = Array.from({ length: 7 }, () => new HandshakeSocket());
+      const harness = await openPlaybackHarness({ sockets });
+      run = harness.run;
+      message(sockets[0], 1, "session.snapshot", candidateSnapshot());
+      sockets[0].close(1006, "drop");
+      for (let attempt = 1; attempt <= 6; attempt += 1) {
+        await vi.advanceTimersByTimeAsync(Math.min(5000, 400 * 2 ** (attempt - 1)));
+        expect(run.getSnapshot().connection.control).toBe("resyncing");
+        if (transientSnapshot) {
+          message(sockets[attempt], attempt + 1, "session.snapshot", candidateSnapshot());
+          expect(run.getSnapshot().connection.control).toBe("connected");
+          sockets[attempt].emit("message", { data: "invalid synthetic event" });
+          await vi.advanceTimersByTimeAsync(1500);
+          expect(sockets[attempt].closeReason).toBe("agent_event_resync_required");
+        } else sockets[attempt].close(1006, "opened_but_not_acknowledged");
+      }
+      await vi.advanceTimersByTimeAsync(0);
+      expect(run.getSnapshot()).toMatchObject({ phase: "paused", problem: { recoverable: false } });
+      expect(harness.request.mock.calls.filter(([path]) => path.endsWith("/agent-ticket"))).toHaveLength(7);
+      expect(runtimeProblemCalls(harness.request)).toHaveLength(1);
+      const attempts = harness.request.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(60000);
+      expect(harness.request).toHaveBeenCalledTimes(attempts);
+    } finally { await run?.close(); vi.useRealTimers(); }
+  });
+
+  it("times out an unacknowledged handshake without renewing its budget for a brief snapshot recovery", async () => {
+    vi.useFakeTimers();
+    let run;
+    try {
+      const sockets = Array.from({ length: 4 }, () => new HandshakeSocket());
+      const harness = await openPlaybackHarness({ sockets });
+      run = harness.run;
+      message(sockets[0], 1, "session.snapshot", candidateSnapshot());
+      sockets[0].close(1006, "drop");
+      await vi.advanceTimersByTimeAsync(400);
+      await vi.advanceTimersByTimeAsync(10000);
+      expect(sockets[1].closeReason).toBe("session_snapshot_timeout");
+      expect(run.getSnapshot().connection.control).toBe("recovering");
+      await vi.advanceTimersByTimeAsync(800);
+      message(sockets[2], 2, "session.snapshot", candidateSnapshot());
+      expect(run.getSnapshot().connection.control).toBe("connected");
+      sockets[2].close(1006, "second_drop_after_recovery");
+      await vi.advanceTimersByTimeAsync(400);
+      expect(sockets[3].sent).toHaveLength(0);
+      await vi.advanceTimersByTimeAsync(1200);
+      expect(sockets[3].sent.some(value => value.type === "session.open")).toBe(true);
+      expect(run.getSnapshot().connection.control).toBe("resyncing");
+    } finally { await run?.close(); vi.useRealTimers(); }
+  });
+
+  it("renews the retry budget only after the acknowledged socket stays stable", async () => {
+    vi.useFakeTimers();
+    let run;
+    try {
+      const sockets = Array.from({ length: 3 }, () => new HandshakeSocket());
+      const harness = await openPlaybackHarness({ sockets });
+      run = harness.run;
+      message(sockets[0], 1, "session.snapshot", candidateSnapshot());
+      sockets[0].close(1006, "drop");
+      await vi.advanceTimersByTimeAsync(400);
+      message(sockets[1], 2, "session.snapshot", candidateSnapshot());
+      await vi.advanceTimersByTimeAsync(10000);
+      sockets[1].close(1006, "drop_after_stable_recovery");
+      await vi.advanceTimersByTimeAsync(400);
+      expect(sockets[2].sent.some(value => value.type === "session.open")).toBe(true);
+      expect(run.getSnapshot().connection.control).toBe("resyncing");
+    } finally { await run?.close(); vi.useRealTimers(); }
+  });
+
+  it("retains an understanding failure through protocol resync until current capture recovery succeeds", async () => {
+    const { run, emit, socket } = await openFormalEndpointHarness();
+    try {
+      emit("problem", { code: "UNDERSTANDING_RESULT_REJECTED", recoverable: true, message: "synthetic", action: "retry", capture_id: "capture_endpoint" });
+      const before = run.getSnapshot();
+      socket.emit("message", { data: "invalid JSON" });
+      expect(run.getSnapshot()).toMatchObject({ phase: before.phase, problem: before.problem, connection: { control: "resyncing" } });
+      expect(await run.act({ type: "continue_speaking" })).toBe(false);
+      emit("session.snapshot", { ...candidateSnapshot(), floor: "candidate", answer_preparation: { status: "retry_required", turn_id: "turn_1", capture_id: "capture_endpoint" } });
+      expect(run.getSnapshot()).toMatchObject({ connection: { control: "connected" }, problem: { code: "UNDERSTANDING_RETRY_EXHAUSTED" } });
+      expect(socket.sent.filter(value => value.type === "continue_speaking")).toHaveLength(0);
+      emit("floor.changed", { owner: "candidate", reason: "understanding_recovered", capture_id: "capture_endpoint" });
+      expect(run.getSnapshot().problem).toBeNull();
+    } finally { await run.close(); }
   });
 });

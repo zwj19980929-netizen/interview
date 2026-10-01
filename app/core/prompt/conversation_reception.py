@@ -5,12 +5,13 @@ import re
 from app.core.prompt.understanding_references import understanding_references
 from app.model_gateway.schemas import ChatMessage
 
-RECEPTION_VERSION = "conversation_reception.v7"
-RECEPTION_SPEECH_VERSION = "conversation_reception_speech.v3"
+RECEPTION_VERSION = "conversation_reception.v9"
+RECEPTION_SPEECH_VERSION = "conversation_reception_speech.v4"
 RECEPTION_SPEECH = {
     "idle_check": "我还在听。需要一点时间，或希望我再解释一下题目，都可以告诉我。",
     "wait": "好的，不着急，你慢慢想，我在听。",
     "continue": "好的，你继续，我在听。",
+    "off_topic": "我们回到当前这道题。你可以围绕题目继续回答；如果不会或已经说完，也可以直接告诉我。",
     "presence": "我在，听得到你，你继续说。",
     "question_clarification": "可以，我们先把题意说清楚。你希望我解释题目里的哪个部分？",
     "transcript_correction": "抱歉，可能有一段没识别准确。你可以纠正刚才那句话，我会结合你的更正继续。",
@@ -128,8 +129,14 @@ def reception_contract(context):
             "transcript_correction：纠正转写、指出自己被误记；audio_problem：听不清、连接或播放问题；"
             "pause：明确暂停整场；unclear：向你提出配合请求但含义不清；"
             "interview_dialogue：其它需要接话的面试交流，例如紧张需要安抚、申请先讲思路或换种表达、"
-            "询问交流方式和面试流程。话题偏离面试时也用interview_dialogue简短接住并温和拉回。"
-            "other：普通技术回答、没有交流请求的自言自语、明确跳题/结束话题/结束整场以及公司反问。"
+            "询问交流方式和面试流程。interview_dialogue不包括无关话题，也不负责提醒跑题。"
+            "other：普通技术回答、清楚但偏离题目的叙述、请求聊与面试无关的话题、没有交流请求的自言自语、"
+            "明确跳题/结束话题/结束整场以及公司反问。所有偏题发言都由正式理解路径统一处理，"
+            "这里kind=other且reply_text为空；不要生成拉回话题的追问、劝告或回应。"
+            "叙述跑题本身不是向你提出请求，不能据此插话；是否答非所问交给正式理解和评分路径。"
+            "内容无关不等于转写不清，不要要求候选人重说、拼写术语或纠正已清楚表达的内容。"
+            "同一句先说无关内容、最后明确说完或不再回答，必须other，reply_text为空，"
+            "不能用拉回话题的回复截住当前完成请求；只结束本题不等于结束整场面试。"
             "本人明确说‘我不会’、‘这题我不会’、‘这道题答不上来’而没有要求继续思考，同样属于other；"
             "不要沿用preceding_text里先前的‘想一下’而回复慢慢想。‘我已经说完了’、‘我们结束面试吧’也必须other。"
             "明确结束整场必须交给正式语义与生命周期路径，不能用wait、pause或安抚回应截住。"

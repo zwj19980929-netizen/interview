@@ -13,6 +13,17 @@ export function understandingRecoveryState(problem) {
   return UNDERSTANDING_RECOVERY_CODES.has(problem.code) ? "retrying" : null;
 }
 
+export function candidateConnectionNotice(experience) {
+  if (!experience?.session || experience.completion || experience.problem?.recoverable === false
+    || ["paused", "completed"].includes(experience.phase)) return null;
+  const connection = experience.connection || {};
+  if (connection.control !== "connected"
+    || ["reconnecting", "disconnected", "recovery"].includes(connection.media)) {
+    return { title: "正在恢复本场面试", detail: "当前题目和已收到的回答会保留。请等待连接恢复，无需重复作答。" };
+  }
+  return null;
+}
+
 export function candidateNotice(problem, pauseConfirmed = false, phase = null) {
   if (!problem) return null;
   if (problem.recoverable === false) {

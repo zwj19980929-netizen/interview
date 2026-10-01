@@ -28,7 +28,7 @@ EXIT_CONFIRMATION_INSTRUCTION = (
     "不能误解成不会本题、没有补充或继续回答。"
     "这时turn_intent=stop_interview，suggested_action=next，followup_allowed=false，"
     "completion_basis只引用完整转写中该最新确认回复的原文，不能以静音、问题台词或旧退出请求代替。"
-    "保留完整转写中已经实际说出的全部技术claims；没有实际专业回答且明确未作答才使用answer_declined和none。"
+    "保留完整转写中已经实际说出的全部技术claims；清楚无关陈述保持off_topic，不捏造技术claims或识别疑点；没有实际陈述且明确未作答才使用answer_declined和none。"
     "若技术转写仍有无法核实的疑点，使用answer_unresolved+stop_interview，保留非空ambiguities、实际clarification_target"
     "及全部可靠claims；没有可靠主张才为none。退出确认只解决是否结束整场，不解决技术正文，不证明候选人不会。"
     "这个退出分支不要求content_clarification，不能因技术疑点再强迫候选人继续澄清后才能退出。"

@@ -225,6 +225,8 @@ class CandidateExperienceRun {
     this.endpointProblemScope = null;
     this.heartbeatTimer = 0;
     this.reconnectTimer = 0;
+    this.controlSnapshotTimer = 0;
+    this.controlStabilityTimer = 0;
     this.eventResyncTimer = 0;
     this.reconnectAttempt = 0;
     this.encryptQueue = Promise.resolve();
@@ -377,6 +379,8 @@ class CandidateExperienceRun {
   async act({ type, idempotencyKey, turnId, payload = {} } = {}) {
     if (this.closed || this.state.completion) return false;
     if (!type) throw new Error("候选人动作缺少 type");
+    if (this.state.session && (this.state.connection.control !== "connected"
+      || ["reconnecting", "disconnected", "recovery"].includes(this.state.connection.media))) return false;
     if (["warmup.confirm", "warmup.retry"].includes(type) && this.isSafetyStopped()) return false;
     if (type === "retry_speech") return this.retrySpeech();
     let causationId = null;
@@ -744,7 +748,10 @@ class CandidateExperienceRun {
       socket.binaryType = "arraybuffer";
       let opened = false;
       const timeout = window.setTimeout(() => {
-        if (!opened) reject(new Error("实时面试控制通道连接超时"));
+        if (!opened) {
+          reject(new Error("实时面试控制通道连接超时"));
+          if (socket.readyState < WebSocket.CLOSING) socket.close(4001, "control_open_timeout");
+        }
       }, 10_000);
       socket.addEventListener("open", () => {
         opened = true;
@@ -754,8 +761,17 @@ class CandidateExperienceRun {
           resolve();
           return;
         }
-        this.reconnectAttempt = 0;
-        this.patch({ connection: { ...this.state.connection, control: "connected" } });
+        // A transport open is not a resumed interview. Only a fresh valid
+        // snapshot acknowledges the session. A stable interval separately
+        // renews retries so snapshot/resync loops remain bounded.
+        this.patch({ connection: { ...this.state.connection, control: this.state.session ? "resyncing" : "connecting" } });
+        window.clearTimeout(this.controlSnapshotTimer);
+        this.controlSnapshotTimer = window.setTimeout(() => {
+          this.controlSnapshotTimer = 0;
+          if (this.socket === socket && !this.closed && !this.state.completion) {
+            socket.close(4001, "session_snapshot_timeout");
+          }
+        }, 10_000);
         socket.send(JSON.stringify({
           type: "session.open",
           payload: {
@@ -773,7 +789,9 @@ class CandidateExperienceRun {
         }
         resolve();
       }, { once: true });
-      socket.addEventListener("message", ({ data }) => this.onAgentEvent(data));
+      socket.addEventListener("message", ({ data }) => {
+        this.onAgentEvent(data, socket);
+      });
       socket.addEventListener("error", () => {
         if (!opened) {
           window.clearTimeout(timeout);
@@ -782,6 +800,12 @@ class CandidateExperienceRun {
       });
       socket.addEventListener("close", () => {
         window.clearTimeout(timeout);
+        if (this.socket !== socket) return;
+        if (!opened) reject(new Error("实时面试控制通道未能建立"));
+        window.clearTimeout(this.controlSnapshotTimer);
+        this.controlSnapshotTimer = 0;
+        window.clearTimeout(this.controlStabilityTimer);
+        this.controlStabilityTimer = 0;
         if (this.socket === socket) {
           if (this.performance?.delivery === "streaming_tts") this.stopPerformance("control_reconnecting", false);
           this.liveSpeech.reset();
@@ -813,15 +837,24 @@ class CandidateExperienceRun {
     });
   }
 
-  async onAgentEvent(raw) {
+  async onAgentEvent(raw, sourceSocket = null) {
     if (this.closed || this.state.completion) return;
     let event;
     try { event = typeof raw === "string" ? JSON.parse(raw) : JSON.parse(await raw.text()); }
     catch {
+      if (sourceSocket && sourceSocket !== this.socket) return;
       this.beginEventResync({
         reason: "invalid_json",
         problem: { code: "AGENT_EVENT_ENVELOPE_INVALID", message: "实时事件不是合法 JSON" },
       });
+      return;
+    }
+    // A terminal receipt already queued on the authenticated previous socket
+    // must still stop devices. Other old-socket activity cannot resume a turn.
+    if (sourceSocket && sourceSocket !== this.socket
+      && !(event.type === "completed" && event.payload?.interview_id === this.interviewId)) return;
+    if (event.type === "session.snapshot" && event.payload?.interview_id !== this.interviewId) {
+      this.beginEventResync({ reason: "foreign_session" });
       return;
     }
     const ordered = this.eventStream.accept(event);
@@ -835,7 +868,9 @@ class CandidateExperienceRun {
     const payload = event.payload || {};
     if (event.type === "session.snapshot") {
       this.finishEventResync(ordered.recovered);
-      return this.applySnapshot(payload);
+      this.applySnapshot(payload);
+      if (!this.isSafetyStopped() && this.evidenceReady && this.evidenceTurnId === this.currentTranscriptTurnId()) this.flushPendingSpeechState();
+      return;
     }
     if (this.isSafetyStopped() && ["floor.changed", "speech.started", "speech.stopped", "transcript.partial", "transcript.final"].includes(event.type)) return;
     if (event.type === "floor.changed") {
@@ -1405,6 +1440,8 @@ class CandidateExperienceRun {
   }
 
   beginEventResync(result) {
+    window.clearTimeout(this.controlStabilityTimer);
+    this.controlStabilityTimer = 0;
     this.eventStream.awaitingSnapshot = true;
     this.stopPerformance("event_stream_resync", false);
     this.liveSpeech.reset();
@@ -1412,7 +1449,7 @@ class CandidateExperienceRun {
     const isGap = result.reason === "sequence_gap" || result.reason === "duplicate_event_id";
     this.patch({
       connection: { ...this.state.connection, control: "resyncing" },
-      problem: this.state.problem?.recoverable === false ? this.state.problem : {
+      problem: this.state.problem || {
         code: validation.code || (isGap ? "AGENT_EVENT_SEQUENCE_GAP" : "AGENT_EVENT_INVALID"),
         message: validation.message || "实时事件顺序不连续，正在从服务端权威快照恢复。",
         recoverable: true,
@@ -1434,13 +1471,23 @@ class CandidateExperienceRun {
   finishEventResync(recovered) {
     window.clearTimeout(this.eventResyncTimer);
     this.eventResyncTimer = 0;
+    window.clearTimeout(this.controlSnapshotTimer);
+    this.controlSnapshotTimer = 0;
     const problem = this.state.problem;
     const localOrderingProblem = String(problem?.code || "").startsWith("AGENT_EVENT_");
-    if (recovered || this.state.connection.control === "resyncing") {
+    if (recovered || this.state.connection.control !== "connected") {
       this.patch({
         connection: { ...this.state.connection, control: "connected" },
         problem: localOrderingProblem ? null : problem,
       });
+    }
+    if (!this.controlStabilityTimer && this.socket) {
+      const socket = this.socket;
+      this.controlStabilityTimer = window.setTimeout(() => {
+        this.controlStabilityTimer = 0;
+        if (this.socket === socket && socket.readyState === WebSocket.OPEN
+          && this.state.connection.control === "connected" && !this.eventStream.awaitingSnapshot) this.reconnectAttempt = 0;
+      }, 10_000);
     }
   }
 
@@ -1626,6 +1673,7 @@ class CandidateExperienceRun {
   }
 
   async ensureEvidenceOpen({ force = false } = {}) {
+    if (this.state.session && this.state.connection.control !== "connected") return;
     const turnId = force && this.evidenceTurnId && this.evidenceTurnId !== "__warmup__"
       ? this.evidenceTurnId
       : this.state.currentQuestion?.turn_id;
@@ -1711,6 +1759,10 @@ class CandidateExperienceRun {
     if (this.closed || ["paused", "completed", "planning"].includes(this.state.phase) || this.state.completion) {
       return;
     }
+    if (this.state.session && this.state.connection.control !== "connected") {
+      this.patch({ microphone: { ...this.state.microphone, localDetected: true } });
+      return;
+    }
     const cancelsPreparation = this.answerFinishRequested || this.state.phase === "answer_preparing";
     this.answerFinishRequested = false;
     // A click can happen while VAD is already active. Still send one fresh,
@@ -1757,6 +1809,10 @@ class CandidateExperienceRun {
     }
     this.localSpeechStoppedAt = this.clock();
     this.patch({ microphone: { ...this.state.microphone, localDetected: false } });
+    if (this.state.session && this.state.connection.control !== "connected") {
+      this.pendingSpeechStop = this.speechStartSignaled;
+      return;
+    }
     if (!this.evidenceOpen) return;
     if (!this.evidenceReady) {
       this.pendingSpeechStop = this.speechStartSignaled;
@@ -1766,7 +1822,6 @@ class CandidateExperienceRun {
     if (this.mediaGap || this.mediaRecoveryRunning) {
       this.pendingSpeechStop = true;
       this.patch({
-        phase: "connecting",
         endpoint: { active: false, deadlineAt: null },
       });
       if (this.mediaConnectionState === "connected") {
@@ -1785,7 +1840,8 @@ class CandidateExperienceRun {
   }
 
   signalSpeechStarted() {
-    if (this.speechStartSignaled || this.socket?.readyState !== WebSocket.OPEN) return false;
+    if (this.speechStartSignaled || this.socket?.readyState !== WebSocket.OPEN
+      || (this.state.session && this.state.connection.control !== "connected")) return false;
     this.sendCaptureSignal("speech.started");
     this.speechStartSignaled = true;
     this.pendingSpeechStop = false;
@@ -1793,7 +1849,7 @@ class CandidateExperienceRun {
   }
 
   flushPendingSpeechState() {
-    if (!this.evidenceReady) return;
+    if (!this.evidenceReady || this.state.connection.control !== "connected") return;
     const speaking = Boolean(this.capture?.speaking ?? this.state.microphone.localDetected);
     if (speaking) {
       this.signalSpeechStarted();
@@ -2087,7 +2143,8 @@ class CandidateExperienceRun {
         audio.load?.();
       } catch { /* cleanup errors from an invalidated element are not playback failures */ }
     }
-    this.patch({ speechPlayback: null, avatar: { ...EMPTY_AVATAR }, phase: this.state.floor === "candidate" ? "listening" : this.state.phase });
+    this.patch({ speechPlayback: null, avatar: { ...EMPTY_AVATAR },
+      phase: this.state.floor === "candidate" && this.state.phase === "responding" ? "listening" : this.state.phase });
     if (notify && performance) {
       this.sendSignal("avatar.performance.stopped", { performance_id: performance.performance_id, reason }, { turnId: performance.turnId });
     }
@@ -2095,8 +2152,13 @@ class CandidateExperienceRun {
   }
 
   scheduleReconnect() {
-    if (this.reconnectTimer || this.closed || this.intentionalClose || this.state.completion) return;
-    this.patch({ connection: { ...this.state.connection, control: "recovering" }, phase: "connecting" });
+    if (this.reconnectTimer || this.closed || this.intentionalClose || this.state.completion || this.runtimeFailurePending) return;
+    if (this.reconnectAttempt >= 6) {
+      this.failClosed(new Error("实时会话未能恢复，请联系面试安排人。"));
+      return;
+    }
+    this.patch({ connection: { ...this.state.connection, control: "recovering" },
+      ...(!this.state.session ? { phase: "connecting" } : {}) });
     const delay = Math.min(5000, 400 * (2 ** this.reconnectAttempt));
     this.reconnectAttempt += 1;
     this.reconnectTimer = window.setTimeout(async () => {
@@ -2207,6 +2269,8 @@ class CandidateExperienceRun {
     window.clearTimeout(this.endpointTimer);
     window.clearTimeout(this.reconnectTimer);
     window.clearTimeout(this.eventResyncTimer);
+    window.clearTimeout(this.controlSnapshotTimer);
+    window.clearTimeout(this.controlStabilityTimer);
     window.clearTimeout(this.backfillAuthorizationTimer);
     this.backfillAuthorizationTimer = 0;
     try { this.stopPerformance(reason, false); }

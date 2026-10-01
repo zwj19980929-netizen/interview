@@ -90,17 +90,20 @@ async def test_expression_timeout_requires_new_words_or_explicit_retry():
 
 
 @pytest.mark.anyio
-async def test_new_stable_request_after_long_wait_gets_fresh_budget_before_final_cut():
+async def test_new_stable_request_after_long_wait_has_separate_budget_until_final_cut():
     from test_reception_cursor_062 import setup
     endpoint, _, spoken, commits, _ = setup()
     try:
         endpoint.cover_transcript(_final("我想一下。"))
         endpoint._interaction_deadline = time.monotonic() - 1
+        expired = endpoint._interaction_deadline
         preview = await endpoint.capture.transcript_preview()
         assert await endpoint.confirmation._receive_request(endpoint, preview, prepare_only=True)
+        assert endpoint._interaction_deadline == expired
+        assert endpoint.capture.requests and not spoken and not commits
+        endpoint.cover_transcript(endpoint.capture.current_final)
         deadline = endpoint._interaction_deadline
         assert deadline > time.monotonic()
-        assert endpoint.capture.requests and not spoken and not commits
         # Identical stable words, confidence changes and unstable hypotheses
         # cannot buy another full preparation period.
         await endpoint.confirmation._receive_request(endpoint, preview, prepare_only=True)

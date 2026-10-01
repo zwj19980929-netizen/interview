@@ -275,7 +275,7 @@ async def test_spoken_finish_answer_commits_parent_and_delivers_formal_child_onc
         assert child["followup_depth"] == 1 and current["current_turn_id"] == child["id"]
         assert current["answers"][0]["turn_id"] == TURN_ID
         assert current["turns"][0]["current_understanding"]["turn_intent"] == "finish_answer"
-        assert child["conversation_acts"][0]["prompt_version"] == current["turns"][0]["current_understanding"]["prompt_version"] == "interview_turn_decision.v95"
+        assert child["conversation_acts"][0]["prompt_version"] == current["turns"][0]["current_understanding"]["prompt_version"] == "interview_turn_decision.v107"
         assert SUPPLEMENT_SPEECH["check"] not in spoken
         assert len([call for call in calls if call[0] == "understanding"]) == 1
         assert not [call for call in calls if call[0] == "supplement"]

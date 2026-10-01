@@ -1,5 +1,11 @@
 # 领域模型
 
+## 068：清楚跑题与交互恢复
+
+`ConversationUnderstanding.intent=off_topic` 表示当前发言含义清楚但没有与题意相关的可用回答；与 `clarification_request`、`answer_declined`、`answer_unresolved` 区分。`turn_intent` 仍独立决定是否思考、结束本题或请求退出，所有完成依据仍须当前权威语音来源。原文及可靠 claims 保留，相关技术回答不能因夹带无关叙述被整段丢弃。无新存储字段或迁移。
+
+稳定预览的 15 秒与正式权威 final 的 20 秒期限独立，取代067所述由稳定预览开始共用整轮时限；同词元数据/VAD不续期，显式重试或新权威文本可重建。理解阻断不阻断已选中播放的超时维护。前端控制连接状态与业务答题阶段分开，重连保留题目及退出确认。见[068说明](off-topic-and-reconnect-068.md)。
+
 ### INTERACTION-RECOVERY-066（仓库与本机验证完成）
 
 - `TurnUnderstanding.intent=answer_unresolved` 表示候选人已结束本题，但在一次已实际播放的内容澄清后仍存在无法核实的转写；允许 `turn_intent=finish_answer`、禁止自动追问，保留已核实 claims，不等于 `answer_declined`。明确整场退出可用 `stop_interview` 进入065独立确认，无须强迫先完成技术澄清；提交必须校验独立退出收据。

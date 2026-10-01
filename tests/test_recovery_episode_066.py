@@ -66,12 +66,16 @@ async def test_manual_retry_ack_waits_until_failure_speech_returns_the_floor():
 
 
 async def advance_to_failure(endpoint, clock, count):
+    # The one-time recovery allowance is spent before speech I/O. Capture
+    # whether this attempt owes playback before advancing the worker, rather
+    # than mistaking its later spent flag for an already selected output.
+    expects_recovery_speech = count == 1 and endpoint.confirmation._failure_spoken_identity is None
     clock.value += 10
     await _until(lambda: endpoint._prepare_failures == count)
     await _until(lambda: endpoint._inference_task is None)
     # The first failure speaks once. Acknowledge delivery before asking the
     # real endpoint loop to attempt the next request.
-    if count == 1 and endpoint.confirmation._failure_spoken_identity is None:
+    if expects_recovery_speech:
         await _until(lambda: endpoint.confirmation.speaking)
     if endpoint.confirmation.speaking:
         endpoint.confirmation.floor_returned(endpoint)

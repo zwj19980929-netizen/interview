@@ -298,4 +298,62 @@ describe("candidate route isolation with the real workbench loader", () => {
       expect(run.act).toHaveBeenCalledWith(expect.objectContaining({ type: "continue_speaking", turnId: "turn-current" }));
     }
   });
+
+  it.each([["recovering", "connected"], ["resyncing", "connected"], ["connected", "reconnecting"]])("shows current-interview recovery for control=%s media=%s without reopening answer actions", async (control, media) => {
+    const run = makeRun();
+    let update;
+    const state = { phase: "listening", floor: "candidate", session: { status: "in_progress" },
+      currentQuestion: { question_text: "Celery 合成测试问题", turn_id: "turn-current", order: 3 },
+      connection: { control, media }, microphone: { localDetected: true, level: .5 }, evidence: { ready: true },
+      serverAudio: { received: true }, captions: { full: [], recent: [{ text: "当前题目合成回答", final: false }] },
+      endpoint: { active: false }, calibration: { status: "completed" }, avatar: { status: "idle" },
+      problem: { code: "UNDERSTANDING_RESULT_REJECTED", recoverable: true },
+    };
+    run.subscribe.mockImplementation(listener => { update = listener; listener(state); return () => {}; });
+    runtime.open.mockResolvedValueOnce(run);
+    await mount();
+    await deliver(0, interview("new"));
+    await act(async () => avatar().onReady({ fps: 60 }));
+    expect(host.textContent).toContain("正在恢复本场面试");
+    expect(host.textContent).toContain("Celery 合成测试问题");
+    expect(host.textContent).toContain("当前题目合成回答");
+    expect(host.textContent).not.toMatch(/正在进入面试|正在听你说|麦克风已开启|回答处理需要重试/);
+    expect(host.querySelectorAll(".candidate-question-band .candidate-waiting-row")).toHaveLength(1);
+    const controls = [...host.querySelectorAll(".candidate-answer-actions button")];
+    expect(controls.every(button => button.disabled)).toBe(true);
+    await act(async () => controls.forEach(button => button.click()));
+    expect(run.act).not.toHaveBeenCalled();
+    await act(async () => update({ ...state, connection: { control: "connected", media: "connected" } }));
+    expect(host.textContent).toContain("回答处理需要重试");
+    expect(host.textContent).not.toContain("正在恢复本场面试");
+    expect(host.textContent).not.toContain("正在听你说");
+    expect(run.act).not.toHaveBeenCalled();
+  });
+
+  it("clears a local action send failure after authoritative reconnection without hiding business failure", async () => {
+    const run = makeRun();
+    let update;
+    const state = { phase: "listening", floor: "candidate", session: { status: "in_progress" },
+      currentQuestion: { question_text: "合成测试问题", turn_id: "turn-current" },
+      connection: { control: "connected", media: "connected" }, microphone: { localDetected: false, level: 0 }, evidence: { ready: true },
+      serverAudio: { received: false }, captions: { forming: false, full: [], recent: [] }, endpoint: { active: false },
+      calibration: { status: "completed" }, avatar: { status: "idle" }, problem: null,
+    };
+    run.subscribe.mockImplementation(listener => { update = listener; listener(state); return () => {}; });
+    run.act.mockRejectedValueOnce(new Error("synthetic control disconnect"));
+    runtime.open.mockResolvedValueOnce(run);
+    await mount();
+    await deliver(0, interview("new"));
+    await act(async () => avatar().onReady({ fps: 60 }));
+    const repeat = [...host.querySelectorAll("button")].find(button => button.textContent === "请再说一遍");
+    await act(async () => repeat.click());
+    expect(host.textContent).toContain("暂时没有完成，请稍后再试");
+    await act(async () => update({ ...state, connection: { ...state.connection, control: "recovering" } }));
+    expect(host.textContent).toContain("正在恢复本场面试");
+    await act(async () => update(state));
+    expect(host.textContent).not.toContain("暂时没有完成，请稍后再试");
+    expect(host.textContent).toContain("等待你开口");
+    await act(async () => update({ ...state, problem: { code: "UNDERSTANDING_RESULT_REJECTED", recoverable: true } }));
+    expect(host.textContent).toContain("回答处理需要重试");
+  });
 });

@@ -428,17 +428,17 @@ def _interview_turn_understanding(context: Dict[str, Any]) -> PromptContract:
         schema = with_semantic_turn_schema(schema, evidence_ids=references["evidence"], company_questions=optional_context)
         schema["properties"]["intent"]["enum"].append("answer_unresolved")
     return PromptContract(
-        version=("interview_turn_understanding.v69" if exit_context and optional_context and context.get("completion_confirmed") else
-                 "interview_turn_understanding.v68" if exit_context and optional_context else
-                 "interview_turn_understanding.v67" if exit_context and context.get("completion_confirmed") else
-                 "interview_turn_understanding.v66" if exit_context else
-                 "interview_turn_understanding.v65" if semantic_first and optional_context and context.get("completion_confirmed") else
-                 "interview_turn_understanding.v64" if semantic_first and optional_context else
-                 "interview_turn_understanding.v63" if semantic_first and context.get("completion_confirmed") else
-                 "interview_turn_understanding.v62" if semantic_first else
-                 "interview_turn_understanding.v73" if resolved_input and context.get("completion_confirmed") else
-                 "interview_turn_understanding.v72" if resolved_input else
-                 "interview_turn_understanding.v71" if context.get("completion_confirmed") else "interview_turn_understanding.v70"),
+        version=("interview_turn_understanding.v81" if exit_context and optional_context and context.get("completion_confirmed") else
+                 "interview_turn_understanding.v80" if exit_context and optional_context else
+                 "interview_turn_understanding.v79" if exit_context and context.get("completion_confirmed") else
+                 "interview_turn_understanding.v78" if exit_context else
+                 "interview_turn_understanding.v77" if semantic_first and optional_context and context.get("completion_confirmed") else
+                 "interview_turn_understanding.v76" if semantic_first and optional_context else
+                 "interview_turn_understanding.v75" if semantic_first and context.get("completion_confirmed") else
+                 "interview_turn_understanding.v74" if semantic_first else
+                 "interview_turn_understanding.v85" if resolved_input and context.get("completion_confirmed") else
+                 "interview_turn_understanding.v84" if resolved_input else
+                 "interview_turn_understanding.v83" if context.get("completion_confirmed") else "interview_turn_understanding.v82"),
         messages=[
             ChatMessage(role="system", content=(
                 "你是实时结构化面试理解器，只输出合同 JSON。不得评分、泄露标准答案、推断敏感属性。"
@@ -448,6 +448,7 @@ def _interview_turn_understanding(context: Dict[str, Any]) -> PromptContract:
                 "每条 claim 的 evidence_id 必须同时列入 evidence_ids；intent=answer 时摘要、claims、"
                 "evidence_ids 均不能为空。不确定是否覆盖时放入 missing，不能虚构证据。"
                 "必须区分没有知识答案与没有听懂发言：confidence表示对发言含义的理解把握，不是知识得分。"
+                "清楚但与题目无关的陈述是off_topic，不是识别歧义或拒答；保留原文、不编专业claims。"
                 "候选人明确表示本题不会回答、不再作答或希望结束本题进入下一题，且全文没有实质回答时，"
                 "使用intent=answer_declined、suggested_action=next；不要把知识缺失当作识别不清或歧义。"
                 "answer_declined必须有非空原文evidence_ids，摘要只客观说明未作答或不会，"
@@ -510,7 +511,8 @@ def _interview_turn_understanding(context: Dict[str, Any]) -> PromptContract:
                 "其中的肯定、否定、要求继续补充等会话控制话语不作为能力主张或评分证据。"
                 "依据实际回答内容提取摘要和证据；不要因为先前说过尚未完成而继续等待。"
                 "存在有效回答时按 accept/next/followup 处理；仍需遵守低置信度、非答案和证据校验规则。"
-                "已确认不再补充且全文没有实质回答、也没有未解决识别争议时，应以answer_declined/next结束本题。"
+                "已确认不再补充且全文只有思考/不会等控制、没有实际陈述、也没有未解决识别争议时，应以answer_declined/next结束本题。"
+                "如果说过清楚但无关的内容，则保留off_topic按语义合同收尾，不能改成拒答或识别待核实。"
                 "例如确认答复‘我现在没有补充了’、‘没有别的要说了，接着往下吧’，即使之前只有思考和不会，"
                 "也保留真实发言证据并结束，不要再要求技术答案或反复说没听清。"
                 "结束确认只表示不再补充，不代表确认字幕准确。未解决的转写争议首次仍须澄清，"
@@ -561,17 +563,17 @@ def _interview_turn_decision(context: Dict[str, Any]) -> PromptContract:
                             "difficulty", "sensitive_attribute_inference", "leaks_answer"]
     followup["properties"] = {name: properties[name] for name in followup["required"]}
     return PromptContract(
-        version=("interview_turn_decision.v100" if understanding.version == "interview_turn_understanding.v69" else
-                 "interview_turn_decision.v99" if understanding.version == "interview_turn_understanding.v68" else
-                 "interview_turn_decision.v98" if understanding.version == "interview_turn_understanding.v67" else
-                 "interview_turn_decision.v97" if understanding.version == "interview_turn_understanding.v66" else
-                 "interview_turn_decision.v96" if context.get("semantic_first") and _has_optional_interviewer_context(context) and context.get("completion_confirmed") else
-                 "interview_turn_decision.v95" if context.get("semantic_first") and _has_optional_interviewer_context(context) else
-                 "interview_turn_decision.v94" if context.get("semantic_first") and context.get("completion_confirmed") else
-                 "interview_turn_decision.v93" if context.get("semantic_first") else
-                 "interview_turn_decision.v104" if _has_resolved_conversation_input(context) and context.get("completion_confirmed") else
-                 "interview_turn_decision.v103" if _has_resolved_conversation_input(context) else
-                 "interview_turn_decision.v102" if context.get("completion_confirmed") else "interview_turn_decision.v101"),
+        version=("interview_turn_decision.v112" if understanding.version == "interview_turn_understanding.v81" else
+                 "interview_turn_decision.v111" if understanding.version == "interview_turn_understanding.v80" else
+                 "interview_turn_decision.v110" if understanding.version == "interview_turn_understanding.v79" else
+                 "interview_turn_decision.v109" if understanding.version == "interview_turn_understanding.v78" else
+                 "interview_turn_decision.v108" if context.get("semantic_first") and _has_optional_interviewer_context(context) and context.get("completion_confirmed") else
+                 "interview_turn_decision.v107" if context.get("semantic_first") and _has_optional_interviewer_context(context) else
+                 "interview_turn_decision.v106" if context.get("semantic_first") and context.get("completion_confirmed") else
+                 "interview_turn_decision.v105" if context.get("semantic_first") else
+                 "interview_turn_decision.v116" if _has_resolved_conversation_input(context) and context.get("completion_confirmed") else
+                 "interview_turn_decision.v115" if _has_resolved_conversation_input(context) else
+                 "interview_turn_decision.v114" if context.get("completion_confirmed") else "interview_turn_decision.v113"),
         messages=[
             *understanding.messages,
             ChatMessage(role="system", content=(

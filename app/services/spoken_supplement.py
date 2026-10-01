@@ -122,6 +122,7 @@ class SpokenSupplementConfirmation:
         self._idle_check_allowed = True
         self._idle_check_sent = False
         self._idle_no_input_revision = None
+        self._off_topic_redirected = False
         # Ending this answer and leaving the entire interview are distinct
         # permissions. An answer-finish button or supplement reply never grants
         # the latter. All exit replies stay in the same authoritative capture.
@@ -146,7 +147,7 @@ class SpokenSupplementConfirmation:
         """Remember delivered input cursors before one exact output is selected."""
         checkpoint = {name: getattr(self, name) for name in (
             "_handled_final", "_handled_trace_revision", "_reception_seen_text", "_reception_seen_final",
-            "_failure_spoken_identity", "_idle_check_allowed", "_idle_check_sent")}
+            "_failure_spoken_identity", "_idle_check_allowed", "_idle_check_sent", "_off_topic_redirected")}
         checkpoint["failed"] = False
         self._unplayed_speech_checkpoint = checkpoint
         return checkpoint
@@ -524,7 +525,7 @@ class SpokenSupplementConfirmation:
             self._playback_started_at = endpoint.clock()
 
     async def _say(self, endpoint: Any, kind: str, *, afterwards: str, reply_text: str = "",
-                   repeat_target: Any = None) -> bool:
+                   repeat_target: Any = None, recovery: bool = False) -> bool:
         endpoint.assert_current()
         self.phase = "preparing_speech"
         self._after_speech = afterwards
@@ -532,7 +533,8 @@ class SpokenSupplementConfirmation:
         try:
             spoken = await endpoint._infer(self.speak(kind, endpoint.assert_current,
                                       **({"reply_text": reply_text} if reply_text else {}),
-                                      **({"repeat_target": repeat_target} if repeat_target else {})), timeout=45)
+                                      **({"repeat_target": repeat_target} if repeat_target else {})),
+                                      timeout=12 if recovery else 45, use_interaction_budget=not recovery)
             if not self._speech_result_current():
                 spoken = False
             if spoken:
@@ -719,13 +721,15 @@ class SpokenSupplementConfirmation:
         new_text = _speech_since(final, self._reception_seen_final, previous)
         if not new_text:
             return False
-        endpoint._begin_interaction(text)
+        if not prepare_only:
+            endpoint._begin_interaction(text)
         cache_key = (text, phase, previous)
         if self._reception_cache and self._reception_cache[0] == cache_key:
             decision = self._reception_cache[1]
         else:
             try:
-                decision = await endpoint._infer(classify(new_text, phase=phase, preceding_text=previous), timeout=5.5)
+                decision = await endpoint._infer(classify(new_text, phase=phase, preceding_text=previous),
+                                                  timeout=5.5, use_interaction_budget=not prepare_only)
                 endpoint.assert_current()
             except Exception as exc:
                 if getattr(exc, "code", None) == "TURN_DECISION_STALE":
@@ -786,8 +790,15 @@ class SpokenSupplementConfirmation:
         if self._failure_spoken_identity is not None:
             return
         endpoint.assert_current()
-        if await self._say(endpoint, "reception_unavailable", afterwards="listening"):
-            self._failure_spoken_identity = True
+        # Spend this one optional notice before I/O. Its failure must neither
+        # retry the same notice nor be counted as another understanding call.
+        self._failure_spoken_identity = True
+        try:
+            await self._say(endpoint, "reception_unavailable", afterwards="listening", recovery=True)
+        except Exception as exc:
+            if getattr(exc, "code", None) == "TURN_DECISION_STALE":
+                raise
+            endpoint.trace("recovery_speech_unavailable", error_type=type(exc).__name__)
 
     async def _semantic_turn(self, endpoint: Any, final: Any, *, reception_kind: Any = None) -> bool:
         """Understand before asking; this never fabricates a spoken reply."""
@@ -835,6 +846,22 @@ class SpokenSupplementConfirmation:
             # must match before the evidence transaction can accept anything.
             await endpoint._propose(final_snapshot=final, prepared_decision=prepared,
                                     recognition_resumed=True)
+            return True
+        if getattr(understanding, "intent", None) == "off_topic":
+            # Coherent unrelated speech is not a transcription defect or
+            # permission to finish. Redirect once, then keep this recording.
+            self._semantic_wait_identity = identity
+            self._remember_boundary(final)
+            self._idle_check_allowed = False
+            await endpoint._notify("answer_listening")
+            if self._off_topic_redirected:
+                self._remember_handled(final)
+            elif await self._say(endpoint, "reception_off_topic", afterwards="listening"):
+                self._off_topic_redirected = True
+                self._remember_handled(final)
+            else:
+                self._semantic_wait_identity = None
+                endpoint._retry_at = endpoint.clock() + 2
             return True
         if understanding.suggested_action == "continue_listening":
             self._semantic_wait_identity = identity

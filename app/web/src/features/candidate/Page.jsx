@@ -8,7 +8,7 @@ import {
   useState,
 } from "react";
 
-import { candidateNotice, candidateEntryMessage, candidateEntryFailure, understandingRecoveryState } from "./presentation.js";
+import { candidateNotice, candidateConnectionNotice, candidateEntryMessage, candidateEntryFailure, understandingRecoveryState } from "./presentation.js";
 import { CandidateQuestionContext, CandidateQuestionHistory, useCandidateQuestionHistory } from "./QuestionHistory.jsx";
 
 import { useWorkbench } from "../../core/WorkbenchProvider.jsx";
@@ -538,6 +538,9 @@ function CandidateRoom({ interview, token }) {
       payload,
       idempotencyKey: uniqueActionKey(type),
       turnId: experience.currentQuestion?.turn_id,
+    }).then((result) => {
+      if (result !== false && mounted.current) setStartingProblem(previous => previous?.code === "CANDIDATE_ACTION_FAILED" ? null : previous);
+      return result;
     }).catch((error) => {
       if (mounted.current && !runtimeBlocked.current) setStartingProblem({
         code: "CANDIDATE_ACTION_FAILED",
@@ -546,6 +549,12 @@ function CandidateRoom({ interview, token }) {
       });
     });
   }, [experience.currentQuestion?.turn_id]);
+
+  useEffect(() => {
+    if (experience.connection.control === "connected") {
+      setStartingProblem(previous => previous?.code === "CANDIDATE_ACTION_FAILED" ? null : previous);
+    }
+  }, [experience.connection.control, experience.currentQuestion?.turn_id]);
 
   const problem = experience.problem || startingProblem;
   const session = experience.session || {};
@@ -562,7 +571,9 @@ function CandidateRoom({ interview, token }) {
   const totalQuestions = adaptive ? null : Number(session.total_primary_questions ?? interview?.turns?.filter((item) => !item.is_followup).length ?? 0);
   const answered = Number(session.completed_answers ?? interview?.answers?.length ?? 0);
   const pauseConfirmed = problem?.pauseConfirmed === true || session.status === "paused";
-  const notice = candidateNotice(problem, pauseConfirmed, experience.phase);
+  const connectionNotice = problem?.recoverable === false ? null : candidateConnectionNotice(experience);
+  const controlsReady = experience.connection.control === "connected" && !connectionNotice;
+  const notice = connectionNotice || candidateNotice(problem, pauseConfirmed, experience.phase);
   const visibleExperience = problem?.recoverable === false ? {
     ...experience, phase: "paused", floor: "none",
     avatar: { ...experience.avatar, status: "idle", viseme: "sil", visemeWeight: 0, gesture: "idle" },
@@ -636,13 +647,13 @@ function CandidateRoom({ interview, token }) {
         {notice && <div className={notice.urgent ? "candidate-problem is-fatal" : "candidate-waiting-row"} role={notice.urgent ? "alert" : "status"}>
           <span><strong>{notice.title}</strong><small>{notice.detail}</small></span>
           {notice.retry && <button className="button button-secondary" type="button"
-            disabled={experience.planningRetryPending || experience.understandingRetryPending
+            disabled={!controlsReady || experience.planningRetryPending || experience.understandingRetryPending
               || Boolean(understandingRecoveryState(problem) && !experience.evidence?.ready)}
             onClick={() => act(notice.action || "continue_speaking")}>{experience.planningRetryPending || experience.understandingRetryPending ? "正在重试…" : notice.retryLabel || "重试"}</button>}
         </div>}
 
-        <SpeechPlaybackState playback={problem?.recoverable === false ? null : experience.speechPlayback} act={act} />
-        {!experience.session ? <CandidateSessionGate problem={problem} /> : calibration.status !== "completed" ? <WarmupPanel calibration={calibration} experience={visibleExperience} act={act} /> : <>
+        <SpeechPlaybackState playback={problem?.recoverable === false || connectionNotice ? null : experience.speechPlayback} act={act} />
+        {!experience.session ? <CandidateSessionGate problem={problem} /> : calibration.status !== "completed" ? <WarmupPanel calibration={calibration} experience={visibleExperience} act={act} controlsReady={controlsReady} showState={!notice} /> : <>
           <CandidateQuestionContext history={questionHistory.history} currentQuestion={currentQuestion} />
           <div className="candidate-question-head">
             <div>
@@ -660,19 +671,19 @@ function CandidateRoom({ interview, token }) {
           />
           <div className="candidate-answer-actions">
             {experience.captureRecovery?.status === "retry_required" && experience.phase !== "paused"
-              ? <AnswerRecoveryAction recovery={experience.captureRecovery} act={act} disabled={problem?.recoverable === false} />
+              ? <AnswerRecoveryAction recovery={experience.captureRecovery} act={act} disabled={!controlsReady || problem?.recoverable === false} />
               : <div className="recording-actions">
-              <button className="button button-secondary" type="button" onClick={() => act("finish_answer")} disabled={!experience.evidence?.ready || !["listening", "answer_preparing", "awaiting_supplement"].includes(visibleExperience.phase)}>
+              <button className="button button-secondary" type="button" onClick={() => act("finish_answer")} disabled={!controlsReady || !experience.evidence?.ready || !["listening", "answer_preparing", "awaiting_supplement"].includes(visibleExperience.phase)}>
                 提前结束回答
               </button>
-              <button className="button button-secondary" type="button" onClick={() => act("request_repeat")} disabled={planning || visibleExperience.phase === "understanding" || visibleExperience.phase === "paused" || Boolean(experience.captureRecovery)}>
+              <button className="button button-secondary" type="button" onClick={() => act("request_repeat")} disabled={!controlsReady || planning || visibleExperience.phase === "understanding" || visibleExperience.phase === "paused" || Boolean(experience.captureRecovery)}>
                 请再说一遍
               </button>
-              <button className="button button-secondary" type="button" onClick={() => act("continue_speaking")} disabled={problem?.recoverable === false || (!experience.endpoint.active && !["answer_preparing", "awaiting_supplement"].includes(experience.phase)) || !experience.evidence?.ready}>
+              <button className="button button-secondary" type="button" onClick={() => act("continue_speaking")} disabled={!controlsReady || problem?.recoverable === false || (!experience.endpoint.active && !["answer_preparing", "awaiting_supplement"].includes(experience.phase)) || !experience.evidence?.ready}>
                 继续补充
               </button>
             </div>}
-            <button className="button button-danger" type="button" onClick={() => act("pause")}>暂停面试</button>
+            <button className="button button-danger" type="button" disabled={!controlsReady} onClick={() => act("pause")}>暂停面试</button>
           </div>
           <CandidateQuestionHistory {...questionHistory} currentQuestion={currentQuestion} />
         </>}
@@ -692,8 +703,8 @@ function CandidateSessionGate({ problem }) {
   </div>;
 }
 
-export function WarmupPanel({ calibration, experience, act }) {
-  const blocked = experience.phase === "paused" || experience.session?.status === "paused" || experience.problem?.recoverable === false;
+export function WarmupPanel({ calibration, experience, act, controlsReady = true, showState = true }) {
+  const blocked = !controlsReady || experience.phase === "paused" || experience.session?.status === "paused" || experience.problem?.recoverable === false;
   const awaiting = calibration.status === "awaiting_confirmation";
   const retryable = calibration.status === "retrying"
     && (calibration.retryRequired === true || (
@@ -704,7 +715,7 @@ export function WarmupPanel({ calibration, experience, act }) {
     <p className="eyebrow">不评分试音</p>
     <h1>{awaiting ? "请确认系统是否正确听懂了你" : "请用普通话做一句简短自我介绍，也可以夹带英文技术词"}</h1>
     <p>这段试音不计分，确认后会删除。</p>
-    <ConversationState phase={experience.phase} endpoint={experience.endpoint} />
+    {showState && <ConversationState phase={experience.phase} endpoint={experience.endpoint} />}
     <CaptionPanel captions={experience.captions} expanded />
     {(awaiting || retryable) && <div className="candidate-warmup-actions">
       {awaiting && <button className="button button-primary" type="button" disabled={blocked} onClick={() => act("warmup.confirm")}>字幕正确，开始正式面试</button>}
@@ -780,11 +791,12 @@ export function AnswerRecoveryAction({ recovery, act, disabled = false }) {
 }
 
 export function CandidateSignalList({ experience, blocked = false }) {
+  const connectionRecovery = candidateConnectionNotice(experience);
   const processingFailure = understandingRecoveryState(experience.problem);
   const stopped = blocked || ["paused", "completed", "answer_retry_required", "planning"].includes(experience.phase)
     || (experience.phase === "understanding" && (!processingFailure || experience.evidence?.ready !== true));
   const recovering = experience.captureRecovery?.status === "recovering" && !stopped;
-  const local = !stopped && experience.microphone.localDetected;
+  const local = !stopped && !connectionRecovery && experience.microphone.localDetected;
   const stoppedDetail = blocked ? "收音已停止，请查看页面提示"
     : experience.phase === "paused" ? "面试已暂停"
     : experience.phase === "completed" ? "面试已结束"
@@ -796,7 +808,7 @@ export function CandidateSignalList({ experience, blocked = false }) {
     : "这段回答已收好，面试官正在整理";
   return <div className="candidate-signal-list">
     <SignalState label={recovering ? "连接有些慢，正在恢复" : "麦克风"} active={local && !recovering}
-      detail={stopped ? stoppedDetail : recovering ? "请稍等，已收到的回答会保留" : local ? "正在收到你的声音"
+      detail={stopped ? stoppedDetail : connectionRecovery ? "连接恢复期间，请稍候" : recovering ? "请稍等，已收到的回答会保留" : local ? "正在收到你的声音"
         : experience.evidence?.ready === false ? "麦克风正在连接" : "麦克风已开启，可随时说话"}>
       <span className="microphone-level" aria-hidden="true"><i style={{ width: `${stopped ? 0 : Math.round(experience.microphone.level * 100)}%` }} /></span>
     </SignalState>
@@ -900,7 +912,7 @@ function connectionText(connection) {
   if (connection.control === "connected" && ["connected", "recovery"].includes(connection.media)) {
     return connection.media === "recovery" ? "正在恢复连接" : "已连接";
   }
-  if (connection.control === "recovering" || connection.media === "reconnecting") return "正在恢复连接";
+  if (["recovering", "resyncing"].includes(connection.control) || ["reconnecting", "disconnected"].includes(connection.media)) return "正在恢复连接";
   return "正在连接";
 }
 

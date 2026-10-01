@@ -3157,7 +3157,7 @@ def test_understanding_reference_contract_retries_partition_without_rewriting_ev
         _utterance(transcript), _turn(), _interview(_turn()),
     ))
     assert result.problem is None
-    assert result.prompt_version == "interview_turn_understanding.v70"
+    assert result.prompt_version == "interview_turn_understanding.v82"
     assert result.evidence_quotes == ["嗯，Fast API 检查 Redis 依赖，readiness 返回 200。"]
     assert result.claims[0].evidence_quote == result.evidence_quotes[0]
     assert len(gateway.requests) == 2

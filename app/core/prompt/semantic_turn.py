@@ -9,10 +9,29 @@ import re
 
 
 SEMANTIC_TURN_INSTRUCTION = (
-    "本轮采用语义优先接话合同semantic_turn.v17。服务端尚未向候选人询问是否补充，"
+    "本轮采用语义优先接话合同semantic_turn.v19。服务端尚未向候选人询问是否补充，"
     "不得假定已发生独立确认。分别判断answer_content与turn_intent，不按关键词匹配。"
     "answer_content描述是否能从原文提取含义确定的专业claims，不是得分：technical/partial必须有真实claims；"
     "none表示没有可确定的技术主张，允许原文有无法理解的技术尝试，不等于没有开口、不会或拒答。"
+    "另外，清楚陈述与本题无关的内容时使用intent=off_topic；跑题是相关性判断，不是识别失败、语义不明或知识拒答。"
+    "例如技术题后清楚讲周末爱好再说‘我的话说完了’，可为off_topic+none+finish_answer，"
+    "claims/covered为空、missing包含全部能力点、ambiguities为空、clarification_target=null，保留真实正文和完成语证据。"
+    "off_topic的answer_content仍按是否有真实专业主张判断；没有就none，不把爱好、游戏情节或结束控制编成技术claims。"
+    "与本题无关但确实存在的专业主张可用partial/technical并保留，covered仍为空；"
+    "off_topic只允许整份回答没有任何与题目相关的实际技术内容。必须逐条检查全文claims的相关性，不按最后一段或篇幅占比判断。"
+    "例如题目问数据库一致性，候选人先说‘多张表的写操作会放进同一事务’，再讲一大段种花，最后‘我说完了’，"
+    "仍必须intent=answer、answer_content=partial、turn_intent=finish_answer；保留事务claim及有证据支持的覆盖点，followup_allowed=true。"
+    "不完整、没有命中全部能力点或只有一句相关做法仍是answer；summary应先概括这份技术作答，不能只概括无关尾段。"
+    "只有逐项都与题目无关的真实专业claims才可off_topic+partial/technical；禁止以跑题尾段将相关作答改成off_topic。"
+    "清楚跑题后明确说完可用finish_answer；明确换题或不再答本题用finish_topic/decline_topic，"
+    "每种收尾都需当前真实completion_basis、confidence至少0.75，followup_allowed=false；"
+    "这只结束本题回答，不结束整场，也不代表答案正确或得分为零，原话交评分环节判断相关性。"
+    "尚未说完仍answering，明确等一下仍thinking，不能因跑题替候选人结束或反复要求解释已听懂的内容。"
+    "明确退出整场则off_topic+stop_interview并由运行时独立确认；不把完成本题改成退出。"
+    "只有控制请求或寒暄不能虚构一份off_topic回答；实际转写有未解决技术疑点仍按下述澄清合同，"
+    "不能用off_topic掩盖听不清、转写投诉或跳过内容澄清和退出确认。"
+    "已听懂的无关内容不能要求换一种说法或拼出术语；即使先前误问过澄清，也应根据完整原文及当前新发言纠正理解，"
+    "不能因旧澄清记录继续制造歧义；清楚内容加当前新完成语仍可用off_topic正常收尾。"
     "先判断answer_content和本人最新有效的turn_intent，再据此选择suggested_action。"
     "intent=answer只表示已有专业内容，不表示候选人已经说完，不能从intent=answer推导为next。"
     "内容抽取优先于结束意图分类：先保留全文中所有未撤回的实际做法、选择或技术判断，"
@@ -78,11 +97,11 @@ SEMANTIC_TURN_INSTRUCTION = (
     "finish_topic/decline_topic/stop_interview必须confidence至少0.75，suggested_action=next，"
     "followup_allowed=false，并提供completion_basis={source:explicit_server_intent,evidence_ids:[E编号]}。"
     "finish_answer只有建议next收尾时才必须confidence至少0.75，并用completion_basis逐字引用"
-    "实际完成回答的原文；可理解的技术回答使用intent=answer、partial或technical；满足上述待核实例外时仍用answer_unresolved。"
+    "实际完成回答的原文；可理解的技术回答使用intent=answer、partial或technical；清楚但完全无关的陈述使用off_topic；满足上述待核实例外时仍用answer_unresolved。"
     "这里只能引用当前完整原文中实际表达结束意图的证据，不把静音、普通陈述结束或模型把握当结束授权。"
     "‘我不想继续面试了’、‘我不想面了’、‘我们结束面试吧’明确结束整场时使用stop_interview，不能误解成只跳过本题。"
     "同一发言既说本题不会又要求结束面试，范围是整场，必须stop_interview；不由answer_content决定结束范围。"
-    "这时技术正文可理解且有实际内容仍intent=answer，无内容且明确未作答才answer_declined；"
+    "这时相关技术正文可理解且有实际内容仍intent=answer，清楚无关陈述仍off_topic，无内容且明确未作答才answer_declined；"
     "技术转写仍有未解决疑点则answer_unresolved，原文、疑点和已答内容全部保留。"
     "除实际建议next的finish_answer/finish_topic/decline_topic/stop_interview外completion_basis必须null；"
     "上述finish_answer+clarification_request+clarify非提交组合也必须null。疑问、转述、否定、引用的不会都不是本人拒答。"
@@ -111,15 +130,15 @@ SEMANTIC_TURN_INSTRUCTION = (
     "repeat/pause分别使用repeat/pause动作。普通answering没有结束依据时可以建议accept，"
     "运行时会在需要时确认，不得凭此建议捏造结束依据。"
     "followup_allowed描述是否允许继续本话题；可理解回答的finish_answer允许追问，answer_unresolved禁止技术追问，"
-    "只有关闭话题、拒答、结束整场、思考或控制请求才为false。"
+    "off_topic、关闭话题、拒答、结束整场、思考或控制请求均为false。"
 )
 
 # A real supplement reply permits completing this answer. It must still be
 # understood semantically so a request to stop the whole interview survives.
 SEMANTIC_CONFIRMED_TURN_INSTRUCTION = SEMANTIC_TURN_INSTRUCTION.replace(
-    "本轮采用语义优先接话合同semantic_turn.v17。服务端尚未向候选人询问是否补充，"
+    "本轮采用语义优先接话合同semantic_turn.v19。服务端尚未向候选人询问是否补充，"
     "不得假定已发生独立确认。",
-    "本轮采用语义接话合同semantic_turn.v18。服务端已取得本次回答的真实结束确认，"
+    "本轮采用语义接话合同semantic_turn.v20。服务端已取得本次回答的真实结束确认，"
     "确认来源由服务端保证，不能从静音或普通陈述伪造。"
     "‘没有补充了’只结束本次回答；已有技术回答时，确认回复的‘没有’、‘补充完了’使用"
     "finish_answer且followup_allowed=true。不能因为否定补充就写finish_topic或拒绝后续追问。"
@@ -420,13 +439,44 @@ def validate_unresolved_completion(data, transcript, clarification_context=None)
 
 
 SERVER_CONTROL_DERIVATION_INSTRUCTION = (
-    "动作与追问权限采用服务端派生合同semantic_controls.v1。请先判断本人当前有效的turn_intent、实际技术内容、"
+    "动作与追问权限采用服务端派生合同semantic_controls.v2。请先判断本人当前有效的turn_intent、实际技术内容、"
     "未解决歧义和真实completion_basis，再填写兼容输出字段；不能为了让suggested_action/followup_allowed匹配而"
     "改变其真实意图、删除技术claims、编造结束依据或抹掉歧义。服务端根据这些已验证事实重新计算动作与追问权限："
     "thinking继续听，repeat重读，pause暂停，clarify/correction澄清，ask_company交资料问答；"
     "有合法依据的完成意图才进入next，首次技术歧义加说完仍须澄清；一般作答且无未解决歧义为accept。"
+    "off_topic仅描述清楚跑题，不由缺少技术claims推断不理解；不授权技术追问，实际说完仍须当前完成依据。"
+    "若同时输出off_topic和已覆盖本题能力点，只有原文绑定的真实专业claims与合法能力点分区均成立时，"
+    "服务端才将这个矛盾标签归一为answer；没有覆盖证据的无关专业主张仍是off_topic。"
     "这些派生字段不是提交或退出授权，独立结束确认和服务端送达记录仍必须满足。"
 )
+
+
+def normalize_answer_relevance(data, transcript, capability_points):
+    """Reconcile a label with the model's own source-bound relevance judgment.
+
+    No words are classified locally. A covered frozen point already asserts
+    relevance; an off-topic label cannot erase that same verified evidence.
+    Unbound claims, unknown points and genuine ambiguity are never repaired.
+    The complete domain validators still run after this narrow projection.
+    """
+    if (data.get("intent") != "off_topic" or not data.get("turn_intent")
+            or data.get("answer_content") not in {"partial", "technical"}
+            or not data.get("covered_capability_points") or not data.get("claims")
+            or data.get("ambiguities") or data.get("clarification_target")):
+        return data
+    covered, missing = data["covered_capability_points"], data["missing_capability_points"]
+    allowed = set(capability_points)
+    if (len(set(covered)) != len(covered) or len(set(missing)) != len(missing)
+            or set(covered) & set(missing) or set(covered) | set(missing) != allowed):
+        return data
+    declared = data.get("evidence_quotes") or []
+    if (not declared or any(not quote.strip() or quote not in transcript for quote in declared)
+            or any(not claim["claim"].strip() or claim["evidence_quote"] not in declared
+                   for claim in data["claims"])):
+        return data
+    result = deepcopy(data)
+    result["intent"] = "answer"
+    return derive_semantic_controls(result)
 
 
 def derive_semantic_controls(data):
@@ -449,6 +499,8 @@ def derive_semantic_controls(data):
         intent == "finish_answer" and result.get("intent") != "answer_unresolved"
         and not clarification_after_finish
     )
+    if result.get("intent") == "off_topic":
+        result["followup_allowed"] = False
     if clarification_after_finish:
         action = "clarify"
     elif continuing:
@@ -540,6 +592,13 @@ def validate_semantic_turn(data, transcript):
     elif company is not None or data["suggested_action"] == "respond_company" or data["intent"] == "company_question":
         raise SemanticContractError("company_question_contract_invalid", "$.company_question")
     unresolved = data["intent"] == "answer_unresolved"
+    if data["intent"] == "off_topic" and (
+        intent not in {"answering", "thinking", "finish_answer", "finish_topic", "decline_topic", "stop_interview"}
+        or not str(data.get("answer_summary") or "").strip() or not data["evidence_quotes"]
+        or data["covered_capability_points"] or data["ambiguities"] or data.get("clarification_target")
+        or data["followup_allowed"]
+    ):
+        raise SemanticContractError("off_topic_contract_invalid", "$.intent")
     if unresolved and (intent not in {"finish_answer", "stop_interview"} or not data["ambiguities"] or data["clarification_target"] is None):
         raise SemanticContractError("unresolved_answer_contract_invalid", "$.intent")
     # Candidate meaning and permission to act are separate: the candidate may
@@ -572,13 +631,13 @@ def validate_semantic_turn(data, transcript):
             raise SemanticContractError("completion_confidence_insufficient", "$.confidence")
         if data["suggested_action"] != "next":
             raise SemanticContractError("completion_action_invalid", "$.suggested_action")
-        if data["followup_allowed"] != (intent == "finish_answer" and not unresolved):
+        if data["followup_allowed"] != (intent == "finish_answer" and not unresolved and data["intent"] != "off_topic"):
             raise SemanticContractError("completion_followup_permission_invalid", "$.followup_allowed")
-        if intent == "finish_answer" and content == "none" and not unresolved:
+        if intent == "finish_answer" and content == "none" and not unresolved and data["intent"] != "off_topic":
             raise SemanticContractError("finish_answer_without_content", "$.answer_content")
         if data["ambiguities"] and not unresolved:
             raise SemanticContractError("completion_has_unresolved_ambiguity", "$.ambiguities")
-        if not unresolved and (data["intent"] not in {"answer", "answer_declined"} or (content == "none") != (data["intent"] == "answer_declined")):
+        if not unresolved and data["intent"] != "off_topic" and (data["intent"] not in {"answer", "answer_declined"} or (content == "none") != (data["intent"] == "answer_declined")):
             raise SemanticContractError("completion_intent_content_mismatch", "$.intent")
         if any(not quote.strip() or quote not in transcript for quote in basis["evidence_quotes"]):
             raise SemanticContractError("semantic_completion_evidence_invalid", "$.completion_basis.evidence_quotes")

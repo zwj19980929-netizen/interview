@@ -126,7 +126,7 @@ def record_turn_control(event: str, *, interview_id: str, turn_id: str,
                         capture_id: str = None, **details) -> None:
     """Explicit safe fields; arbitrary exception/response bodies never escape."""
     if event not in {"input_invalidated", "supplement_decided", "proposal_rejected", "audio_playback",
-                     "understanding_retry_budget", "reception_selected", "reception_unavailable",
+                     "understanding_retry_budget", "reception_selected", "reception_unavailable", "recovery_speech_unavailable",
                      "idle_check", "followup_decided", "handled_final_suppressed"}:
         return
     safe = {key: details[key] for key in (

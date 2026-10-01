@@ -15,7 +15,7 @@ from test_semantic_turn_policy import semantic_response
 
 def test_idle_check_is_versioned_speech_without_submission_or_new_assessment():
     from app.core.prompt.conversation_reception import RECEPTION_SPEECH, RECEPTION_SPEECH_VERSION
-    assert RECEPTION_SPEECH_VERSION == "conversation_reception_speech.v3"
+    assert RECEPTION_SPEECH_VERSION == "conversation_reception_speech.v4"
     assert RECEPTION_SPEECH["idle_check"] == "我还在听。需要一点时间，或希望我再解释一下题目，都可以告诉我。"
 
 
@@ -28,7 +28,7 @@ async def test_reception_uses_small_grounded_schema_and_no_answer_preparation():
     assert request.max_output_tokens == 320
     assert request.execution_budget.timeout_s == 4
     assert request.execution_budget.max_provider_retries == 0
-    assert request.metadata == {'prompt_version': 'conversation_reception.v7'}
+    assert request.metadata == {'prompt_version': 'conversation_reception.v9'}
     assert 'standard_answer' not in str(request.messages)
 
 

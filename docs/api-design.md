@@ -1,5 +1,9 @@
 # 接口设计
 
+### OFF-TOPIC-AND-RECONNECT-068
+
+无新增 REST/WebSocket 字段或客户端授权。私有理解合同新增 `off_topic`；语义内容与 `turn_intent` 独立，跑题且明确结束本题可沿原提交接口推进，不能结束整场。前端收到当前 socket 的同场合法快照后才恢复控制按钮；10 秒快照握手超时、最多 6 次重连、稳定 10 秒才重置次数。`answer_preparation` 业务错误跨重连保持，题目、转写及退出确认不重置为首次进入。正式权威 final 的 20 秒期限独立于稳定预览的 15 秒期限，修正下方067的共同起点说明。详见[068说明](off-topic-and-reconnect-068.md)。
+
 ### AGENT-CHAIN-IMPROVEMENTS-067
 
 管理端 Agent metrics 接口保留既有 `metrics`，新增 `aggregation`（`interview-agent-metrics.aggregate.v1`）：进程 `instance_id`、`started_at`、累计 counters、固定桶 histograms，以及 stage 的 success/failure/cancelled 结果数。聚合不包含候选原话、凭据或媒体；跨进程采集须按 instance_id 区分重启。`stt_preview_reused` 纳入服务端指标白名单。
