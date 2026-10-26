@@ -3,6 +3,24 @@ import { describe, expect, it } from "vitest";
 import { OrderedAgentEventStream, validateAgentEvent } from "./agent-event-runtime.js";
 
 describe("ordered AgentEvent runtime", () => {
+  it("bounds formal question audio recovery to the current followup without capture or private fields", () => {
+    const snapshot = { ...candidateSnapshot(), floor: "none",
+      current_question: { ...candidateSnapshot().current_question, is_followup: true },
+      question_audio_recovery: { status: "retry_required", turn_id: "turn_1", selection_event_id: "event_1" } };
+    const validate = (value) => validateAgentEvent(event(1, "session.snapshot", value)).ok;
+    expect(validate(snapshot)).toBe(true);
+    expect(validate({ ...snapshot, floor: "agent", question_audio_recovery: { ...snapshot.question_audio_recovery, status: "retrying" } })).toBe(true);
+    for (const change of [{ status: "paused" }, { floor: "candidate" }, { calibration_status: "listening" },
+      { current_question: { ...snapshot.current_question, is_followup: false } },
+      { question_audio_recovery: { ...snapshot.question_audio_recovery, turn_id: "turn_stale" } },
+      { question_audio_recovery: { ...snapshot.question_audio_recovery, act_id: "private" } },
+      { question_audio_recovery: { ...snapshot.question_audio_recovery, status: "ready" } },
+      { question_audio_recovery: { ...snapshot.question_audio_recovery, selection_event_id: "" } }]) {
+      expect(validate({ ...snapshot, ...change })).toBe(false);
+    }
+    expect(validateAgentEvent(event(2, "problem", { code: "QUESTION_AUDIO_RETRY_REQUIRED", message: "synthetic", recoverable: true, action: "retry_question_audio" })).ok).toBe(true);
+    expect(validateAgentEvent(event(2, "problem", { code: "QUESTION_AUDIO_RETRY_REQUIRED", message: "synthetic", recoverable: true, action: "continue_speaking" })).ok).toBe(false);
+  });
   it("accepts only a bounded completion receipt for the snapshot interview", () => {
     const completion = { interview_id: "iv_1", status: "submitted_for_human_review", submitted_at: "2026-09-23T00:00:00Z", recording_retention_notice: "已停止采集。", human_review_required: true };
     for (const receipt of [undefined, null, completion]) {
@@ -214,6 +232,19 @@ describe("ordered AgentEvent runtime", () => {
       expect(validateAgentEvent({ ...item, payload: { ...payload, cause_type: "ProviderError" } }).ok).toBe(false);
       expect(validateAgentEvent({ ...item, payload: { ...payload, ...(type === "problem" ? { action: "pause_or_human_takeover" } : { owner: "human" }) } }).ok).toBe(false);
     }
+  });
+
+  it("validates safe recovery stage, cause and finite attempt fields", () => {
+    const snapshot = { ...candidateSnapshot(), current_turn_id: "turn_1" };
+    const preparation = { status: "retrying", turn_id: "turn_1", capture_id: "capture_1",
+      stage: "answer_understanding", reason_code: "provider_timeout", attempt: 2, max_attempts: 2, retryable: true };
+    expect(validateAgentEvent(event(1, "session.snapshot", { ...snapshot, answer_preparation: preparation })).ok).toBe(true);
+    for (const change of [{ reason_code: "private exception" }, { stage: "private stage" }, { attempt: 3 },
+      { attempt: true }, { max_attempts: 20 }, { retryable: "true" }, { provider_result: "private" }]) {
+      expect(validateAgentEvent(event(1, "session.snapshot", { ...snapshot, answer_preparation: { ...preparation, ...change } })).ok).toBe(false);
+    }
+    expect(validateAgentEvent(event(1, "session.snapshot", { ...snapshot, answer_preparation: { ...preparation,
+      status: "blocked", reason_code: "provider_billing_required", retryable: false } })).ok).toBe(true);
   });
 
   it("accepts durable understanding recovery on any active floor without relaxing snapshot scope", () => {

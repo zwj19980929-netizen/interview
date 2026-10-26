@@ -33,7 +33,9 @@ async def test_answer_completion_keeps_covered_claim_detail_probe_available(conf
     understanding, followup = await service.prepare_decision(utterance, turn, interview)
     assert understanding.problem is None
     assert understanding.turn_intent == "finish_answer" and understanding.followup_allowed
-    assert service.can_complete_without_confirmation(understanding, utterance.text)
+    # Preparation may plan a probe; normal answers still need the runtime's
+    # supplement confirmation before that plan can be committed.
+    assert not service.can_complete_without_confirmation(understanding, utterance.text)
     assert not source_topic_closed({"current_understanding": understanding.model_dump()})
     assert understanding.missing_capability_points == []
     assert followup["selected"] and followup["target_key_points"] == ["确认序号"]
@@ -130,7 +132,7 @@ async def test_finishing_answer_does_not_override_followup_budgets(budget, reaso
     service = _service(gateway)
     understanding, followup = await service.prepare_decision(utterance, turn, interview)
     assert understanding.problem is None
-    assert service.can_complete_without_confirmation(understanding, utterance.text)
+    assert not service.can_complete_without_confirmation(understanding, utterance.text)
     assert not followup["selected"] and followup["reason"] == reason
     assert len(gateway.requests) == 1
     assert "understanding" not in gateway.requests[0].json_schema["properties"]
@@ -171,7 +173,7 @@ async def test_derived_followup_permission_still_requires_source_evidence_and_re
     understanding, followup = await service.prepare_decision(utterance, turn, interview)
     assert understanding.problem is None and understanding.followup_allowed
     assert understanding.claims and understanding.completion_basis.evidence_quotes == ["我讲完了。"]
-    assert service.can_complete_without_confirmation(understanding, utterance.text)
+    assert not service.can_complete_without_confirmation(understanding, utterance.text)
     assert followup["selected"] is allow_followup and len(gateway.requests) == 1
     if not allow_followup:
         assert followup["reason"] == "followup_disabled" and "conversation_act" not in followup
@@ -197,7 +199,7 @@ async def test_covered_detail_probe_requires_explicit_reason_and_exact_claim_sou
     service = _service(gateway)
     understanding, followup = await service.prepare_decision(utterance, turn, interview)
     assert understanding.problem is None
-    assert service.can_complete_without_confirmation(understanding, utterance.text)
+    assert not service.can_complete_without_confirmation(understanding, utterance.text)
     assert not followup["selected"] and followup["reason"] == "followup_proposal_rejected"
     assert len(gateway.requests) == 1
     if mode == "separate":
@@ -236,10 +238,12 @@ def test_confirmation_prompt_distinguishes_completion_scope_and_has_no_next_ques
 @pytest.mark.anyio
 async def test_spoken_finish_answer_commits_parent_and_delivers_formal_child_once(tmp_path, monkeypatch):
     from app.core.prompt.understanding_references import understanding_references
-    from app.providers.mock.provider import MockProvider
-    from test_automatic_turn_integration import _automatic_session, _current, _assert_one_automatic_answer
+    from app.providers.mock.provider import MockProvider, MockSTTStream
+    from test_automatic_turn_integration import (_automatic_session, _current, _assert_one_automatic_answer,
+        _feed, _CONTINUATION)
     from test_declined_answer_integration import (
         _semantic_provider, _add_next_question, _playable_speech, _answer_without_confirmation, _TECHNICAL,
+        _stop_current_playback,
     )
     from test_evidence_owner_recovery_integration import TURN_ID, _wait_until
 
@@ -259,14 +263,33 @@ async def test_spoken_finish_answer_commits_parent_and_delivers_formal_child_onc
 
     monkeypatch.setattr(MockProvider, "invoke", finish_answer)
     body = _TECHNICAL + "我讲完了。"
-    async with _automatic_session(tmp_path, monkeypatch, [body, ""], spoken_confirmation=True) as (store, runtime, channel, managed):
+    reply = "没有补充了。"
+    pending = iter([body, reply])
+    original_send = MockSTTStream.send_audio
+
+    async def audio_aligned_send(stream, chunk):
+        if any(chunk) and not getattr(stream, "_synthetic_speech_assigned", False):
+            stream._synthetic_speech_assigned = True
+            stream.request = stream.request.model_copy(update={"metadata": {
+                **stream.request.metadata, "development_transcript": next(pending, "")}})
+        return await original_send(stream, chunk)
+
+    monkeypatch.setattr(MockSTTStream, "send_audio", audio_aligned_send)
+    async with _automatic_session(tmp_path, monkeypatch, [""], spoken_confirmation=True) as (store, runtime, channel, managed):
         _add_next_question(store)
         spoken = _playable_speech(runtime)
-        await _answer_without_confirmation(managed)
+        endpoint, clock = await _answer_without_confirmation(managed)
+        await _wait_until(lambda: endpoint.confirmation.speaking)
+        assert not _current(runtime)["answers"]
+        assert spoken == [SUPPLEMENT_SPEECH["check"]]
+        await _stop_current_playback(runtime, channel)
+        await _wait_until(lambda: endpoint.confirmation._supplement_question_delivered)
+        await _feed(managed._ingress, _CONTINUATION, 5)
+        clock.value += 1
         await _wait_until(lambda: len(_current(runtime)["answers"]) == 1, timeout=5)
         await _wait_until(lambda: any(event["type"] == "conversation.act.selected"
             and event["payload"]["act_type"] == "followup" for event in _current(runtime)["agent_events"]), timeout=5)
-        _assert_one_automatic_answer(store, runtime, body, voice_frames=5, continuation_frames=0)
+        _assert_one_automatic_answer(store, runtime, body + reply, voice_frames=5, continuation_frames=5)
         current = _current(runtime)
         children = [turn for turn in current["turns"] if turn.get("is_followup")]
         assert len(children) == 1
@@ -275,7 +298,7 @@ async def test_spoken_finish_answer_commits_parent_and_delivers_formal_child_onc
         assert child["followup_depth"] == 1 and current["current_turn_id"] == child["id"]
         assert current["answers"][0]["turn_id"] == TURN_ID
         assert current["turns"][0]["current_understanding"]["turn_intent"] == "finish_answer"
-        assert child["conversation_acts"][0]["prompt_version"] == current["turns"][0]["current_understanding"]["prompt_version"] == "interview_turn_decision.v107"
-        assert SUPPLEMENT_SPEECH["check"] not in spoken
-        assert len([call for call in calls if call[0] == "understanding"]) == 1
-        assert not [call for call in calls if call[0] == "supplement"]
+        assert child["conversation_acts"][0]["prompt_version"] == current["turns"][0]["current_understanding"]["prompt_version"] == "interview_turn_decision.v132"
+        assert spoken.count(SUPPLEMENT_SPEECH["check"]) == 1
+        assert len([call for call in calls if call[0] == "understanding"]) == 2
+        assert [call for call in calls if call[0] == "supplement"] == [("supplement", reply, "finish")]

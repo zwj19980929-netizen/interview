@@ -60,7 +60,9 @@ def record_selection(session, event):
         return
     payload = event.get("payload") or {}
     turn = next((t for t in session.get("turns", []) if t.get("id") == event.get("turn_id")), None)
-    acts = [a for a in (turn or {}).get("conversation_acts", [])
+    target = ((session.get("agent_runtime") or {}).get("session_conversation_acts", [])
+              if event.get("turn_id") is None else (turn or {}).get("conversation_acts", []))
+    acts = [a for a in target
             if a.get("act_id") == payload.get("act_id") and a.get("turn_id") == event.get("turn_id")]
     if (len(acts) != 1 or payload.get("approved") is not True
             or not acts[0].get("text") or payload.get("text") != acts[0]["text"]):
@@ -83,8 +85,8 @@ def update_delivery(session, *, event_id, performance_id, status, updated_at):
     """
     if not event_id or not performance_id or status not in {"selected", "playing", "delivered", "interrupted", "failed"}:
         return False
-    for turn in session.get("turns", []):
-        for act in turn.get("conversation_acts", []):
+    for acts in _delivery_groups(session):
+        for act in acts:
             for receipt in act.get("selection_receipts", []):
                 if receipt.get("event_id") != event_id:
                     continue
@@ -109,8 +111,8 @@ def mark_unplayed_selection(session, *, event_id, status, updated_at):
     """Record failed/cancelled preparation only before a performance exists."""
     if not event_id or status not in {"failed", "interrupted"}:
         return False
-    for turn in session.get("turns", []):
-        for act in turn.get("conversation_acts", []):
+    for acts in _delivery_groups(session):
+        for act in acts:
             for receipt in act.get("selection_receipts", []):
                 delivery = receipt.get("delivery") or {}
                 if (receipt.get("event_id") == event_id and not delivery.get("performance_id")
@@ -118,3 +120,12 @@ def mark_unplayed_selection(session, *, event_id, status, updated_at):
                     receipt["delivery"] = {"status": status, "updated_at": updated_at}
                     return True
     return False
+
+
+def _delivery_groups(session):
+    # Session speech has delivery facts but is never returned by
+    # selected_events(), which only supplies evidence for a real turn.
+    for turn in session.get("turns", []):
+        yield [act for act in turn.get("conversation_acts", []) if act.get("turn_id") == turn.get("id")]
+    yield [act for act in (session.get("agent_runtime") or {}).get("session_conversation_acts", [])
+           if act.get("turn_id") is None]

@@ -115,7 +115,8 @@ async def test_archive_capacity_is_bounded_while_threads_are_blocked():
 @pytest.mark.anyio
 async def test_gateway_open_retries_share_one_first_audio_budget():
     store, route = store_and_route()
-    route["policy"] = {"retry_count": 3}
+    # Isolate the shared deadline from the separately tested circuit threshold.
+    route["policy"] = {"retry_count": 3, "circuit_failure_threshold": 10}
     calls = []
     class Adapter(DashScopeProvider):
         async def open_tts_stream(self, request, context):
@@ -125,9 +126,10 @@ async def test_gateway_open_retries_share_one_first_audio_budget():
     start = monotonic()
     with pytest.raises(ProviderError) as error:
         await gateway.open_tts_stream(TTSSynthesizeRequest(text="synthetic approved"), route=route,
-                                      first_audio_deadline=start + .03)
+                                      first_audio_deadline=start + .12)
     assert error.value.code == "provider_timeout"
-    assert len(calls) == 1 and 0 < calls[0] <= .03
+    assert len(calls) == 4 and 0 < calls[0] <= .03
+    assert all(0 < timeout <= .12 for timeout in calls) and sum(calls) <= .12
     assert monotonic() - start < .2
 
 

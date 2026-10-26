@@ -58,6 +58,7 @@ EvidenceCommandType = Literal[
     "speech.started",
     "speech.stopped",
     "evidence.continue",
+    "evidence.retry_processing",
     "evidence.seal",
     "evidence.reset",
     "evidence.backfill",

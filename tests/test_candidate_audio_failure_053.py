@@ -130,6 +130,7 @@ def test_barge_in_revokes_and_notifies_before_blocked_media_cleanup(monkeypatch,
                                  principal=Principal(actor_id="candidate:synthetic", organization_id="org_default", roles=frozenset({"candidate"}), authenticated=True),
                                  _evidence_session=None, _endpoint_task=None, _require_active_interview=lambda: None,
                                  _emit=emit, _cancel_speech_output=cleanup, _set_floor=AsyncMock())
+        source._require_question_audio_delivered = lambda: AgentChannel._require_question_audio_delivered(source)
         signal = ClientSignal(type="speech.started", idempotency_key="barge_synthetic")
         evidence = SimpleNamespace(interview_id=interview_id, organization_id="org_default", chain=SimpleNamespace(is_open=False),
                                    _matches_capture=lambda signal: False, _presentation_task=None)

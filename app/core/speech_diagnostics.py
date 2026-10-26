@@ -5,6 +5,7 @@ import logging
 from collections import OrderedDict
 
 from app.core.time import utc_now
+from app.core.model_diagnostics import safe_model_diagnostic_fields
 
 _LOG = logging.getLogger("interviewer.speech_evidence")
 
@@ -127,17 +128,32 @@ def record_turn_control(event: str, *, interview_id: str, turn_id: str,
     """Explicit safe fields; arbitrary exception/response bodies never escape."""
     if event not in {"input_invalidated", "supplement_decided", "proposal_rejected", "audio_playback",
                      "understanding_retry_budget", "reception_selected", "reception_unavailable", "recovery_speech_unavailable",
-                     "idle_check", "followup_decided", "handled_final_suppressed"}:
+                     "idle_check", "followup_decided", "handled_final_suppressed", "prepared_answer_reused"}:
         return
     safe = {key: details[key] for key in (
         "revision", "phase", "source", "stage", "cause_code", "intent", "confidence",
         "performance_id", "status", "failures", "exhausted",
         "kind", "reason", "selected", "target_count", "error_type",
         "prompt_version", "max_depth", "max_per_root", "max_total", "min_remaining_seconds",
+        "source_understanding_id", "current_understanding_id", "question_act_id",
     ) if key in details}
+    safe.update(safe_model_diagnostic_fields({key: details.get(key) for key in (
+        "diagnostic_scope_id", "parent_scope_id", "interaction_remaining_ms", "retryable",
+    )}))
+    if details.get("reason_code") in {
+        "timeout", "unavailable", "invalid_result", "retry_exhausted", "non_retryable",
+        "call_budget_exhausted", "provider_timeout", "provider_auth_failed", "provider_billing_required",
+        "provider_rate_limited", "provider_circuit_open", "provider_unavailable",
+    }:
+        safe["reason_code"] = details["reason_code"]
     if isinstance(details.get("text"), str):
         safe.update(text_sha256=hashlib.sha256(details["text"].encode()).hexdigest(),
                     text_chars=len(details["text"]))
-    _LOG.info(json.dumps({"event": "turn_control." + event, "at": utc_now(),
-        "interview_id": interview_id, "turn_id": turn_id, "capture_id": capture_id,
-        **safe}, ensure_ascii=True))
+    try:
+        _LOG.info(json.dumps({"event": "turn_control." + event, "at": utc_now(),
+            "interview_id": interview_id, "turn_id": turn_id, "capture_id": capture_id,
+            **safe}, ensure_ascii=True))
+    except Exception:
+        # Diagnostic delivery is optional; a sink failure cannot change the
+        # answer's retry budget, cancellation or submission permissions.
+        pass

@@ -274,23 +274,17 @@ def test_preparation_failures_keep_listening_without_repeated_calls_or_commit(fa
             clock.value += 0.02
             await _until(lambda: capture.resumes >= 2)
             assert len(capture.prepares) == 2
-            clock.value += 1.99
-            await asyncio.sleep(0.07)
-            assert len(capture.prepares) == 2
-            clock.value += 0.02
-            await _until(lambda: capture.resumes >= 3)
-            assert len(capture.prepares) == 3
             clock.value += 60
             await asyncio.sleep(0.15)
-            assert len(capture.prepares) == 3, "Three failures exhaust this input's retry budget"
+            assert len(capture.prepares) == 2, "First attempt plus one automatic recovery exhausts these words"
             _voice_then_pause(endpoint, clock)
-            await _until(lambda: capture.resumes >= 4)
-            assert len(capture.prepares) == 3, "Audio alone cannot restart the same server evidence budget"
+            await _until(lambda: capture.resumes >= 3)
+            assert len(capture.prepares) == 2, "Audio alone cannot restart the same server evidence budget"
             capture.current_final = _final(capture.current_final.text + "新增服务端补充内容。")
             endpoint.observe_transcript(capture.current_final.text)
             clock.value += .8
-            await _until(lambda: len(capture.prepares) == 4)
-            assert len(capture.prepares) == 4, "New server words start a fresh bounded budget"
+            await _until(lambda: len(capture.prepares) == 3)
+            assert len(capture.prepares) == 3, "New server words allow a fresh evidence attempt"
         else:
             count = len(capture.prepares)
             clock.value += 60

@@ -196,8 +196,22 @@ class ModelRouteReadinessRefresher:
                 done, _ = await asyncio.wait({task}, timeout=0.1)
                 if not done:
                     task.add_done_callback(lambda finished: None if finished.cancelled() else finished.exception())
+            reported_error = getattr(task, "provider_error", None)
             if task.done() and not task.cancelled():
-                task.exception()
+                task_error = task.exception()
+                if (isinstance(task_error, ProviderError)
+                        and (not isinstance(reported_error, ProviderError)
+                             or (reported_error.retryable and not task_error.retryable))):
+                    reported_error = task_error
+            # A provider may already have rejected the request while its
+            # transport is still closing. Preserve that known classification
+            # when our deadline cancels the probe; cancellation still propagates.
+            if (error is not None
+                    and error.code in {"provider_timeout", "provider_probe_cancelled"}
+                    and isinstance(reported_error, ProviderError)
+                    and reported_error.code not in {"provider_cancelled", "provider_probe_cancelled"}):
+                error = ProviderError(safe_probe_code(reported_error.code), "Model route probe failed.",
+                                      retryable=bool(reported_error.retryable))
         committed = self._complete(route["id"], organization_id, lease, error)
         if cancelled:
             raise asyncio.CancelledError

@@ -16,6 +16,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 from app.core.auth import Principal
 from app.core.errors import ApiError
 from app.services.capture_recovery import candidate_capture_recovery
+from app.services.answer_preparation_recovery import public_preparation_recovery
 from app.core.ids import new_id
 from app.core.interview_agent_metrics import (
     CANDIDATE_INTERVIEW_AGENT_METRICS,
@@ -25,6 +26,8 @@ from app.core.interview_agent_metrics import (
 from app.core.time import utc_now
 from app.domain.adaptive_interview import is_adaptive
 from app.core.prompt.contracts import SUPPLEMENT_SPEECH_VERSION
+from app.core.prompt.fixed_speech import WARMUP_CONFIRMATION_SPEECH
+from app.services.fixed_speech_preparation import cached_fixed_speech, prepare_fixed_speech_for_session
 from app.core.prompt.interviewer_supervisor import transition_speech
 from app.domain.interview_agent import (
     ApprovedConversationAct,
@@ -75,6 +78,7 @@ _DURABLE_EVIDENCE_SIGNALS = {
     "speech.started",
     "speech.stopped",
     "continue_speaking",
+    "retry_answer_processing",
     "meta.not_finished",
     "warmup.retry",
     "evidence.recovery.chunk",
@@ -293,6 +297,10 @@ class AgentChannel:
             self.interview_id, self.organization_id
         )
         self.runtime._validate_open(session, self.opened)
+        if session.get("status") == "in_progress" and "candidate" in self.principal.roles:
+            prepare_fixed_speech_for_session(
+                self.runtime.gateway, self.organization_id, session.get("settings") or {},
+            )
         runtime_state = session.get("agent_runtime") or {}
         history_floor = int(runtime_state.get("replay_history_floor", 0))
         history = session.get("agent_events", [])
@@ -459,11 +467,20 @@ class AgentChannel:
         failure: Optional[BaseException] = None
         if self._speech_output is not None:
             try:
+                if self._evidence_session is not None and hasattr(self._evidence_session, "assert_controller"):
+                    self._evidence_session.assert_controller(self)
                 self.runtime._mark_streamed_expression_for_replay(
                     self.interview_id, self.organization_id,
                     performance_id=self._speech_output.performance_id,
                     output_id=self._speech_output.output_id,
                 )
+            except ApiError as exc:
+                if exc.code not in _STALE_EVIDENCE_CONTROL_ERRORS | {
+                        "EVIDENCE_OWNER_FENCED", "EVIDENCE_OWNERSHIP_LOST", "EVIDENCE_OWNER_UNAVAILABLE"}:
+                    failure = exc
+                # An old channel may close after its replacement takes control.
+                # Its output still needs local cleanup, but it has no authority
+                # to rewrite replay/floor state or pause the replacement.
             except BaseException as exc:
                 failure = exc
         try:
@@ -636,10 +653,16 @@ class AgentChannel:
             if "candidate" in self.principal.roles:
                 if self._evidence_session is not None:
                     self._evidence_session.assert_controller(self)
+                recovery = self.runtime._question_audio_recovery(session)
+                if recovery and recovery["status"] == "retry_required":
+                    return
                 if self._speech_output is None:
                     replay = self.runtime._recover_streamed_expression(
                         self.interview_id, self.organization_id,
                     )
+                    if self.runtime.interviews.get_interview(self.interview_id, self.organization_id).get("status") != "in_progress":
+                        await self._emit_snapshot(signal.causation_id)
+                        return
                     if replay is not None:
                         await self._select_act(
                             act_type=replay["payload"]["act_type"],
@@ -758,9 +781,18 @@ class AgentChannel:
             await self._set_floor(FloorOwner.NONE, "candidate_pause", signal.causation_id)
             await self._emit_snapshot(signal.causation_id)
             return
+        if kind == "retry_answer_processing":
+            self.runtime._require_candidate(self.principal)
+            self._require_active_interview()
+            self._require_question_audio_delivered()
+            if self._evidence_session is None:
+                raise ApiError("ANSWER_PROCESSING_RECOVERY_UNAVAILABLE", "The current answer capture is not available for recovery.", status_code=409)
+            await self._evidence_session.dispatch(self, signal)
+            return
         if kind in {"continue_speaking", "meta.not_finished"}:
             self.runtime._require_candidate(self.principal)
             self._require_active_interview()
+            self._require_question_audio_delivered()
             if self._evidence_session is not None:
                 await self._evidence_session.dispatch(self, signal)
                 return
@@ -860,6 +892,13 @@ class AgentChannel:
             )
             if runtime_state.get("completion_emitted_at"):
                 return
+            question_recovery = runtime_state.get("question_audio_recovery") or {}
+            if question_recovery and (
+                    question_recovery.get("status") != "retrying"
+                    or signal.turn_id != session.get("current_turn_id")
+                    or question_recovery.get("turn_id") != signal.turn_id
+                    or question_recovery.get("selection_event_id") != runtime_state.get("active_expression_act_event_id")):
+                return
             if not stopped_performance_id:
                 return
             if runtime_state.get("active_output_id"):
@@ -879,6 +918,10 @@ class AgentChannel:
                 # performance has started.  A stale stop must have no effect on
                 # the current floor, calibration, or completion state.
                 return
+            if runtime_state.get("question_audio_recovery"):
+                # Clients keep VAD/capture gated until this authoritative clear
+                # arrives; release candidate floor only after the snapshot.
+                await self._emit_snapshot(signal.causation_id)
             await self._emit(
                 "avatar.performance.stopped",
                 {"performance_id": signal.payload.get("performance_id"), "reason": "completed"},
@@ -948,6 +991,7 @@ class AgentChannel:
     async def _candidate_speech_started(self, signal: ClientSignal) -> None:
         self.runtime._require_candidate(self.principal)
         self._require_active_interview()
+        self._require_question_audio_delivered()
         if self._evidence_session is not None:
             await self._evidence_session.dispatch(self, signal)
             return
@@ -1025,9 +1069,17 @@ class AgentChannel:
         finally:
             self._endpoint_task = None
 
+    def _require_question_audio_delivered(self) -> None:
+        session = self.runtime.interviews.get_interview(self.interview_id, self.organization_id)
+        marker = (session.get("agent_runtime") or {}).get("question_audio_recovery") or {}
+        if (marker.get("status") in {"retry_required", "retrying"}
+                and marker.get("turn_id") == session.get("current_turn_id")):
+            raise ApiError("QUESTION_AUDIO_RETRY_REQUIRED", "The question must finish playing before new evidence.", status_code=409)
+
     async def _open_evidence(self, signal: ClientSignal) -> None:
         self.runtime._require_candidate(self.principal)
         self._require_active_interview()
+        self._require_question_audio_delivered()
         if self._evidence_session is not None:
             await self._evidence_session.dispatch(self, signal)
             return
@@ -1168,7 +1220,7 @@ class AgentChannel:
             )
             await self._select_act(
                 act_type="warmup_confirmation",
-                text="我已经形成了试音字幕。请确认是否听写正确；不正确可以立即重试。",
+                text=WARMUP_CONFIRMATION_SPEECH,
                 turn_id=None,
                 causation_id=signal.causation_id,
                 evidence_refs=[],
@@ -1197,7 +1249,7 @@ class AgentChannel:
 
     async def _complete_warmup_evidence(
         self, result: EvidenceFinishResult, signal: ClientSignal
-    ) -> None:
+    ) -> str:
         final = result.final or {}
         for raw in result.events:
             await self._project_warmup_event(raw, signal.causation_id)
@@ -1206,6 +1258,9 @@ class AgentChannel:
             "awaiting_confirmation",
             self.organization_id,
         )
+        revision = self.runtime.interviews.get_interview(
+            self.interview_id, self.organization_id
+        )["agent_runtime"]["calibration_updated_at"]
         await self._emit(
             "transcript.final",
             {
@@ -1219,14 +1274,98 @@ class AgentChannel:
             causation_id=signal.causation_id,
             replayability=Replayability.TRANSIENT,
         )
-        await self._select_act(
-            act_type="warmup_confirmation",
-            text="我已经形成了试音字幕。请确认是否听写正确；不正确可以立即重试。",
-            turn_id=None,
-            causation_id=signal.causation_id,
-            evidence_refs=[],
-            gesture="nod",
-        )
+        return revision
+
+    async def _present_warmup_confirmation(self, signal: ClientSignal, *, revision: str) -> None:
+        """Optional output starts only after the server final phase succeeded."""
+        from app.services.evidence_coordination import assert_current_evidence_fence, assert_current_evidence_control
+
+        evidence = self._evidence_session
+        if evidence is None:
+            raise ApiError("EVIDENCE_CONTROL_STALE", "Warm-up output has no current controller.", status_code=409)
+        grant = evidence._require_attached(self)
+        capture_id = evidence._capture_id
+        session = self._require_active_interview()
+        state = session.get("agent_runtime") or {}
+        if (session.get("current_turn_id") is not None
+                or state.get("calibration_status") != "awaiting_confirmation"
+                or state.get("calibration_updated_at") != revision):
+            raise ApiError("EVIDENCE_CONTROL_STALE", "Warm-up confirmation is no longer current.", status_code=409)
+        before = next((item.get("event_id") for item in reversed(session.get("agent_events", []))
+                       if item.get("type") == "conversation.act.selected"), None)
+        try:
+            await self._select_act(
+                act_type="warmup_confirmation", text=WARMUP_CONFIRMATION_SPEECH,
+                turn_id=None, causation_id=signal.causation_id, evidence_refs=[], gesture="nod",
+            )
+        except ApiError:
+            # Authorization and stale-control errors retain their own meaning.
+            raise
+        except Exception as exc:
+            if (self._closed or self._terminating or self._evidence_session is not evidence
+                    or evidence._stopped or evidence._capture_id != capture_id):
+                raise ApiError("EVIDENCE_CONTROL_STALE", "Warm-up output is no longer current.", status_code=409) from exc
+            evidence.assert_controller(self)
+            problem = {
+                "code": "WARMUP_CONFIRMATION_AUDIO_UNAVAILABLE", "message": "Warm-up confirmation output is unavailable.",
+                "recoverable": True, "action": "retry_or_correct_signal", "calibration": True,
+                "cause_code": getattr(exc, "code", type(exc).__name__), "cause_type": type(exc).__name__,
+            }
+            failed_performance_id = None
+            fatal = False
+            with self.runtime.persistence.transaction(self.organization_id) as transaction:
+                assert_current_evidence_fence(transaction, grant.commit_fence())
+                assert_current_evidence_control(transaction, grant)
+                current = transaction.interview_sessions.get(self.interview_id)
+                state = (current or {}).get("agent_runtime") or {}
+                self.runtime.interviews.assert_skill_authorized(transaction, current or {})
+                latest = next((item.get("event_id") for item in reversed((current or {}).get("agent_events", []))
+                               if item.get("type") == "conversation.act.selected"), None)
+                if (not current or current.get("status") != "in_progress" or current.get("current_turn_id") is not None
+                        or current.get("candidate_input_completed_at")
+                        or state.get("calibration_status") != "awaiting_confirmation"
+                        or state.get("calibration_updated_at") != revision
+                        or (state.get("takeover") or {}).get("status") == "active"
+                        or ((state.get("takeover") or {}).get("status") is None
+                            and self.runtime._lease_active(state.get("takeover") or {}, now=transaction.database_now()))):
+                    raise ApiError("EVIDENCE_CONTROL_STALE", "Warm-up confirmation changed before recovery.", status_code=409) from exc
+                if latest != before or state.get("active_performance_id") or self._speech_output is not None:
+                    # No proof that a selected output closed without PCM. Do
+                    # not return the floor or retry the already-consumed STT.
+                    fatal = True
+                    failed_performance_id = state.get("active_performance_id")
+                    problem.update(code="WARMUP_CONFIRMATION_OUTPUT_FAILED", recoverable=False,
+                                   action="pause_or_human_takeover", message="Warm-up output could not be completed safely.")
+                    state.update(active_performance_id=None, active_output_id=None,
+                                 active_expression_act_event_id=None, expression_replay_act_event_id=None)
+                state.update(floor=FloorOwner.NONE.value if fatal else FloorOwner.CANDIDATE.value,
+                             floor_reason="expression_failure" if fatal else "warmup_awaiting_confirmation",
+                             floor_changed_at=utc_now())
+                state.setdefault("problems", []).append({**problem, "occurred_at": utc_now()})
+                del state["problems"][:-100]
+                current["updated_at"] = utc_now()
+                if fatal:
+                    from app.domain.interview_lifecycle import LifecycleCommand, LifecycleCommandType
+                    self.runtime.interviews._decide_and_persist(transaction, current,
+                        LifecycleCommand(LifecycleCommandType.PAUSE, {"reason": "agent_expression_unavailable"}),
+                        self.organization_id)
+                else:
+                    transaction.interview_sessions.update(current, expected_version=current["version"])
+            await self._emit_snapshot(signal.causation_id)
+            if failed_performance_id:
+                try:
+                    await notify_performance_interrupted(self, failed_performance_id, reason="expression_failure",
+                                                         causation_id=signal.causation_id)
+                finally:
+                    await self._cancel_speech_output(expected_performance_id=failed_performance_id)
+            evidence.assert_controller(self)
+            current = self.runtime.interviews.get_interview(self.interview_id, self.organization_id)
+            state = current.get("agent_runtime") or {}
+            if (current.get("status") == ("paused" if fatal else "in_progress") and current.get("current_turn_id") is None
+                    and state.get("calibration_status") == "awaiting_confirmation"
+                    and state.get("calibration_updated_at") == revision):
+                await self._emit("problem", problem, turn_id=None, causation_id=signal.causation_id,
+                                 replayability=Replayability.TRANSIENT)
 
     async def _after_formal_evidence_finished(
         self,
@@ -1917,6 +2056,19 @@ class AgentChannel:
         current = self.runtime._current_turn(session)
         if current is None:
             raise ApiError("INTERVIEW_TURN_NOT_ACTIVE", "There is no question to repeat.", status_code=409)
+        recovery = self.runtime._question_audio_recovery(session)
+        if recovery or signal.payload.get("question_audio_recovery_event_id"):
+            if (not recovery or recovery["status"] != "retry_required"
+                    or signal.turn_id != current["id"]
+                    or signal.payload.get("question_audio_recovery_event_id") != recovery["selection_event_id"]):
+                raise ApiError("QUESTION_AUDIO_RETRY_STALE", "Question audio retry is no longer current.", status_code=409)
+            approved = next(item for item in current.get("conversation_acts", [])
+                            if item.get("act_id") == recovery["act_id"])
+            await self._select_act(act_type=approved["act_type"], text=approved["text"],
+                turn_id=current["id"], causation_id=signal.causation_id,
+                evidence_refs=list(approved.get("evidence_quotes") or []), gesture="look_at_candidate",
+                question_audio_retry_event_id=recovery["selection_event_id"])
+            return
         from app.services.dialogue_focus import question_for_repeat
         await self._select_act(act_type="repeat", text=question_for_repeat(current),
             turn_id=current["id"], causation_id=signal.causation_id,
@@ -1975,6 +2127,7 @@ class AgentChannel:
         prompt_version: Optional[str] = None,
         on_playback_selected: Any = None,
         dialogue_question: bool = False,
+        question_audio_retry_event_id: Optional[str] = None,
     ) -> Optional[AvatarPerformance]:
         if not text.strip():
             raise ApiError("CONVERSATION_ACT_EMPTY", "Approved conversation act is empty.", status_code=409)
@@ -1983,10 +2136,12 @@ class AgentChannel:
         # Expression I/O can outlive a pause, another act, or this Evidence
         # owner. Bind completion to the original authority, not whichever
         # owner/turn happens to be current when the provider finally returns.
-        from app.services.evidence_coordination import assert_current_evidence_fence
+        from app.services.evidence_coordination import assert_current_evidence_fence, assert_current_evidence_control
 
         evidence_session = self._evidence_session
         preparation_endpoint = getattr(evidence_session, "_answer_endpoint", None)
+        if preparation_endpoint is not None and not getattr(getattr(preparation_endpoint, "capture", None), "is_open", False):
+            preparation_endpoint = None
         preparation_capture_id = getattr(evidence_session, "_capture_id", None)
         preparation_revision = getattr(preparation_endpoint, "revision", None)
         preparation_confirmation = getattr(preparation_endpoint, "confirmation", None)
@@ -1995,24 +2150,50 @@ class AgentChannel:
                 or (evidence_session is not None and evidence_session._stopped)):
             return None
         owner_fence = None
+        warmup_control = None
+        question_control = None
         if evidence_session is not None:
             try:
                 grant = evidence_session.ownership or evidence_session._require_attached(self)
                 owner_fence = grant.commit_fence()
+                if turn_id is not None and act_type in {"question", "followup", "repeat"}:
+                    question_control = (evidence_session._require_attached(self)
+                                        if hasattr(evidence_session, "_require_attached") else grant)
+                if act_type == "warmup_confirmation":
+                    warmup_control = (evidence_session._require_attached(self)
+                                      if hasattr(evidence_session, "_require_attached") else grant)
             except ApiError:
                 return None
         try:
-            with self.runtime.persistence.transaction(self.organization_id, read_only=True) as transaction:
+            with self.runtime.persistence.transaction(self.organization_id, read_only=question_audio_retry_event_id is None) as transaction:
                 if owner_fence is not None:
                     assert_current_evidence_fence(transaction, owner_fence)
                 initial_session = transaction.interview_sessions.get(self.interview_id)
                 if initial_session:
                     self.runtime.interviews.assert_skill_authorized(transaction, initial_session)
+                if question_audio_retry_event_id is not None:
+                    recovery = self.runtime._question_audio_recovery(initial_session or {})
+                    if question_control is None:
+                        raise ApiError("QUESTION_AUDIO_RETRY_STALE", "Question retry requires the current controller.", status_code=409)
+                    assert_current_evidence_control(transaction, question_control)
+                    if (not recovery or recovery["status"] != "retry_required"
+                            or recovery["selection_event_id"] != question_audio_retry_event_id
+                            or recovery["turn_id"] != turn_id or preparation_endpoint is not None):
+                        raise ApiError("QUESTION_AUDIO_RETRY_STALE", "Question audio retry is no longer current.", status_code=409)
+                    recovery.update(status="retrying", updated_at=utc_now())
+                    initial_session["agent_runtime"]["question_audio_recovery"] = recovery
+                    transaction.interview_sessions.update(initial_session, expected_version=initial_session["version"])
         except ApiError:
             return None
         if not initial_session:
             return None
         expected_turn_id = initial_session.get("current_turn_id")
+        initial_turn = self.runtime._current_turn(initial_session) or {}
+        formal_followup = bool(preparation_endpoint is None and question_control is not None
+                               and turn_id == expected_turn_id and initial_turn.get("is_followup")
+                               and initial_turn.get("status") == "asking"
+                               and act_type in {"question", "followup", "repeat"})
+        warmup_revision = (initial_session.get("agent_runtime") or {}).get("calibration_updated_at")
         allowed_statuses = {"in_progress"}
         if act_type == "closing":
             # The existing completion protocol deliberately speaks its one
@@ -2040,6 +2221,10 @@ class AgentChannel:
             try:
                 if approval_guard is not None:
                     approval_guard()
+                if act_type == "warmup_confirmation" and evidence_session is not None:
+                    # This check opens its own ownership transaction. Never
+                    # nest it under the read snapshot below (SQLite locks).
+                    evidence_session.assert_controller(self)
                 with self.runtime.persistence.transaction(self.organization_id, read_only=True) as transaction:
                     if owner_fence is not None:
                         assert_current_evidence_fence(transaction, owner_fence)
@@ -2048,6 +2233,15 @@ class AgentChannel:
                         return False
                     self.runtime.interviews.assert_skill_authorized(transaction, session)
                     state = session.get("agent_runtime") or {}
+                    if formal_followup:
+                        assert_current_evidence_control(transaction, question_control)
+                    if act_type == "warmup_confirmation":
+                        if warmup_control is not None:
+                            assert_current_evidence_control(transaction, warmup_control)
+                        if (state.get("calibration_status") != "awaiting_confirmation"
+                                or state.get("calibration_updated_at") != warmup_revision
+                                or preparation_capture_id != getattr(evidence_session, "_capture_id", None)):
+                            return False
                     if act_type == "closing" and state.get("completion_emitted_at"):
                         return False
                     if (session.get("current_turn_id") != expected_turn_id
@@ -2076,6 +2270,15 @@ class AgentChannel:
             **({"prompt_version": prompt_version} if prompt_version else {}),
         )
         await self._set_floor(FloorOwner.AGENT, "approved_conversation_act", causation_id)
+        if formal_followup:
+            with self.runtime.persistence.transaction(self.organization_id, read_only=True) as transaction:
+                assert_current_evidence_fence(transaction, owner_fence)
+                assert_current_evidence_control(transaction, question_control)
+                latest_session = transaction.interview_sessions.realtime_state(self.interview_id)
+                if (not latest_session or latest_session.get("status") != "in_progress"
+                        or latest_session.get("current_turn_id") != turn_id
+                        or (latest_session.get("agent_runtime") or {}).get("floor") != FloorOwner.AGENT.value):
+                    return None
         selected_event = await self._emit(
             "conversation.act.selected",
             {
@@ -2091,6 +2294,194 @@ class AgentChannel:
             causation_id=causation_id,
             replayability=Replayability.REPLAYABLE,
         )
+
+        if question_audio_retry_event_id is not None:
+            with self.runtime.persistence.transaction(self.organization_id) as transaction:
+                assert_current_evidence_fence(transaction, owner_fence)
+                assert_current_evidence_control(transaction, question_control)
+                current = transaction.interview_sessions.get(self.interview_id)
+                marker = (current.get("agent_runtime") or {}).get("question_audio_recovery") or {}
+                if (current.get("status") != "in_progress" or current.get("current_turn_id") != turn_id
+                        or marker.get("status") != "retrying"
+                        or marker.get("selection_event_id") != question_audio_retry_event_id
+                        or marker.get("act_id") != act.act_id):
+                    return None
+                marker.update(selection_event_id=selected_event.event_id, updated_at=utc_now())
+                transaction.interview_sessions.update(current, expected_version=current["version"])
+            await self._emit_snapshot(causation_id)
+
+        async def restore_unplayed_followup(failure, *, selected_output=None) -> bool:
+            # No AnswerEndpoint exists after committing the parent. Recovery
+            # references that already-approved child, never another decision.
+            from app.services.capture_recovery import classify_capture_failure
+            if (classify_capture_failure(failure, "speech").safety_violation
+                    or not formal_followup or not expression_is_current()
+                    or getattr(getattr(getattr(evidence_session, "_answer_endpoint", None), "capture", None), "is_open", False)):
+                return False
+            if selected_output is not None and (
+                    selected_output.total_samples != 0
+                    or getattr(selected_output.publisher, "total_samples", 0) != 0
+                    or getattr(selected_output.publisher, "pcm_delivery_started", False)
+                    or not selected_output.closed or not getattr(selected_output, "cleanup_complete", False)
+                    or (expected_performance_id is not None and self._speech_output is not selected_output)):
+                return False
+            if (selected_output is None and stream_preparation_started
+                    and getattr(failure, "speech_preparation_closed", False) is not True):
+                return False
+            try:
+                with self.runtime.persistence.transaction(self.organization_id) as transaction:
+                    assert_current_evidence_fence(transaction, owner_fence)
+                    assert_current_evidence_control(transaction, question_control)
+                    current = transaction.interview_sessions.get(self.interview_id)
+                    state = (current or {}).get("agent_runtime") or {}
+                    current_turn = self.runtime._current_turn(current or {}) or {}
+                    latest = next((event for event in reversed((current or {}).get("agent_events", []))
+                                   if event.get("type") == "conversation.act.selected"), None)
+                    if (not current or current.get("status") != "in_progress"
+                            or current.get("candidate_input_completed_at")
+                            or current.get("current_turn_id") != turn_id
+                            or current_turn.get("status") != "asking" or not current_turn.get("is_followup")
+                            or any(answer.get("turn_id") == turn_id for answer in current.get("answers", []))
+                            or state.get("calibration_status") != "completed"
+                            or self.runtime._lease_active(state.get("takeover") or {}, now=transaction.database_now())
+                            or (state.get("takeover") or {}).get("status") == "active"
+                            or state.get("floor") != FloorOwner.AGENT.value
+                            or state.get("active_performance_id") != expected_performance_id
+                            or (expected_performance_id is not None and (
+                                state.get("active_output_id") != selected_output.output_id
+                                or state.get("active_expression_act_event_id") != selected_event.event_id))
+                            or not latest or latest.get("event_id") != selected_event.event_id
+                            or latest.get("payload", {}).get("act_id") != act.act_id):
+                        return False
+                    self.runtime.interviews.assert_skill_authorized(transaction, current)
+                    from app.services.conversation_delivery import mark_unplayed_selection, update_delivery
+                    if expected_performance_id is None:
+                        mark_unplayed_selection(current, event_id=selected_event.event_id,
+                                                status="failed", updated_at=utc_now())
+                    else:
+                        update_delivery(current, event_id=selected_event.event_id,
+                                        performance_id=expected_performance_id, status="failed", updated_at=utc_now())
+                    state.update(active_performance_id=None, active_output_id=None,
+                                 active_expression_act_event_id=None, expression_replay_act_event_id=None,
+                                 performance_cleared_at=utc_now(), floor=FloorOwner.NONE.value,
+                                 floor_reason="question_audio_retry_required", floor_changed_at=utc_now(),
+                                 question_audio_recovery={"status": "retry_required", "turn_id": turn_id,
+                                     "act_id": act.act_id, "selection_event_id": selected_event.event_id,
+                                     "updated_at": utc_now()})
+                    transaction.interview_sessions.update(current, expected_version=current["version"])
+            except ApiError:
+                return False
+            problem = {"code": "QUESTION_AUDIO_RETRY_REQUIRED", "message": "追问语音暂未播放，原题和上一题回答已保留，请重试播放。",
+                       "recoverable": True, "action": "retry_question_audio",
+                       "cause_code": getattr(failure, "code", type(failure).__name__), "cause_type": type(failure).__name__}
+            self.runtime._record_problem(self.interview_id, problem, self.organization_id)
+            if selected_output is not None and expected_performance_id is not None:
+                await notify_performance_interrupted(self, selected_output.performance_id,
+                    reason="question_audio_retry_required", turn_id=turn_id, causation_id=causation_id)
+            await self._emit_snapshot(causation_id)
+            fresh = self.runtime.interviews.get_interview(self.interview_id, self.organization_id)
+            marker = self.runtime._question_audio_recovery(fresh)
+            if (not self._closed and not self._terminating and marker
+                    and marker.get("status") == "retry_required"
+                    and marker.get("selection_event_id") == selected_event.event_id):
+                try:
+                    with self.runtime.persistence.transaction(self.organization_id, read_only=True) as transaction:
+                        assert_current_evidence_fence(transaction, owner_fence)
+                        assert_current_evidence_control(transaction, question_control)
+                except ApiError:
+                    return True
+                await self._emit("problem", problem, turn_id=turn_id, causation_id=causation_id,
+                                 replayability=Replayability.TRANSIENT)
+            return True
+
+        async def restore_unplayed_warmup(failure, *, selected_output=None) -> bool:
+            # The transcript already exists. Its optional spoken invitation
+            # must not turn a zero-audio failure into a session-wide pause.
+            # A partial output is deliberately outside this recovery path.
+            if (act_type != "warmup_confirmation" or turn_id is not None
+                    or expected_turn_id is not None or owner_fence is None
+                    or evidence_session is None or not expression_is_current()):
+                return False
+            if selected_output is not None and (
+                    selected_output.total_samples != 0
+                    or getattr(selected_output.publisher, "total_samples", 0) != 0
+                    or getattr(selected_output.publisher, "pcm_delivery_started", False)
+                    or not selected_output.closed or not getattr(selected_output, "cleanup_complete", False)
+                    or getattr(selected_output.stream, "cleanup_confirmed", True) is not True
+                    or (expected_performance_id is not None and self._speech_output is not selected_output)):
+                return False
+            if (selected_output is None and stream_preparation_started
+                    and getattr(failure, "speech_preparation_closed", False) is not True):
+                return False
+            try:
+                evidence_session.assert_controller(self)
+                with self.runtime.persistence.transaction(self.organization_id) as transaction:
+                    assert_current_evidence_fence(transaction, owner_fence)
+                    assert_current_evidence_control(transaction, warmup_control)
+                    current = transaction.interview_sessions.get(self.interview_id)
+                    state = (current or {}).get("agent_runtime") or {}
+                    latest = next((event for event in reversed((current or {}).get("agent_events", []))
+                                   if event.get("type") == "conversation.act.selected"), None)
+                    if (not current or current.get("status") != "in_progress"
+                            or current.get("current_turn_id") is not None
+                            or current.get("candidate_input_completed_at")
+                            or state.get("calibration_status") != "awaiting_confirmation"
+                            or state.get("calibration_updated_at") != warmup_revision
+                            or (state.get("takeover") or {}).get("status") == "active"
+                            or ((state.get("takeover") or {}).get("status") is None
+                                and self.runtime._lease_active(state.get("takeover") or {}, now=transaction.database_now()))
+                            or state.get("floor") != FloorOwner.AGENT.value
+                            or state.get("active_performance_id") != expected_performance_id
+                            or (expected_performance_id is not None and (
+                                state.get("active_output_id") != selected_output.output_id
+                                or state.get("active_expression_act_event_id") != selected_event.event_id))
+                            or not latest or latest.get("event_id") != selected_event.event_id
+                            or latest.get("payload", {}).get("act_id") != act.act_id):
+                        return False
+                    self.runtime.interviews.assert_skill_authorized(transaction, current)
+                    from app.services.conversation_delivery import mark_unplayed_selection, update_delivery
+                    if expected_performance_id is None:
+                        mark_unplayed_selection(current, event_id=selected_event.event_id,
+                                                status="failed", updated_at=utc_now())
+                    else:
+                        update_delivery(current, event_id=selected_event.event_id,
+                                        performance_id=expected_performance_id, status="failed", updated_at=utc_now())
+                    state.update(active_performance_id=None, active_output_id=None,
+                                 active_expression_act_event_id=None, expression_replay_act_event_id=None,
+                                 performance_cleared_at=utc_now(), floor=FloorOwner.CANDIDATE.value,
+                                 floor_reason="warmup_awaiting_confirmation", floor_changed_at=utc_now())
+                    transaction.interview_sessions.update(current, expected_version=current["version"])
+            except ApiError:
+                return False
+            problem = {
+                "code": "WARMUP_CONFIRMATION_AUDIO_UNAVAILABLE",
+                "message": "试音确认提示音暂时不可用，字幕已保留。请核对字幕后确认，或选择重新试音。",
+                "recoverable": True, "action": "retry_or_correct_signal", "calibration": True,
+                "cause_code": getattr(failure, "code", type(failure).__name__),
+                "cause_type": type(failure).__name__,
+            }
+            self.runtime._record_problem(self.interview_id, problem, self.organization_id)
+            if selected_output is not None and expected_performance_id is not None:
+                await notify_performance_interrupted(self, selected_output.performance_id,
+                    reason="warmup_confirmation_audio_unavailable", turn_id=None, causation_id=causation_id)
+            # A confirmation, retry or pause may win while interruption is
+            # sent. Project fresh authoritative state, never a late floor grant.
+            await self._emit_snapshot(causation_id)
+            current = self.runtime.interviews.get_interview(self.interview_id, self.organization_id)
+            state = current.get("agent_runtime") or {}
+            if (not self._closed and not self._terminating and self._evidence_session is evidence_session
+                    and preparation_capture_id == getattr(evidence_session, "_capture_id", None)
+                    and current.get("status") == "in_progress" and current.get("current_turn_id") is None
+                    and state.get("calibration_status") == "awaiting_confirmation"
+                    and state.get("calibration_updated_at") == warmup_revision
+                    and state.get("floor") == FloorOwner.CANDIDATE.value):
+                try:
+                    evidence_session.assert_controller(self)
+                except ApiError:
+                    return True
+                await self._emit("problem", problem, turn_id=None, causation_id=causation_id,
+                                 replayability=Replayability.TRANSIENT)
+            return True
 
         async def restore_unplayed_preparation(*, retry_required: bool, selected_output=None) -> bool:
             # A cancelled provider preparation may have an obsolete input
@@ -2166,6 +2557,8 @@ class AgentChannel:
                     await endpoint.expression_preparation_failed()
             return True
 
+        preparation_output = None
+        stream_preparation_started = False
         try:
             if not expression_is_current():
                 return None
@@ -2186,19 +2579,33 @@ class AgentChannel:
                     # a control interruption; current transport failures retain
                     # their existing fatal/problem handling.
                     if (output is None or output.playback_drained
-                            or expected_performance_id != stream_performance_id or expression_is_current()):
+                            or expected_performance_id != stream_performance_id):
+                        return
+                    if expression_is_current():
+                        if not (((act_type == "warmup_confirmation" and expected_turn_id is None) or formal_followup)
+                                and output.total_samples == 0
+                                and getattr(output.publisher, "total_samples", 0) == 0
+                                and not getattr(output.publisher, "pcm_delivery_started", False)):
+                            return
+                        await notify_performance_interrupted(self, stream_performance_id,
+                            reason="question_audio_retry_required" if formal_followup else "warmup_confirmation_audio_unavailable",
+                            turn_id=turn_id, causation_id=causation_id)
                         return
                     await notify_performance_interrupted(self, stream_performance_id, reason="stale_output",
                         turn_id=turn_id, causation_id=causation_id)
                 if (isinstance(self._evidence_session, ManagedLiveKitEvidenceSession)
                         and act_type != "closing"):
+                    stream_preparation_started = True
                     output = await self.runtime._open_streamed_expression(
                         self.interview_id, turn_id, text, self.organization_id,
                         performance_id=stream_performance_id,
                         assert_current=assert_stream_current,
                         before_abort=before_stream_abort,
                     )
+                    if output is None:
+                        stream_preparation_started = False
                 if output is not None:
+                    preparation_output = output
                     try:
                         binding = await output.open()
                         assert_stream_current()
@@ -2227,7 +2634,9 @@ class AgentChannel:
                         assert_stream_current()
                         self._speech_output_task = asyncio.create_task(
                             self._run_speech_output(output, expression_is_current, turn_id, causation_id,
-                                                    recover_unplayed=restore_unplayed_preparation)
+                                                    recover_unplayed=restore_unplayed_preparation,
+                                                    recover_warmup=restore_unplayed_warmup,
+                                                    recover_followup=restore_unplayed_followup)
                         )
                         return performance
                     except BaseException as exc:
@@ -2240,6 +2649,10 @@ class AgentChannel:
                         elif (isinstance(exc, asyncio.TimeoutError) or getattr(exc, "code", None) in {
                                 "provider_timeout", "AGENT_AUDIO_FIRST_PCM_TIMEOUT", "LIVEKIT_AUDIO_OUTPUT_TIMEOUT"}):
                             await restore_unplayed_preparation(retry_required=True, selected_output=output)
+                        if isinstance(exc, Exception) and await restore_unplayed_followup(exc, selected_output=output):
+                            if self._speech_output is output:
+                                self._speech_output = None
+                            return None
                         if self._speech_output is output:
                             self._speech_output = None
                         raise
@@ -2281,6 +2694,10 @@ class AgentChannel:
             await restore_unplayed_preparation(retry_required=remaining is not None and remaining <= 0)
             raise
         except Exception as exc:
+            if await restore_unplayed_followup(exc, selected_output=preparation_output):
+                return None
+            if await restore_unplayed_warmup(exc, selected_output=preparation_output):
+                return None
             if (isinstance(exc, asyncio.TimeoutError) or getattr(exc, "code", None) in {
                     "provider_timeout", "AGENT_AUDIO_FIRST_PCM_TIMEOUT", "LIVEKIT_AUDIO_OUTPUT_TIMEOUT"}):
                 if await restore_unplayed_preparation(retry_required=True):
@@ -2307,6 +2724,7 @@ class AgentChannel:
                 self.interview_id, self.organization_id
             )
             await self._set_floor(FloorOwner.NONE, "expression_failure", causation_id)
+            await self._emit_snapshot(causation_id)
             return None
         if not expression_is_current():
             return None
@@ -2326,7 +2744,7 @@ class AgentChannel:
         )
         return performance
 
-    async def _run_speech_output(self, output, is_current, turn_id, causation_id, *, recover_unplayed=None) -> None:
+    async def _run_speech_output(self, output, is_current, turn_id, causation_id, *, recover_unplayed=None, recover_warmup=None, recover_followup=None) -> None:
         async def finished(payload):
             await self._emit(
                 "avatar.performance.producer_finished", payload,
@@ -2339,6 +2757,10 @@ class AgentChannel:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
+            if recover_followup is not None and await recover_followup(exc, selected_output=output):
+                return
+            if recover_warmup is not None and await recover_warmup(exc, selected_output=output):
+                return
             if (recover_unplayed is not None and (
                     isinstance(exc, asyncio.TimeoutError) or getattr(exc, "code", None) in {
                         "provider_timeout", "AGENT_AUDIO_FIRST_PCM_TIMEOUT", "AGENT_AUDIO_SUBSCRIPTION_TIMEOUT",
@@ -2956,18 +3378,20 @@ class InterviewAgentRuntime:
         current_preparation = None
         if (session.get("status") == "in_progress" and current
                 and (runtime_state.get("floor") == FloorOwner.CANDIDATE.value
-                     or preparation.get("status") in {"retrying", "retry_required"})
+                     or preparation.get("status") in {"retrying", "retry_required", "blocked"})
                 and runtime_state.get("calibration_status") == "completed"
                 and not runtime_state.get("capture_recovery")
                 and (runtime_state.get("takeover") or {}).get("status") != "active"
-                and preparation.get("status") in {"preparing", "retrying", "retry_required"}
+                and preparation.get("status") in {"preparing", "retrying", "retry_required", "blocked"}
                 and preparation.get("turn_id") == current["id"]
                 and isinstance(preparation.get("capture_id"), str) and preparation["capture_id"]
                 and not any(answer.get("turn_id") == current["id"] for answer in session.get("answers", []))):
             current_preparation = {key: preparation[key] for key in ("status", "turn_id", "capture_id")}
+            current_preparation.update(public_preparation_recovery(preparation))
         capture = self.media_captures.get_for_interview(
             session["id"], session.get("organization_id", "org_default")
         )
+        question_recovery = self._question_audio_recovery(session)
         candidate_view = {
             "interview_id": session["id"],
             "status": session["status"],
@@ -2979,6 +3403,8 @@ class InterviewAgentRuntime:
             "capture_recovery": candidate_capture_recovery(session),
             "supplement_confirmation": self._supplement_projection(session),
             "answer_preparation": current_preparation,
+            "question_audio_recovery": ({key: question_recovery[key] for key in ("status", "turn_id", "selection_event_id")}
+                                        if question_recovery else None),
             "takeover": self._takeover_projection(
                 (session.get("agent_runtime") or {}).get("takeover"),
                 privileged=False,
@@ -3187,7 +3613,8 @@ class InterviewAgentRuntime:
                 "version",
                 "ai_resumed",
             },
-            "problem": {"code", "message", "recoverable", "action", "calibration", "capture_id"},
+            "problem": {"code", "message", "recoverable", "action", "calibration", "capture_id",
+                        "stage", "reason_code", "attempt", "max_attempts", "retryable"},
             "completed": {
                 "interview_id",
                 "status",
@@ -3383,6 +3810,11 @@ class InterviewAgentRuntime:
             from app.services.conversation_delivery import update_delivery
             update_delivery(session, event_id=state.get("active_expression_act_event_id"),
                             performance_id=active, status=delivery_status, updated_at=utc_now())
+            recovery = state.get("question_audio_recovery") or {}
+            if (delivery_status == "delivered" and recovery.get("status") == "retrying"
+                    and recovery.get("turn_id") == session.get("current_turn_id")
+                    and recovery.get("selection_event_id") == state.get("active_expression_act_event_id")):
+                state["question_audio_recovery"] = None
             state["active_performance_id"] = None
             state["active_output_id"] = None
             state["active_expression_act_event_id"] = None
@@ -3394,18 +3826,33 @@ class InterviewAgentRuntime:
             )
             return True
 
+    @staticmethod
+    def _formal_followup_selection(session, selected) -> bool:
+        turn = next((item for item in session.get("turns", [])
+                     if item.get("id") == session.get("current_turn_id")), None)
+        return bool(turn and turn.get("is_followup") and turn.get("status") == "asking"
+                    and selected and selected.get("turn_id") == turn["id"]
+                    and selected.get("payload", {}).get("approved") is True
+                    and selected.get("payload", {}).get("act_type") in {"question", "followup", "repeat"})
+
     def _mark_streamed_expression_for_replay(
         self, interview_id: str, organization_id: str, *, performance_id: str, output_id: str,
     ) -> None:
+        pause_question = False
         with self.persistence.transaction(organization_id) as transaction:
             session = self._required(transaction.interview_sessions.get(interview_id))
             state = session.setdefault("agent_runtime", {})
             if (state.get("active_performance_id") != performance_id
                     or state.get("active_output_id") != output_id):
                 return
+            latest = next((item for item in reversed(session.get("agent_events", []))
+                           if item.get("type") == "conversation.act.selected"), None)
+            pause_question = (session.get("status") == "in_progress"
+                              and self._formal_followup_selection(session, latest)
+                              and latest.get("event_id") == state.get("active_expression_act_event_id"))
             state["expression_replay_act_event_id"] = (
                 state.get("active_expression_act_event_id")
-                if session.get("status") == "in_progress" and state.get("floor") == FloorOwner.AGENT.value
+                if not pause_question and session.get("status") == "in_progress" and state.get("floor") == FloorOwner.AGENT.value
                 else None
             )
             from app.services.conversation_delivery import update_delivery
@@ -3418,26 +3865,35 @@ class InterviewAgentRuntime:
                 state["floor"] = FloorOwner.NONE.value
             session["updated_at"] = utc_now()
             transaction.interview_sessions.update(session, expected_version=session["version"])
+        if pause_question:
+            self._pause_for_fatal_expression(interview_id, organization_id)
 
     def _recover_streamed_expression(self, interview_id: str, organization_id: str) -> Optional[dict]:
-        """A current controller may restart an interrupted act with a NEW track.
+        """Reconcile orphan output before considering an existing replay.
 
-        A worker crash has no close callback, so it can also leave orphan active
-        IDs. The approved event reference, current turn/status and controller
-        fence (checked by the caller) bind this recovery, never raw client text.
+        A formal child question whose playback is uncertain needs the existing
+        human resume lifecycle. Reconnecting is never permission to replay it.
         """
+        pause_question = False
         with self.persistence.transaction(organization_id) as transaction:
             session = self._required(transaction.interview_sessions.get(interview_id))
             state = session.setdefault("agent_runtime", {})
+            recovery = self._question_audio_recovery(session)
+            if recovery and recovery["status"] == "retry_required":
+                return None
             reference = state.get("expression_replay_act_event_id")
             if not reference and state.get("active_output_id"):
                 reference = state.get("active_expression_act_event_id")
-            if not reference:
+            if not reference and not (recovery and recovery["status"] == "retrying"):
                 return None
             latest = next((item for item in reversed(session.get("agent_events", []))
                            if item.get("type") == "conversation.act.selected"), None)
+            pause_question = bool(session.get("status") == "in_progress" and (
+                (recovery and recovery["status"] == "retrying")
+                or (self._formal_followup_selection(session, latest)
+                    and latest.get("event_id") == reference)))
             replay = (
-                deepcopy(latest) if latest and latest.get("event_id") == reference
+                deepcopy(latest) if not pause_question and latest and latest.get("event_id") == reference
                 and latest.get("payload", {}).get("approved") is True
                 and (latest.get("turn_id") == session.get("current_turn_id")
                      or (latest.get("turn_id") is None and latest.get("payload", {}).get("act_type") == "opening"))
@@ -3453,7 +3909,9 @@ class InterviewAgentRuntime:
                 state["floor"] = FloorOwner.NONE.value
             session["updated_at"] = utc_now()
             transaction.interview_sessions.update(session, expected_version=session["version"])
-            return replay
+        if pause_question:
+            self._pause_for_fatal_expression(interview_id, organization_id)
+        return replay
 
     def _mark_completion_closing(
         self,
@@ -4029,7 +4487,9 @@ class InterviewAgentRuntime:
         remaining = remaining_interaction_seconds()
         first_budget = min(12.0, remaining) if remaining is not None else 12.0
         if first_budget <= 0:
-            raise ApiError("AGENT_AUDIO_FIRST_PCM_TIMEOUT", "Speech preparation budget exhausted.", status_code=504)
+            failure = ApiError("AGENT_AUDIO_FIRST_PCM_TIMEOUT", "Speech preparation budget exhausted.", status_code=504)
+            failure.speech_preparation_closed = True  # No transport was created.
+            raise failure
         deadline = monotonic() + first_budget
         output_id = new_id("speech_output")
         publisher = LiveKitApprovedAudioPublisher(
@@ -4041,23 +4501,29 @@ class InterviewAgentRuntime:
 
         async def open_tts():
             with measure_interview_agent_stage("tts_stream_open_ms"):
-                return await self.gateway.open_tts_stream(TTSSynthesizeRequest(
+                request = TTSSynthesizeRequest(
                     organization_id=organization_id, purpose="interview_agent_expression",
                     text=text, language=session.get("settings", {}).get("language", "zh-CN"),
                     voice_profile_id=session.get("settings", {}).get("voice_profile_id") or "voice_default_cn",
                     format="audio/wav",
                     metadata={"interview_id": interview_id, "turn_id": turn_id, "approved": True},
-                ), first_audio_deadline=deadline)
+                )
+                cached = cached_fixed_speech(self.gateway, request, first_audio_deadline=deadline)
+                if cached is not None:
+                    return cached
+                return await self.gateway.open_tts_stream(request, first_audio_deadline=deadline)
 
         tts_task = asyncio.create_task(open_tts())
         publication_task = asyncio.create_task(publisher.open())
         async def prepare_transports():
-            await asyncio.wait({tts_task, publication_task}, return_when=asyncio.FIRST_EXCEPTION)
-            # Streaming support is the compatibility decision. A concurrent
-            # media-open failure must not hide an explicit unsupported TTS
-            # result and disable the existing complete-asset delivery path.
-            stream = await tts_task
-            publication = await publication_task
+            done, _ = await asyncio.wait({tts_task, publication_task}, return_when=asyncio.FIRST_EXCEPTION)
+            # Prefer an already-known TTS compatibility decision when both
+            # sides finish together. A failed publisher must not wait for a
+            # still-pending TTS call and lose its cause to the outer deadline.
+            if publication_task in done and tts_task not in done:
+                publication_task.result()
+            stream = tts_task.result()
+            publication = publication_task.result()
             return stream, publication
         try:
             # Both transports prepare concurrently; neither publishes PCM.
@@ -4075,19 +4541,62 @@ class InterviewAgentRuntime:
                 ),
             )
         except BaseException as exc:
+            failure = exc
+            if isinstance(exc, asyncio.TimeoutError):
+                # The gateway and outer first-audio timer can expire on the
+                # same loop turn. Prefer an error already produced by a child;
+                # inspecting it must never wait past the shared deadline.
+                tts_error = tts_task.exception() if tts_task.done() and not tts_task.cancelled() else None
+                publication_error = (publication_task.exception()
+                                     if publication_task.done() and not publication_task.cancelled() else None)
+                tts_pending, publication_pending = not tts_task.done(), not publication_task.done()
+                stage = ("tts_stream_open" if tts_error is not None else
+                         "media_publication_open" if publication_error is not None else
+                         "tts_stream_open" if tts_pending and not publication_pending else
+                         "media_publication_open" if publication_pending and not tts_pending else
+                         "speech_transports_open")
+                budget_ms = round(first_budget * 1000)
+                failure = tts_error if tts_error is not None else publication_error if publication_error is not None else exc
+                if isinstance(failure, asyncio.TimeoutError):
+                    failure = ApiError(
+                        "AGENT_AUDIO_FIRST_PCM_TIMEOUT",
+                        "Approved speech preparation timed out (stage=%s, budget_ms=%s)." % (stage, budget_ms),
+                        status_code=504, details={"stage": stage, "budget_ms": budget_ms},
+                    )
+                else:
+                    _LOG.warning("Expression transport failed at preparation deadline: stage=%s budget_ms=%s",
+                                 stage, budget_ms)
             for task in (tts_task, publication_task):
                 if not task.done():
                     task.cancel()
-            results = await asyncio.gather(tts_task, publication_task, return_exceptions=True)
+            cleanup_complete = False
             try:
+                results = await asyncio.gather(tts_task, publication_task, return_exceptions=True)
+                cleanup_complete = True
                 if not isinstance(results[0], BaseException):
-                    await results[0].abort()
+                    try:
+                        await results[0].abort()
+                        if getattr(results[0], "cleanup_confirmed", True) is not True:
+                            cleanup_complete = False
+                    except Exception as cleanup_error:
+                        cleanup_complete = False
+                        _LOG.warning("Expression transport cleanup failed: stage=tts error_type=%s", type(cleanup_error).__name__)
             finally:
-                await publisher.abort()
-            if isinstance(exc, ProviderError):
+                try:
+                    await publisher.abort()
+                except Exception as cleanup_error:
+                    cleanup_complete = False
+                    _LOG.warning("Expression transport cleanup failed: stage=publisher error_type=%s", type(cleanup_error).__name__)
+            if (cleanup_complete and not isinstance(failure, asyncio.CancelledError)
+                    and getattr(publisher, "total_samples", 0) == 0
+                    and not getattr(publisher, "pcm_delivery_started", False)):
+                failure.speech_preparation_closed = True
+            if isinstance(failure, ProviderError):
                 assert_current()
-                if exc.code in {"provider_streaming_not_supported", "provider_bad_request"}:
+                if failure.code == "provider_streaming_not_supported" and cleanup_complete:
                     return None
+            if failure is not exc:
+                raise failure from exc
             raise
 
     async def _expression_audio(
@@ -4239,6 +4748,27 @@ class InterviewAgentRuntime:
         return "candidate" if "candidate" in principal.roles else "human"
 
     @staticmethod
+    def _question_audio_recovery(session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        state = session.get("agent_runtime") or {}
+        marker = state.get("question_audio_recovery") or {}
+        turn = next((item for item in session.get("turns", [])
+                     if item.get("id") == session.get("current_turn_id")), None)
+        if (session.get("status") != "in_progress" or session.get("candidate_input_completed_at")
+                or not turn or not turn.get("is_followup") or turn.get("status") != "asking"
+                or marker.get("turn_id") != turn["id"] or marker.get("status") not in {"retry_required", "retrying"}
+                or state.get("calibration_status") != "completed"
+                or (state.get("takeover") or {}).get("status") == "active"
+                or any(answer.get("turn_id") == turn["id"] for answer in session.get("answers", []))):
+            return None
+        from app.services.conversation_delivery import selected_events
+        selections = selected_events(session, turn)
+        selected = max(selections, key=lambda item: item["session_sequence"], default=None)
+        if (not selected or selected.get("event_id") != marker.get("selection_event_id")
+                or selected.get("payload", {}).get("act_id") != marker.get("act_id")):
+            return None
+        return deepcopy(marker)
+
+    @staticmethod
     def _supplement_projection(session: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         value = (session.get("agent_runtime") or {}).get("supplement_confirmation") or {}
         if (session.get("status") != "in_progress" or value.get("turn_id") != session.get("current_turn_id")
@@ -4273,9 +4803,16 @@ class InterviewAgentRuntime:
                 )
             )[:128],
         }
+        if payload.get("code") == "QUESTION_AUDIO_RETRY_REQUIRED":
+            # Both transport failures and rejected early Evidence commands
+            # project the same explicit question-audio recovery contract.
+            result["action"] = "retry_question_audio"
         messages = {
+            "QUESTION_AUDIO_RETRY_REQUIRED": "追问语音暂未播放，原题和上一题回答已保留，请重试播放。",
+            "WARMUP_CONFIRMATION_AUDIO_UNAVAILABLE": "试音确认提示音暂时不可用，字幕已保留。请核对字幕后确认，或选择重新试音。",
             "UNDERSTANDING_UNAVAILABLE": "语音已收到，暂时无法完成回答理解；正在重试，你也可以继续补充。",
-            "UNDERSTANDING_RETRY_EXHAUSTED": "语音已保留，但回答理解暂时不可用。恢复后请说话或点击提前结束回答重试。",
+            "UNDERSTANDING_RETRY_EXHAUSTED": "录音和转写已保留；自动恢复未完成，可重试处理已有回答，无需重复作答。",
+            "UNDERSTANDING_RESULT_REJECTED": "回答处理尚未完成，录音和转写已保留。",
             "TRANSCRIPT_UNAVAILABLE": "已收到音频，仍在等待本段最终转写；已有字幕和回答会保留。",
             "TRANSCRIPT_RETRY_REQUIRED": "这段语音暂未识别完成，录音和已识别内容仍保留；请再说一句或点击重试。",
             "DETECTOR_UNAVAILABLE": "自动接话检测暂时不可用，仍在收音。",
@@ -4285,6 +4822,11 @@ class InterviewAgentRuntime:
             result["message"] = messages[payload["code"]]
             if isinstance(payload.get("capture_id"), str):
                 result["capture_id"] = payload["capture_id"][:128]
+        if payload.get("code") in {"UNDERSTANDING_UNAVAILABLE", "UNDERSTANDING_RETRY_EXHAUSTED", "UNDERSTANDING_RESULT_REJECTED"}:
+            result.update(public_preparation_recovery(payload))
+            if result.get("retryable") is False:
+                result["action"] = "contact_support"
+                result["message"] = "回答处理服务暂时不可用，录音、转写和确认进度已保留；请联系面试安排人恢复服务。"
         if payload.get("code") in {"CAPTURE_RECOVERING", "CAPTURE_RETRY_REQUIRED"}:
             result["message"] = (
                 "正在恢复语音识别，音频仍在保留。"

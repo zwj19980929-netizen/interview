@@ -116,7 +116,8 @@ def test_semantic_failures_use_one_shared_budget_and_noise_does_not_reset_it():
 
         endpoint.notify = notify
         try:
-            for attempt in range(3):
+            # One original understanding plus one bounded automatic recovery.
+            for attempt in range(2):
                 clock.value += 5
                 await _until(lambda: endpoint._prepare_failures == attempt + 1)
                 if attempt == 0:
@@ -127,12 +128,12 @@ def test_semantic_failures_use_one_shared_budget_and_noise_does_not_reset_it():
                     release_failure_notice.set()
                     await _until(lambda: endpoint.confirmation.speaking)
                     endpoint.confirmation.floor_returned(endpoint)
-            assert len(endpoint.capture.prepares) == 3
+            assert len(endpoint.capture.prepares) == 2
             for _ in range(3):
                 endpoint.speech_started()
                 clock.value += 10
                 await asyncio.sleep(.06)
-            assert len(endpoint.capture.prepares) == 3
+            assert len(endpoint.capture.prepares) == 2
             assert "understanding_retry_exhausted" in notices
             assert not commits and spoken == ["reception_unavailable"] and endpoint.capture.is_open
         finally:

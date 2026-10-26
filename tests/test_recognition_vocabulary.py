@@ -53,7 +53,7 @@ async def test_native_vocabulary_is_word_bias_and_only_sent_to_supported_models(
 
 def test_understanding_and_scoring_preserve_verbatim_evidence_and_handle_asr_disputes():
     original = "使用 redios 做缓存，不是 Radius，我说的是 Redis。"
-    for confirmed, version in [(False, "v82"), (True, "v83")]:
+    for confirmed, version in [(False, "v106"), (True, "v107")]:
         contract = prompt_contract("interview_turn_understanding", {
             "transcript": original, "capability_points": ["Redis 缓存"], "completion_confirmed": confirmed})
         assert contract.version == "interview_turn_understanding." + version

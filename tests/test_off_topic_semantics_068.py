@@ -49,7 +49,7 @@ def off_topic_response(text=TEXT, points=("幂等键", "确认序号"), *, inten
 @pytest.mark.parametrize("turn_intent,tail", [("finish_answer", FINISH),
     ("finish_topic", "下一题吧。"), ("decline_topic", "这题我不会了。"),
     ("stop_interview", "我不想继续面试了。")])
-async def test_clear_off_topic_can_finish_once_without_fabricating_claims(composite, turn_intent, tail):
+async def test_clear_off_topic_retains_evidence_and_respects_completion_scope(composite, turn_intent, tail):
     utterance, turn, interview = _input()
     utterance = utterance.model_copy(update={"text": BODY + tail})
     interview["_semantic_first"] = True
@@ -66,7 +66,7 @@ async def test_clear_off_topic_can_finish_once_without_fabricating_claims(compos
     assert result.evidence_quotes == [BODY, tail]
     assert result.completion_basis.evidence_quotes == [tail]
     assert result.followup_allowed is False and not followup["selected"]
-    assert service.can_complete_without_confirmation(result, utterance.text) is (turn_intent != "stop_interview")
+    assert service.can_complete_without_confirmation(result, utterance.text) is (turn_intent in {"finish_topic", "decline_topic"})
     assert service.accepts_as_answer(result, utterance.text)
     assert len(service.gateway.requests) == 1
 
@@ -100,7 +100,7 @@ async def test_real_technical_claim_survives_irrelevant_tail_without_invented_co
     assert result.answer_content == "partial" and result.claims[0].evidence_quote == body
     assert result.covered_capability_points == (["幂等键"] if relevant else [])
     assert result.followup_allowed is relevant and not followup["selected"]
-    assert service.can_complete_without_confirmation(result, text)
+    assert not service.can_complete_without_confirmation(result, text)
 
 
 @pytest.mark.anyio
@@ -153,7 +153,7 @@ async def test_old_erroneous_clarification_does_not_make_clear_irrelevance_unres
     service = _service(Gateway(off_topic_response()))
     result, followup = await service.prepare_decision(utterance, turn, interview)
     assert result.problem is None and result.intent == "off_topic" and not result.ambiguities
-    assert service.can_complete_without_confirmation(result, TEXT) and not followup["selected"]
+    assert not service.can_complete_without_confirmation(result, TEXT) and not followup["selected"]
     assert len(service.gateway.requests) == 1
 
 
@@ -226,7 +226,7 @@ def test_versioned_contract_distinguishes_clear_irrelevance_from_recognition_and
     assert "跑题是相关性判断，不是识别失败" in text
     assert "只有控制请求或寒暄不能虚构一份off_topic回答" in text
     assert "不能因旧澄清记录继续制造歧义" in text
-    assert "semantic_controls.v2" in text
+    assert "semantic_controls.v3" in text
 
 
 @pytest.mark.anyio

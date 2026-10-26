@@ -284,19 +284,23 @@ def test_transport_sequence_changes_do_not_revoke_identical_exit_evidence():
     asyncio.run(scenario())
 
 
-def test_withdrawal_reply_can_finish_its_substantive_answer_without_another_utterance(tmp_path, monkeypatch):
+def test_withdrawal_reply_keeps_its_substantive_answer_until_supplement_confirmation(tmp_path, monkeypatch):
+    from app.core.prompt.contracts import SUPPLEMENT_SPEECH
     from app.core.prompt.understanding_references import understanding_references
     from app.providers.mock.provider import MockProvider
-    from test_automatic_turn_integration import _automatic_session, _current
+    from test_automatic_turn_integration import _automatic_session, _current, _feed, _CONTINUATION
     from test_declined_answer_integration import (
         _TECHNICAL, _NEXT_TURN_ID, _add_next_question, _semantic_provider,
-        _playable_speech, _answer_and_confirm_exit,
+        _playable_speech, _answer_and_confirm_exit, _stop_current_playback,
     )
     from test_evidence_owner_recovery_integration import _wait_until
+    from test_spoken_supplement_integration import _audio_aligned_transcripts, _speaking
 
     _semantic_provider(monkeypatch, technical=True, stop_interview=True)
     original = MockProvider.invoke
     reply_words = "不了，我继续。补充一点，我会设置唯一约束。我的回答说完了。"
+    body = _TECHNICAL + "我不想面了。"
+    _audio_aligned_transcripts(monkeypatch, [body, reply_words, "没有补充了。"])
 
     async def invoke(provider, capability, request, context):
         response = await original(provider, capability, request, context)
@@ -313,18 +317,30 @@ def test_withdrawal_reply_can_finish_its_substantive_answer_without_another_utte
     monkeypatch.setattr(MockProvider, "invoke", invoke)
 
     async def scenario():
-        body = _TECHNICAL + "我不想面了。"
-        async with _automatic_session(tmp_path, monkeypatch, [body, "", "", reply_words, ""],
+        async with _automatic_session(tmp_path, monkeypatch, [""],
                 spoken_confirmation=True) as (store, runtime, channel, managed):
             _add_next_question(store)
             _playable_speech(runtime)
-            await _answer_and_confirm_exit(runtime, channel, managed)
+            endpoint, clock = await _answer_and_confirm_exit(runtime, channel, managed)
+            await _speaking(endpoint, runtime)
+            current = _current(runtime)
+            assert not current["answers"] and not current.get("candidate_input_completed_at")
+            selected = [event for event in current["agent_events"] if event["type"] == "conversation.act.selected"]
+            assert selected[-1]["payload"]["text"] == SUPPLEMENT_SPEECH["check"]
+            assert not endpoint.confirmation._exit_waiting
+            capture_id = managed._capture_id
+            await _stop_current_playback(runtime, channel)
+            await _wait_until(lambda: endpoint.confirmation._supplement_question_delivered)
+            assert managed._capture_id == capture_id and not _current(runtime)["answers"]
+            await _feed(managed._ingress, _CONTINUATION, 5)
+            clock.value += 1
             await _wait_until(lambda: len(_current(runtime)["answers"]) == 1, timeout=5)
             current = _current(runtime)
             assert not current.get("candidate_input_completed_at")
             assert current["current_turn_id"] == _NEXT_TURN_ID
-            assert current["answers"][0]["final_transcript"] == body + reply_words
+            assert current["answers"][0]["final_transcript"] == body + reply_words + "没有补充了。"
             assert current["turns"][0]["current_understanding"]["turn_intent"] == "finish_answer"
+            assert current["turns"][0]["current_understanding"]["completion_basis"]["evidence_quotes"] == ["没有补充了。"]
             assert not current["turns"][0].get("candidate_exit_confirmation")
             assert current["turns"][0]["current_understanding"]["claims"][0]["evidence_quote"] == _TECHNICAL
     asyncio.run(scenario())

@@ -1,6 +1,6 @@
 import base64
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -64,6 +64,20 @@ class PreparedTurnDecision:
     completion_confirmed: bool = False
     exit_confirmation: Optional[Dict[str, Any]] = None
     content_clarification: Optional[Dict[str, Any]] = None
+    supplement_context_fingerprint: Optional[str] = None
+    capture_binding: Any = None
+    completion_receipt: Optional["PreparedCompletionReceipt"] = None
+
+
+@dataclass(frozen=True)
+class PreparedCompletionReceipt:
+    """Process-local composition of unchanged answer evidence and a new reply."""
+    source: PreparedTurnDecision
+    base_final: StreamingSTTEvent
+    boundary_final: StreamingSTTEvent
+    reply_text: str
+    confidence: float
+    question_act_id: str
 
 
 class InterviewService:
@@ -1496,6 +1510,7 @@ class InterviewService:
             "transcript_source": "server_streaming",
         })
         context_fingerprint = self._prepared_context_fingerprint(session, turn)
+        supplement_context_fingerprint = self._supplement_context_fingerprint(session, turn)
         if content_clarification is not None:
             from app.services.content_clarification import validated_content_clarification
             content_clarification = validated_content_clarification(session, turn, final.text.strip(), content_clarification)
@@ -1527,7 +1542,154 @@ class InterviewService:
             completion_confirmed=completion_confirmed,
             exit_confirmation=exit_confirmation,
             content_clarification=content_clarification,
+            supplement_context_fingerprint=supplement_context_fingerprint,
         )
+
+    def confirm_prepared_streaming_decision(
+        self, prepared: PreparedTurnDecision, base_final: StreamingSTTEvent,
+        delivered_boundary_final: StreamingSTTEvent, final: StreamingSTTEvent,
+        organization_id: str = "org_default", *, reply_text: str,
+        decision: Dict[str, Any], question_delivered: bool,
+    ) -> Optional[PreparedTurnDecision]:
+        """Compose a delivered control reply with unchanged technical evidence.
+
+        A cache miss has no lifecycle effect and grants no completion authority.
+        In particular, an appended technical detail or ASR rewrite requires a
+        fresh understanding rather than silently inheriting the old decision.
+        """
+        if (question_delivered is not True or not isinstance(decision, dict)
+                or decision.get("intent") != "finish"
+                or type(decision.get("confidence")) not in {float, int}
+                or not .75 <= decision["confidence"] <= 1):
+            return None
+        try:
+            self._require_streaming_final(final)
+            session = self.get_interview(prepared.interview_id, organization_id)
+            turn = self.lifecycle.require_active_turn(session, prepared.turn_id, allowed_statuses=("asking",))
+            question = self._delivered_supplement_question(session, turn)
+            if question is None:
+                return None
+            receipt = PreparedCompletionReceipt(
+                source=prepared, base_final=base_final.model_copy(deep=True),
+                boundary_final=delivered_boundary_final.model_copy(deep=True),
+                reply_text=reply_text, confidence=minimum_reported_confidence(
+                    float(decision["confidence"]), final.confidence,
+                    *(item.confidence for item in final.segments[len(base_final.segments):])),
+                question_act_id=question,
+            )
+            payload = self._streaming_prepared_payload(final)
+            understanding = self._compose_supplement_understanding(receipt, final.text.strip())
+            composed = replace(prepared, text=final.text.strip(), understanding=understanding,
+                followup=deepcopy(prepared.followup), completion_confirmed=True,
+                stt_fingerprint=self._prepared_stt_fingerprint(payload),
+                context_fingerprint=self._prepared_context_fingerprint(session, turn),
+                completion_receipt=receipt)
+            self._assert_prepared_decision(composed, session, turn, payload)
+            from app.core.interview_agent_metrics import observe_interview_agent_metric
+            from app.core.speech_diagnostics import record_turn_control
+            observe_interview_agent_metric("confirmed_answer_preparation_reused", 1)
+            record_turn_control("prepared_answer_reused", interview_id=prepared.interview_id,
+                turn_id=prepared.turn_id, source_understanding_id=prepared.understanding.understanding_id,
+                current_understanding_id=composed.understanding.understanding_id,
+                question_act_id=question)
+            return composed
+        except (ApiError, ValueError, TypeError, KeyError, AttributeError):
+            return None
+
+    @staticmethod
+    def _streaming_prepared_payload(final: StreamingSTTEvent) -> Dict[str, Any]:
+        return {"final_transcript": final.text, "stt_confidence": final.confidence,
+                "language": final.language,
+                "transcript_segments": [item.model_dump(mode="json") for item in final.segments],
+                "stt_provider": final.provider.model_dump(mode="json") if final.provider else {},
+                "transcript_source": "server_streaming"}
+
+    @staticmethod
+    def _delivered_supplement_question(session: Dict[str, Any], turn: Dict[str, Any]) -> Optional[str]:
+        from app.core.prompt.contracts import SUPPLEMENT_SPEECH, SUPPLEMENT_SPEECH_VERSION
+        from app.services.conversation_delivery import selected_events
+        acts = {act.get("act_id"): act for act in turn.get("conversation_acts", [])
+                if act.get("act_type") in {"supplement_check", "supplement_clarify"}
+                and act.get("prompt_version") == SUPPLEMENT_SPEECH_VERSION}
+        events = [event for event in selected_events(session, turn)
+                  if (event.get("payload") or {}).get("act_id") in acts]
+        if not events:
+            return None
+        event = max(events, key=lambda item: item.get("session_sequence", 0))
+        act_id = event["payload"]["act_id"]
+        delivery = event.get("delivery") or {}
+        if (delivery.get("status") != "delivered" or not delivery.get("performance_id")
+                or acts[act_id].get("text") not in {SUPPLEMENT_SPEECH["check"], SUPPLEMENT_SPEECH["clarify"]}):
+            return None
+        return act_id
+
+    @classmethod
+    def _supplement_context_fingerprint(cls, session: Dict[str, Any], turn: Dict[str, Any]) -> str:
+        # Supplement checks add dialogue but cannot change the technical answer.
+        # Remove only these known fixed acts; policy, questions, ownership-related
+        # lifecycle events, clarifications and every other exchange remain bound.
+        normalized = deepcopy(session)
+        normalized_turn = next(item for item in normalized["turns"] if item["id"] == turn["id"])
+        normalized_turn["conversation_acts"] = [act for act in normalized_turn.get("conversation_acts", [])
+            if act.get("act_type") not in {"supplement_check", "supplement_clarify", "supplement_continue"}]
+        return cls._prepared_context_fingerprint(normalized, normalized_turn)
+
+    @staticmethod
+    def _compose_supplement_understanding(receipt: PreparedCompletionReceipt, transcript: str,
+                                          *, understanding_id: Optional[str] = None,
+                                          created_at: Optional[str] = None) -> TurnUnderstanding:
+        from app.services.prepared_answer_completion import pure_completion_reply
+        source = receipt.source
+        understanding = source.understanding
+        if (source.completion_receipt is not None or source.completion_confirmed
+                or not source.semantic_first or source.exit_confirmation is not None
+                or source.content_clarification is not None or understanding.problem is not None
+                or understanding.intent not in {"answer", "off_topic"}
+                or understanding.turn_intent not in {"answering", "finish_answer"}
+                or understanding.suggested_action not in {"accept", "followup", "next", "continue_listening"}
+                or understanding.ambiguities or understanding.contradictions
+                or understanding.clarification_target is not None
+                or not pure_completion_reply(receipt.reply_text)):
+            raise ValueError("Preparation cannot be composed with a control reply")
+        data = understanding.model_dump(mode="json")
+        data.update(understanding_id=understanding_id or new_id("understanding"),
+            created_at=created_at or utc_now(), turn_intent="finish_answer", suggested_action="next",
+            followup_allowed=understanding.intent != "off_topic",
+            completion_basis={"source": "explicit_server_intent", "evidence_quotes": [receipt.reply_text]},
+            confidence=min(understanding.confidence, receipt.confidence))
+        composed = TurnUnderstanding.model_validate(data)
+        from app.core.prompt.semantic_turn import validate_semantic_turn
+        validate_semantic_turn(composed.model_dump(mode="json"), transcript)
+        return composed
+
+    def _assert_completion_receipt(self, prepared: PreparedTurnDecision, session: Dict[str, Any],
+                                   turn: Dict[str, Any], payload: Dict[str, Any]) -> None:
+        receipt = prepared.completion_receipt
+        if receipt is None:
+            return
+        from app.services.prepared_answer_completion import unchanged_answer_prefix
+        source = receipt.source
+        self._require_streaming_final(receipt.base_final)
+        self._require_streaming_final(receipt.boundary_final)
+        base_payload = self._streaming_prepared_payload(receipt.base_final)
+        boundary_payload = self._streaming_prepared_payload(receipt.boundary_final)
+        expected = self._compose_supplement_understanding(receipt, str(payload["final_transcript"]).strip(),
+            understanding_id=prepared.understanding.understanding_id, created_at=prepared.understanding.created_at)
+        valid = (source.interview_id == session["id"] and source.turn_id == turn["id"]
+                 and prepared.completion_confirmed and prepared.semantic_first
+                 and prepared.capture_binding is source.capture_binding
+                 and source.text == receipt.base_final.text.strip()
+                 and source.stt_fingerprint == self._prepared_stt_fingerprint(base_payload)
+                 and source.stt_fingerprint == self._prepared_stt_fingerprint(boundary_payload)
+                 and source.supplement_context_fingerprint == self._supplement_context_fingerprint(session, turn)
+                 and receipt.question_act_id == self._delivered_supplement_question(session, turn)
+                 and unchanged_answer_prefix(base_payload, payload, receipt.reply_text)
+                 and prepared.followup == source.followup
+                 and prepared.understanding == expected)
+        if not valid:
+            raise ValueError("Completion evidence no longer matches preparation")
+        self.conversation._validate_understanding_content(expected.model_dump(mode="json"),
+            str(payload["final_transcript"]).strip(), self.conversation._capability_points(turn))
 
     @staticmethod
     def _require_streaming_final(final: StreamingSTTEvent) -> None:
@@ -1637,6 +1799,7 @@ class InterviewService:
         turn: Dict[str, Any], payload: Dict[str, Any],
     ) -> None:
         try:
+            self._assert_completion_receipt(prepared, session, turn, payload)
             from app.services.content_clarification import validated_content_clarification
             clarification = validated_content_clarification(session, turn, str(payload["final_transcript"]).strip(), prepared.content_clarification)
             if prepared.understanding.intent == "answer_unresolved":

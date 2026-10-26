@@ -600,7 +600,7 @@ def test_candidate_telemetry_is_ephemeral_non_idempotent_and_fair_on_sqlite(
         invalid_samples = [
             {},
             {"metric": "not_registered", "value": 1},
-            {"metric": "evidence_owner_renew_success", "value": 1},
+            *({"metric": name, "value": 1} for name in sorted(INTERNAL_INTERVIEW_AGENT_METRICS)),
             {"metric": "avatar_viseme_drift_ms"},
             {"metric": "avatar_viseme_drift_ms", "value": True},
             {"metric": "avatar_viseme_drift_ms", "value": -1},
@@ -3157,7 +3157,7 @@ def test_understanding_reference_contract_retries_partition_without_rewriting_ev
         _utterance(transcript), _turn(), _interview(_turn()),
     ))
     assert result.problem is None
-    assert result.prompt_version == "interview_turn_understanding.v82"
+    assert result.prompt_version == "interview_turn_understanding.v106"
     assert result.evidence_quotes == ["嗯，Fast API 检查 Redis 依赖，readiness 返回 200。"]
     assert result.claims[0].evidence_quote == result.evidence_quotes[0]
     assert len(gateway.requests) == 2

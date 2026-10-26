@@ -194,6 +194,6 @@ def test_control_projection_is_pure_and_prompt_keeps_strict_provider_compatible_
     assert projected["completion_basis"] == raw["completion_basis"] and projected["claims"] == raw["claims"]
     contract = prompt_contract("interview_turn_understanding", {"semantic_first": True,
         "transcript": "我用幂等键。下一题吧。", "capability_points": ["幂等键"]})
-    assert contract.version == "interview_turn_understanding.v74"
-    assert "semantic_controls.v2" in "".join(message.content for message in contract.messages)
+    assert contract.version == "interview_turn_understanding.v98"
+    assert "semantic_controls.v3" in "".join(message.content for message in contract.messages)
     assert {"suggested_action", "followup_allowed", "completion_basis"} <= set(contract.response_schema["required"])

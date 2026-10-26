@@ -1,5 +1,35 @@
 # 模型供应商插件化设计
 
+## 079：非流式调用开始与取消审计
+
+非流式`invoke`的attempt开始/结束输出安全结构化诊断，使用`invocation_id + attempt + fallback_index`及`diagnostic_scope_id/parent_scope_id`关联端点和理解阶段。记录配置请求期限、实际执行期限、交互剩余时间及耗时；`CancelledError`补`status=cancelled`终态审计后原样传播，不重试、不fallback、不增加断路器失败。正常供应商超时仍是`failed/provider_timeout`，不能把调用方撤销写成供应商失败。取消来源由实际取消方标注；未取得来源时保留`caller_cancelled`，由关联的外层timeout或输入撤销事件解释，不猜测网络子阶段。开始事件不增加数据库attempt行；诊断写入失败不吞掉取消。范围仅新增观测，不改模型、路由、Prompt和时间策略。验证见[操作日志079](change-log.md)。
+
+## 078：理解调用额度与语义版本（仓库与本机已验证）
+
+理解合同98–109、组合决策129–140增加普通交流澄清约束，保留历史版本读取。关键理解调用18秒、max_provider_retries=0、max_provider_attempts=1；同答案实际模型尝试由Endpoint共用额度，防止预计算/格式纠正/恢复各自加倍。固定提示继续用075原供应商/音色缓存。安全失败保留timeout/auth/billing/rate/circuit及调用额度耗尽原因，使用量不表示余额。详见[078](answer-recovery-and-reuse-078.md)。
+
+DashScope在显式`max_provider_attempts=1`时不得在adapter内部进行HTTP400后的`json_schema→json_object`第二次请求；该400沿原结构化错误返回。无显式单次attempt限制时保留原协议兼容路径，仅`max_provider_retries=0`不会改变兼容。统一结果Schema校验始终执行，不改现有模型、结构化配置或音色。每capture投机仅一次实际模型调用，同一证据的正式处理继承已消费额度；新证据不是无条件刷新不可重试的供应商错误。
+
+## 075：同音色提示缓存与连接复用（已实现，末次追加暂未加载）
+
+保留现有TTS路由和音色，不添加备用目标。版本化固定提示预热只使用当前primary，在独立有界期限内完成并验证PCM；精确配置身份匹配才可复用，正式动态表达仍走现有网关。预热不继承正式交互ContextVar期限，不阻塞控制会话，不生成播放/送达事实或失败暂停。
+
+单次预热作业最多首轮加一次延迟2秒补齐，只处理可重试缺失项；成功项、认证/欠费/配置等终止错误不补试。每轮仍受既有网关重试策略和单项8秒期限约束。补齐前再次核对配置，关闭取消旧作业；无定时循环，60秒冷却后需新的会话/实际miss触发。DashScope流与`ValidatedTTSStream.terminal_error`只读保留或透传既有标准终止错误，形成于清理等待前；缓存的内外层流发生已知终止错误时，即使清理随后耗尽期限，也不能改判为可重试超时。并发位直到原collector关闭才释放。
+
+开流尚未返回source时，已知标准错误通过当前调用Task传递，下一次调用清除本网关的旧注记。当前TTS调用的`tts_cleanup_completion`汇总未交付开流及迟到stream的实际abort完成；缓存直到成功清理才释放原key/slot，不能把网关有界等待返回等同底层结束。迟到abort异常或取消不能证明释放，只隔离当前缓存scope内的原占位；其它槽与正式合成保持原路径，关闭仍有界。
+
+DashScope HTTP连接池仅在显式API生命周期内启用，按PID/事件循环/组织/连接配置和端点隔离，认证与超时逐请求传入；取消单流仅关闭其响应。空闲连接与池容量有界，退出先停止业务媒体与预热，再关闭当前循环的池。worker等短生命周期asyncio.run调用未显式启用时保留逐流客户端，避免已关闭事件循环的资源复用。注入client_factory保留隔离测试路径。
+
+## 074：流式 TTS 错误与期限
+
+DashScope HTTP/SSE 错误体必须有界解析，明确区分欠费 `Arrearage`、免费额度停用 `AllocationQuota.FreeTierOnly`、认证失败、速率限制和服务错误；`Throttling.AllocationQuota` 是 TPS/TPM 限流，不能当作余额不足。仅保留白名单错误码、HTTP 状态、请求标识、网络阶段与耗时，不记录原始响应正文、message、输入或凭据。取消继续向上传播；开流重试只发生在音频尚未暴露时，不能在已开始播放后透明重放。详见[074说明](warmup-tts-resilience-074.md)。
+
+同一次调用因真实失败达到熔断阈值后，结束当前目标重试，保留最后真实错误决定是否转向备用目标；不能用随后产生的 `provider_circuit_open` 覆盖超时并绕过 `fallback_on=["timeout"]`。下一独立调用仍执行熔断预检。所有实际尝试共享首音总期限，不因重试或备用目标延长截止时间。
+
+072：当前理解 v86–97、组合决策 v117–128、服务端派生说明 semantic_controls.v3；为完成与歧义冲突、未核实收尾字段冲突增加固定纠正指令。首次矛盾仅可经来源校验后撤销提交权限并具体澄清，不能删除疑点强行完成。统一 seam、原 wire 字段与供应商路由保持；领域/网关/Mock 保留旧版本读取。详见[072说明](ambiguous-completion-recovery-072.md)。
+
+071：不调整TTS模型、供应商协议或路由配置。并行准备需区分TTS初始化与媒体发布阶段，保持12秒共享首音预算；明确的供应商/媒体错误不得被另一挂起任务遮蔽，总预算超时应留下非空结构化诊断。已有重试策略只使用剩余预算，第一次耗尽预算时不会开始第二次调用。现场记录与恢复限制见[071说明](followup-speech-timeout-071.md)。
+
 068：当前理解 v74–85、组合决策 v105–116、语义指令 v19/v20、控制意图规则 v2 支持 `off_topic`；快速接话 v9 将无关发言交回完整理解，固定接话台词 v4 增加一次回题提示。所有结构化与来源校验继续经过统一 seam；历史版本保留读取兼容。新增业务拒绝原因码与恢复播报异常诊断，不记录原话、响应正文或凭据。没有新增供应商或配置；详见[068说明](off-topic-and-reconnect-068.md)。
 
 067：理解 v62–73、组合决策 v93–104、接话 v7 升级送达说明与服务端动作投影；规划 v4、证据专家 v2 改为有界引用 Schema、工具分页与完整冻结池领域校验。为保持厂商 strict JSON Schema 兼容，wire 仍包含 `followup_allowed`/`suggested_action`，统一校验后由已验证语义派生，业务不接受模型的冗余权限声明。TTS 打开/重试/首 PCM、媒体连接/订阅共用最多 12 秒首音期限，并受当前整轮剩余预算限制；首音后单次读取最多 8 秒，播放仍有总期限且不切换到另一供应商重播。无新增供应商凭据或路由配置；详见[067说明](agent-chain-improvements-067.md)。
@@ -150,7 +180,11 @@ DashScope正常finish在拿到有效final后复用独立共享清理任务，优
 
 邀请、企业显式 readiness refresh 和已通过前置准入的候选人 readiness/start 复用统一路由探测模块：健康且未过期复用；未测/过期按需探测；失败有 30 秒冷却。每批至多 3 条并行、每条探测至多 15 秒、自动刷新总预算 30 秒，同租户同路由通过持久化租约去重；配置变化或旧探针完成不得覆盖新配置证据。手动 route test 使用同一所有权和配置检查，不以模型 test 冒充路由健康。
 
-探针继续只使用 `app/core/prompt/` 的既有版本化合成输入；流式 STT/实时语音只验证 ready 握手并关闭，不拿静音要求 final，也不评价 WER。TTS 探针只检测既有完整合成能力，不创建候选流式输出；052 的实际表达播放验收独立记录。错误仅持久化安全分类，不写原始异常/响应/凭据；取消或超时须回收已经打开的流连接。成功仍不等于正式业务质量/端到端验收。
+流式 STT/实时语音探针只验证 ready 握手并关闭，不拿静音要求 final，也不评价 WER。076修正动态表达路由探针：启用流式TTS时，`interview_agent_expression` 使用统一网关的PCM流式合成，读取固定连接测试短句的完整有效PCM和终片并确认回收；不能仅收到ready或首片就宣告健康。其他TTS用途或明确关闭流式表达时沿用批量合成。探测使用同一路由模型及其默认语音配置，不替代预约冻结音色的资产匹配或实际媒体播放验收，也不读取候选内容、使用固定提示缓存冒充联网成功。外层15秒/批次30秒及失败冷却保持；错误仅保留安全分类，不写原始异常/响应/凭据，取消或超时须回收已打开的流连接。成功仍不等于正式业务质量或端到端验收。
+
+076的TTS关闭观测仅提供`cleanup_confirmed/cleanup_error`，不改变既有abort取消、连接池或重试语义；探针不能把吞异常的abort返回当作已确认回收。健康写入前仍复核原租约和配置指纹。截止或取消期间已取得的标准供应商错误优先保留，调用取消本身仍传播。安全错误码增加既有标准类别`provider_audio_final_missing`与`provider_audio_format_unsupported`，让不完整/不支持的音频有明确诊断；不得持久化原始响应。
+
+沿用实际表达的协议兼容：仅开流阶段明确`provider_streaming_not_supported`、尚无PCM且清理确认后，可在原探针剩余时间内调用同一路由、同一请求的批量合成；不新增备用供应商或音色。超时、鉴权、计费、格式或语义错误不触发该兼容分支，清理过程中迟到的明确拒绝也不得被忽略。该批量兼容路径仍可能在外层取消时缺少单次invocation记录；路由健康会记录失败，此项未修改通用批量网关的审计语义。
 
 手动路由测试可显式重试冷却中的失败，但仍与自动刷新共享租约和配置检查。STT 探针独立回收预算2秒，仍受每条15秒总预算约束，不能确认回收时返回安全分类 `provider_probe_cleanup_failed`。DashScope abort 以共享独立任务保证重复调用能等到同一次清理，优雅关闭至多0.5秒，取消/超时先强制回收底层 transport 再取消等待；不能仅凭 closed 标志跳过未完成清理。正常正式 finish 与尾音 final 不变。批次网络等待预算30秒，取消任务另有最多0.1秒收尾等待；前端邀请/候选检查和开场40秒、手动路由测试35秒局部超时与此预算匹配。
 
@@ -836,7 +870,7 @@ ModelConfiguration、连接和模型 `default_voice`，并冻结成带 `source=m
 | `model_configuration_id` | 使用的模型配置 |
 | `provider_id` | provider 类型 |
 | `model` | 模型名 |
-| `status` | `success`、`failed`、`fallback_success` |
+| `status` | `success`、`failed`、`fallback_success`；079为非流式调用增加`cancelled`，流式保留既有`stream_*`状态 |
 | `attempt` | 当前 target 尝试序号 |
 | `fallback_index` | primary 为 0，fallback 依次递增 |
 | `latency_ms` | 本 attempt 耗时 |
@@ -848,6 +882,12 @@ ModelConfiguration、连接和模型 `default_voice`，并冻结成带 `source=m
 | `estimated_cost_usd` | 预估费用 |
 | `error_code` | 统一错误码 |
 | `redacted_request_hash` | 统一请求的 SHA-256，用于关联重复调用 |
+| `interview_id/turn_id/capture_id` | 可选内部归属标识，禁止用转写或凭据填充 |
+| `diagnostic_scope_id/parent_scope_id/stage` | 当前处理阶段与父阶段的诊断关联；不产生业务权限 |
+| `requested_timeout_ms/effective_timeout_ms/interaction_remaining_ms` | 该层请求等待上限、实际传入等待器的上限、开始时外层交互剩余时间；没有外层期限时剩余字段缺省。网关自身不新增期限裁剪，端点保留原裁剪规则 |
+| `cancel_reason/outcome/provider_invoked` | 受控取消来源、阶段结果、是否已进入adapter调用；preflight/熔断拒绝为false，不代表厂商已收到网络请求 |
+
+079新增运行事件使用`model.scope_*`、`model.operation_*`、`model.attempt_*`及`model.understanding_failed/rejected`前缀，失败重试事件继续使用`turn_control.understanding_retry_budget`并补安全原因与关联字段。按会话和题目定位后，用scope父链与`invocation_id/attempt/fallback_index`串联开始、终态和外层取消。函数正常返回的operation success不代表答案被接受，应同时查看understanding_failed/rejected和原提交事件。没有用量回执的cancelled记录中token与估算费用为null，不能当作免费调用。诊断sink失败不改变处理结果；取消审计失败仍传播原取消并记录`model.audit_failed`，不会伪造持久成功。
 
 日志默认不保存完整 prompt、候选人音频或标准答案。需要调试时必须通过受控开关开启短期脱敏采样。
 

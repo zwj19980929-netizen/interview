@@ -1,5 +1,15 @@
 # 数据库与向量存储设计
 
+079：非流式ModelInvocation终态审计补`cancelled`及可选安全关联/时间/取消字段，沿用现有JSON持久化与组织事务，无新表、索引或DDL。开始事件只写结构化运行日志，避免将一次attempt重复统计为两次调用；取消不表示成功计费或供应商故障。历史调用审计不回填猜测原因，不修改候选音频、回答或评分。验证证据见[操作日志079](change-log.md)。
+
+078（仓库与本机已验证）：既有InterviewSession JSON中的answer_preparation增加blocked和白名单失败诊断；新evidence.retry_processing沿原命令幂等、租约及当前capture/control校验。准备组合证明仅在进程内，提交仍以原事务验证权威final和上下文，不新增表或迁移。详见[078](answer-recovery-and-reuse-078.md)。
+
+077（仓库已验证）：试音确认逐帧守卫禁止读事务内嵌套开启独立写事务的控制权检查。SQLite默认回滚日志模式下，内层BEGIN IMMEDIATE可成功，但commit仍会等待外层读锁；增加超时不能修复自等待。独立controller检查移出会话事务，事务内原owner/control/校准版本核验保留，不修改journal_mode、锁等待配置、DDL或业务记录。真实临时SQLite已验证Evidence试音生命周期、缓存命中/未命中、实际PCM播放与显式确认，原始现场库只读。用户授权后，运行后端已于2026-10-20T01:09Z加载077；所有原面试业务摘要保持一致。
+
+075（已实现）：既有InterviewSession JSON聚合新增可空`agent_runtime.question_audio_recovery`，引用原批准行为和选择收据，使用原事务/CAS，不增加表或索引。固定提示只缓存白名单完整PCM于有界进程内存，不写会话转写、不产生共享私有文件访问许可，无数据库迁移。缓存配置更新、过期、损坏或进程重启均视为miss，不修改真实会话或评分数据。
+
+074：实时媒体只读投影增加已有 `agent_runtime.calibration_status` 和 `calibration_updated_at`，供试音确认输出核对新确认/重试边界；SQLite/PostgreSQL 在查询中投影字段，不能因守卫新增整份历史解码。内存与 SQLite 通过更新后即时读取及大历史体积限制回归，PostgreSQL 查询形状经合同验证；无 DDL 或数据迁移。见[074说明](warmup-tts-resilience-074.md)。
+
 ## 067：耐久交流收据
 
 InterviewSession 聚合内每个已审批 ConversationAct 增加内部 `selection_receipts`，最多保留该 act 最近 8 次选择；每条存 event/turn/act/sequence/时间/文字 SHA256 及绑定 performance 的送达状态。与选中事件同一事务写入，独立于 1000 条客户端重放窗口。向 ApprovedConversationAct 表达合同投影时去掉内部收据，其余额外字段仍严格拒绝；旧聚合可从原 selected event 读取，不能伪造已送达。没有新表或迁移，组织隔离、CAS 与媒体逐帧权限守卫保留。详见[067说明](agent-chain-improvements-067.md)。

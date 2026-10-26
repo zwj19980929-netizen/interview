@@ -101,6 +101,20 @@ describe("candidate automatic answer completion", () => {
 });
 
 describe("candidate capture recovery presentation", () => {
+  it.each(["retry_required", "retrying"])("keeps the microphone indicator waiting while follow-up audio is %s", async status => {
+    const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+    try {
+      await act(async () => root.render(<CandidateSignalList experience={{
+        phase: status === "retrying" ? "preparing" : "question_audio_retry_required",
+        questionAudioRecovery: { status, turn_id: "turn_followup", selection_event_id: "selection_failed" },
+        microphone: { localDetected: true, level: 0.8 }, evidence: { ready: false },
+      }} />));
+      expect(host.textContent).toContain("请先听完追问，再开始作答");
+      expect(host.textContent).not.toMatch(/正在收到你的声音|麦克风正在连接|面试已暂停/);
+      expect(host.querySelectorAll(".is-active")).toHaveLength(0);
+      expect(host.querySelector(".microphone-level i").style.width).toBe("0%");
+    } finally { await act(async () => root.unmount()); host.remove(); }
+  });
   it("shows live warm-up input and explains why capture is waiting after the trial", async () => {
     const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
     const experience = { phase: "listening", calibration: { status: "listening" }, microphone: { localDetected: true, level: 0.5 } };

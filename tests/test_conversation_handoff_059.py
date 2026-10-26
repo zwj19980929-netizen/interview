@@ -41,7 +41,7 @@ async def test_invitation_retains_answer_and_respects_real_followup_decision(sel
     assert understanding.problem is None and understanding.turn_intent == "finish_answer"
     assert understanding.followup_allowed and understanding.claims
     assert understanding.completion_basis.evidence_quotes == ["有没有哪些细节您想继续了解？"]
-    assert service.can_complete_without_confirmation(understanding, utterance.text)
+    assert not service.can_complete_without_confirmation(understanding, utterance.text)
     assert decision["reason"] == {"selected": "claim_detail_verification", "sufficient": "model_declined",
         "budget": "followup_disabled", "rejected": "followup_repair_rejected"}[selection]
 

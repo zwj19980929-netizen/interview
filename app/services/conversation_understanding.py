@@ -12,11 +12,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from app.domain.speech_quality import limit_semantic_confidence, control_evidence_confidence, transcript_confidence_segments
 from app.domain.adaptive_interview import is_adaptive, assessment_contract
 from app.core.ids import new_id
+from app.core.answer_processing_budget import consume_answer_model_call
+from app.core.model_diagnostics import diagnosed_wait_for, record_model_diagnostic, safe_model_call_context
 from app.core.prompt.contracts import prompt_contract, understanding_canonical_schema, supplement_reply_canonical_schema
 from app.core.prompt.semantic_turn import (
     with_semantic_turn_schema, validate_semantic_turn, validate_current_speech, validate_unresolved_completion, SemanticContractError,
-    normalize_answer_relevance,
-    derive_semantic_controls,
+    normalize_answer_relevance, normalize_ambiguous_completion,
+    derive_semantic_controls, validate_conversation_clarification,
 )
 from app.core.prompt.understanding_references import (
     understanding_references,
@@ -51,7 +53,7 @@ _SENSITIVE = re.compile(
 )
 
 _LOGGER = logging.getLogger(__name__)
-_DECISION_TIMEOUT = 15.0
+_DECISION_TIMEOUT = 20.0
 _FOLLOWUP_REPAIR_TIMEOUT = 3.0
 _DEADLINE_RESERVE = .02
 
@@ -95,6 +97,11 @@ def _log_validation_rejection(
     def safe_id(value: Optional[str]) -> str:
         return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value) else "-"
 
+    record_model_diagnostic("understanding_rejected", **{
+        **safe_model_call_context(), "interview_id": safe_id(interview_id), "turn_id": safe_id(turn_id),
+        "validation_stage": stage, "failure_reason": reason, "schema_path": path,
+        "attempt": attempt, "provider_request_id": safe_id(provider_request_id),
+    })
     _LOGGER.warning(
         "%s validation_stage=%s reason=%s path=%s attempt=%d interview_id=%s turn_id=%s provider_request_id=%s",
         event, stage, reason, path, attempt,
@@ -170,6 +177,11 @@ class ConversationUnderstandingService:
                 data = normalize_answer_relevance(data, utterance.text, context["capability_points"])
             stage = "understanding_content"
             dialogue = context.get("interviewer_context") or {}
+            if semantic_first:
+                data = normalize_ambiguous_completion(data, utterance.text,
+                    input_context=dialogue.get("input_context"),
+                    content_clarification=dialogue.get("content_clarification"))
+                validate_structured_response(data, self._canonical_schema(semantic_first))
             self._validate_understanding_content(data, utterance.text, context["capability_points"],
                 input_context=dialogue.get("input_context"), exit_confirmation=dialogue.get("exit_confirmation"),
                 content_clarification=dialogue.get("content_clarification"))
@@ -278,10 +290,15 @@ class ConversationUnderstandingService:
             }
         else:
             for attempt in range(1, 3):
+                if not consume_answer_model_call():
+                    return self._safe_failure_understanding(
+                        utterance, turn, capability_points, source="provider", retryable=False,
+                        reason_code="call_budget_exhausted", attempts=attempt, prompt_version=contract.version,
+                    )
                 stage = "provider"
                 request_id = None
                 try:
-                    response = await asyncio.wait_for(
+                    response = await diagnosed_wait_for(
                         self.gateway.invoke(
                             cap.LLM_CHAT_JSON,
                             ChatJSONRequest(
@@ -291,8 +308,8 @@ class ConversationUnderstandingService:
                                 json_schema=contract.response_schema,
                                 temperature=0.0,
                                 max_output_tokens=1800,
-                                execution_budget=(InvocationExecutionBudget(timeout_s=12, max_provider_retries=0)
-                                                  if semantic_first else None),
+                                execution_budget=InvocationExecutionBudget(timeout_s=18, max_provider_retries=0,
+                                                                           max_provider_attempts=1),
                                 metadata={
                                     "prompt_version": contract.version,
                                     "interview_id": interview["id"],
@@ -303,6 +320,8 @@ class ConversationUnderstandingService:
                             ),
                         ),
                         timeout=20.0,
+                        stage="answer_understanding", timeout_reason="understanding_timeout",
+                        interview_id=interview.get("id"), turn_id=turn.get("id"),
                     )
                     request_id = response.provider.request_id
                     stage = "wire_schema"
@@ -314,7 +333,7 @@ class ConversationUnderstandingService:
                         return self._safe_failure_understanding(
                             utterance, turn, capability_points, source="provider",
                             retryable=isinstance(exc, asyncio.TimeoutError) or bool(exc.retryable),
-                            reason_code="provider_unavailable", attempts=attempt,
+                            reason_code=self._provider_failure_reason(exc), attempts=attempt,
                             prompt_version=contract.version,
                         )
                     reason = "wire_schema_invalid"
@@ -354,8 +373,9 @@ class ConversationUnderstandingService:
 
         self._require_authoritative_final(utterance)
         deadline = asyncio.get_running_loop().time() + _DECISION_TIMEOUT
-        result = await asyncio.wait_for(self._prepare_decision(utterance, turn, interview, deadline=deadline),
-                                        timeout=_DECISION_TIMEOUT)
+        result = await diagnosed_wait_for(self._prepare_decision(utterance, turn, interview, deadline=deadline),
+            timeout=_DECISION_TIMEOUT, stage="turn_decision", timeout_reason="decision_timeout",
+            interview_id=interview.get("id"), turn_id=turn.get("id"))
         self._record_followup_decision(result[1], interview, turn, phase="prepared", prompt_version=result[0].prompt_version)
         return result
 
@@ -383,13 +403,13 @@ class ConversationUnderstandingService:
             "root_turn_id": root_turn_id, "parent_turn_id": parent_turn_id,
             "history": history, "process_facts": process_facts, "skill_instructions": skill_instructions,
         })
-        response = await asyncio.wait_for(self.gateway.invoke(cap.LLM_CHAT_JSON, ChatJSONRequest(
+        response = await diagnosed_wait_for(self.gateway.invoke(cap.LLM_CHAT_JSON, ChatJSONRequest(
             organization_id=organization_id, purpose="interview_turn_understanding",
             messages=contract.messages, json_schema=contract.response_schema,
             temperature=0, max_output_tokens=320,
             execution_budget=InvocationExecutionBudget(timeout_s=4, max_provider_retries=0),
             metadata={"prompt_version": contract.version},
-        )), timeout=5)
+        )), timeout=5, stage="reception", timeout_reason="reception_timeout", turn_id=current_turn_id)
         from app.core.prompt.conversation_reception import validate_reception_response, resolve_reception_repeat_target
         try:
             validate_reception_response(response.data, contract.response_schema, current_speech=text)
@@ -440,13 +460,13 @@ class ConversationUnderstandingService:
         from app.core.prompt.candidate_exit import exit_reply_contract, validate_exit_reply_response
 
         contract = exit_reply_contract({"reply": reply})
-        response = await asyncio.wait_for(self.gateway.invoke(cap.LLM_CHAT_JSON, ChatJSONRequest(
+        response = await diagnosed_wait_for(self.gateway.invoke(cap.LLM_CHAT_JSON, ChatJSONRequest(
             organization_id=organization_id, purpose="interview_turn_understanding",
             messages=contract.messages, json_schema=contract.response_schema,
             temperature=0, max_output_tokens=400,
             execution_budget=InvocationExecutionBudget(timeout_s=8, max_provider_retries=0),
             metadata={"prompt_version": contract.version},
-        )), timeout=8)
+        )), timeout=8, stage="supplement_reply", timeout_reason="supplement_timeout")
         validate_exit_reply_response(response.data, reply, contract.response_schema)
         return dict(response.data)
 
@@ -494,16 +514,20 @@ class ConversationUnderstandingService:
         if len(utterance.text) > int(scope["policy"]["max_answer_chars"]):
             # Full authoritative text still goes to the existing understanding
             # contract. Only verified, bounded evidence goes to the probe call.
-            understanding = await asyncio.wait_for(self._understand(utterance, turn, interview),
-                timeout=max(.001, deadline - asyncio.get_running_loop().time() - _DEADLINE_RESERVE))
+            understanding = await diagnosed_wait_for(self._understand(utterance, turn, interview),
+                timeout=max(.001, deadline - asyncio.get_running_loop().time() - _DEADLINE_RESERVE),
+                stage="answer_understanding", timeout_reason="understanding_timeout",
+                interview_id=interview.get("id"), turn_id=turn.get("id"))
             if understanding.problem is not None:
                 return understanding, self._no_followup("understanding_unavailable", scope["policy"])
             decision, _ = await self._select_followup(interview, turn, utterance, understanding, deadline=deadline)
             return understanding, decision
         if (not interview.get("_answer_completion_confirmed") and not interview.get("_semantic_first")
                 and self.meta_intents.detect(utterance.text)) or scope.get("selected") is False:
-            understanding = await asyncio.wait_for(self._understand(utterance, turn, interview),
-                timeout=max(.001, deadline - asyncio.get_running_loop().time() - _DEADLINE_RESERVE))
+            understanding = await diagnosed_wait_for(self._understand(utterance, turn, interview),
+                timeout=max(.001, deadline - asyncio.get_running_loop().time() - _DEADLINE_RESERVE),
+                stage="answer_understanding", timeout_reason="understanding_timeout",
+                interview_id=interview.get("id"), turn_id=turn.get("id"))
             # No second invocation when the budget or acoustic confidence
             # already rules out a probe. Deterministic controls invoke none.
             decision = self._followup_scope(interview, turn, utterance, understanding)
@@ -532,10 +556,16 @@ class ConversationUnderstandingService:
         }
         contract = prompt_contract("interview_turn_decision", context)
         for attempt in range(1, 3):
+            if not consume_answer_model_call():
+                failed = self._safe_failure_understanding(
+                    utterance, turn, capability_points, source="provider", retryable=False,
+                    reason_code="call_budget_exhausted", attempts=attempt, prompt_version=contract.version,
+                )
+                return failed, self._no_followup("understanding_unavailable", scope["policy"])
             stage = "provider"
             request_id = None
             try:
-                response = await asyncio.wait_for(
+                response = await diagnosed_wait_for(
                     self.gateway.invoke(
                         cap.LLM_CHAT_JSON,
                         ChatJSONRequest(
@@ -545,8 +575,8 @@ class ConversationUnderstandingService:
                             json_schema=contract.response_schema,
                             temperature=0.0,
                             max_output_tokens=2000,
-                            execution_budget=(InvocationExecutionBudget(timeout_s=12, max_provider_retries=0)
-                                              if context["semantic_first"] else None),
+                            execution_budget=InvocationExecutionBudget(timeout_s=18, max_provider_retries=0,
+                                                                       max_provider_attempts=1),
                             metadata={
                                 "prompt_version": contract.version,
                                 "interview_id": interview["id"],
@@ -559,6 +589,8 @@ class ConversationUnderstandingService:
                         ),
                     ),
                     timeout=max(.001, deadline - asyncio.get_running_loop().time() - _DEADLINE_RESERVE),
+                    stage="turn_decision", timeout_reason="decision_timeout",
+                    interview_id=interview.get("id"), turn_id=turn.get("id"),
                 )
                 request_id = response.provider.request_id
                 # Validate the entire composite response before indexing or
@@ -582,7 +614,7 @@ class ConversationUnderstandingService:
                     failed = self._safe_failure_understanding(
                         utterance, turn, capability_points, source="provider",
                         retryable=isinstance(exc, asyncio.TimeoutError) or bool(exc.retryable),
-                        reason_code="provider_unavailable", attempts=attempt,
+                        reason_code=self._provider_failure_reason(exc), attempts=attempt,
                         prompt_version=contract.version,
                     )
                     return failed, self._no_followup("understanding_unavailable", scope["policy"])
@@ -692,8 +724,10 @@ class ConversationUnderstandingService:
                 "max_probe_chars": int(policy["max_probe_chars"]),
             },
         )
+        if not consume_answer_model_call():
+            return self._no_followup("followup_call_budget_exhausted", policy), contract.version
         try:
-            response = await asyncio.wait_for(self.gateway.invoke(
+            response = await diagnosed_wait_for(self.gateway.invoke(
                 cap.LLM_CHAT_JSON,
                 ChatJSONRequest(
                     organization_id=interview.get("organization_id", "org_default"),
@@ -713,7 +747,8 @@ class ConversationUnderstandingService:
                         "difficulty": difficulty,
                     },
                 ),
-            ), timeout=remaining)
+            ), timeout=remaining, stage="followup", timeout_reason="followup_timeout",
+                interview_id=interview.get("id"), turn_id=turn.get("id"))
             data = deepcopy(response.data)
             validate_structured_response(data, contract.response_schema)
             scope = self._followup_scope(interview, turn, utterance, understanding, now=now)
@@ -776,8 +811,10 @@ class ConversationUnderstandingService:
             "difficulty": scope["difficulty"], "max_probe_chars": int(scope["policy"]["max_probe_chars"]),
         })
         request_id = None
+        if not consume_answer_model_call():
+            return self._no_followup("followup_call_budget_exhausted", scope["policy"])
         try:
-            response = await asyncio.wait_for(self.gateway.invoke(cap.LLM_CHAT_JSON, ChatJSONRequest(
+            response = await diagnosed_wait_for(self.gateway.invoke(cap.LLM_CHAT_JSON, ChatJSONRequest(
                 organization_id=interview.get("organization_id", "org_default"), purpose="controlled_followup",
                 messages=contract.messages, json_schema=contract.response_schema, temperature=0,
                 max_output_tokens=180,
@@ -785,7 +822,8 @@ class ConversationUnderstandingService:
                                                            max_provider_attempts=1),
                 metadata={"prompt_version": contract.version, "interview_id": interview["id"],
                           "turn_id": turn["id"], "repair_reason": "question_shape_invalid"},
-            )), timeout=remaining)
+            )), timeout=remaining, stage="followup", timeout_reason="followup_timeout",
+                interview_id=interview.get("id"), turn_id=turn.get("id"))
             request_id = response.provider.request_id
             validate_structured_response(response.data, contract.response_schema)
             if not response.data["selected"]:
@@ -978,6 +1016,16 @@ class ConversationUnderstandingService:
             transaction.interview_sessions.update(session, expected_version=session["version"])
 
     @staticmethod
+    def _provider_failure_reason(exc: BaseException) -> str:
+        if isinstance(exc, asyncio.TimeoutError):
+            return "provider_timeout"
+        code = getattr(exc, "code", None)
+        return code if code in {
+            "provider_timeout", "provider_auth_failed", "provider_billing_required",
+            "provider_rate_limited", "provider_circuit_open",
+        } else "provider_unavailable"
+
+    @staticmethod
     def _safe_failure_understanding(
         utterance: ConversationUtterance,
         turn: Dict[str, Any],
@@ -997,6 +1045,11 @@ class ConversationUnderstandingService:
         CandidateAnswer or a provider-authored conversation act.
         """
 
+        record_model_diagnostic("understanding_failed", **{
+            **safe_model_call_context(), "turn_id": turn.get("id"),
+            "failure_reason": reason_code, "failure_source": source,
+            "retryable": retryable, "attempt": attempts, "prompt_version": prompt_version,
+        })
         clarify = source == "provider" and retryable
         action = "clarify" if clarify else "pause"
         code = (
@@ -1047,6 +1100,7 @@ class ConversationUnderstandingService:
 
         validate_semantic_turn(data, transcript)
         validate_current_speech(data, transcript, input_context)
+        validate_conversation_clarification(data)
         validate_exit_understanding(data, transcript, exit_confirmation)
         validate_unresolved_completion(data, transcript, content_clarification)
         allowed = set(capability_points)
@@ -1148,9 +1202,19 @@ class ConversationUnderstandingService:
 
     @staticmethod
     def can_complete_without_confirmation(understanding: TurnUnderstanding, transcript: str) -> bool:
-        """Authorize answer/topic completion; full withdrawal needs its own receipt."""
+        """Only explicit topic closure or a verified unresolved reply may bypass.
+
+        A model's finish_answer label and verbatim basis do not prove that an
+        ordinary answer is ready to submit. Those answers need the runtime's
+        supplement confirmation or explicit finish control. Unresolved replies
+        retain their separate delivered-clarification check at preparation and
+        commit; full withdrawal always needs its own receipt.
+        """
         if (understanding.problem is not None or understanding.completion_basis is None
                 or understanding.turn_intent == "stop_interview"):
+            return False
+        if not (understanding.turn_intent in {"finish_topic", "decline_topic"}
+                or (understanding.turn_intent == "finish_answer" and understanding.intent == "answer_unresolved")):
             return False
         data = understanding.model_dump(mode="json")
         validate_semantic_turn(data, transcript)
@@ -1377,6 +1441,7 @@ class ConversationUnderstandingService:
             "optional_detail_probe_unavailable", "model_declined", "missing_capability_evidence",
             "claim_detail_verification", "model_unavailable_or_rejected", "approved_fallback_unavailable",
             "followup_deadline_exhausted", "followup_repair_timeout", "followup_repair_rejected",
+            "followup_call_budget_exhausted",
         }
         reason = decision.get("reason")
         policy = decision.get("policy") or {}

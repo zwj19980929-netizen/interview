@@ -6,12 +6,17 @@ from copy import deepcopy
 import pytest
 
 from app.providers.mock.provider import MockProvider
-from test_automatic_turn_integration import _automatic_session, _current, _assert_one_automatic_answer
+from app.core.prompt.contracts import SUPPLEMENT_SPEECH
+from test_automatic_turn_integration import (
+    _automatic_session, _current, _assert_one_automatic_answer, _feed, _CONTINUATION,
+)
 from test_declined_answer_integration import (
-    _semantic_provider, _add_next_question, _playable_speech, _answer_and_confirm,
+    _semantic_provider, _add_next_question, _playable_speech, _answer_without_confirmation,
+    _stop_current_playback,
     _TECHNICAL, _NEXT_TURN_ID,
 )
 from test_evidence_owner_recovery_integration import _wait_until
+from test_spoken_supplement_integration import _audio_aligned_transcripts
 
 
 @pytest.mark.parametrize("rejection", ["answer_leakage", "multiple_questions"])
@@ -34,15 +39,23 @@ def test_invalid_optional_probe_advances_valid_answer_without_repeating_inferenc
         return response
 
     monkeypatch.setattr(MockProvider, "invoke", invoke)
+    reply = "没有补充了。"
+    _audio_aligned_transcripts(monkeypatch, [_TECHNICAL, reply])
 
     async def scenario():
-        reply = "没有补充了。"
         async with _automatic_session(
-            tmp_path, monkeypatch, [_TECHNICAL, reply, ""], spoken_confirmation=True,
+            tmp_path, monkeypatch, [""], spoken_confirmation=True,
         ) as (store, runtime, channel, managed):
             _add_next_question(store)
-            _playable_speech(runtime)
-            await _answer_and_confirm(runtime, channel, managed)
+            spoken = _playable_speech(runtime)
+            endpoint, clock = await _answer_without_confirmation(managed)
+            await _wait_until(lambda: endpoint.confirmation.speaking)
+            assert spoken == [SUPPLEMENT_SPEECH["check"]] and not _current(runtime)["answers"]
+            await _stop_current_playback(runtime, channel)
+            await _wait_until(lambda: endpoint.confirmation._supplement_question_delivered)
+            assert not _current(runtime)["answers"]
+            await _feed(managed._ingress, _CONTINUATION, 5)
+            clock.value += 1
             await _wait_until(lambda: len(_current(runtime)["answers"]) == 1, timeout=5)
             await _wait_until(lambda: all(c["status"] == "completed" for c in store.evidence_commands.values()))
             _assert_one_automatic_answer(
@@ -55,8 +68,10 @@ def test_invalid_optional_probe_advances_valid_answer_without_repeating_inferenc
             assert understanding["turn_intent"] == "finish_answer" and understanding["followup_allowed"]
             assert understanding["evidence_quotes"] == [_TECHNICAL]
             assert [call[2] for call in calls if call[0] == "understanding"] == [
-                "interview_turn_decision.v107", "interview_turn_decision.v108",
+                "interview_turn_decision.v131", "interview_turn_decision.v132",
             ], "One semantic preparation per distinct final, no rejected-probe retries"
+            assert [call for call in calls if call[0] == "supplement"] == [("supplement", reply, "finish")]
+            assert spoken.count(SUPPLEMENT_SPEECH["check"]) == 1
             assert not any(turn.get("is_followup") for turn in current["turns"])
             acts = [event["payload"]["act_type"] for event in current["agent_events"]
                     if event["type"] == "conversation.act.selected"]

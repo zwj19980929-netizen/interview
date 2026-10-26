@@ -409,6 +409,73 @@ def test_cancellation_and_late_provider_success_never_write_healthy():
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("code", ["provider_billing_required", "provider_auth_failed"])
+@pytest.mark.parametrize("cancel_caller", [False, True])
+def test_known_provider_rejection_survives_probe_deadline_or_caller_cancellation(code, cancel_caller):
+    service, _ = fixture()
+
+    async def scenario():
+        entered = asyncio.Event()
+
+        async def probe(*args):
+            # A real provider can know its rejection before bounded transport
+            # cleanup finishes. A fresh probe Task owns this observation.
+            asyncio.current_task().provider_error = ProviderError(code, "private vendor detail", retryable=False)
+            entered.set()
+            await asyncio.Event().wait()
+
+        refresher(service, probe, probe_timeout=.03, batch_timeout=1)
+        task = asyncio.create_task(service.refresh_routes(["route_0"]))
+        await entered.wait()
+        if cancel_caller:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            await task
+        assert state(service)["reason_code"] == code
+        assert stored(service)["last_health"]["retryable"] is False
+        assert "private vendor detail" not in json.dumps(stored(service))
+
+        # Subsequent explicit checks cannot inherit the previous task's error.
+        async def healthy(*args):
+            return {"ok": True}
+        refresher(service, healthy)
+        await service.test_route("route_0")
+        assert state(service)["ready"] is True
+
+    asyncio.run(scenario())
+
+
+def test_known_terminal_error_is_not_replaced_by_cleanup_failure():
+    service, _ = fixture()
+
+    async def probe(*args):
+        asyncio.current_task().provider_error = ProviderError("provider_auth_failed", "private", retryable=False)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise ProviderError("provider_probe_cleanup_failed", "cleanup failed", retryable=True)
+
+    refresher(service, probe, probe_timeout=.03, batch_timeout=1)
+    asyncio.run(service.refresh_routes(["route_0"]))
+    assert state(service)["reason_code"] == "provider_auth_failed"
+    assert stored(service)["last_health"]["retryable"] is False
+
+
+def test_unstructured_probe_error_observation_does_not_replace_timeout():
+    service, _ = fixture()
+
+    async def probe(*args):
+        asyncio.current_task().provider_error = "private vendor text"
+        await asyncio.Event().wait()
+
+    refresher(service, probe, probe_timeout=.03, batch_timeout=1)
+    asyncio.run(service.refresh_routes(["route_0"]))
+    assert state(service)["reason_code"] == "provider_timeout"
+    assert "private vendor text" not in json.dumps(stored(service))
+
+
 def test_foreign_tenant_route_is_indistinguishable_from_missing():
     service, _ = fixture(organization_id="org_foreign")
     async def probe(*args):

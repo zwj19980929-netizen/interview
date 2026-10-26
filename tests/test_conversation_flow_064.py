@@ -5,13 +5,14 @@ import json
 import pytest
 
 from app.core.prompt.understanding_references import understanding_references
+from app.core.prompt.contracts import SUPPLEMENT_SPEECH
 from app.model_gateway.schemas import ChatJSONResponse, ProviderMeta, Usage
 from app.providers.mock.provider import MockProvider
 from test_answer_endpoint import _Clock
 from test_automatic_turn_integration import _automatic_session, _current, _feed, _VOICE, _CONTINUATION
 from test_declined_answer_integration import _add_next_question, _NEXT_TURN_ID, _playable_speech, _confirm_pending_exit
 from test_evidence_owner_recovery_integration import TURN_ID, _wait_until
-from test_spoken_supplement_integration import _finish_playback
+from test_spoken_supplement_integration import _audio_aligned_transcripts, _finish_playback
 
 
 _QUESTION = "持久检查点是什么意思？"
@@ -19,6 +20,7 @@ _EXPLANATION = "持久检查点是已保存的任务进度记录。"
 _WAIT = "让我想一下。"
 _WAIT_REPLY = "好的，你慢慢想。"
 _TECHNICAL = "我使用持久检查点和幂等提交恢复任务。"
+_SUPPLEMENT_REPLY = "没有补充了。"
 
 
 def _dialogue_provider(monkeypatch, *, ending, misread_fast_finish=False):
@@ -32,6 +34,12 @@ def _dialogue_provider(monkeypatch, *, ending, misread_fast_finish=False):
         if version == "candidate_exit_reply.v1":
             reply = json.loads(request.messages[-1].content)["new_reply"]
             data = {"intent": "confirm", "confidence": .98, "evidence_quote": reply}
+        elif version.startswith("supplement_reply."):
+            value = json.loads(request.messages[-1].content)
+            assert value["reply"] == _SUPPLEMENT_REPLY
+            evidence_id = next(key for key, text in value["evidence"].items() if text == _SUPPLEMENT_REPLY)
+            data = {"intent": "finish", "confidence": .98, "evidence_id": evidence_id}
+            calls.append({"stage": "supplement", "current_speech": value["reply"]})
         elif version.startswith("conversation_reception."):
             value = json.loads(request.messages[-1].content)
             current = value["new_speech"]
@@ -51,7 +59,7 @@ def _dialogue_provider(monkeypatch, *, ending, misread_fast_finish=False):
             thinking = not finishing and _WAIT in transcript
             technical = _TECHNICAL in transcript
             evidence_id = next((key for key, text in evidence.items() if text == _TECHNICAL), None)
-            ending_id = (list(evidence)[-1] if transcript.endswith("确定结束面试。") else
+            ending_id = (list(evidence)[-1] if transcript.endswith(("确定结束面试。", _SUPPLEMENT_REPLY)) else
                          next((key for key, text in evidence.items() if ending in text), None))
             data = {"intent": "answer" if technical else "answer_declined" if finishing else "not_finished",
                 "answer_content": "technical" if technical else "none",
@@ -107,6 +115,11 @@ def test_real_endpoint_explanation_wait_then_current_finish_completes_once(
     async def scenario():
         transcripts = ([_QUESTION, _WAIT, body, "", "", "确定结束面试。", ""] if expected_intent == "stop_interview"
                        else [_QUESTION, _WAIT, body, ""])
+        if expected_intent == "finish_answer":
+            # Assign words only when actual ingress audio arrives. Empty STT
+            # cuts at the playback boundary must not consume the fresh reply.
+            _audio_aligned_transcripts(monkeypatch, [_QUESTION, _WAIT, body, _SUPPLEMENT_REPLY])
+            transcripts = [""]
         async with _automatic_session(tmp_path, monkeypatch, transcripts,
                 stable_previews=True, spoken_confirmation=True) as (store, runtime, channel, managed):
             _add_next_question(store)
@@ -139,6 +152,16 @@ def test_real_endpoint_explanation_wait_then_current_finish_completes_once(
                 clock.value += 1.1
             if expected_intent == "stop_interview":
                 await _confirm_pending_exit(runtime, channel, managed, clock)
+            elif expected_intent == "finish_answer":
+                await _wait_until(lambda: SUPPLEMENT_SPEECH["check"] in spoken, timeout=5)
+                assert not _current(runtime)["answers"]
+                assert not endpoint.confirmation.confirmed
+                await _finish_playback(channel, runtime, managed)
+                assert endpoint.confirmation.phase == "awaiting_reply"
+                assert endpoint.confirmation._supplement_question_delivered
+                assert not _current(runtime)["answers"]
+                await _feed(managed._ingress, _CONTINUATION, 5)
+                clock.value += 1.1
             await _wait_until(lambda: len(_current(runtime)["answers"]) == 1, timeout=5)
             if expected_intent == "stop_interview":
                 await _wait_until(lambda: bool(_current(runtime).get("candidate_input_completed_at")), timeout=5)
@@ -146,7 +169,8 @@ def test_real_endpoint_explanation_wait_then_current_finish_completes_once(
             root = next(turn for turn in current["turns"] if turn["id"] == TURN_ID)
             assert root["current_understanding"]["turn_intent"] == expected_intent
             assert current["answers"][0]["final_transcript"] == _QUESTION + _WAIT + body + (
-                "确定结束面试。" if expected_intent == "stop_interview" else "")
+                "确定结束面试。" if expected_intent == "stop_interview" else
+                _SUPPLEMENT_REPLY if expected_intent == "finish_answer" else "")
             assert current["answers"][0]["media_evidence"]["complete"] is True
             assert not [act for act in root["conversation_acts"] if act.get("act_type") == "clarification"]
             assert spoken.count(_WAIT_REPLY) == (2 if acknowledged_finish else 1), "The old waiting request must not shadow the newest finish"
@@ -159,11 +183,24 @@ def test_real_endpoint_explanation_wait_then_current_finish_completes_once(
                             if event["type"] == "conversation.act.selected" and event.get("turn_id") == _NEXT_TURN_ID]
             else:
                 assert current["current_turn_id"] == _NEXT_TURN_ID
+            if expected_intent == "finish_answer":
+                assert spoken.count(SUPPLEMENT_SPEECH["check"]) == 1
+                assert [call["current_speech"] for call in calls if call["stage"] == "supplement"] == [_SUPPLEMENT_REPLY]
+                assert root["current_understanding"]["claims"][0]["claim"] == _TECHNICAL
+                assert root["current_understanding"]["completion_basis"]["evidence_quotes"] == [_SUPPLEMENT_REPLY]
             final_calls = [call for call in calls if call["stage"] == "understanding" and ending in call["transcript"]]
             assert final_calls and all(call["input_context"] for call in final_calls)
-            assert all(call["input_context"]["current_speech"] == body or (
-                expected_intent == "stop_interview" and call["input_context"]["current_speech"] == "确定结束面试。") or (
-                acknowledged_finish and call["input_context"]["current_speech"] == ""
-                and call["input_context"]["responded_exchanges"][-1]["request_text"] == body) for call in final_calls)
+            for call in final_calls:
+                input_context = call["input_context"]
+                if expected_intent == "finish_answer" and call["transcript"].endswith(_SUPPLEMENT_REPLY):
+                    # Full understanding retains the unanswered body; a prior
+                    # reception acknowledgement instead advances that boundary.
+                    assert input_context["current_speech"] == (
+                        _SUPPLEMENT_REPLY if acknowledged_finish else body + _SUPPLEMENT_REPLY)
+                else:
+                    assert input_context["current_speech"] == body or (
+                        expected_intent == "stop_interview" and input_context["current_speech"] == "确定结束面试。") or (
+                        acknowledged_finish and input_context["current_speech"] == ""
+                        and input_context["responded_exchanges"][-1]["request_text"] == body)
 
     asyncio.run(scenario())

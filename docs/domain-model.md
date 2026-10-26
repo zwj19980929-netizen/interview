@@ -1,5 +1,33 @@
 # 领域模型
 
+## 079：模型调用诊断作用域
+
+`ModelCallScope`为进程内诊断上下文，父子作用域及受控取消来源只用于归因，不提供业务权限。既有`ModelInvocationLog` JSON增加非流式`cancelled`终态及可选会话/题目/采集关联、诊断scope/parent、阶段、实际时间预算和取消原因字段。每attempt仍只有一条终态审计；未开始或因调用额度拒绝的业务处理仅写诊断事件，不虚构供应商请求。历史缺字段可读，原会话状态和答案数据不变，无DDL迁移。详见[供应商日志约束](model-provider-plugins.md)及[操作日志079](change-log.md)。
+
+## 078：补充确认组合与处理恢复（仓库与本机已验证）
+
+`PreparedCompletionReceipt`是进程内原准备/原final/送达边界/新纯结束回复的组合证明；不持久化许可、不代替当前owner和完整final核验。`agent_runtime.answer_preparation`增加blocked及白名单诊断stage/reason_code/attempt/max_attempts/retryable。`evidence.retry_processing`只恢复当前失败处理，`continue_speaking`仍表示继续补充。详见[078](answer-recovery-and-reuse-078.md)。
+
+## 077：试音完成与确认输出的阶段边界
+
+非评分试音STT完成后，`awaiting_confirmation`与其校准修订是后续提示音的输入事实；提示音异常不得重置为STT重试。零输出且当前owner/control/capture/修订仍有效的可选提示失败保留显式确认；未知已选中输出沿已有生命周期暂停并保留字幕状态，不代表确认已通过。前端确认还须会话未暂停，不能只看字幕或calibration_status。未新增领域字段或迁移。
+
+## 075：固定提示音与追问音频恢复（已实现）
+
+`agent_runtime.question_audio_recovery`记录当前正式追问音频恢复事实：`status`为`retry_required|retrying`，绑定`turn_id/act_id/selection_event_id/updated_at`；只引用当前服务端批准行为，重试创建同一行为的新选择收据。它不能形成送达或作答证据，真正播放完成后才清除；切题、暂停、接管或失权不得复活旧播放。候选投影仅提供status/turn_id/selection_event_id，不提供内部诊断。
+
+固定提示音是进程内有界优化缓存：只有版本化白名单的试音确认、补充确认与退出确认固定文案可进入，按组织、路由/模型/连接配置指纹、文案版本、音色、语言、格式及合成参数精确匹配；完整验证PCM才发布，重启或失效后后台预热，丢失不改变领域状态。不复用候选录音、动态追问或跨配置音色；命中仍创建新输出身份并经过实际播放回执。无DDL。
+
+## 074：试音确认与表达失败
+
+试音字幕待确认与确认提示音成功是独立事实；零 PCM、当前所有权和当前选择均成立时，提示音失败不得把已取得的试音字幕当作无效证据，也不能自动授予确认。恢复后仍为 `awaiting_confirmation`，不创建正式题、答案或确认许可。会话级 `session_conversation_acts` 复用既有选择与送达回执形状；失败选中记录为 failed，不能当作已送达或正式评分证据。不新增会话状态或 DDL。模型调用诊断增加可空 `vendor_code`、`provider_request_id`、`transport_phase`、`transport_phase_ms`、`transport_elapsed_ms`、`transport_outcome`，仅保存白名单值；调用 token 用量不表示账户剩余额度。详见[074说明](warmup-tts-resilience-074.md)。
+
+## 073：补充确认的送达事实
+
+普通 `answer/off_topic + finish_answer` 表示模型对发言结束的判断，不能单独授权提交；正常语音作答先进入补充询问，当前 owner/turn/capture 下问题实际播完并取得新的服务端语音答复后才可确认。`CompletionBasis` 的逐字来源校验不等同产品确认。此规则取代056普通口头结束不再询问补充的行为。
+
+`SpokenSupplementConfirmation` 的问题待播放与已送达标记是进程内事实；选中、开始播放、超时、打断或仅调用 floor_returned 都不能授予确认。实际播放完成后取得权威 final 固定回复边界；继续补充仍在同一采集内保留内容和已问上下文。明确按钮、拒答/关闭话题、具备实际内容澄清证明的待核实收尾及整场退出继续使用各自门禁。无新持久字段或数据库迁移。见[073说明](supplement-confirmation-stability-073.md)。
+
 ## 068：清楚跑题与交互恢复
 
 `ConversationUnderstanding.intent=off_topic` 表示当前发言含义清楚但没有与题意相关的可用回答；与 `clarification_request`、`answer_declined`、`answer_unresolved` 区分。`turn_intent` 仍独立决定是否思考、结束本题或请求退出，所有完成依据仍须当前权威语音来源。原文及可靠 claims 保留，相关技术回答不能因夹带无关叙述被整段丢弃。无新存储字段或迁移。
@@ -1142,7 +1170,7 @@ stateDiagram-v2
 
 ### 056 完成回答与结束话题
 
-`TurnUnderstanding.turn_intent=finish_answer` 表示候选人明确完成了当前这一次回答，已有技术内容与逐字结束证据保留，`followup_allowed=true`；不再重复询问是否补充。`finish_topic/decline_topic/stop_interview` 分别表示关闭当前话题、拒答、结束整场，继续令 `followup_allowed=false`。按钮确认没有口头结束证据时不伪造 `completion_basis`。此扩展无需迁移旧理解记录，不能把历史 `finish_topic` 猜测改成新意图或补造追问。
+`TurnUnderstanding.turn_intent=finish_answer` 表示候选人明确完成了当前这一次回答，已有技术内容与逐字结束证据保留，`followup_allowed=true`；073起普通语音回答仍须实际询问补充并获得新的确认答复，取代056直接推进的行为。`finish_topic/decline_topic/stop_interview` 分别表示关闭当前话题、拒答、结束整场，继续令 `followup_allowed=false`。按钮确认没有口头结束证据时不伪造 `completion_basis`。此扩展无需迁移旧理解记录，不能把历史 `finish_topic` 猜测改成新意图或补造追问。
 
 正式子问题可以核实已提及能力点的具体做法与依据，`claim_detail_verification` 记录这种选择原因；覆盖某点不等于其细节已经充分。是否选择由有证据约束的模型决定，受冻结范围、既有追问次数与深度、剩余时间和候选边界约束。
 

@@ -260,7 +260,9 @@ def test_pause_commit_rechecks_owner_inside_the_lifecycle_transaction(tmp_path, 
     asyncio.run(scenario())
 
 
-def test_unpreset_interview_request_speaks_generated_reply_while_analysis_is_pending(tmp_path, monkeypatch):
+@pytest.mark.parametrize("quiet,analysis_started", [(1.1, False), (3.1, True)])
+def test_unpreset_interview_request_speaks_generated_reply_without_waiting_for_analysis(
+        tmp_path, monkeypatch, quiet, analysis_started):
     reply = "可以，先讲你自己的组织方式，我会跟着你的思路听。"
     reception_provider(monkeypatch, "interview_dialogue", reply_text=reply)
 
@@ -284,9 +286,13 @@ def test_unpreset_interview_request_speaks_generated_reply_while_analysis_is_pen
             before = _current(runtime)
             try:
                 await _feed(managed._ingress, _VOICE, 5)
-                clock.value = 1.1
+                clock.value = quiet
                 await _wait_until(lambda: bool(spoken), timeout=5)
-                assert analysis_entered.is_set() and not analysis_release.is_set()
+                # Fast dialogue stays available at 1s without buying a full
+                # understanding call; an already-started 3s analysis also
+                # cannot hold up the same natural acknowledgement.
+                assert analysis_entered.is_set() == analysis_started
+                assert not analysis_release.is_set()
                 assert spoken == [reply]
                 act = acts(runtime)[0]
                 assert act["act_type"] == "conversation_acknowledgement"

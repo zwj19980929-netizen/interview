@@ -9,8 +9,15 @@ const UNDERSTANDING_RETRY_CODES = new Set([
 
 export function understandingRecoveryState(problem) {
   if (problem?.recoverable !== true) return null;
+  if ((UNDERSTANDING_RETRY_CODES.has(problem.code) || UNDERSTANDING_RECOVERY_CODES.has(problem.code))
+    && problem.action === "contact_support") return "blocked";
   if (UNDERSTANDING_RETRY_CODES.has(problem.code)) return "retry_required";
   return UNDERSTANDING_RECOVERY_CODES.has(problem.code) ? "retrying" : null;
+}
+
+export function warmupRetryRequired(problem) {
+  return problem?.recoverable === true && (problem.action === "retry_warmup"
+    || ["WARMUP_STT_PROBLEM", "WARMUP_RETRY_REQUIRED"].includes(problem.code));
 }
 
 export function candidateConnectionNotice(experience) {
@@ -22,6 +29,25 @@ export function candidateConnectionNotice(experience) {
     return { title: "正在恢复本场面试", detail: "当前题目和已收到的回答会保留。请等待连接恢复，无需重复作答。" };
   }
   return null;
+}
+
+// A local safety stop is not proof that the server accepted a pause. Project
+// every stopped surface from the same facts, including before open() succeeds.
+export function candidateStoppedPresentation({ experience, interview, problem }) {
+  const status = experience?.session?.status ?? interview?.status;
+  const pauseConfirmed = status === "paused" || problem?.pauseConfirmed === true;
+  if (!pauseConfirmed && problem?.recoverable !== false && experience?.phase !== "paused") return null;
+  const pausePending = !pauseConfirmed && problem?.pausePending === true;
+  const notice = candidateNotice({ ...problem, recoverable: false, pausePending }, pauseConfirmed);
+  return {
+    notice,
+    header: pauseConfirmed ? "面试已暂停" : pausePending ? "正在暂停面试" : "连接已中断",
+    cameraTitle: "画面已关闭",
+    cameraDetail: "请按下方面试状态提示操作。",
+    gateTitle: pauseConfirmed ? "面试已暂停" : pausePending ? "正在暂停面试" : "暂时无法进入面试",
+    gateDetail: notice.detail,
+    microphoneDetail: pauseConfirmed ? "面试已暂停，收音已停止" : pausePending ? "收音已停止，正在确认暂停结果" : "收音已停止，请查看页面提示",
+  };
 }
 
 export function candidateNotice(problem, pauseConfirmed = false, phase = null) {
@@ -42,14 +68,28 @@ export function candidateNotice(problem, pauseConfirmed = false, phase = null) {
   if (problem.action === "retry_planning") {
     return { title: "下一话题暂时没准备好", detail: "你的回答已保留，可以重试继续面试。", retry: true, action: "planning.retry" };
   }
+  if (problem.code === "QUESTION_AUDIO_RETRY_REQUIRED") {
+    return { title: "追问语音需要重试", detail: "上一题回答已保留。点击“重试播放”收听这道追问，播完后再作答。",
+      retry: true, action: "retry_question_audio", retryLabel: "重试播放" };
+  }
+  if (problem.code === "WARMUP_CONFIRMATION_AUDIO_UNAVAILABLE") {
+    return { title: "试音确认提示音暂时不可用", detail: "字幕已保留。请核对下方字幕：正确可确认开始，不正确请选择重新试音。" };
+  }
+  if (warmupRetryRequired(problem)) {
+    return { title: "试音流程未完成，需要重新试音", detail: "即使已经显示字幕，本次试音仍未完成。请点击下方“重新试音”，完成后再确认进入正式面试。这段试音不计分。" };
+  }
+  if (understandingRecoveryState(problem) === "blocked") {
+    return { title: "回答处理服务暂时不可用", detail: "录音、已识别内容和确认进度已保留。请联系面试安排人恢复服务，无需重复作答。" };
+  }
   if (understandingRecoveryState(problem) === "retrying") {
-    return { title: "回答处理暂时遇到问题", detail: "录音和已识别内容已保留，系统正在有限重试。无需重说整题；想补充仍可直接开口。"
+    const stage = problem.stage === "supplement_prompt" ? "正在恢复补充确认提示" : "正在恢复回答处理";
+    return { title: stage, detail: "录音和已识别内容已保留，系统正在自动恢复此步骤。无需重说整题；想补充仍可直接开口。"
       + (phase === "awaiting_exit_confirmation" ? "本次面试尚未结束。" : "") };
   }
   if (understandingRecoveryState(problem) === "retry_required") {
     return { title: "回答处理需要重试", detail: "录音和已识别内容已保留。点击“重试处理”继续处理已有回答，无需重说整题。"
       + (phase === "awaiting_exit_confirmation" ? "本次面试尚未结束。" : ""),
-      retry: true, action: "continue_speaking", retryLabel: "重试处理" };
+      retry: true, action: "retry_answer_processing", retryLabel: "重试处理" };
   }
   if (problem.code === "TRANSCRIPT_RETRY_REQUIRED") {
     return { title: "这段语音暂未识别完成", detail: "录音和已识别内容已保留。请点击“重试处理”继续处理，无需重说整题。", retry: true, retryLabel: "重试处理" };

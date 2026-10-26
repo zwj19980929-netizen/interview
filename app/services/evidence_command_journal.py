@@ -437,7 +437,7 @@ class EvidenceCommandJournal:
             allowed = _SEAL_PAYLOAD_FIELDS
         elif submission.command_type == "evidence.backfill":
             allowed = _BACKFILL_PAYLOAD_FIELDS
-        elif submission.command_type in {"speech.started", "speech.stopped", "evidence.continue"}:
+        elif submission.command_type in {"speech.started", "speech.stopped", "evidence.continue", "evidence.retry_processing"}:
             allowed = {"capture_id"}
         else:
             allowed = set()
@@ -539,6 +539,8 @@ class EvidenceCommandJournal:
                 "audio_epoch": audio_epoch,
                 "client_sequence": client_sequence,
             }
+        if submission.command_type == "evidence.retry_processing" and not (submission.turn_id and scope.get("capture_id")):
+            raise ApiError("EVIDENCE_COMMAND_PAYLOAD_INVALID", "Answer recovery requires the current turn and capture.", status_code=422)
         return scope
 
     @classmethod

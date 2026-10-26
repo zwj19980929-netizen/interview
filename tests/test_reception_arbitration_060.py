@@ -65,7 +65,7 @@ class Capture(_Capture):
                                understanding=understanding, followup=followup)
 
 
-def setup(capture):
+def setup(capture, *, initial_quiet=1.1):
     endpoint, clock, notices, commits = _endpoint(capture=capture)
     spoken = []
 
@@ -80,14 +80,15 @@ def setup(capture):
     endpoint.confirmation = SpokenSupplementConfirmation(speak=speak)
     endpoint.speech_started(source="audio")
     endpoint.start()
-    clock.value = 1.1
+    clock.value = initial_quiet
     return endpoint, clock, notices, commits, spoken
 
 
 @pytest.mark.anyio
 async def test_full_finish_corrects_fast_wait_using_the_already_running_preparation():
     capture = Capture()
-    endpoint, clock, _, commits, spoken = setup(capture)
+    # Full speculation begins after 3s; fast reception remains eligible at 1s.
+    endpoint, clock, _, commits, spoken = setup(capture, initial_quiet=3.1)
     try:
         await _until(lambda: spoken == ["reception_wait"])
         assert capture.prepares and not capture.cancelled, "Fast reception must not cancel full understanding"
@@ -108,7 +109,7 @@ async def test_full_finish_corrects_fast_wait_using_the_already_running_preparat
 @pytest.mark.anyio
 async def test_late_final_correction_cannot_be_committed_using_the_fast_waits_old_full_result():
     capture = Capture()
-    endpoint, clock, _, commits, spoken = setup(capture)
+    endpoint, clock, _, commits, spoken = setup(capture, initial_quiet=3.1)
     try:
         await _until(lambda: spoken)
         capture.release.set()
@@ -257,7 +258,7 @@ async def test_uncertain_full_result_replaces_fast_wait_lock_with_one_completion
 @pytest.mark.anyio
 async def test_full_review_deadline_cancels_work_and_never_creates_a_polling_inference_loop():
     capture = Capture()
-    endpoint, clock, notices, commits, spoken = setup(capture)
+    endpoint, clock, notices, commits, spoken = setup(capture, initial_quiet=3.1)
     endpoint.preparation._timeout = .05
     infer = endpoint._infer
 

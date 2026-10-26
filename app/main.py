@@ -36,6 +36,9 @@ from app.core.access_log import install_sensitive_access_log_filter
 from app.core.speech_diagnostics import configure_speech_diagnostics
 from app.core.rate_limit import public_rate_limiter
 from app.model_gateway.errors import ProviderError
+from app.model_gateway.gateway import ModelGateway
+from app.providers.dashscope.tts_http_pool import start_tts_http_pools, close_tts_http_pools
+from app.services.fixed_speech_preparation import start_fixed_speech_preparation, close_fixed_speech_preparation
 from app.persistence.errors import PersistenceError
 
 
@@ -47,6 +50,11 @@ WEB_DIST_DIR = WEB_DIR / "dist"
 async def lifespan(app: FastAPI):
     install_sensitive_access_log_filter()
     configure_speech_diagnostics()
+    start_tts_http_pools()
+    start_fixed_speech_preparation(
+        ModelGateway(get_store()),
+        organization_id=os.getenv("INTERVIEWER_ORGANIZATION_ID", "org_default"),
+    )
     task = None
     takeover_watchdog = asyncio.create_task(
         run_takeover_lease_watchdog(
@@ -84,6 +92,8 @@ async def lifespan(app: FastAPI):
         if task is not None:
             task.cancel()
         await shutdown_livekit_evidence_supervisors()
+        await close_fixed_speech_preparation()
+        await close_tts_http_pools()
         await event_bus.close()
         await public_rate_limiter.close()
 

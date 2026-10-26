@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { WorkbenchProvider, useWorkbench } from "../../core/WorkbenchProvider.jsx";
 import CandidateFeaturePage from "./Page.jsx";
+import { discardPreparedCandidateMedia, prepareCandidateMedia } from "./preflight.js";
 
 const runtime = vi.hoisted(() => ({ avatars: [], open: vi.fn(), report: vi.fn() }));
 vi.mock("./VrmAvatar.jsx", () => ({
@@ -47,6 +48,7 @@ describe("candidate route isolation with the real workbench loader", () => {
   const avatar = () => runtime.avatars.at(-1);
 
   beforeEach(() => {
+    discardPreparedCandidateMedia();
     sessionStorage.clear();
     runtime.avatars.length = 0;
     runtime.open.mockReset().mockImplementation(async () => makeRun());
@@ -68,6 +70,75 @@ describe("candidate route isolation with the real workbench loader", () => {
     host.remove();
     vi.unstubAllGlobals();
     sessionStorage.clear();
+    discardPreparedCandidateMedia();
+  });
+
+  it("shows a persisted pause without restarting devices, opening the agent, or reporting another failure", async () => {
+    const getUserMedia = vi.fn();
+    vi.stubGlobal("navigator", { mediaDevices: { getUserMedia } });
+    const audio = { readyState: "live", stop: vi.fn() };
+    const video = { readyState: "live", stop: vi.fn() };
+    const stream = { getTracks: () => [audio, video], getAudioTracks: () => [audio], getVideoTracks: () => [video] };
+    prepareCandidateMedia(stream, {});
+    await mount("paused", "token-paused");
+    await deliver(0, { ...interview("paused"), status: "paused" });
+    await act(async () => {
+      avatar().onReady({ fps: 60 });
+      await avatar().onFatalProblem(new Error("synthetic renderer failure"));
+    });
+    expect(host.querySelector(".candidate-header-meta").textContent).toContain("面试已暂停");
+    expect(host.querySelector(".candidate-warmup h1").textContent).toBe("面试已暂停");
+    expect(host.querySelector(".candidate-camera").textContent).toContain("画面已关闭");
+    expect(host.querySelector(".candidate-signal-list").textContent).toContain("面试已暂停，收音已停止");
+    expect(host.textContent).not.toMatch(/正在连接|正在进入|synthetic/);
+    expect(host.querySelector("video").srcObject).toBeNull();
+    expect(audio.stop).toHaveBeenCalledOnce();
+    expect(video.stop).toHaveBeenCalledOnce();
+    expect(runtime.open).not.toHaveBeenCalled();
+    expect(runtime.report).not.toHaveBeenCalled();
+    expect(getUserMedia).not.toHaveBeenCalled();
+  });
+
+  it.each(["confirmed", "rejected"])("keeps startup failure surfaces consistent while pause is pending and then %s", async outcome => {
+    const pause = deferred();
+    runtime.open.mockRejectedValueOnce(new Error("synthetic control handshake failed"));
+    runtime.report.mockReturnValueOnce(pause.promise);
+    await mount();
+    await deliver(0, interview("new"));
+    await act(async () => avatar().onReady({ fps: 60 }));
+    expect(host.querySelector(".candidate-header-meta").textContent).toContain("正在暂停面试");
+    expect(host.querySelector(".candidate-warmup h1").textContent).toBe("正在暂停面试");
+    expect(host.querySelector(".candidate-camera").textContent).toContain("画面已关闭");
+    expect(host.querySelector(".candidate-signal-list").textContent).toContain("正在确认暂停结果");
+    expect(host.textContent).not.toMatch(/正在连接|正在进入|面试已暂停|synthetic/);
+    await act(async () => {
+      if (outcome === "confirmed") pause.resolve({ status: "paused" });
+      else pause.reject(new Error("synthetic report failed"));
+    });
+    expect(host.textContent).not.toMatch(/正在连接|正在进入|正在暂停|synthetic/);
+    if (outcome === "confirmed") {
+      expect(host.querySelector(".candidate-header-meta").textContent).toContain("面试已暂停");
+      expect(host.querySelector(".candidate-warmup h1").textContent).toBe("面试已暂停");
+    } else {
+      expect(host.querySelector(".candidate-header-meta").textContent).toContain("连接已中断");
+      expect(host.querySelector(".candidate-warmup h1").textContent).toBe("暂时无法进入面试");
+      expect(host.textContent).not.toContain("面试已暂停");
+    }
+    expect(runtime.open).toHaveBeenCalledOnce();
+    expect(runtime.report).toHaveBeenCalledOnce();
+  });
+
+  it("retains the connecting display during an actual pending startup", async () => {
+    const pending = deferred();
+    runtime.open.mockReturnValueOnce(pending.promise);
+    await mount();
+    await deliver(0, interview("new"));
+    await act(async () => avatar().onReady({ fps: 60 }));
+    expect(host.querySelector(".candidate-header-meta").textContent).toContain("正在连接");
+    expect(host.querySelector(".candidate-camera").textContent).toContain("正在连接摄像头");
+    expect(host.querySelector(".candidate-warmup h1").textContent).toBe("正在进入面试");
+    expect(host.textContent).not.toContain("面试已暂停");
+    await act(async () => pending.resolve(makeRun()));
   });
 
   it("never pairs an admin's previous interview with the new candidate credential while loading", async () => {
@@ -201,6 +272,7 @@ describe("candidate route isolation with the real workbench loader", () => {
         serverAudio: { received: false }, captions: { full: [], recent: [] }, endpoint: { active: true },
         calibration: { status: "completed" }, avatar: { status: "speaking" },
         speechPlayback: { status: "blocked", message: "播放受阻" },
+        problem: { code: "UNDERSTANDING_UNAVAILABLE", recoverable: true },
       });
       return () => {};
     });
@@ -214,9 +286,38 @@ describe("candidate route isolation with the real workbench loader", () => {
     expect(run.act).toHaveBeenCalledWith(expect.objectContaining({ type: "pause" }));
     expect(host.textContent).not.toContain("面试官正在说话");
     expect(host.textContent).not.toContain("播放这句话");
+    expect(host.querySelector(".candidate-header-meta").textContent).toContain("面试已暂停");
+    expect(host.querySelector(".candidate-camera").textContent).toContain("画面已关闭");
+    expect(host.textContent).not.toContain("回答处理暂时遇到问题");
     const answerButtons = [...host.querySelectorAll(".recording-actions button")];
     expect(answerButtons).toHaveLength(3);
     expect(answerButtons.every((button) => button.disabled)).toBe(true);
+  });
+
+  it("uses an authoritative paused snapshot across all surfaces while retaining the current question and transcript", async () => {
+    const run = makeRun();
+    run.subscribe.mockImplementation(listener => {
+      listener({ phase: "paused", floor: "none", session: { status: "paused" },
+        currentQuestion: { question_text: "暂停中的合成问题", turn_id: "turn-current" },
+        connection: { control: "connected", media: "connected" },
+        microphone: { localDetected: true, level: .6 }, evidence: { ready: false },
+        serverAudio: { received: false }, captions: { full: [], recent: [{ text: "暂停前的合成回答", final: false }] },
+        endpoint: { active: false }, calibration: { status: "completed" }, avatar: { status: "idle" },
+      });
+      return () => {};
+    });
+    runtime.open.mockResolvedValueOnce(run);
+    await mount();
+    await deliver(0, interview("new"));
+    await act(async () => avatar().onReady({ fps: 60 }));
+    expect(host.querySelector(".candidate-header-meta").textContent).toContain("面试已暂停");
+    expect(host.querySelector(".candidate-camera").textContent).toContain("画面已关闭");
+    expect(host.querySelector(".candidate-signal-list").textContent).toContain("面试已暂停，收音已停止");
+    expect(host.textContent).toContain("暂停中的合成问题");
+    expect(host.textContent).toContain("暂停前的合成回答");
+    expect(host.textContent).not.toMatch(/正在连接|正在进入|已连接|正在听你说/);
+    expect([...host.querySelectorAll(".candidate-answer-actions button")].every(button => button.disabled)).toBe(true);
+    expect(runtime.report).not.toHaveBeenCalled();
   });
 
   it("requires a spoken withdrawal confirmation and keeps answer controls from authorizing it", async () => {
@@ -295,7 +396,7 @@ describe("candidate route isolation with the real workbench loader", () => {
     expect(host.textContent).toContain("处理已有回答");
     if (!retry.disabled) {
       await act(async () => retry.click());
-      expect(run.act).toHaveBeenCalledWith(expect.objectContaining({ type: "continue_speaking", turnId: "turn-current" }));
+      expect(run.act).toHaveBeenCalledWith(expect.objectContaining({ type: "retry_answer_processing", turnId: "turn-current" }));
     }
   });
 

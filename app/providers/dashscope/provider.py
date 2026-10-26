@@ -76,7 +76,16 @@ class DashScopeProvider(OpenAICompatibleProvider):
         try:
             return await super().invoke(capability, request, context)
         except ProviderError as exc:
+            # A trusted single-attempt workflow must observe every provider
+            # request. Do not hide another HTTP call behind schema transport
+            # compatibility; legacy requests without this limit keep it.
+            single_attempt = (
+                isinstance(original_request, ChatJSONRequest)
+                and original_request.execution_budget is not None
+                and original_request.execution_budget.max_provider_attempts == 1
+            )
             if (capability != cap.LLM_CHAT_JSON or context.purpose != "interview_turn_understanding"
+                    or single_attempt
                     or str(context.config.get("structured_output_mode") or self.structured_output_mode) != "json_schema"
                     or exc.code != "provider_bad_request" or exc.details.get("http_status") != 400):
                 raise

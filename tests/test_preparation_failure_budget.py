@@ -32,8 +32,8 @@ def test_noise_and_provider_metadata_changes_cannot_restart_exhausted_word_budge
             revised.provider.request_id = "synthetic-noise-%d" % index
             revised.provider.latency_ms = index
             await _attempt(endpoint, revised)
-        assert len(endpoint.capture.prepares) == 3
-        assert endpoint._prepare_failures == 3
+        assert len(endpoint.capture.prepares) == 2
+        assert endpoint._prepare_failures == 2
         assert "understanding_retry_exhausted" in notices
         assert endpoint.capture.is_open and not endpoint._closed and not commits
         await endpoint.close()
@@ -47,7 +47,7 @@ def test_cancelled_waiters_do_not_hide_or_double_count_background_failures(failu
         endpoint, clock, notices, commits, _ = setup()
         endpoint.capture.problem = _retryable_problem()
         final = _final("合成回答。已经讲完了。")
-        for attempt in range(3):
+        for attempt in range(2):
             release = asyncio.Event()
 
             async def prepare(transcript):
@@ -70,7 +70,7 @@ def test_cancelled_waiters_do_not_hide_or_double_count_background_failures(failu
         for _ in range(10):
             endpoint.speech_started(source="client")
             await _attempt(endpoint, final)
-        assert len(endpoint.capture.prepares) == endpoint._prepare_failures == 3
+        assert len(endpoint.capture.prepares) == endpoint._prepare_failures == 2
         assert "understanding_retry_exhausted" in notices
         assert endpoint.capture.is_open and not commits
         await endpoint.close()
@@ -84,9 +84,9 @@ def test_real_new_words_or_explicit_retry_allow_a_successful_fresh_preparation(r
         endpoint, _, _, commits, _ = setup()
         endpoint.capture.problem = _retryable_problem()
         final = _final("合成回答。没有了。")
-        for _ in range(3):
+        for _ in range(2):
             await _attempt(endpoint, final)
-        assert endpoint._prepare_failures == 3
+        assert endpoint._prepare_failures == 2
         endpoint.capture.problem = None
         if reset == "explicit_retry":
             endpoint.request_finish()
@@ -97,10 +97,10 @@ def test_real_new_words_or_explicit_retry_allow_a_successful_fresh_preparation(r
                 endpoint.observe_transcript(final.text)
             # New authoritative words permit one fresh request. They do not
             # renew the failed episode's automatic retry allowance.
-            assert endpoint._prepare_failures == 3
+            assert endpoint._prepare_failures == 2
         assert not commits
         await _attempt(endpoint, final)
-        assert len(endpoint.capture.prepares) == 4
+        assert len(endpoint.capture.prepares) == 3
         assert len(commits) == 1 and commits[0].text == final.text
         assert endpoint._prepare_failures == 0
         await endpoint.close()
@@ -140,12 +140,12 @@ def test_switching_back_to_previously_failed_server_words_keeps_their_budget():
         endpoint, _, _, commits, _ = setup()
         endpoint.capture.problem = _retryable_problem()
         final = _final("合成回答。没有了。")
-        for _ in range(3):
+        for _ in range(2):
             await _attempt(endpoint, final)
         for _ in range(10):
             endpoint.observe_transcript(final.text + "新的未决假设。")
             await _attempt(endpoint, final)
-        assert len(endpoint.capture.prepares) == endpoint._prepare_failures == 3
+        assert len(endpoint.capture.prepares) == endpoint._prepare_failures == 2
         assert not commits and endpoint.capture.is_open
         await endpoint.close()
 
@@ -157,7 +157,7 @@ def test_running_endpoint_publishes_orphan_failure_exhaustion_and_keeps_recordin
         endpoint, clock, notices, commits, spoken = setup()
         await ask(endpoint, clock, spoken)
         endpoint.capture.problem = _retryable_problem()
-        releases = [asyncio.Event() for _ in range(3)]
+        releases = [asyncio.Event() for _ in range(2)]
 
         async def prepare(transcript):
             await releases[len(endpoint.capture.prepares) - 1].wait()
@@ -167,7 +167,7 @@ def test_running_endpoint_publishes_orphan_failure_exhaustion_and_keeps_recordin
         endpoint.capture.current_final = _final("合成回答结束。没有需要补充了。")
         endpoint.speech_started()
         clock.value += 1
-        for attempt in range(3):
+        for attempt in range(2):
             await _until(lambda: len(endpoint.capture.prepares) == attempt + 1)
             for _ in range(20):
                 endpoint.speech_started(source="audio")
@@ -180,7 +180,7 @@ def test_running_endpoint_publishes_orphan_failure_exhaustion_and_keeps_recordin
             endpoint.speech_started(source="client")
         clock.value += 10
         await asyncio.sleep(.2)
-        assert len(endpoint.capture.prepares) == endpoint._prepare_failures == 3
+        assert len(endpoint.capture.prepares) == endpoint._prepare_failures == 2
         assert not commits and endpoint.capture.is_open and not endpoint._closed
         await endpoint.close()
 

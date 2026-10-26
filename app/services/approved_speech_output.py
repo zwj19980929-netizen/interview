@@ -38,6 +38,7 @@ class ApprovedSpeechOutput:
         self._max_bytes = max_bytes
         self._ready, self._drained = asyncio.Event(), asyncio.Event()
         self._closed = False
+        self._cleanup_complete = False
         self._running = False
         self.producer_finished = False
         self.archive_reference: Optional[str] = None
@@ -88,6 +89,11 @@ class ApprovedSpeechOutput:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    @property
+    def cleanup_complete(self) -> bool:
+        """Both transport cleanup calls returned, beyond fencing new writes."""
+        return self._cleanup_complete
 
     async def run(self, on_producer_finished: Callable[[dict], Awaitable[None]]) -> None:
         if self._running:
@@ -221,3 +227,4 @@ class ApprovedSpeechOutput:
             await self.publisher.abort()
         finally:
             await self.stream.abort()
+        self._cleanup_complete = True

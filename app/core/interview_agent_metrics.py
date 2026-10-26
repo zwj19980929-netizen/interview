@@ -61,6 +61,9 @@ INTERNAL_INTERVIEW_AGENT_METRICS = INTERVIEW_AGENT_STAGE_METRICS | frozenset(
         "stt_preview_prepared",
         "stt_preview_reused",
         "stt_preview_final_revised",
+        "answer_model_call_started",
+        "answer_model_call_budget_exhausted",
+        "confirmed_answer_preparation_reused",
     }
 )
 
@@ -72,6 +75,7 @@ INTERVIEW_AGENT_METRICS = (
 INTERVIEW_AGENT_COUNTER_METRICS = frozenset({
     "turn_decision_cancelled", "stt_recognition_opened", "stt_recognition_finished",
     "stt_preview_prepared", "stt_preview_reused", "stt_preview_final_revised",
+    "answer_model_call_started", "answer_model_call_budget_exhausted", "confirmed_answer_preparation_reused",
 })
 INTERVIEW_AGENT_STAGE_OUTCOMES = frozenset({"success", "failure", "cancelled"})
 HISTOGRAM_BOUNDS = (1, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000,

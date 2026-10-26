@@ -10,6 +10,7 @@ REALTIME_PATHS = (
     ("candidate_input_completed_at",),
     ("agent_runtime", "floor"), ("agent_runtime", "active_performance_id"),
     ("agent_runtime", "completion_emitted_at"), ("agent_runtime", "takeover", "status"),
+    ("agent_runtime", "calibration_status"), ("agent_runtime", "calibration_updated_at"),
     ("plan_snapshot", "enterprise_skill_snapshot"),
 )
 
@@ -21,12 +22,13 @@ def realtime_state_from_values(
     # Never turn a malformed non-object plan into an apparently absent Skill.
     if any(kind not in (None, "null", "object") for kind in (plan_type, runtime_type, takeover_type)):
         return None
-    identity, org, version, status, turn, completed, floor, performance, emitted, takeover, skill = values
+    identity, org, version, status, turn, completed, floor, performance, emitted, takeover, calibration, calibration_at, skill = values
     return {
         "id": identity, "organization_id": org, "version": version if version is not None else 1,
         "status": status, "current_turn_id": turn, "candidate_input_completed_at": completed,
         "agent_runtime": {"floor": floor, "active_performance_id": performance,
-                          "completion_emitted_at": emitted, "takeover": {"status": takeover}},
+                          "completion_emitted_at": emitted, "takeover": {"status": takeover},
+                          "calibration_status": calibration, "calibration_updated_at": calibration_at},
         "plan_snapshot": {"enterprise_skill_snapshot": deepcopy(skill)},
         "agent_events": ([{"type": "conversation.act.selected", "event_id": selected[0],
                            "payload": {"act_id": selected[1], "approved": selected[2]}}] if selected else []),

@@ -160,6 +160,34 @@ SEMANTIC_CONTROL_CORRECTION_INSTRUCTION = (
 def semantic_content_correction_instruction(reason_code):
     """Only fixed diagnostics may select centrally governed recovery guidance."""
     return {
+        "clarification_targets_conversation_control": (
+            "上次把清楚的开始回答或等待请求误当作技术疑点。按当前交流语境重新判断，"
+            "不能要求候选人解释或拼写这些流程用语；没有真实疑点时clarification_target=null、ambiguities=[]。"
+            "保留先前实际技术claims；仅准备开始回答用answering，请求思考用thinking。"
+            "这两者都不授权完成回答或退出面试，不能编造completion_basis。"
+        ),
+        "completion_has_unresolved_ambiguity": (
+            "本次字段冲突位于$.ambiguities：普通回答完成不能同时保留未解决的语义歧义。"
+            "先区分知识点缺失、上下文已能唯一确定的音近词和真正影响含义的歧义；知识缺失属于missing，"
+            "音近词保留原文并仅提取含义确定的claims，不能机械要求拼写；真实歧义不能为通过校验而删除。"
+            "没有本轮有效content_clarification已送达证明时，首次真实歧义加finish_answer应输出"
+            "clarification_request+finish_answer+clarify、confidence低于0.65、followup_allowed=false、"
+            "completion_basis=null，保留可靠claims、ambiguities和原文clarification_target。"
+            "已有有效证明时不能重复追问同一疑点；只有播完后的新回复明确坚持结束，才可"
+            "answer_unresolved+finish_answer并引用新回复作为completion_basis。新回复纠正了疑点则按纠正后含义理解，"
+            "仍在思考则继续听；不得编造送达记录、删除可靠claims或将本题结束改成退出整场。"
+        ),
+        "unresolved_answer_contract_invalid": (
+            "本次字段冲突位于$.intent：answer_unresolved只用于仍有具体语义歧义的待核实收尾，"
+            "不是知识缺失、一般低置信度或所有澄清回复的兜底。保留可靠claims、非空原文evidence、"
+            "真实ambiguities及有原文依据的clarification_target；不确定的残片不能伪造成claim。"
+            "finish_answer必须有本轮有效content_clarification已送达证明，completion_basis只能引用播完后的新回复，"
+            "不能复用澄清前说完。新回复仍在思考或纠正时按thinking/correction处理；"
+            "原文确实finish_answer且仍有真实歧义、但没有有效证明时先用"
+            "clarification_request+finish_answer+clarify、confidence低于0.65、followup_allowed=false、completion_basis=null。"
+            "若疑点已解决则正常answer，不保留虚假的ambiguities或answer_unresolved；矛盾claims仍须按原文重新核对。"
+            "stop_interview只限本人明确要求结束整场，仍须独立退出确认，不能从待核实收尾推导退出许可。"
+        ),
         "technical_content_claims_missing": (
             "本次字段冲突位于$.claims：answer_content为partial/technical却没有claims。"
             "重新检查完整原文：存在含义确定的真实做法或判断时，保留partial/technical并引用对应E编号提取claims；"
@@ -394,6 +422,23 @@ def validate_current_speech(data, transcript, input_context=None):
         raise CurrentSpeechContractError()
 
 
+def validate_conversation_clarification(data):
+    """Reject exact conversational sentences miscast as unclear terminology.
+
+    This veto never supplies an intent, claim or completion permission. Quotes,
+    negations, mixed technical sentences and genuine recognition complaints
+    remain with semantic inference and the normal evidence validators.
+    """
+    target = data.get("clarification_target")
+    if not isinstance(target, dict):
+        return
+    sentence = re.sub(r"[\s，。！？,.!?]", "", target.get("evidence_quote", ""))
+    ready = r"(?:那|好|好的|嗯)?(?:我)?(?:现在)?(?:(?:可以|能)?(?:开始|准备开始))?回答(?:啦|了|吧|啊|吗)?"
+    wait = r"(?:请|你)?(?:稍等(?:一下)?|等一下)|我(?:先|再|来)?(?:思考|想)(?:一想|一下)(?:啊|呀)?"
+    if re.fullmatch(ready, sentence) or re.fullmatch(wait, sentence):
+        raise SemanticContractError("clarification_targets_conversation_control", "$.clarification_target")
+
+
 def validate_unresolved_completion(data, transcript, clarification_context=None):
     """Require server-proven clarification and fresh completion evidence.
 
@@ -439,7 +484,7 @@ def validate_unresolved_completion(data, transcript, clarification_context=None)
 
 
 SERVER_CONTROL_DERIVATION_INSTRUCTION = (
-    "动作与追问权限采用服务端派生合同semantic_controls.v2。请先判断本人当前有效的turn_intent、实际技术内容、"
+    "动作与追问权限采用服务端派生合同semantic_controls.v3。请先判断本人当前有效的turn_intent、实际技术内容、"
     "未解决歧义和真实completion_basis，再填写兼容输出字段；不能为了让suggested_action/followup_allowed匹配而"
     "改变其真实意图、删除技术claims、编造结束依据或抹掉歧义。服务端根据这些已验证事实重新计算动作与追问权限："
     "thinking继续听，repeat重读，pause暂停，clarify/correction澄清，ask_company交资料问答；"
@@ -447,8 +492,45 @@ SERVER_CONTROL_DERIVATION_INSTRUCTION = (
     "off_topic仅描述清楚跑题，不由缺少技术claims推断不理解；不授权技术追问，实际说完仍须当前完成依据。"
     "若同时输出off_topic和已覆盖本题能力点，只有原文绑定的真实专业claims与合法能力点分区均成立时，"
     "服务端才将这个矛盾标签归一为answer；没有覆盖证据的无关专业主张仍是off_topic。"
+    "首次回答同时声明finish_answer及具体未解歧义时，服务端仅在当前完成依据与疑点原文校验通过后，"
+    "撤销提交权限并保留claims进入具体澄清；已经提供内容澄清记录时不得借此重复开启同一问题。"
     "这些派生字段不是提交或退出授权，独立结束确认和服务端送达记录仍必须满足。"
 )
+
+
+def normalize_ambiguous_completion(data, transcript, *, input_context=None, content_clarification=None):
+    """Revoke a conflicting first completion, never infer a new permission.
+
+    Canonical shape validation precedes this projection. Validate the original
+    completion sources before dropping them, so stale/quoted/fabricated control
+    cannot disappear from validation. The full semantic and evidence validators
+    still run on the projected result. Delivered clarification is handled by
+    its separate, source-bound unresolved-completion contract, not re-opened.
+    """
+    target, basis = data.get("clarification_target"), data.get("completion_basis")
+    if (data.get("turn_intent") != "finish_answer"
+            or data.get("intent") not in {"answer", "clarification_request"}
+            or not data.get("ambiguities") or not target or not basis
+            or data["confidence"] < .75 or content_clarification is not None
+            or (data["intent"] == "answer" and data.get("answer_content") == "none")):
+        return data
+    try:
+        validate_semantic_turn(data, transcript)
+    except SemanticContractError as exc:
+        if exc.reason_code != "completion_has_unresolved_ambiguity":
+            raise
+    else:
+        return data
+    if any(not quote.strip() or quote not in transcript for quote in basis["evidence_quotes"]):
+        raise SemanticContractError("semantic_completion_evidence_invalid", "$.completion_basis.evidence_quotes")
+    validate_current_speech(data, transcript, input_context)
+    if (not target["evidence_quote"].strip() or target["evidence_quote"] not in transcript
+            or not target["focus_quote"].strip() or target["focus_quote"] not in target["evidence_quote"]):
+        return data  # The unchanged result must still fail the domain validator.
+    result = deepcopy(data)
+    result.update(intent="clarification_request", completion_basis=None,
+                  confidence=min(data["confidence"], .64))
+    return derive_semantic_controls(result)
 
 
 def normalize_answer_relevance(data, transcript, capability_points):

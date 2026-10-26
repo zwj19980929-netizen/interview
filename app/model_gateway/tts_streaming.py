@@ -88,6 +88,10 @@ class ValidatedTTSStream:
         self._closed = False
         self._consumed = False
         self._read_task = None
+        self._read_diagnostics = {}
+        self._terminal_error = None
+        self._cleanup_confirmed = False
+        self._cleanup_error = None
         self._sequence = 0
         self._request_id = ""
         self.byte_count = 0
@@ -97,8 +101,30 @@ class ValidatedTTSStream:
         self.channels = self.ready_event.channels
         self.sample_format = self.ready_event.sample_format
 
+    @property
+    def terminal_error(self) -> Optional[ProviderError]:
+        """A known standard failure remains observable while cleanup awaits.
+
+        Providers may themselves await cleanup before raising. A known
+        rejection must not be hidden by an outer cancellation/timeout, but
+        this observation never changes delivery, notification or propagation.
+        """
+        nested = getattr(self._stream, "terminal_error", None)
+        errors = [error for error in (self._terminal_error, nested)
+                  if isinstance(error, ProviderError) and error.code != "provider_cancelled"]
+        return next((error for error in errors if not error.retryable), errors[0] if errors else self._terminal_error)
+
+    @property
+    def cleanup_confirmed(self) -> bool:
+        return self._cleanup_confirmed
+
+    @property
+    def cleanup_error(self) -> Optional[ProviderError]:
+        return self._cleanup_error
+
     def _error(self, error: ProviderError) -> ProviderError:
-        error.details = {**error.details, "audio_started": self.audio_started, "fallback_allowed": not self.audio_started}
+        error.details = {**error.details, "audio_started": self.audio_started,
+                         "fallback_allowed": not self.audio_started and error.details.get("fallback_allowed", True)}
         return error
 
     def _validate(self, raw: Any, *, ready: bool = False) -> TTSStreamEvent:
@@ -170,17 +196,33 @@ class ValidatedTTSStream:
             remaining = min(remaining, self._first_audio_deadline - monotonic())
         if remaining <= 0:
             raise tts_stream_error("provider_timeout", "TTS stream exceeded the wall-clock limit.")
-        task = asyncio.ensure_future(iterator.__anext__())
+        self._read_diagnostics = {}
+
+        async def read():
+            try:
+                return await iterator.__anext__()
+            except asyncio.CancelledError as exc:
+                diagnostics = getattr(exc, "provider_diagnostics", None)
+                if not isinstance(diagnostics, dict):
+                    diagnostics = getattr(asyncio.current_task(), "provider_diagnostics", {})
+                if isinstance(diagnostics, dict):
+                    self._read_diagnostics.update(diagnostics)
+                raise
+
+        task = asyncio.ensure_future(read())
         self._read_task = task
         try:
             return await asyncio.wait_for(task, timeout=min(self._read_timeout_s, remaining))
         except asyncio.TimeoutError as exc:
-            raise tts_stream_error("provider_timeout", "TTS stream exceeded the read or wall-clock timeout.") from exc
+            raise ProviderError("provider_timeout", "TTS stream exceeded the read or wall-clock timeout.",
+                                retryable=True, details={**self._read_diagnostics, "transport_outcome": "timeout"}) from exc
         finally:
             if self._read_task is task:
                 self._read_task = None
 
     def _notify(self, status: str, event: Optional[TTSStreamEvent] = None, error: Optional[ProviderError] = None) -> None:
+        if error is not None and self._terminal_error is None:
+            self._terminal_error = error
         if not self._notified:
             self._notified = True
             if self._on_terminal:
@@ -219,8 +261,16 @@ class ValidatedTTSStream:
                 self.audio_started = True
                 yield event
         except asyncio.CancelledError:
+            expired = (not self.audio_started and self._first_audio_deadline is not None
+                       and monotonic() >= self._first_audio_deadline and not self._closed)
+            error = self._error(ProviderError(
+                "provider_timeout" if expired else "provider_cancelled",
+                "TTS first audio budget exhausted." if expired else "TTS stream was cancelled.",
+                retryable=expired,
+                details={**self._read_diagnostics, "transport_outcome": "timeout" if expired else "cancelled"},
+            ))
             try:
-                self._notify("cancelled")
+                self._notify("failed" if expired else "cancelled", error=error)
             except Exception:
                 pass
             raise
@@ -257,6 +307,9 @@ class ValidatedTTSStream:
             pass
         try:
             await asyncio.wait_for(self._stream.abort(), timeout=min(5.0, self._read_timeout_s))
+            self._cleanup_confirmed = getattr(self._stream, "cleanup_confirmed", True) is True
+            if not self._cleanup_confirmed:
+                self._cleanup_error = tts_stream_error("provider_stream_cleanup_failed", "TTS transport cleanup was not confirmed.")
         except Exception:
             # A cleanup failure cannot turn cancellation into another response.
-            pass
+            self._cleanup_error = tts_stream_error("provider_stream_cleanup_failed", "TTS transport cleanup failed.")

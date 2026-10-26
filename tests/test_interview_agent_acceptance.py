@@ -176,6 +176,9 @@ def test_candidate_and_internal_metric_vocabularies_are_disjoint() -> None:
         "stt_preview_prepared",
         "stt_preview_reused",
         "stt_preview_final_revised",
+        "answer_model_call_started",
+        "answer_model_call_budget_exhausted",
+        "confirmed_answer_preparation_reused",
     }
     assert CANDIDATE_INTERVIEW_AGENT_METRICS.isdisjoint(
         INTERNAL_INTERVIEW_AGENT_METRICS

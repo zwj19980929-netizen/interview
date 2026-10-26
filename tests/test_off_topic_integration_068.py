@@ -19,6 +19,27 @@ from test_declined_answer_evaluation import session_for, question, persist
 from test_off_topic_semantics_068 import BODY, FINISH, TEXT, off_topic_response
 
 
+SUPPLEMENT_REPLY = "没有补充了。"
+
+
+def _audio_aligned_speech(monkeypatch, phrases):
+    from app.providers.mock.provider import MockSTTStream
+    original_send = MockSTTStream.send_audio
+    pending, assigned = iter(phrases), []
+
+    async def send_audio(stream, chunk):
+        if any(chunk) and not getattr(stream, "_synthetic_speech_assigned", False):
+            stream._synthetic_speech_assigned = True
+            text = next(pending, "")
+            assigned.append(text)
+            stream.request = stream.request.model_copy(update={"metadata": {
+                **stream.request.metadata, "development_transcript": text}})
+        return await original_send(stream, chunk)
+
+    monkeypatch.setattr(MockSTTStream, "send_audio", send_audio)
+    return assigned
+
+
 def _provider(monkeypatch, *, technical=False, relevant=False, stop=False, inconsistent_label=False):
     original = MockProvider.invoke
     calls = []
@@ -34,6 +55,12 @@ def _provider(monkeypatch, *, technical=False, relevant=False, stop=False, incon
             data = {"intent": "confirm", "confidence": .98,
                     "evidence_quote": list(understanding_references(reply, [])["evidence"].values())[-1]}
             calls.append(("exit", reply))
+        elif version == "supplement_reply.v5":
+            reply = json.loads(request.messages[-1].content)["reply"]
+            if reply != SUPPLEMENT_REPLY:
+                return await original(provider, capability, request, context)
+            data = {"intent": "finish", "confidence": .98, "evidence_id": "E1"}
+            calls.append(("supplement", reply))
         elif version.startswith(("interview_turn_understanding.", "interview_turn_decision.")):
             transcript = request.metadata["transcript"]
             envelope = off_topic_response(transcript, request.metadata["capability_points"],
@@ -57,30 +84,44 @@ def _provider(monkeypatch, *, technical=False, relevant=False, stop=False, incon
 @pytest.mark.parametrize("technical,relevant", [(False, False), (True, False), (True, True)])
 def test_clear_irrelevance_or_mixed_answer_commits_original_audio_once_and_only_advances_question(
         tmp_path, monkeypatch, technical, relevant):
+    from app.core.prompt.contracts import SUPPLEMENT_SPEECH
+    from test_automatic_turn_integration import _feed, _CONTINUATION
+    from test_declined_answer_integration import _stop_current_playback
+
     calls = _provider(monkeypatch, technical=technical, relevant=relevant, inconsistent_label=relevant)
     body = (("我使用持久检查点恢复任务。" if relevant else "我曾使用图形引擎绘制三维场景。") if technical else "") + TEXT
+    assigned = _audio_aligned_speech(monkeypatch, [body, SUPPLEMENT_REPLY])
 
     async def scenario():
-        async with _automatic_session(tmp_path, monkeypatch, [body, ""], spoken_confirmation=True) as (store, runtime, channel, managed):
+        async with _automatic_session(tmp_path, monkeypatch, [""], spoken_confirmation=True) as (store, runtime, channel, managed):
             _add_next_question(store)
-            _playable_speech(runtime)
-            await _answer_without_confirmation(managed)
+            spoken = _playable_speech(runtime)
+            endpoint, clock = await _answer_without_confirmation(managed)
+            await _wait_until(lambda: endpoint.confirmation.speaking)
+            assert not _current(runtime)["answers"] and spoken == [SUPPLEMENT_SPEECH["check"]]
+            await _stop_current_playback(runtime, channel)
+            await _wait_until(lambda: endpoint.confirmation._supplement_question_delivered)
+            assert not _current(runtime)["answers"]
+            await _feed(managed._ingress, _CONTINUATION, 5)
+            clock.value += 1
             await _wait_until(lambda: len(_current(runtime)["answers"]) == 1, timeout=5)
             await _wait_until(lambda: all(c["status"] == "completed" for c in store.evidence_commands.values()))
             await _wait_until(lambda: _current(runtime)["current_turn_id"] == _NEXT_TURN_ID)
-            _assert_one_automatic_answer(store, runtime, body, voice_frames=5)
+            _assert_one_automatic_answer(store, runtime, body + SUPPLEMENT_REPLY, voice_frames=5, continuation_frames=5)
             session = _current(runtime)
             result = session["turns"][0]["current_understanding"]
-            assert session["answers"][0]["raw_transcript"] == body
+            assert session["answers"][0]["raw_transcript"] == body + SUPPLEMENT_REPLY
             assert result["intent"] == ("answer" if relevant else "off_topic")
             assert bool(result["claims"]) is technical
             assert result["ambiguities"] == [] and result["clarification_target"] is None
             assert result["followup_allowed"] is relevant
-            assert result["completion_basis"]["evidence_quotes"] == [FINISH]
+            assert result["completion_basis"]["evidence_quotes"] == [SUPPLEMENT_REPLY]
             assert not session.get("candidate_input_completed_at") and not session.get("candidate_exit")
             assert not any(t.get("is_followup") for t in session["turns"])
-            assert len([call for call in calls if call[0] == "understanding"]) == 1
-            assert not any(event["payload"]["act_type"] in {"answer_clarify", "supplement_check", "reception_off_topic"}
+            assert len([call for call in calls if call[0] == "understanding"]) == 2
+            assert [call for call in calls if call[0] == "supplement"] == [("supplement", SUPPLEMENT_REPLY)]
+            assert spoken.count(SUPPLEMENT_SPEECH["check"]) == 1 and assigned == [body, SUPPLEMENT_REPLY]
+            assert not any(event["payload"]["act_type"] in {"answer_clarify", "reception_off_topic"}
                 for event in session["agent_events"] if event["type"] == "conversation.act.selected")
 
     asyncio.run(scenario())
@@ -113,13 +154,12 @@ def test_off_topic_withdrawal_requires_a_delivered_separate_question_and_fresh_a
 
 @pytest.mark.anyio
 async def test_delivered_old_mistaken_clarification_does_not_repeat_after_fresh_clear_completion(tmp_path, monkeypatch):
-    from app.providers.mock.provider import MockSTTStream
-    from app.core.prompt.contracts import clarification_speech
+    from app.core.prompt.contracts import clarification_speech, SUPPLEMENT_SPEECH
     from test_automatic_turn_integration import _feed, _CONTINUATION
     from test_declined_answer_integration import _stop_current_playback
     _provider(monkeypatch)
-    original_invoke, original_send = MockProvider.invoke, MockSTTStream.send_audio
-    pending, assigned = iter([BODY, FINISH]), []
+    original_invoke = MockProvider.invoke
+    assigned = _audio_aligned_speech(monkeypatch, [BODY, FINISH, SUPPLEMENT_REPLY])
 
     async def invoke(provider, capability, request, context):
         response = await original_invoke(provider, capability, request, context)
@@ -134,17 +174,7 @@ async def test_delivered_old_mistaken_clarification_does_not_repeat_after_fresh_
                 clarification_target={"evidence_id": "E1", "focus_quote": "桌游"})
         return response
 
-    async def audio_aligned_send(stream, chunk):
-        if any(chunk) and not getattr(stream, "_synthetic_speech_assigned", False):
-            stream._synthetic_speech_assigned = True
-            text = next(pending, "")
-            assigned.append(text)
-            stream.request = stream.request.model_copy(update={"metadata": {
-                **stream.request.metadata, "development_transcript": text}})
-        return await original_send(stream, chunk)
-
     monkeypatch.setattr(MockProvider, "invoke", invoke)
-    monkeypatch.setattr(MockSTTStream, "send_audio", audio_aligned_send)
     async with _automatic_session(tmp_path, monkeypatch, [""], spoken_confirmation=True) as (store, runtime, channel, managed):
         _add_next_question(store)
         _playable_speech(runtime)
@@ -156,16 +186,23 @@ async def test_delivered_old_mistaken_clarification_does_not_repeat_after_fresh_
         await _wait_until(lambda: endpoint.confirmation._content_question_delivered)
         await _feed(managed._ingress, _CONTINUATION, 5)
         clock.value += 5
+        await _wait_until(lambda: endpoint.confirmation.speaking and endpoint.confirmation._supplement_delivery_pending)
+        assert not _current(runtime)["answers"]
+        await _stop_current_playback(runtime, channel)
+        await _wait_until(lambda: endpoint.confirmation._supplement_question_delivered)
+        await _feed(managed._ingress, _CONTINUATION, 5)
+        clock.value += 1
         await _wait_until(lambda: len(_current(runtime)["answers"]) == 1)
         await _wait_until(lambda: all(c["status"] == "completed" for c in store.evidence_commands.values()))
         await _wait_until(lambda: _current(runtime)["current_turn_id"] == _NEXT_TURN_ID)
-        _assert_one_automatic_answer(store, runtime, TEXT, voice_frames=5, continuation_frames=5)
+        _assert_one_automatic_answer(store, runtime, TEXT + SUPPLEMENT_REPLY, voice_frames=5, continuation_frames=10)
         result = _current(runtime)["turns"][0]["current_understanding"]
         assert result["intent"] == "off_topic" and result["ambiguities"] == [] and result["clarification_target"] is None
-        assert result["completion_basis"]["evidence_quotes"] == [FINISH]
+        assert result["completion_basis"]["evidence_quotes"] == [SUPPLEMENT_REPLY]
         acts = [event["payload"] for event in _current(runtime)["agent_events"] if event["type"] == "conversation.act.selected"]
         assert len([act for act in acts if act.get("text") == clarification_speech("桌游")]) == 1
-        assert assigned == [BODY, FINISH]
+        assert len([act for act in acts if act.get("text") == SUPPLEMENT_SPEECH["check"]]) == 1
+        assert assigned == [BODY, FINISH, SUPPLEMENT_REPLY]
 
 
 class _OffTopicScore:

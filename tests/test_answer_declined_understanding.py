@@ -32,8 +32,8 @@ def no_followup():
 
 
 @pytest.mark.parametrize("confirmed,expected_understanding,expected_decision", [
-    (False, "interview_turn_understanding.v82", "interview_turn_decision.v113"),
-    (True, "interview_turn_understanding.v83", "interview_turn_decision.v114"),
+    (False, "interview_turn_understanding.v106", "interview_turn_decision.v137"),
+    (True, "interview_turn_understanding.v107", "interview_turn_decision.v138"),
 ])
 def test_declined_contract_versions_and_reference_schema(confirmed, expected_understanding, expected_decision):
     text = "这部分没有做过，咱们聊下一道吧。"

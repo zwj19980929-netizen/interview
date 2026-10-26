@@ -221,6 +221,7 @@ class InterviewSessionLifecycle:
         if session["status"] != "in_progress":
             self._invalid("Only an in-progress InterviewSession can be interrupted.")
         session["status"] = "paused"
+        self._clear_uncertain_question_audio(session)
         session["interruption"] = {
             "kind": kind,
             "reason": payload.get("reason", kind),
@@ -228,6 +229,17 @@ class InterviewSessionLifecycle:
             "occurred_at": now,
         }
         self._emit(session, events, event_type, deepcopy(session["interruption"]), now)
+
+    @staticmethod
+    def _clear_uncertain_question_audio(session: Document) -> None:
+        state = session.get("agent_runtime") or {}
+        marker = state.get("question_audio_recovery") or {}
+        if marker.get("status") == "retrying":
+            # Human resume restarts the existing question through the normal
+            # repeat control. Unknown playback must never survive as a retry.
+            state.update(question_audio_recovery=None, expression_replay_act_event_id=None,
+                         active_expression_act_event_id=None, active_performance_id=None,
+                         active_output_id=None, floor="none")
 
     def _resume(self, session: Document, payload: Document, now: str, events: List[Document], effects: List[Document]) -> None:
         self._restore(session, payload, now, events, effects, "interview.resumed")
@@ -248,6 +260,7 @@ class InterviewSessionLifecycle:
             return
         if session["status"] != "paused":
             self._invalid("Only a paused InterviewSession can be restored.")
+        self._clear_uncertain_question_audio(session)
         interruption = deepcopy(session.get("interruption"))
         session["status"] = "in_progress"
         session["interruption"] = None

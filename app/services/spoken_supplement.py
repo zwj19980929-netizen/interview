@@ -8,6 +8,8 @@ from app.services.capture_recovery import classify_capture_failure
 from typing import Any
 import hashlib
 import logging
+import asyncio
+import time
 
 _LOG = logging.getLogger(__name__)
 
@@ -141,7 +143,18 @@ class SpokenSupplementConfirmation:
         self._content_request_final = None
         self._content_question_delivered = False
         self._content_delivery_pending = False
+        self._supplement_question_delivered = False
+        self._supplement_delivery_pending = False
         self._unplayed_speech_checkpoint = None
+        self._pending_prompt = None
+        self._pending_prompt_checkpoint = None
+        self._selecting_supplement_prompt = False
+        self._prompt_attempts = 0
+        self._prompt_budgets = {}
+        self._prompt_stage_deadline = 0.0
+        self._prepared_answer = None
+        self._prepared_answer_final = None
+        self._confirmed_reused_prepared = None
 
     def begin_unplayed_speech(self) -> Any:
         """Remember delivered input cursors before one exact output is selected."""
@@ -150,6 +163,8 @@ class SpokenSupplementConfirmation:
             "_failure_spoken_identity", "_idle_check_allowed", "_idle_check_sent", "_off_topic_redirected")}
         checkpoint["failed"] = False
         self._unplayed_speech_checkpoint = checkpoint
+        if self._selecting_supplement_prompt:
+            self._pending_prompt_checkpoint = checkpoint
         return checkpoint
 
     def restore_unplayed_speech(self, checkpoint: Any) -> bool:
@@ -173,12 +188,24 @@ class SpokenSupplementConfirmation:
         self._exit_context = self._exit_context_final = self._exit_evidence_identity = None
         self._content_question_act_id = self._content_question_focus = self._content_request_final = None
         self._content_question_delivered = self._content_delivery_pending = False
+        self._supplement_question_delivered = self._supplement_delivery_pending = False
         return True
 
     def _speech_result_current(self) -> bool:
         # A zero-audio task can fail between selection and its caller resuming.
         # That late successful selection result must not re-advance the cursors.
         return not (self._unplayed_speech_checkpoint or {}).get("failed", False)
+
+    @property
+    def content_clarification_active(self) -> bool:
+        """A targeted exchange needs a fresh final and its delivery context.
+
+        This starts before speech selection and remains true for the current
+        capture, including interrupted playback and replies. It only disables
+        context-free speculation; delivery and completion still require their
+        separate evidence checks.
+        """
+        return self._content_question_focus is not None
 
     def content_clarification_context(self, final: Any) -> Any:
         if not self._content_question_delivered or self._content_request_final is None:
@@ -191,6 +218,45 @@ class SpokenSupplementConfirmation:
         return {"version": "content_clarification.v1", "request_text": request,
                 "focus_quote": self._content_question_focus, "reply_text": reply,
                 "question_act_id": self._content_question_act_id, "delivered": True}
+
+    @staticmethod
+    def needs_supplement_confirmation(understanding: Any) -> bool:
+        """Ordinary answers close after a separate opportunity to supplement."""
+        intent = getattr(understanding, "intent", None)
+        turn_intent = getattr(understanding, "turn_intent", None)
+        action = getattr(understanding, "suggested_action", None)
+        if action in {"clarify", "repeat", "pause", "respond_company"}:
+            return False
+        return ((intent in {"answer", "off_topic"} and turn_intent == "finish_answer")
+                or (intent == "answer" and turn_intent == "answering"))
+
+    async def gate_answer_completion(self, endpoint: Any, prepared: Any, final: Any) -> bool:
+        """Keep ordinary answers in this capture until a fresh supplement reply.
+
+        The endpoint calls this after its final-cut fence, including revisions
+        discovered only at that cut. Explicit finish and other semantic intents
+        retain their own authority; this gate never grants interview exit.
+        """
+        if (not self.needs_supplement_confirmation(prepared.understanding)
+                or self.confirmed or endpoint._explicit_revision == endpoint.revision):
+            return False
+        endpoint.assert_current()
+        if self._supplement_question_delivered:
+            # A candidate may have chosen to add detail and returned to normal
+            # listening. Classify only the new reply; do not ask the same check
+            # again or infer consent from the earlier answer's finish phrase.
+            await self._reply(endpoint, final)
+        else:
+            self._prepared_answer = prepared
+            self._prepared_answer_final = final.model_copy(deep=True)
+            self._remember_boundary(final)
+            self._clarification_revision = None
+            self._semantic_wait_identity = None
+            self._reminded = False
+            endpoint._discard_confirmed_preparation()
+            endpoint.preparation.cancel()
+            await self._say(endpoint, "check", afterwards="awaiting_reply")
+        return True
 
     def exit_context(self, final: Any) -> Any:
         """Project only a server-classified reply bound to this live exchange."""
@@ -416,7 +482,20 @@ class SpokenSupplementConfirmation:
                 # Do not consume or classify a late/new final as an idle pause.
                 return False
         self._idle_check_sent = True
-        if await self._say(endpoint, "reception_idle_check", afterwards="listening"):
+        try:
+            # This is a later optional presence reminder, not more reasoning
+            # about the already answered request. Its own bounded speech must
+            # neither spend nor renew that earlier preparation deadline.
+            spoken = await self._say(endpoint, "reception_idle_check", afterwards="listening", recovery=True)
+        except Exception as exc:
+            if (getattr(exc, "code", None) == "TURN_DECISION_STALE"
+                    or classify_capture_failure(exc, "speech").safety_violation):
+                raise
+            # Consume this one attempt before I/O. Optional reminder failure
+            # cannot turn a successfully handled request into retry_required.
+            endpoint.trace("idle_check_unavailable", error_type=type(exc).__name__)
+            return True
+        if spoken:
             endpoint.trace("idle_check", phase=self.phase, reason="initial" if initial else "handled_speech")
         else:
             # The durable floor may still belong to question playback. Retry
@@ -479,7 +558,18 @@ class SpokenSupplementConfirmation:
         cannot later become a new confirmation through a button or VAD noise.
         """
         verified = False
+        supplement_verified = False
         try:
+            if self.speaking and self._supplement_delivery_pending:
+                self._supplement_question_delivered = False
+                if reason == "agent_finished":
+                    endpoint._proposal_revision = endpoint.revision
+                    final = await endpoint.listening_snapshot()
+                    endpoint.assert_current()
+                    if (getattr(final, "type", None) == "transcript.final"
+                            and getattr(final, "is_final", False)):
+                        self._remember_boundary(final)
+                        supplement_verified = True
             if self.speaking and self._content_delivery_pending:
                 self._content_question_delivered = False
                 if reason == "agent_finished":
@@ -503,15 +593,25 @@ class SpokenSupplementConfirmation:
             endpoint.trace("exit_delivery_boundary_unavailable", error_type=type(exc).__name__)
         finally:
             self._content_delivery_pending = False
-            self.floor_returned(endpoint, reason=reason, exit_boundary_verified=verified)
+            self._supplement_delivery_pending = False
+            self.floor_returned(endpoint, reason=reason, exit_boundary_verified=verified,
+                                supplement_boundary_verified=supplement_verified)
+            if supplement_verified and endpoint._recovery_stage == "supplement_prompt":
+                await endpoint._understanding_succeeded()
 
     def floor_returned(self, endpoint: Any, *, reason: str = "agent_finished",
-                       exit_boundary_verified: bool = False) -> None:
+                       exit_boundary_verified: bool = False,
+                       supplement_boundary_verified: bool = False) -> None:
         if self.phase != "speaking":
             return
         if self._exit_waiting and self._after_speech == "awaiting_exit_reply":
             self._exit_question_delivered = reason == "agent_finished" and exit_boundary_verified
             self._exit_delivery_revision = endpoint.revision if self._exit_question_delivered else None
+        if self._after_speech == "awaiting_reply":
+            self._supplement_question_delivered = reason == "agent_finished" and supplement_boundary_verified
+            if self._supplement_question_delivered:
+                self._pending_prompt = None
+                self._pending_prompt_checkpoint = None
         self.phase = self._after_speech
         self.reply_seen = False
         self._missing_reply_since = None
@@ -527,37 +627,137 @@ class SpokenSupplementConfirmation:
     async def _say(self, endpoint: Any, kind: str, *, afterwards: str, reply_text: str = "",
                    repeat_target: Any = None, recovery: bool = False) -> bool:
         endpoint.assert_current()
+        prompt = kind in {"check", "clarify"}
+        if prompt:
+            identity = (kind, self.boundary, endpoint.revision)
+            if self._pending_prompt is None or self._pending_prompt[0] != identity:
+                self._pending_prompt = (identity, kind, afterwards, self._boundary_final)
+                self._prompt_attempts, self._prompt_stage_deadline = self._prompt_budgets.get(
+                    identity[:2], (0, time.monotonic() + 25.0))
+            if self._prompt_attempts >= 2 or time.monotonic() >= self._prompt_stage_deadline:
+                await self._prompt_failed(endpoint, safe_to_retry=self._prompt_cleanup_confirmed())
+                return False
+            self._prompt_attempts += 1
+            self._prompt_budgets[identity[:2]] = (self._prompt_attempts, self._prompt_stage_deadline)
+        self._selecting_supplement_prompt = prompt
+        if prompt:
+            self._pending_prompt_checkpoint = None
         self.phase = "preparing_speech"
         self._after_speech = afterwards
         self._playback_started_at = endpoint.clock()
+        if prompt:
+            from app.core.prompt.contracts import SUPPLEMENT_SPEECH
+            self._reply_question = SUPPLEMENT_SPEECH[kind]
+            self._supplement_question_delivered = False
+            self._supplement_delivery_pending = True
+            self._confirmed_final = self._confirmation_origin = None
         try:
             spoken = await endpoint._infer(self.speak(kind, endpoint.assert_current,
                                       **({"reply_text": reply_text} if reply_text else {}),
                                       **({"repeat_target": repeat_target} if repeat_target else {})),
-                                      timeout=12 if recovery else 45, use_interaction_budget=not recovery)
+                                      timeout=(max(.001, min(12, self._prompt_stage_deadline - time.monotonic())) if prompt
+                                               else 12 if recovery else 45),
+                                      use_interaction_budget=not (recovery or prompt))
             if not self._speech_result_current():
                 spoken = False
             if spoken:
                 self.playback_selected(endpoint)
-                if kind in {"check", "clarify"}:
-                    from app.core.prompt.contracts import SUPPLEMENT_SPEECH
-                    self._reply_question = SUPPLEMENT_SPEECH[kind]
-                    # A newly delivered question replaces the old exchange.
-                    # Its answer cannot borrow an earlier finish decision.
-                    self._confirmed_final = None
-                    self._confirmation_origin = None
-            if not spoken and self.phase in {"preparing_speech", "speaking"}:
+            if not spoken and prompt:
+                # Only the output owner's exact zero-PCM cleanup checkpoint
+                # may authorize reselecting a failed question.
+                await self._prompt_failed(endpoint, safe_to_retry=self._prompt_cleanup_confirmed())
+            elif not spoken and self.phase in {"preparing_speech", "speaking"}:
+                self._supplement_delivery_pending = False
                 self.phase = "listening" if afterwards == "pause_requested" else afterwards
                 self.reply_seen = endpoint.revision != endpoint._proposal_revision
                 endpoint._last_voice = endpoint.clock()
             return bool(spoken)
-        except BaseException:
+        except Exception as exc:
+            self._supplement_delivery_pending = False
+            if (getattr(exc, "code", None) == "TURN_DECISION_STALE"
+                    or classify_capture_failure(exc, "understanding").safety_violation):
+                self._pending_prompt = None
+                self.phase = "listening"
+                raise
+            if prompt:
+                await self._prompt_failed(endpoint, safe_to_retry=self._prompt_cleanup_confirmed(),
+                    retryable=getattr(exc, "retryable", True))
+                return False
             if self.phase in {"preparing_speech", "speaking"}:
                 self.phase = "listening" if afterwards == "pause_requested" else afterwards
                 self.reply_seen = endpoint.revision != endpoint._proposal_revision
             raise
+        except BaseException:
+            self._pending_prompt = None
+            raise
+        finally:
+            self._selecting_supplement_prompt = False
+
+    def _prompt_cleanup_confirmed(self) -> bool:
+        return bool(self._pending_prompt_checkpoint is not None
+                    and self._pending_prompt_checkpoint is self._unplayed_speech_checkpoint
+                    and self._pending_prompt_checkpoint.get("failed"))
+
+    async def _prompt_failed(self, endpoint: Any, *, safe_to_retry: bool, retryable: bool = True) -> None:
+        pending = self._pending_prompt
+        if pending is None:
+            return
+        identity, _, _, boundary_final = pending
+        self._supplement_question_delivered = self._supplement_delivery_pending = False
+        if boundary_final is not None:
+            self._remember_boundary(boundary_final)
+        # Unknown/partly played output keeps its playback watchdog and cannot
+        # be replayed until the output owner proves exact safe cleanup.
+        if safe_to_retry or self.phase != "speaking":
+            self.phase = "retrying_speech"
+        retryable = retryable and safe_to_retry
+        endpoint._understanding_recovery_active = True
+        endpoint._recovery_stage = "supplement_prompt"
+        endpoint._recovery_reason = "unavailable" if retryable else "non_retryable"
+        endpoint._recovery_retryable = retryable
+        current = identity[2] == endpoint.revision
+        if (safe_to_retry and retryable and current and self._prompt_attempts < 2
+                and time.monotonic() < self._prompt_stage_deadline):
+            endpoint._retry_at = endpoint.clock() + 1
+            endpoint._blocked_revision = None
+            await endpoint._notify("understanding_retrying")
+        else:
+            endpoint._blocked_revision = endpoint.revision
+            await endpoint._notify("understanding_retry_exhausted" if retryable else "understanding_result_rejected")
+
+    async def retry_unplayed_expression(self, endpoint: Any) -> bool:
+        if self._pending_prompt is None or not self._prompt_cleanup_confirmed():
+            return False
+        await self._prompt_failed(endpoint, safe_to_retry=True)
+        return True
+
+    def retry_pending_prompt(self, endpoint: Any) -> None:
+        if self._pending_prompt is not None:
+            # Renew the stage only after exact failed-output cleanup proof.
+            if not self._prompt_cleanup_confirmed():
+                return
+            self._prompt_attempts = 0
+            self._prompt_stage_deadline = time.monotonic() + 25
+            self._prompt_budgets[self._pending_prompt[0][:2]] = (0, self._prompt_stage_deadline)
+            self.phase = "retrying_speech"
 
     async def step(self, endpoint: Any, quiet: float) -> None:
+        if self.phase == "retrying_speech":
+            if (endpoint.preparation_blocked or endpoint._blocked_revision == endpoint.revision
+                    or endpoint.clock() < endpoint._retry_at):
+                return
+            pending = self._pending_prompt
+            if pending is None:
+                self.phase = "listening"
+                return
+            identity, kind, afterwards, _ = pending
+            if identity[2] != endpoint.revision:
+                self._pending_prompt = None
+                self.phase = "listening"
+                return
+            endpoint._proposal_revision = endpoint.revision
+            await self._say(endpoint, kind, afterwards=afterwards)
+            return
         if self.speaking:
             if endpoint.clock() - self._playback_started_at >= 30:
                 # Missing playback acknowledgement is not a candidate reply.
@@ -575,7 +775,11 @@ class SpokenSupplementConfirmation:
         if self.confirmed or endpoint._explicit_revision == endpoint.revision:
             self.confirmed = True
             endpoint._proposal_revision = endpoint.revision
-            await endpoint._propose()
+            if self._confirmed_final is not None and self._confirmed_reused_prepared is not None:
+                await endpoint._propose(final_snapshot=self._confirmed_final,
+                    prepared_decision=self._confirmed_reused_prepared, recognition_resumed=True)
+            else:
+                await endpoint._propose()
             return
         if self.phase == "listening":
             if self._reception_review is not None:
@@ -646,7 +850,13 @@ class SpokenSupplementConfirmation:
             if quiet >= 15 and not self._reminded:
                 self._reminded = True
                 endpoint._proposal_revision = endpoint.revision
-                await self._say(endpoint, "clarify", afterwards="awaiting_reply")
+                try:
+                    await self._say(endpoint, "clarify", afterwards="awaiting_reply", recovery=True)
+                except Exception as exc:
+                    if (getattr(exc, "code", None) == "TURN_DECISION_STALE"
+                            or classify_capture_failure(exc, "speech").safety_violation):
+                        raise
+                    endpoint.trace("supplement_reminder_unavailable", error_type=type(exc).__name__)
             return
         if quiet < endpoint.min_silence_seconds:
             return
@@ -674,7 +884,7 @@ class SpokenSupplementConfirmation:
         if final is None:
             if endpoint._awaiting_fresh_audio:
                 return
-            if self.boundary:
+            if self.boundary and not self._supplement_question_delivered:
                 # Existing boundary is conversational context only. Missing
                 # audio/text never grants completion of an earlier answer.
                 self._reminded = False
@@ -693,6 +903,9 @@ class SpokenSupplementConfirmation:
             endpoint._retry_at = endpoint._last_voice + self.silence_seconds
             return
         if self.semantic_first and await self._semantic_turn(endpoint, final):
+            return
+        if self._supplement_question_delivered:
+            await self._reply(endpoint, final)
             return
         self._remember_boundary(final)
         self._clarification_revision = None
@@ -800,7 +1013,8 @@ class SpokenSupplementConfirmation:
                 raise
             endpoint.trace("recovery_speech_unavailable", error_type=type(exc).__name__)
 
-    async def _semantic_turn(self, endpoint: Any, final: Any, *, reception_kind: Any = None) -> bool:
+    async def _semantic_turn(self, endpoint: Any, final: Any, *, reception_kind: Any = None,
+                             supplement_reply: bool = False) -> bool:
         """Understand before asking; this never fabricates a spoken reply."""
         if getattr(final, "type", None) != "transcript.final" or not getattr(final, "is_final", False):
             raise ValueError("Semantic completion requires a complete server final")
@@ -835,6 +1049,17 @@ class SpokenSupplementConfirmation:
             if reception_kind is not None:
                 self._semantic_wait_identity = None
             await self.company_answer(endpoint, prepared, final)
+            return True
+        if self.needs_supplement_confirmation(understanding):
+            if supplement_reply:
+                # This final already came from an uncertain supplement reply.
+                # Sending an ordinary answer back through its gate would call
+                # _reply recursively and buy another classification attempt.
+                return False
+            # Obtain the current final again before asking or accepting a reply;
+            # the endpoint's gate owns the one supplement exchange per capture.
+            await endpoint._propose(final_snapshot=final, prepared_decision=prepared,
+                                    recognition_resumed=True)
             return True
         if (understanding.turn_intent == "stop_interview"
                 or ConversationUnderstandingService.can_complete_without_confirmation(understanding, final.text)):
@@ -941,6 +1166,11 @@ class SpokenSupplementConfirmation:
         self._content_request_final = None
         self._content_question_delivered = False
         self._content_delivery_pending = False
+        # A preparation started before this question has neither its delivery
+        # boundary nor its fresh reply. Do not leave that context-free request
+        # running alongside the authoritative clarification exchange.
+        if self.content_clarification_active:
+            endpoint.preparation.cancel()
         self._playback_started_at = endpoint.clock()
         try:
             spoken = await endpoint._infer(self.speak("answer_clarify", endpoint.assert_current,
@@ -983,6 +1213,12 @@ class SpokenSupplementConfirmation:
         self._missing_reply_since = None
         if getattr(final, "type", None) != "transcript.final" or not getattr(final, "is_final", False):
             raise ValueError("Supplement completion requires a complete server final")
+        if not self._supplement_question_delivered:
+            # A selection, early reply or interrupted question cannot authorize
+            # completion. Retain these words and offer the check audibly again.
+            self._remember_boundary(final)
+            await self._say(endpoint, "check", afterwards="awaiting_reply")
+            return
         text = final.text.strip()
         reply = _speech_since(final, self._boundary_final, self.boundary)
         if reply is None:
@@ -1063,26 +1299,43 @@ class SpokenSupplementConfirmation:
         _LOG.info("supplement_reply_decided intent=%s confident=%s", action, decision["confidence"] >= 0.75)
         if action == "company_question" and decision["confidence"] >= 0.75:
             self.phase = "listening"
-            if not await self._semantic_turn(endpoint, final):
+            if not await self._semantic_turn(endpoint, final, supplement_reply=True):
                 await self._say(endpoint, "clarify", afterwards="awaiting_reply")
         elif action == "finish" and decision["confidence"] >= 0.75:
-            await self._accept_finish(endpoint, final)
+            await self._accept_finish(endpoint, final, reply_text=reply, decision=decision)
         elif action in {"continue", "supplement"} and decision["confidence"] >= 0.75:
             self._confirmed_final = None
             self._remember_boundary(final)
+            self._remember_handled(final)
+            self._semantic_wait_identity = endpoint._identity(final)
             await self._say(endpoint, "continue", afterwards="listening")
         elif action == "pause" and decision["confidence"] >= 0.75:
             await self.speak("pause", endpoint.assert_current)
         else:
             self._confirmed_final = None
+            if self.semantic_first and await self._semantic_turn(endpoint, final, supplement_reply=True):
+                # The small supplement contract has no exit/topic controls.
+                # One full review can route those meanings to their existing
+                # gates; it never turns this uncertain reply into permission.
+                return
             self._remember_boundary(final)
             await self._say(endpoint, "clarify", afterwards="awaiting_reply")
 
-    async def _accept_finish(self, endpoint: Any, final: Any) -> None:
+    async def _accept_finish(self, endpoint: Any, final: Any, *, reply_text: str = "", decision: Any = None) -> None:
+        prepared = (self._confirmed_reused_prepared if self._confirmed_final is not None
+                    and endpoint._identity(self._confirmed_final) == endpoint._identity(final) else None)
+        confirm_prepared = getattr(endpoint.capture, "confirm_prepared_decision", None)
+        if (callable(confirm_prepared) and decision is not None and self._prepared_answer is not None
+                and self._prepared_answer_final is not None):
+            prepared = confirm_prepared(self._prepared_answer, self._prepared_answer_final,
+                self._boundary_final, final, reply_text=reply_text, decision=decision,
+                question_delivered=self._supplement_question_delivered)
         if self._confirmed_final is None:
             self._confirmation_origin = (self.boundary, self._boundary_final)
         self.confirmed = True
         self.phase = "confirmed"
+        self._confirmed_reused_prepared = prepared
         self._confirmed_final = final.model_copy(deep=True)
         self._remember_boundary(final)
-        await endpoint._propose(final_snapshot=final, recognition_resumed=self.semantic_first)
+        await endpoint._propose(final_snapshot=final, prepared_decision=prepared,
+                                recognition_resumed=self.semantic_first)

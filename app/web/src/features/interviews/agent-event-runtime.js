@@ -69,7 +69,7 @@ const BASE_PAYLOAD_KEYS = Object.freeze({
   "avatar.performance.interrupted": ["performance_id", "reason", "deadline_ms"],
   "avatar.performance.stopped": ["performance_id", "output_id", "reason"],
   "takeover.changed": ["status", "expires_at", "version", "ai_resumed"],
-  problem: ["code", "message", "recoverable", "action", "calibration", "capture_id"],
+  problem: ["code", "message", "recoverable", "action", "calibration", "capture_id", "stage", "reason_code", "attempt", "max_attempts", "retryable"],
   completed: [
     "interview_id", "status", "submitted_at", "recording_retention_notice", "human_review_required",
   ],
@@ -91,6 +91,7 @@ const CANDIDATE_SNAPSHOT_KEYS = Object.freeze([
   "capture_recovery",
   "supplement_confirmation",
   "answer_preparation",
+  "question_audio_recovery",
   "completion",
   "execution_schema_version", "dialogue_state", "planning_problem", "runtime_problem_code",
 ]);
@@ -325,7 +326,9 @@ function validatePayload(type, payload, audience) {
         && optionalString(payload.capture_id, 128)
         && (payload.code !== "CAPTURE_RECOVERING" || (payload.recoverable === true && payload.action === "continue_listening"))
         && (payload.code !== "CAPTURE_RETRY_REQUIRED" || (payload.recoverable === true && payload.action === "retry_answer"))
+        && (payload.code !== "QUESTION_AUDIO_RETRY_REQUIRED" || (payload.recoverable === true && payload.action === "retry_question_audio"))
         && optionalBooleanFields(payload, ["calibration"])
+        && validatePreparationRecoveryDetails(payload)
         ? valid() : invalidPayload(type);
     case "completed":
       return boundedString(payload.interview_id, 1, 128)
@@ -378,7 +381,8 @@ function validateSnapshot(payload, audience) {
     || !validateTakeover(payload.takeover, audience)
     || !validateCaptureRecovery(payload.capture_recovery, payload)
     || !validateSupplementConfirmation(payload.supplement_confirmation, payload)
-    || !validateAnswerPreparation(payload.answer_preparation, payload)) {
+    || !validateAnswerPreparation(payload.answer_preparation, payload)
+    || !validateQuestionAudioRecovery(payload.question_audio_recovery, payload)) {
     return invalidPayload("session.snapshot");
   }
   if (audience === "enterprise") {
@@ -396,6 +400,17 @@ function scopeId(value) {
   return boundedString(value, 1, 128) && /^[A-Za-z0-9_-]+$/.test(value);
 }
 
+function validateQuestionAudioRecovery(value, snapshot) {
+  if (value == null) return true;
+  return isPlainObject(value) && hasExactKeys(value, ["status", "turn_id", "selection_event_id"])
+    && ["retry_required", "retrying"].includes(value.status)
+    && scopeId(value.turn_id) && scopeId(value.selection_event_id)
+    && value.turn_id === snapshot.current_turn_id && value.turn_id === snapshot.current_question?.turn_id
+    && snapshot.current_question?.is_followup === true && snapshot.status === "in_progress"
+    && snapshot.calibration_status === "completed" && ["none", "agent"].includes(snapshot.floor)
+    && !snapshot.capture_recovery && !snapshot.answer_preparation;
+}
+
 function validateSupplementConfirmation(value, snapshot) {
   if (value == null) return true;
   return isPlainObject(value) && hasExactKeys(value, ["status", "turn_id", "capture_id"])
@@ -406,11 +421,25 @@ function validateSupplementConfirmation(value, snapshot) {
 
 function validateAnswerPreparation(value, snapshot) {
   if (value == null) return true;
-  return isPlainObject(value) && hasExactKeys(value, ["status", "turn_id", "capture_id"])
-    && ["preparing", "retrying", "retry_required"].includes(value.status) && scopeId(value.turn_id) && scopeId(value.capture_id)
+  return isPlainObject(value) && ["status", "turn_id", "capture_id"].every(key => Object.hasOwn(value, key))
+    && hasOnlyKeys(value, ["status", "turn_id", "capture_id", "stage", "reason_code", "attempt", "max_attempts", "retryable"])
+    && validatePreparationRecoveryDetails(value)
+    && ["preparing", "retrying", "retry_required", "blocked"].includes(value.status) && scopeId(value.turn_id) && scopeId(value.capture_id)
     && value.turn_id === snapshot.current_turn_id
     && snapshot.status === "in_progress" && (value.status !== "preparing" || snapshot.floor === "candidate")
     && snapshot.calibration_status === "completed" && !snapshot.capture_recovery;
+}
+
+function validatePreparationRecoveryDetails(value) {
+  const keys = ["stage", "reason_code", "attempt", "max_attempts", "retryable"];
+  if (!keys.some(key => Object.hasOwn(value, key))) return true;
+  return keys.every(key => Object.hasOwn(value, key))
+    && ["answer_understanding", "supplement_prompt"].includes(value.stage)
+    && ["timeout", "unavailable", "invalid_result", "retry_exhausted", "non_retryable", "call_budget_exhausted",
+      "provider_timeout", "provider_auth_failed", "provider_billing_required", "provider_rate_limited",
+      "provider_circuit_open", "provider_unavailable"].includes(value.reason_code)
+    && Number.isSafeInteger(value.attempt) && value.attempt >= 0 && value.attempt <= 2
+    && value.max_attempts === 2 && typeof value.retryable === "boolean";
 }
 
 function validateCaptureRecovery(value, snapshot) {

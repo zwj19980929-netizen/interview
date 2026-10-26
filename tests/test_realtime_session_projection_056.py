@@ -132,6 +132,33 @@ def test_empty_legacy_state_has_no_selected_expression(persistence):
     projected = _read(persistence)
     assert projected["agent_events"] == [] and projected["agent_runtime"]["floor"] is None
     assert projected["plan_snapshot"]["enterprise_skill_snapshot"] is None
+    assert projected["agent_runtime"]["calibration_status"] is None
+    assert projected["agent_runtime"]["calibration_updated_at"] is None
+
+
+@pytest.mark.parametrize("next_status", ["completed", "retrying"])
+def test_warmup_guard_sees_explicit_confirm_or_retry_without_decoding_history(persistence, monkeypatch, next_status):
+    with persistence.transaction(ORG) as tx:
+        session = tx.interview_sessions.get(IDENTITY)
+        session["current_turn_id"] = None
+        session["agent_runtime"].update(calibration_status="awaiting_confirmation", calibration_updated_at="trial_1")
+        tx.interview_sessions.update(session, expected_version=session["version"])
+    before = _read(persistence)
+    with persistence.transaction(ORG) as tx:
+        session = tx.interview_sessions.get(IDENTITY)
+        session["agent_runtime"].update(calibration_status=next_status, calibration_updated_at="trial_2")
+        tx.interview_sessions.update(session, expected_version=session["version"])
+    for backend in (_MemoryTransactionBackend, _SQLiteTransactionBackend):
+        original = backend.get_document
+        def guarded(self, collection, item_id, original=original):
+            assert collection != "interviews", "Warmup PCM guard decoded whole history"
+            return original(self, collection, item_id)
+        monkeypatch.setattr(backend, "get_document", guarded)
+    after = _read(persistence)
+    assert before["agent_runtime"]["calibration_status"] == "awaiting_confirmation"
+    assert after["agent_runtime"]["calibration_status"] == next_status
+    assert after["agent_runtime"]["calibration_updated_at"] != before["agent_runtime"]["calibration_updated_at"]
+    assert "private" not in json.dumps(after)
 
 
 def test_postgresql_projection_is_parameterized_scoped_and_read_only():
@@ -144,6 +171,8 @@ def test_postgresql_projection_is_parameterized_scoped_and_read_only():
     assert "jsonb_build_array" in sql and "WITH ORDINALITY" in sql
     assert "organization_id = %s" in sql and "id = %s" in sql
     assert "FOR UPDATE" not in sql
+    assert "{agent_runtime,calibration_status}" in sql
+    assert "{agent_runtime,calibration_updated_at}" in sql
     assert params == (IDENTITY, ORG)
 
 

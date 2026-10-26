@@ -1,5 +1,43 @@
 # 接口设计
 
+### ANSWER-RECOVERY-AND-REUSE-078（仓库与本机已验证）
+
+回答处理重试与`continue_speaking`继续补充分开。新增当前题/当前capture绑定的`retry_answer_processing`控制操作，映射durable `evidence.retry_processing`，只允许恢复已有回答的失败步骤，不重开采集、不撤销仍有效的补充确认、不直接授予答案提交或退出许可。自动恢复与显式重试遵守单任务执行约束；新的技术内容、转写修正、失权、换题及终态使旧准备失效。重复处理合并，旧capture、暂停、已作答、失权与终态拒绝；前端仅由当前causation匹配的恢复拒绝解除pending。
+
+`answer_preparation`的事件与快照保留安全字段`stage`（`answer_understanding|supplement_prompt`）、`reason_code`、`attempt`（0–2的失败摘要）、`max_attempts=2`与`retryable`。它们不含供应商响应或原始转写；attempt不代表实时模型调用序号。恢复中无重复按钮；不可重试故障投影`status=blocked`、`action=contact_support`，保留已有录音/转写。可恢复额度耗尽的兜底重试使用新操作；接口成功收据仍不等于答案已提交。详见[078说明](answer-recovery-and-reuse-078.md)。
+
+### WARMUP-SQLITE-CONFIRMATION-077（仓库已验证）
+
+保持既有warmup.confirm/warmup.retry、calibration_status与calibration_retry_required合同。前端对WARMUP_STT_PROBLEM、WARMUP_RETRY_REQUIRED及retry_warmup给出明确的显式重试提示；后续open门禁拒绝不把试音恢复提示覆盖成通用“请稍等”，重连快照可重建retry_required提示。只有服务端awaiting_confirmation可显示确认；完整字幕本身不授予确认权。确认提示音失败继续使用074的WARMUP_CONFIRMATION_AUDIO_UNAVAILABLE及零PCM恢复门禁，不新增客户端授权。
+
+若当前试音已选中输出但未知故障无法证明安全清理，服务端持久暂停并发送`WARMUP_CONFIRMATION_OUTPUT_FAILED`、`recoverable=false`、`action=pause_or_human_takeover`及暂停快照；不将其表示为试音STT失败、允许重新消费同一流或自动确认。当前开流causation匹配的WARMUP_RETRY_REQUIRED门禁拒绝立即清理前端pending；过期拒绝不得覆盖新的成功试音。
+
+### INVITATION-READINESS-DIAGNOSTICS-076
+
+签发邀请仍复用原 `POST /api/v1/interview-appointments/{id}/invite` 与 `APPOINTMENT_NOT_READY` 的 `details.checks`，不新增接口或绕过准入。工作台保留创建成功的预约，并在弹窗持续展示本次签发失败的安全原因；仅对就绪错误按 `blocking`、`invite_ready` 及 `runtime_environment` 对应的 `ready/production_ready` 提取阻塞项。超时、欠费/额度、鉴权、配置、检查冷却以及非模型的音频/媒体/部署检查分别说明；网络失败、权限不足、预约过期或状态不符不冒充模型未就绪。用户显式重试失败时更新同一弹窗，不自动重建预约或重复签发。
+
+启用流式表达时，既有路由测试接口对`interview_agent_expression`的TTS成功结果返回`{probe_mode: "tts_stream", audio_chunks: 正整数, audio_bytes: 正整数}`，不返回探测音频、URL或合成文本；其余TTS用途继续返回批量结果。安全路由失败分类补充`provider_audio_final_missing`与`provider_audio_format_unsupported`。预约就绪响应的结构、授权和签发事务保持原合同。
+
+明确不支持流式的既有模型保留同路由批量兼容结果；只限开流前无PCM且清理确认的协议不支持，不用于超时、计费或鉴权恢复，也不重新获得探测预算。
+
+### SAME-VOICE-TTS-STABILITY-075（已实现）
+
+沿用`request_repeat`/`meta.request_repeat`控制信号。正式追问音频待恢复时，客户端必须发送当前`turn_id`与`payload.question_audio_recovery_event_id`（当前快照的selection_event_id），使用既有幂等键；服务端只重试存储的原批准文本，客户端不得指定题干。新增可恢复problem `QUESTION_AUDIO_RETRY_REQUIRED`，`action=retry_question_audio`。角色安全snapshot增加可空`question_audio_recovery={status:retry_required|retrying,turn_id,selection_event_id}`；重试中状态不等同已送达，只有实际播放排空才能解除该状态并开放回答。
+
+零PCM、无不确定媒体写入、精确输出已关闭且当前owner/control/turn/selection均合法时才进入该恢复；部分播放继续失败关闭。重连展示原状态，不能自动消费重试许可或让旧回执、barge-in、直接打开采集绕过未送达题。不存在备用供应商配置变更。固定提示缓存仅服务端PCM复用，无新客户端共享资产URL或访问权限。
+
+### WARMUP-TTS-RESILIENCE-074
+
+沿用既有试音确认/重试操作，不新增端点或客户端授权。仅当前 owner/control/capture 下、无正式题且 `calibration_status=awaiting_confirmation` 的未发声确认提示失败，清理精确输出并保留显式操作；`WARMUP_CONFIRMATION_AUDIO_UNAVAILABLE` 为可恢复 problem，不能推断面试已暂停。已播放部分音频、失去所有权或新动作不走该恢复。正式试题、答案提交、退出确认权限保持各自围栏。详见[074说明](warmup-tts-resilience-074.md)。
+
+### SUPPLEMENT-CONFIRMATION-STABILITY-073
+
+无新增客户端授权或公共端点。服务端语义 `finish_answer` 对普通作答不再等于可直接提交，补充确认仍由服务端实际播放及新权威回复产生；客户端文本、播放状态上报或模型的引用字段均不单独授权。明确“提前结束回答”按钮保留其独立显式语义；整场退出继续独立确认。后续可选提醒失败不投影为`answer_preparation.retry_required`。见[073说明](supplement-confirmation-stability-073.md)。
+
+### FOLLOWUP-SPEECH-TIMEOUT-DIAGNOSTICS-071
+
+无新增端点或客户端权限。表达准备保留已明确的供应商/媒体错误，无明确底层原因的首音超时使用已有`AGENT_AUDIO_FIRST_PCM_TIMEOUT`结构化错误，候选提示仍走安全投影；诊断阶段信息仅在服务端保留。准备失败导致持久暂停后立即发既有`session.snapshot`，候选以快照中的`status=paused`确认暂停，不能仅凭fatal problem推断生命周期已提交。原题、追问和答案保持，详情见[071说明](followup-speech-timeout-071.md)。
+
 ### OFF-TOPIC-AND-RECONNECT-068
 
 无新增 REST/WebSocket 字段或客户端授权。私有理解合同新增 `off_topic`；语义内容与 `turn_intent` 独立，跑题且明确结束本题可沿原提交接口推进，不能结束整场。前端收到当前 socket 的同场合法快照后才恢复控制按钮；10 秒快照握手超时、最多 6 次重连、稳定 10 秒才重置次数。`answer_preparation` 业务错误跨重连保持，题目、转写及退出确认不重置为首次进入。正式权威 final 的 20 秒期限独立于稳定预览的 15 秒期限，修正下方067的共同起点说明。详见[068说明](off-topic-and-reconnect-068.md)。

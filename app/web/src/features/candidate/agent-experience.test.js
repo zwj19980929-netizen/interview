@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { createSpeechActivityDetector } from "./audio-worklet-capture.js";
+import { candidateNotice, candidateStoppedPresentation } from "./presentation.js";
 
 import {
   createCandidateMetricReporter,
@@ -2433,11 +2434,11 @@ describe("understanding failure recovery", () => {
     const { run, emit, socket } = await openFormalEndpointHarness();
     try {
       emit("problem", failure("UNDERSTANDING_RESULT_REJECTED"));
-      expect(await run.act({ type: "continue_speaking", turnId: "turn_old" })).toBe(false);
-      expect(await run.act({ type: "continue_speaking", payload: { capture_id: "capture_old" } })).toBe(false);
-      await run.act({ type: "continue_speaking" });
-      expect(await run.act({ type: "continue_speaking" })).toBe(false);
-      expect(latestSentSignal(socket, "continue_speaking")).toMatchObject({ turn_id: "turn_1", payload: { capture_id: "capture_endpoint" } });
+      expect(await run.act({ type: "retry_answer_processing", turnId: "turn_old" })).toBe(false);
+      expect(await run.act({ type: "retry_answer_processing", payload: { capture_id: "capture_old" } })).toBe(false);
+      await run.act({ type: "retry_answer_processing" });
+      expect(await run.act({ type: "retry_answer_processing" })).toBe(false);
+      expect(latestSentSignal(socket, "retry_answer_processing")).toMatchObject({ turn_id: "turn_1", payload: { capture_id: "capture_endpoint" } });
       expect(run.getSnapshot()).toMatchObject({ understandingRetryPending: true, problem: { code: "UNDERSTANDING_RESULT_REJECTED" } });
       emit("session.snapshot", durable("retry_required"));
       expect(run.getSnapshot().understandingRetryPending).toBe(true);
@@ -2453,16 +2454,78 @@ describe("understanding failure recovery", () => {
     } finally { await run.close(); }
   });
 
+  it("retries processing without withdrawing the finish hint or returning to listening", async () => {
+    const { run, emit, socket } = await openFormalEndpointHarness();
+    try {
+      await run.act({ type: "finish_answer" });
+      expect(await run.act({ type: "finish_answer" })).toBe(false);
+      emit("floor.changed", { owner: "candidate", reason: "supplement_awaiting_reply", capture_id: "capture_endpoint" });
+      emit("problem", failure("UNDERSTANDING_RETRY_EXHAUSTED"));
+      const phase = run.getSnapshot().phase;
+      await run.act({ type: "retry_answer_processing" });
+      expect(await run.act({ type: "finish_answer" })).toBe(false);
+      expect(run.getSnapshot().phase).toBe(phase);
+      expect(latestSentSignal(socket, "retry_answer_processing").payload).toEqual({ capture_id: "capture_endpoint" });
+      expect(socket.sent.filter(value => value.type === "continue_speaking")).toHaveLength(0);
+    } finally { await run.close(); }
+  });
+
+  it("keeps actual continue-speaking independent from processing retry", async () => {
+    const { run, emit, socket } = await openFormalEndpointHarness();
+    try {
+      await run.act({ type: "finish_answer" });
+      emit("problem", failure("UNDERSTANDING_RETRY_EXHAUSTED"));
+      await run.act({ type: "continue_speaking" });
+      expect(await run.act({ type: "finish_answer" })).not.toBe(false);
+      expect(run.getSnapshot().understandingRetryPending).toBe(false);
+      expect(latestSentSignal(socket, "continue_speaking").payload).toEqual({ capture_id: "capture_endpoint" });
+    } finally { await run.close(); }
+  });
+
+  it("restores bounded automatic recovery diagnostics and prevents retries while recovering or blocked", async () => {
+    const { run, emit, socket } = await openFormalEndpointHarness();
+    try {
+      const details = { stage: "answer_understanding", reason_code: "provider_timeout", attempt: 2, max_attempts: 2, retryable: true };
+      const snapshot = durable("retrying");
+      emit("session.snapshot", { ...snapshot, answer_preparation: { ...snapshot.answer_preparation, ...details } });
+      expect(run.getSnapshot().problem).toMatchObject(details);
+      expect(await run.act({ type: "retry_answer_processing" })).toBe(false);
+      const blocked = durable("blocked");
+      emit("session.snapshot", { ...blocked, answer_preparation: { ...blocked.answer_preparation, ...details,
+        reason_code: "provider_billing_required", retryable: false } });
+      expect(run.getSnapshot().problem).toMatchObject({ action: "contact_support", retryable: false });
+      expect(await run.act({ type: "retry_answer_processing" })).toBe(false);
+      expect(socket.sent.filter(value => value.type === "retry_answer_processing")).toHaveLength(0);
+      emit("session.snapshot", { ...blocked, current_turn_id: "old_turn", answer_preparation: { ...blocked.answer_preparation, turn_id: "old_turn" } });
+      expect(run.getSnapshot().currentQuestion.turn_id).toBe("turn_1");
+    } finally { await run.close(); }
+  });
+
+  it("unlocks only the current rejected processing retry without erasing retained recovery", async () => {
+    const { run, emit, socket } = await openFormalEndpointHarness();
+    try {
+      emit("problem", failure("UNDERSTANDING_RETRY_EXHAUSTED"));
+      await run.act({ type: "retry_answer_processing" });
+      const retry = latestSentSignal(socket, "retry_answer_processing");
+      const rejection = { code: "ANSWER_PROCESSING_RECOVERY_UNAVAILABLE", message: "synthetic", recoverable: true, action: "retry_or_correct_signal" };
+      emit("problem", rejection);
+      expect(run.getSnapshot().understandingRetryPending).toBe(true);
+      emit("problem", rejection, "turn_1", retry.causation_id);
+      expect(run.getSnapshot()).toMatchObject({ understandingRetryPending: false,
+        problem: { code: "UNDERSTANDING_RETRY_EXHAUSTED" } });
+    } finally { await run.close(); }
+  });
+
   it("unlocks a failed or disconnected manual retry while retaining its recovery state", async () => {
     const { run, emit, socket } = await openFormalEndpointHarness();
     try {
       emit("problem", failure("UNDERSTANDING_RETRY_EXHAUSTED"));
       const send = socket.send;
       socket.send = () => { throw new Error("synthetic send failure"); };
-      await expect(run.act({ type: "continue_speaking" })).rejects.toThrow("synthetic send failure");
+      await expect(run.act({ type: "retry_answer_processing" })).rejects.toThrow("synthetic send failure");
       expect(run.getSnapshot().understandingRetryPending).toBe(false);
       socket.send = send;
-      await run.act({ type: "continue_speaking" });
+      await run.act({ type: "retry_answer_processing" });
       socket.emit("close", {});
       expect(run.getSnapshot()).toMatchObject({ understandingRetryPending: false, problem: { code: "UNDERSTANDING_RETRY_EXHAUSTED" } });
       emit("session.snapshot", { ...candidateSnapshot(), current_turn_id: "turn_2", floor: "agent",
@@ -2478,7 +2541,7 @@ describe("understanding failure recovery", () => {
       socket.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", { ...durable(status), floor: "agent" })) });
       expect(run.getSnapshot()).toMatchObject({ evidence: { ready: false }, problem: { code: status === "retrying" ? "UNDERSTANDING_UNAVAILABLE" : "UNDERSTANDING_RETRY_EXHAUSTED" } });
       expect(socket.sent.filter(item => item.type === "evidence.stream.open")).toHaveLength(0);
-      expect(await run.act({ type: "continue_speaking" })).toBe(false);
+      expect(await run.act({ type: "retry_answer_processing" })).toBe(false);
       socket.emit("message", { data: JSON.stringify(candidateEvent(2, "session.snapshot", durable(status))) });
       socket.emit("message", { data: JSON.stringify({ ...correlatedCandidateEvent(3, "floor.changed", {
         owner: "candidate", reason: "evidence_stream_open", capture_id: "capture_endpoint",
@@ -2771,6 +2834,111 @@ function candidateEvent(sequence, type, payload) {
   };
 }
 
+describe("formal question audio recovery 075", () => {
+  const recoverySnapshot = (status = "retry_required", selection = "selection_failed") => ({
+    ...candidateSnapshot(), floor: status === "retrying" ? "agent" : "none",
+    current_question: { ...candidateSnapshot().current_question, is_followup: true },
+    question_audio_recovery: { status, turn_id: "turn_1", selection_event_id: selection },
+  });
+  it("retries the original selection once and rejects late capture and local barge-in until delivered", async () => {
+    const { run, emit, socket, capture } = await openFormalEndpointHarness();
+    try {
+      await capture.onSpeechStarted();
+      expect(run.getSnapshot().microphone.localDetected).toBe(true);
+      emit("session.snapshot", recoverySnapshot());
+      expect(run.getSnapshot()).toMatchObject({ phase: "question_audio_retry_required", evidence: { ready: false },
+        microphone: { localDetected: false }, problem: { code: "QUESTION_AUDIO_RETRY_REQUIRED" } });
+      const count = socket.sent.length;
+      await capture.onSpeechStarted();
+      capture.onSpeechStopped();
+      emit("floor.changed", { owner: "candidate", reason: "evidence_stream_open", capture_id: "capture_stale" });
+      expect(socket.sent).toHaveLength(count);
+      expect(run.getSnapshot().evidence.ready).toBe(false);
+      expect(await run.act({ type: "finish_answer" })).toBe(false);
+      expect(await run.act({ type: "continue_speaking" })).toBe(false);
+      await run.act({ type: "retry_question_audio" });
+      expect(latestSentSignal(socket, "request_repeat")).toMatchObject({ turn_id: "turn_1", payload: { question_audio_recovery_event_id: "selection_failed" } });
+      expect(await run.act({ type: "request_repeat" })).toBe(false);
+      emit("session.snapshot", recoverySnapshot());
+      expect(run.getSnapshot().questionAudioRetryPending).toBe(true);
+      emit("session.snapshot", recoverySnapshot("retrying", "selection_retry"));
+      await capture.onSpeechStarted();
+      expect(run.getSnapshot()).toMatchObject({ questionAudioRetryPending: true, evidence: { ready: false } });
+      emit("session.snapshot", { ...recoverySnapshot(), floor: "candidate", question_audio_recovery: null });
+      expect(run.getSnapshot()).toMatchObject({ questionAudioRecovery: null, questionAudioRetryPending: false, problem: null, evidence: { requested: true, ready: false } });
+      const opening = latestSentSignal(socket, "evidence.stream.open");
+      emit("floor.changed", { owner: "candidate", reason: "evidence_stream_open", capture_id: "capture_retry" }, "turn_1", opening.causation_id);
+      expect(run.getSnapshot().evidence.ready).toBe(true);
+    } finally { await run.close(); }
+  });
+  it("restores the retry button on repeated zero audio failure and ignores foreign turn problems", async () => {
+    const { run, emit, socket } = await openFormalEndpointHarness();
+    try {
+      emit("session.snapshot", recoverySnapshot());
+      expect(socket.sent.filter(item => item.type === "request_repeat")).toHaveLength(0);
+      await run.act({ type: "request_repeat" });
+      emit("session.snapshot", recoverySnapshot("retrying", "selection_retry"));
+      emit("session.snapshot", recoverySnapshot("retry_required", "selection_retry"));
+      expect(run.getSnapshot().questionAudioRetryPending).toBe(false);
+      emit("problem", { code: "QUESTION_AUDIO_RETRY_REQUIRED", recoverable: true, message: "synthetic", action: "retry_question_audio" }, "turn_old");
+      expect(run.getSnapshot().questionAudioRecovery.selection_event_id).toBe("selection_retry");
+      await run.act({ type: "retry_question_audio" });
+      expect(latestSentSignal(socket, "request_repeat").payload.question_audio_recovery_event_id).toBe("selection_retry");
+      emit("session.snapshot", { ...candidateSnapshot(), status: "paused", floor: "none", question_audio_recovery: null });
+      expect(run.getSnapshot().questionAudioRecovery).toBeNull();
+      expect(await run.act({ type: "retry_question_audio" })).toBe(false);
+    } finally { await run.close(); }
+  });
+  it.each(["retry_required", "retrying"])("restores durable %s after a retry is interrupted by control reconnect", async status => {
+    vi.useFakeTimers();
+    let run;
+    try {
+      const first = new CandidateFakeSocket();
+      const second = new CandidateFakeSocket();
+      ({ run } = await openPlaybackHarness({ sockets: [first, second] }));
+      first.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", recoverySnapshot())) });
+      await run.act({ type: "retry_question_audio" });
+      expect(run.getSnapshot().questionAudioRetryPending).toBe(true);
+
+      // A socket write alone does not establish that the retry was accepted.
+      first.readyState = WebSocket.CLOSED;
+      first.emit("close", {});
+      await vi.advanceTimersByTimeAsync(400);
+      await vi.runAllTicks();
+      second.emit("message", { data: JSON.stringify(candidateEvent(2, "session.snapshot", recoverySnapshot(status))) });
+
+      expect(run.getSnapshot()).toMatchObject({
+        questionAudioRecovery: { status, selection_event_id: "selection_failed" },
+        questionAudioRetryPending: status === "retrying",
+        evidence: { requested: false, ready: false },
+      });
+      expect(second.sent.filter(item => ["request_repeat", "evidence.stream.open"].includes(item.type))).toHaveLength(0);
+      const sent = await run.act({ type: "retry_question_audio" });
+      if (status === "retrying") {
+        expect(sent).toBe(false);
+      } else {
+        expect(latestSentSignal(second, "request_repeat").payload.question_audio_recovery_event_id).toBe("selection_failed");
+      }
+    } finally {
+      await run?.close();
+      vi.useRealTimers();
+    }
+  });
+  it("rolls back a failed send without consuming the retry", async () => {
+    const { run, emit, socket } = await openFormalEndpointHarness();
+    try {
+      emit("session.snapshot", recoverySnapshot());
+      const original = socket.send;
+      socket.send = () => { throw new Error("synthetic send failure"); };
+      await expect(run.act({ type: "retry_question_audio" })).rejects.toThrow("synthetic send failure");
+      expect(run.getSnapshot().questionAudioRetryPending).toBe(false);
+      socket.send = original;
+      await run.act({ type: "retry_question_audio" });
+      expect(latestSentSignal(socket, "request_repeat").payload.question_audio_recovery_event_id).toBe("selection_failed");
+    } finally { await run.close(); }
+  });
+});
+
 function latestSentSignal(socket, type) {
   const signal = socket.sent.filter((item) => item.type === type).at(-1);
   if (!signal) throw new Error(`Missing sent ${type} signal`);
@@ -2874,6 +3042,147 @@ class CandidateFakeAudio {
     }
   }
 }
+
+describe("warm-up confirmation audio recovery", () => {
+  const warning = { code: "WARMUP_CONFIRMATION_AUDIO_UNAVAILABLE", message: "试音确认提示音暂时不可用，字幕已保留。",
+    recoverable: true, action: "retry_or_correct_signal", calibration: true };
+  const trial = () => ({ ...candidateSnapshot(), current_turn_id: null, current_question: null,
+    calibration_status: "awaiting_confirmation", floor: "candidate", recording: { audio: true, video: true, status: "not_requested" } });
+
+  it("makes a rejected current warm-up open retryable even when the original failure event was missed", async () => {
+    const { run, socket } = await openPlaybackHarness();
+    try {
+      socket.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", {
+        ...trial(), calibration_status: "listening",
+      })) });
+      const open = latestSentSignal(socket, "evidence.stream.open");
+      expect(run.getSnapshot().evidence).toEqual({ requested: true, ready: false });
+      socket.emit("message", { data: JSON.stringify(correlatedCandidateEvent(2, "problem", {
+        code: "WARMUP_RETRY_REQUIRED", message: "private current open denial", recoverable: true,
+        action: "retry_or_correct_signal",
+      }, open)) });
+      expect(run.getSnapshot()).toMatchObject({
+        evidence: { requested: false, ready: false },
+        calibration: { status: "retrying", retryRequired: true },
+        problem: { code: "WARMUP_RETRY_REQUIRED", action: "retry_warmup" },
+      });
+      expect(candidateNotice(run.getSnapshot().problem).detail).toContain("点击下方“重新试音”");
+      expect(JSON.stringify(run.getSnapshot().problem)).not.toContain("private");
+      expect(await run.act({ type: "warmup.confirm" })).toBe(false);
+      expect(socket.sent.filter(signal => signal.type === "evidence.stream.open")).toHaveLength(1);
+      await run.act({ type: "warmup.retry" });
+      expect(socket.sent.filter(signal => signal.type === "warmup.retry")).toHaveLength(1);
+      expect(socket.sent.filter(signal => signal.type === "evidence.stream.open")).toHaveLength(1);
+    } finally { await run.close(); }
+  });
+
+  it.each(["WARMUP_STT_PROBLEM", "WARMUP_RETRY_REQUIRED"])("keeps a completed transcript retry-only through %s, gate rejection and heartbeat", async code => {
+    const { run, socket } = await openPlaybackHarness();
+    const emit = (sequence, type, payload) => socket.emit("message", { data: JSON.stringify(candidateEvent(sequence, type, payload)) });
+    const retryProblem = { code, recoverable: true, action: "retry_warmup", calibration: true,
+      message: "private operational failure" };
+    const rejection = { code: "WARMUP_RETRY_REQUIRED", recoverable: true, action: "retry_or_correct_signal",
+      message: "private queued open denial" };
+    const failed = { ...trial(), calibration_status: "retrying", calibration_retry_required: true };
+    try {
+      emit(1, "session.snapshot", trial());
+      emit(2, "transcript.final", { text: "这是已经识别完成的合成试音。", confidence: .97,
+        authoritative: false, persisted_audio: false, calibration: true, ephemeral: true });
+      expect(run.getSnapshot().calibration.status).toBe("awaiting_confirmation");
+      emit(3, "problem", retryProblem);
+      const firstProblem = run.getSnapshot().problem;
+      expect(firstProblem).toMatchObject({ code: "WARMUP_RETRY_REQUIRED", action: "retry_warmup", calibration: true });
+      emit(4, "problem", rejection);
+      expect(run.getSnapshot().problem).toEqual(firstProblem);
+      emit(5, "session.snapshot", failed);
+      expect(run.getSnapshot()).toMatchObject({
+        calibration: { status: "retrying", retryRequired: true, transcript: "这是已经识别完成的合成试音。" },
+        evidence: { requested: false, ready: false }, problem: firstProblem,
+      });
+      expect(run.getSnapshot().captions.full).toEqual(expect.arrayContaining([
+        expect.objectContaining({ text: "这是已经识别完成的合成试音。", final: true }),
+      ]));
+      expect(candidateNotice(run.getSnapshot().problem).detail).toContain("点击下方“重新试音”");
+      expect(JSON.stringify(run.getSnapshot().problem)).not.toContain("private");
+      expect(await run.act({ type: "warmup.confirm" })).toBe(false);
+      expect(socket.sent.filter(signal => ["warmup.confirm", "evidence.stream.open", "warmup.retry"].includes(signal.type))).toHaveLength(0);
+
+      await run.act({ type: "warmup.retry" });
+      emit(6, "problem", rejection);
+      emit(7, "session.snapshot", failed); // Old heartbeat does not acknowledge the retry.
+      expect(run.getSnapshot().problem).toBeNull();
+      expect(socket.sent.filter(signal => signal.type === "warmup.retry")).toHaveLength(1);
+      expect(socket.sent.filter(signal => signal.type === "evidence.stream.open")).toHaveLength(0);
+      emit(8, "session.snapshot", { ...failed, calibration_retry_required: false });
+      expect(run.getSnapshot().problem).toBeNull();
+      expect(socket.sent.filter(signal => signal.type === "evidence.stream.open")).toHaveLength(1);
+    } finally { await run.close(); }
+  });
+
+  it("reconstructs trial recovery from a fresh retry-required snapshot without inventing captions or confirmation", async () => {
+    const { run, socket } = await openPlaybackHarness();
+    try {
+      socket.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", {
+        ...trial(), calibration_status: "retrying", calibration_retry_required: true,
+      })) });
+      expect(run.getSnapshot()).toMatchObject({ calibration: { status: "retrying", retryRequired: true },
+        problem: { code: "WARMUP_RETRY_REQUIRED", action: "retry_warmup" } });
+      expect(run.getSnapshot().captions.full).toEqual([]);
+      expect(candidateNotice(run.getSnapshot().problem).title).toBe("试音流程未完成，需要重新试音");
+      expect(await run.act({ type: "warmup.confirm" })).toBe(false);
+      expect(socket.sent.filter(signal => signal.type === "evidence.stream.open")).toHaveLength(0);
+      socket.emit("message", { data: JSON.stringify(candidateEvent(2, "problem", {
+        code: "AUDIO_TRACK_LOST", message: "safe pause", recoverable: false, action: "pause_or_human_takeover",
+      })) });
+      socket.emit("message", { data: JSON.stringify(candidateEvent(3, "session.snapshot", {
+        ...trial(), calibration_status: "retrying", calibration_retry_required: true, status: "paused", floor: "none",
+      })) });
+      expect(run.getSnapshot().problem.recoverable).toBe(false);
+      expect(await run.act({ type: "warmup.retry" })).toBe(false);
+    } finally { await run.close(); }
+  });
+
+  it.each(["warmup.confirm", "warmup.retry"])("retains server trial captions and permits explicit %s without automatic progress", async control => {
+    const { run, socket, captureResource, request } = await openPlaybackHarness();
+    const emit = (sequence, type, payload) => socket.emit("message", { data: JSON.stringify(candidateEvent(sequence, type, payload)) });
+    try {
+      emit(1, "session.snapshot", trial());
+      emit(2, "transcript.final", { text: "这是合成试音字幕。", confidence: .96,
+        authoritative: false, persisted_audio: false, calibration: true, ephemeral: true });
+      emit(3, "session.snapshot", trial());
+      emit(4, "problem", warning);
+      expect(run.getSnapshot()).toMatchObject({ session: { status: "in_progress" },
+        calibration: { status: "awaiting_confirmation", transcript: "这是合成试音字幕。" },
+        problem: warning, evidence: { ready: false } });
+      expect(run.getSnapshot().captions.full).toEqual(expect.arrayContaining([expect.objectContaining({ text: "这是合成试音字幕。" })]));
+      emit(5, "problem", { code: "WARMUP_RETRY_REQUIRED", message: "stale open rejection",
+        recoverable: true, action: "retry_or_correct_signal" });
+      expect(run.getSnapshot().problem).toEqual(warning);
+      expect(run.getSnapshot().calibration.status).toBe("awaiting_confirmation");
+      expect(socket.sent.filter(signal => ["warmup.confirm", "warmup.retry", "evidence.stream.open", "finish_answer"].includes(signal.type))).toHaveLength(0);
+      expect(request.mock.calls.some(([url]) => url.includes("runtime-problems"))).toBe(false);
+      expect(captureResource.close).not.toHaveBeenCalled();
+      await run.act({ type: control });
+      expect(socket.sent.filter(signal => signal.type === control)).toHaveLength(1);
+      expect(run.getSnapshot().calibration.status).toBe(control === "warmup.confirm" ? "confirming" : "retrying");
+      expect(run.getSnapshot().problem).toBeNull();
+      emit(6, "problem", warning);
+      expect(run.getSnapshot().problem).toBeNull();
+    } finally { await run.close(); }
+  });
+
+  it("cannot restore a paused trial from a late recoverable invitation warning", async () => {
+    const { run, socket } = await openPlaybackHarness();
+    try {
+      socket.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", { ...trial(), status: "paused", floor: "none" })) });
+      socket.emit("message", { data: JSON.stringify(candidateEvent(2, "problem", warning)) });
+      expect(run.getSnapshot()).toMatchObject({ phase: "paused", session: { status: "paused" } });
+      expect(run.getSnapshot().problem?.code).not.toBe(warning.code);
+      expect(await run.act({ type: "warmup.confirm" })).toBe(false);
+      expect(await run.act({ type: "warmup.retry" })).toBe(false);
+    } finally { await run.close(); }
+  });
+});
 
 async function openPlaybackHarness({ audios = [], sockets = null, clock, runtimeReport, captureFactory, streamOverride, requestOverride } = {}) {
   const liveSink = { append: vi.fn(), finish: vi.fn(), close: vi.fn(), outputTime: () => 100 };
@@ -3247,6 +3556,63 @@ describe("current interview control recovery", () => {
   }
   const message = (socket, sequence, type, payload, turnId = "turn_1", causationId = null) => socket.emit("message", {
     data: JSON.stringify({ ...candidateEvent(sequence, type, payload), turn_id: turnId, causation_id: causationId }),
+  });
+
+  it("accepts an authoritative pause after a fatal speech problem without reopening capture or reconnecting", async () => {
+    vi.useFakeTimers();
+    let run;
+    try {
+      const socket = new HandshakeSocket(), unexpectedReconnect = new HandshakeSocket();
+      const harness = await openPlaybackHarness({ sockets: [socket, unexpectedReconnect] });
+      run = harness.run;
+      const initial = { ...candidateSnapshot(), floor: "candidate" };
+      message(socket, 1, "session.snapshot", initial);
+      message(socket, 2, "floor.changed", { owner: "candidate", reason: "evidence_stream_open", capture_id: "capture_current" },
+        "turn_1", latestSentSignal(socket, "evidence.stream.open").causation_id);
+      message(socket, 3, "transcript.partial", { text: "合成的已收到回答。", confidence: .99, server_received: true });
+      const before = run.getSnapshot();
+      expect(before.evidence.ready).toBe(true);
+
+      message(socket, 4, "problem", {
+        code: "AGENT_AUDIO_FIRST_PCM_TIMEOUT", message: "实时面试已暂停，请等待面试官处理。",
+        recoverable: false, action: "pause_or_human_takeover",
+      });
+      const locallyStopped = run.getSnapshot();
+      expect(locallyStopped).toMatchObject({ phase: "paused", session: { status: "in_progress" }, evidence: { ready: false } });
+      expect(candidateStoppedPresentation({ experience: locallyStopped, problem: locallyStopped.problem }).notice.title).not.toBe("面试已暂停");
+
+      message(socket, 5, "floor.changed", { owner: "none", reason: "expression_failure" });
+      message(socket, 6, "session.snapshot", { ...initial, status: "paused", floor: "none" });
+      const paused = run.getSnapshot();
+      expect(paused).toMatchObject({
+        phase: "paused", floor: "none", session: { status: "paused" },
+        connection: { control: "connected" }, evidence: { requested: false, ready: false },
+        problem: { code: "AGENT_AUDIO_FIRST_PCM_TIMEOUT", recoverable: false },
+        currentQuestion: before.currentQuestion, captions: { full: before.captions.full, recent: before.captions.recent, forming: false },
+      });
+      expect(candidateStoppedPresentation({ experience: paused, problem: paused.problem })).toMatchObject({
+        header: "面试已暂停", gateTitle: "面试已暂停", notice: { title: "面试已暂停" },
+      });
+
+      const inputSignals = () => socket.sent.filter(signal => [
+        "evidence.stream.open", "speech.started", "speech.stopped", "finish_answer", "continue_speaking",
+      ].includes(signal.type));
+      const acceptedInputs = [...inputSignals()];
+      await harness.capture.onSpeechStarted();
+      harness.capture.onPcm(new ArrayBuffer(640));
+      harness.capture.onSpeechStopped();
+      for (const type of ["finish_answer", "continue_speaking", "warmup.confirm", "warmup.retry"]) {
+        expect(await run.act({ type })).toBe(false);
+      }
+      await vi.advanceTimersByTimeAsync(21_000);
+      expect(inputSignals()).toEqual(acceptedInputs);
+      expect(harness.ring.append).not.toHaveBeenCalled();
+      expect(harness.request.mock.calls.filter(([path]) => path.endsWith("/agent-ticket"))).toHaveLength(1);
+      expect(runtimeProblemCalls(harness.request)).toHaveLength(0);
+      expect(unexpectedReconnect.sent).toHaveLength(0);
+      expect(socket.closeReason).toBeUndefined();
+      expect(run.getSnapshot()).toMatchObject({ phase: "paused", session: { status: "paused" }, connection: { control: "connected" } });
+    } finally { await run?.close(); vi.useRealTimers(); }
   });
 
   it.each(["listening", "answer_preparing", "awaiting_exit_confirmation", "paused"])("keeps the %s turn and transcript while waiting for a valid current-socket snapshot", async phase => {

@@ -89,12 +89,12 @@ async def let_endpoint_poll(clock):
 
 
 @pytest.mark.anyio
-async def test_retryable_episode_stops_at_three_and_fresh_finished_words_get_only_one_request():
+async def test_retryable_episode_stops_at_two_and_fresh_finished_words_get_only_one_request():
     endpoint, clock, notices, commits, spoken = setup()
     try:
-        for count in range(1, 4):
+        for count in range(1, 3):
             await advance_to_failure(endpoint, clock, count)
-        assert len(endpoint.capture.prepares) == 3
+        assert len(endpoint.capture.prepares) == 2
         assert "understanding_retry_exhausted" in notices
         assert spoken == ["reception_unavailable"]
 
@@ -103,15 +103,15 @@ async def test_retryable_episode_stops_at_three_and_fresh_finished_words_get_onl
         })
         endpoint.speech_started(source="audio")
         await let_endpoint_poll(clock)
-        assert len(endpoint.capture.prepares) == 3
+        assert len(endpoint.capture.prepares) == 2
 
         text = endpoint.capture.current_final.text + "我说完了。"
         endpoint.capture.current_final = _final(text)
         endpoint.observe_transcript(text)
-        await advance_to_failure(endpoint, clock, 4)
+        await advance_to_failure(endpoint, clock, 3)
         await let_endpoint_poll(clock)
-        assert len(endpoint.capture.prepares) == 4
-        assert endpoint.preparation_blocked and endpoint._prepare_failures == 4
+        assert len(endpoint.capture.prepares) == 3
+        assert endpoint.preparation_blocked and endpoint._prepare_failures == 3
         assert spoken == ["reception_unavailable"]
         assert not commits and not endpoint.confirmation.confirmed and endpoint.capture.is_open
     finally:
@@ -146,16 +146,16 @@ async def test_nonretryable_schema_problem_blocks_same_words_but_accepts_one_new
 async def test_explicit_continue_renews_budget_without_completion_or_another_apology():
     endpoint, clock, notices, commits, spoken = setup()
     try:
-        for count in range(1, 4):
+        for count in range(1, 3):
             await advance_to_failure(endpoint, clock, count)
         endpoint.continue_speaking()
         assert not endpoint.confirmation.confirmed and endpoint._explicit_revision is None
         assert endpoint.confirmation.exit_context(endpoint.capture.current_final) is None
         assert endpoint._prepare_failures == 0 and not endpoint.preparation_blocked
-        for count in range(1, 4):
+        for count in range(1, 3):
             await advance_to_failure(endpoint, clock, count)
         await let_endpoint_poll(clock)
-        assert len(endpoint.capture.prepares) == 6
+        assert len(endpoint.capture.prepares) == 4
         assert not commits and spoken == ["reception_unavailable"]
     finally:
         await endpoint.close()

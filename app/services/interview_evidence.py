@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional
 
 from app.core.errors import ApiError
@@ -418,20 +418,42 @@ class InterviewEvidenceChain:
             raise ApiError("AGENT_EVIDENCE_NOT_OPEN", "Evidence is not open.", status_code=409)
         # Preview itself is cheap and read-only; seal a durable, incomplete
         # prefix only when a new speculative decision is actually requested.
-        checkpoint = self._stt.checkpoint_for_preparation() or {}
+        stream = self._stt
+        stream._assert_commit_allowed()
+        checkpoint = stream.checkpoint_for_preparation() or {}
         if not checkpoint.get("last_sealed_frame_sequence"):
             raise ApiError("EVIDENCE_MEDIA_INCOMPLETE", "Durable prefix required.", status_code=409)
         snapshot_ref = "evidence-checkpoint://%s/%s/%s" % (
             checkpoint["stream_id"], checkpoint["capture_revision"],
             checkpoint["last_sealed_frame_sequence"],
         )
-        return await self._stt.interviews.prepare_streaming_decision(
-            self.interview_id, self._stt.turn_id, final, self.organization_id,
+        prepared = await stream.interviews.prepare_streaming_decision(
+            self.interview_id, stream.turn_id, final, self.organization_id,
             snapshot_ref=snapshot_ref,
             completion_confirmed=completion_confirmed,
             semantic_first=semantic_first,
             exit_confirmation=exit_confirmation,
             content_clarification=content_clarification,
+        )
+        if stream is not self._stt or self._input_revoked:
+            raise ApiError("TURN_DECISION_STALE", "Capture changed.", status_code=409)
+        stream._assert_commit_allowed()
+        return replace(prepared, capture_binding=stream)
+
+    def confirm_prepared_decision(self, prepared: Any, base_final: Any,
+                                  delivered_boundary_final: Any, final: Any, *,
+                                  reply_text: str, decision: Dict[str, Any],
+                                  question_delivered: bool) -> Any:
+        """Reuse unchanged prepared evidence under the live capture's fence."""
+        stream = self._stt
+        if stream is None or self._input_revoked:
+            raise ApiError("TURN_DECISION_STALE", "Capture is no longer active.", status_code=409)
+        stream._assert_commit_allowed()
+        if getattr(prepared, "capture_binding", None) is not stream:
+            return None
+        return stream.interviews.confirm_prepared_streaming_decision(
+            prepared, base_final, delivered_boundary_final, final, self.organization_id,
+            reply_text=reply_text, decision=decision, question_delivered=question_delivered,
         )
 
     async def finish(self, payload: Dict[str, Any], *, prepared_decision: Any = None,
@@ -450,6 +472,9 @@ class InterviewEvidenceChain:
             elif self._stt is not None:
                 stream = self._stt
                 if prepared_decision is not None:
+                    binding = getattr(prepared_decision, "capture_binding", None)
+                    if binding is not None and binding is not stream:
+                        raise ApiError("TURN_DECISION_STALE", "Prepared capture changed.", status_code=409)
                     stream.assert_snapshot_current(prepared_decision)
                 turn_id = stream.turn_id
                 self._stt = None

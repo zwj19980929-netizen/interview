@@ -8,6 +8,8 @@ channel attaches and resumes event projection.
 
 from __future__ import annotations
 
+from app.services.answer_preparation_recovery import public_preparation_recovery
+
 import asyncio
 import logging
 import os
@@ -385,6 +387,7 @@ class ManagedLiveKitEvidenceSession:
             "speech.started": "speech.started",
             "speech.stopped": "speech.stopped",
             "continue_speaking": "evidence.continue",
+            "retry_answer_processing": "evidence.retry_processing",
             "meta.not_finished": "evidence.continue",
             "warmup.retry": "evidence.reset",
         }.get(signal.type)
@@ -562,11 +565,14 @@ class ManagedLiveKitEvidenceSession:
                 wait_notice_key = self._current_transcript_wait_key()
                 if (wait_notice_key is None or wait_notice_key[:3] != (endpoint, capture_id, turn_id)):
                     return
+            recovery_details = public_preparation_recovery(getattr(endpoint, "preparation_recovery_details", None))
+            blocked = recovery_details.get("retryable") is False
             if reason == "answer_preparing":
                 self._persist_answer_preparation(capture_id, turn_id, preparing=True)
             elif reason in {"understanding_unavailable", "understanding_retry_exhausted", "understanding_result_rejected", "understanding_retrying"}:
                 self._persist_answer_preparation(capture_id, turn_id, preparing=True,
-                    status="retrying" if reason in {"understanding_unavailable", "understanding_retrying"} else "retry_required")
+                    status=("blocked" if blocked else "retrying" if reason in {"understanding_unavailable", "understanding_retrying"} else "retry_required"),
+                    recovery_details=recovery_details)
             elif reason == "understanding_recovered":
                 self._persist_answer_preparation(capture_id, turn_id, preparing=False)
             elif reason in {"answer_listening", "supplement_awaiting_reply", "exit_awaiting_reply",
@@ -606,8 +612,9 @@ class ManagedLiveKitEvidenceSession:
                 await source._emit("problem", {
                     "code": reason.upper(), "message": message,
                     "recoverable": True,
-                    "action": "retry" if reason in {"understanding_result_rejected", "understanding_retry_exhausted"} else "continue_listening",
+                    "action": ("contact_support" if blocked else "retry_answer_processing" if reason in {"understanding_result_rejected", "understanding_retry_exhausted"} else "continue_listening"),
                     "capture_id": capture_id,
+                    **recovery_details,
                 }, turn_id=turn_id, causation_id=None, replayability=Replayability.TRANSIENT)
                 if wait_notice_key is not None:
                     # Mark successful publication only. A failed emit may be
@@ -866,6 +873,7 @@ class ManagedLiveKitEvidenceSession:
             on_failure=on_failure,
             on_snapshot=on_snapshot,
             trace=trace,
+            diagnostic_context={"interview_id": self.interview_id, "turn_id": turn_id, "capture_id": capture_id},
             confirmation=SpokenSupplementConfirmation(speak=speak, respond_company=respond_company,
                 interview_id=self.interview_id, turn_id=turn_id, capture_id=capture_id),
             speech_activity=ServerSpeechActivity(),
@@ -927,7 +935,7 @@ class ManagedLiveKitEvidenceSession:
         await endpoint._notify(endpoint._listening_notice())
 
     def _persist_answer_preparation(self, capture_id: Optional[str], turn_id: Optional[str], *, preparing: bool,
-                                    status: str = "preparing", preserve_recovery: bool = False) -> None:
+                                    status: str = "preparing", preserve_recovery: bool = False, recovery_details: Optional[dict] = None) -> None:
         """Persist the active wait before lossy UI delivery; never change capture readiness."""
         if not capture_id:
             return
@@ -941,7 +949,7 @@ class ManagedLiveKitEvidenceSession:
                 state = session.setdefault("agent_runtime", {})
                 previous = state.get("answer_preparation") or {}
                 same = previous.get("capture_id") == capture_id and previous.get("turn_id") == turn_id
-                recovering = same and previous.get("status") in {"retrying", "retry_required"}
+                recovering = same and previous.get("status") in {"retrying", "retry_required", "blocked"}
                 if recovering and ((preparing and status == "preparing") or preserve_recovery):
                     return
                 if preparing:
@@ -950,7 +958,8 @@ class ManagedLiveKitEvidenceSession:
                             or session.get("current_turn_id") != turn_id
                             or (state.get("takeover") or {}).get("status") == "active"):
                         return
-                    value = {"status": status, "turn_id": turn_id, "capture_id": capture_id}
+                    value = {"status": status, "turn_id": turn_id, "capture_id": capture_id,
+                             **public_preparation_recovery(recovery_details)}
                     if previous == value:
                         return
                     state["answer_preparation"] = value
@@ -1097,7 +1106,8 @@ class ManagedLiveKitEvidenceSession:
                 self.interview_id, FloorOwner.NONE, "answer_processing", self.organization_id,
             )
         if result.kind == "warmup":
-            await channel._complete_warmup_evidence(result, signal)
+            revision = await channel._complete_warmup_evidence(result, signal)
+            await channel._present_warmup_confirmation(signal, revision=revision)
             return
         if prepared is not None and (result.interview_result or {}).get("accepted") is True:
             from app.services.conversation_understanding import ConversationUnderstandingService
@@ -1187,7 +1197,7 @@ class ManagedLiveKitEvidenceSession:
         if command_type not in {"evidence.open", "evidence.seal", "evidence.backfill"}:
             payload = (
                 {"capture_id": payload["capture_id"]}
-                if command_type in {"speech.started", "speech.stopped", "evidence.continue"} and "capture_id" in payload
+                if command_type in {"speech.started", "speech.stopped", "evidence.continue", "evidence.retry_processing"} and "capture_id" in payload
                 else {}
             )
         deadline_seconds = 120.0 if command_type == "evidence.seal" else 30.0
@@ -1397,6 +1407,8 @@ class ManagedLiveKitEvidenceSession:
             return await self._apply_speech_started(source, signal)
         if claimed.command_type == "speech.stopped":
             return await self._apply_speech_stopped(source, signal)
+        if claimed.command_type == "evidence.retry_processing":
+            return await self._apply_retry_answer_processing(source, signal, control_generation=claimed.control_generation)
         if claimed.command_type == "evidence.continue":
             return await self._apply_continue(source, signal, control_generation=claimed.control_generation)
         if claimed.command_type == "evidence.backfill":
@@ -1547,7 +1559,7 @@ class ManagedLiveKitEvidenceSession:
                     )
                     raise failure
                 try:
-                    await source._complete_warmup_evidence(result, signal)
+                    revision = await source._complete_warmup_evidence(result, signal)
                 except Exception as exc:
                     failure = await self._recover_failed_warmup_finalize(
                         source,
@@ -1558,6 +1570,9 @@ class ManagedLiveKitEvidenceSession:
                     raise failure from exc
                 if self._active_warmup_epoch == warmup_epoch:
                     self._active_warmup_epoch = None
+                # Finalization has succeeded. An optional output failure must
+                # never invalidate or re-enter the consumed warm-up STT chain.
+                await source._present_warmup_confirmation(signal, revision=revision)
                 return None
             effective_turn_id = claimed.turn_id or self.turn_id
             if not effective_turn_id:
@@ -1885,6 +1900,10 @@ class ManagedLiveKitEvidenceSession:
             self.interview_id, self.organization_id
         )
         runtime_state = session.get("agent_runtime") or {}
+        question_recovery = runtime_state.get("question_audio_recovery") or {}
+        if (question_recovery.get("status") in {"retry_required", "retrying"}
+                and question_recovery.get("turn_id") == session.get("current_turn_id")):
+            raise ApiError("QUESTION_AUDIO_RETRY_REQUIRED", "The current question must finish playing before capture opens.", status_code=409)
         recovery = runtime_state.get("capture_recovery") or {}
         if recovery.get("status") == "retry_required" and (
             recovery.get("capture_id") != retry_capture_id or recovery.get("turn_id") != signal.turn_id
@@ -2008,6 +2027,10 @@ class ManagedLiveKitEvidenceSession:
             self.interview_id, self.organization_id
         )
         runtime_state = session.get("agent_runtime") or {}
+        question_recovery = runtime_state.get("question_audio_recovery") or {}
+        if (question_recovery.get("status") in {"retry_required", "retrying"}
+                and question_recovery.get("turn_id") == session.get("current_turn_id")):
+            raise ApiError("QUESTION_AUDIO_RETRY_REQUIRED", "The current question must finish playing before interruption.", status_code=409)
         matches = self._matches_capture(signal)
         if not matches:
             # An unscoped barge-in may interrupt the current agent performance,
@@ -2121,6 +2144,32 @@ class ManagedLiveKitEvidenceSession:
                     raise ApiError("TURN_DECISION_STALE", "Interview state changed during output cancellation.", status_code=409)
         guard()
         return guard
+
+    async def _apply_retry_answer_processing(
+        self, source: "AgentChannel", signal: ClientSignal, *, control_generation: Optional[int] = None,
+    ) -> Optional[str]:
+        # This operation never resumes speech, cancels a confirmation, opens
+        # a capture, or interrupts output. It only wakes retained processing.
+        current = self.supervisor.interviews.get_interview(self.interview_id, self.organization_id)
+        state = current.get("agent_runtime") or {}
+        recovery = state.get("answer_preparation") or {}
+        if (not self._matches_capture(signal) or self._answer_endpoint is None
+                or current.get("status") != "in_progress" or current.get("current_turn_id") != signal.turn_id
+                or state.get("calibration_status") != "completed"
+                or (state.get("takeover") or {}).get("status") == "active"
+                or any(answer.get("turn_id") == signal.turn_id for answer in current.get("answers", []))
+                or recovery.get("turn_id") != signal.turn_id or recovery.get("capture_id") != self._capture_id):
+            raise ApiError("ANSWER_PROCESSING_RECOVERY_STALE", "Answer recovery no longer matches the current capture.", status_code=409)
+        if recovery.get("status") == "blocked":
+            raise ApiError("ANSWER_PROCESSING_RECOVERY_BLOCKED", "This answer processing failure requires service recovery.", status_code=409)
+        if recovery.get("status") not in {"retrying", "retry_required"}:
+            raise ApiError("ANSWER_PROCESSING_RECOVERY_UNAVAILABLE", "No failed answer processing is available to retry.", status_code=409)
+        self._output_transition_guard(current, control_generation=control_generation)()
+        if recovery["status"] == "retry_required" and not self._answer_endpoint.retry_answer_processing():
+            await source._emit_snapshot(signal.causation_id)
+            raise ApiError("ANSWER_PROCESSING_RECOVERY_UNAVAILABLE", "Retained answer processing is no longer retryable.", status_code=409)
+        await source._emit_snapshot(signal.causation_id)
+        return signal.turn_id
 
     async def _apply_continue(
         self, source: "AgentChannel", signal: ClientSignal, *, control_generation: Optional[int] = None,

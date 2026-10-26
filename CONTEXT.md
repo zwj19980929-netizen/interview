@@ -1,5 +1,21 @@
 # Interviewer Domain
 
+## 079：模型处理诊断
+
+**ModelCallScope**：进程内一次等待/处理阶段的诊断关联上下文，包含父作用域与受控取消来源；不是授权、模型调用次数或持久会话状态。**Cancelled ModelInvocation**：调用方撤销后的终态审计，不等于供应商超时、失败计费或自动重试许可。见[操作日志079](docs/change-log.md)。
+
+## 078：处理恢复与补充确认（仓库与本机已验证）
+
+**PreparedCompletionReceipt**：已验证答案理解与实际送达补充询问后的新结束回复之间的服务端证明；不能代替当前来源与提交校验。**AnswerProcessingRetry**：恢复已有回答的失败处理，保留仍有效的确认；与表示新发言的继续补充不同。详见[078说明](docs/answer-recovery-and-reuse-078.md)。
+
+## 075：固定提示与追问音频恢复（已实现）
+
+固定提示音（Fixed Speech）是 `app/core/prompt/fixed_speech.py` 的版本化精确文案白名单，不含候选内容。固定音频缓存只复用当前组织、路由、模型、voice、语言及合成参数匹配的完整 PCM。追问音频恢复（Question Audio Recovery）只重试当前未播出原题，不重新规划、重交答案或视为已送达；`retry_required` 等候候选显式重试，`retrying` 直到真实播放排空。部分播放或无法证明清理完成维持暂停恢复流程。用户未配置备用，本轮保留当前 TTS 音色。详见[075说明](docs/same-voice-tts-stability-075.md)。
+
+074：试音 `awaiting_confirmation` 表示有待候选人核对的权威试音字幕，不要求提示音成功才能保留确认按钮；零音频恢复必须绑定当前 owner、capture 与选择，不能自动开始正式面试。供应商 token 用量、账户余额、速率配额及首音期限分别诊断。见[074说明](docs/warmup-tts-resilience-074.md)。
+
+073领域补充：**SupplementQuestionDelivered** 是当前采集内补充询问已实际播完并取得权威回复边界的事实；选中或播放开始不等同送达。正常语音回答先询问补充，再用之后的新答复确认；**CompletionBasis** 的有效原文引用不能代替此流程。继续补充保留同一回答，整场退出使用独立二次确认。详见[073说明](docs/supplement-confirmation-stability-073.md)。
+
 066领域补充：**ContentClarification** 是具体疑点的实际送达与后续新语音事实；**UnresolvedAnswer** 是已结束但技术转写仍待核实的回答，保留证据且不计零分；**UnderstandingRecovery** 是当前 capture 的有限恢复状态，不是候选人没回答，也不授予退出许可。详见[066说明](docs/interaction-recovery-066.md)。
 
 065领域补充：**CandidateExitConfirmation**是独立问题实际送达后、当前权威新语音明确确认整场退出的事实，与补充确认或本题完成不同。**CandidateWithdrawal**客观记录候选人主动退出，报告交由人工复核，不自动作出淘汰决定。详见[065说明](docs/candidate-exit-confirmation-065.md)。
@@ -118,7 +134,7 @@ _Avoid_: EmptyStreamReconfirmation、EnergyEqualsSpeech、VadEqualsTranscript
 
 ## SpokenSupplementConfirmation
 
-**SpokenSupplementConfirmation**：语义判断仍未取得明确完成依据时使用的补充确认；038已在首次静音边界先理解服务端发言。肯定或实质补充继续同题收听，明确否定才授权准备完整答案，未知/无答复不会自动跳题。它是当前owner/turn/capture内的会话控制状态，不是评分或答案事实。
+**SpokenSupplementConfirmation**：普通语音作答完成前的补充确认；073要求正常答案即使被模型标为finish_answer，也先实际询问补充。首次静音边界仍先理解服务端发言。肯定或实质补充继续同题收听，问题实际播完后的新明确否定才授权准备完整答案，未知/无答复不会自动跳题。它是当前owner/turn/capture内的会话控制状态，不是评分或答案事实；明确按钮和独立话题/整场控制按各自门禁处理。
 _Avoid_: SilenceEqualsAnswer、ButtonRequired、BrowserTranscript
 
 本领域描述从岗位题库与候选人简历形成计划和预约，执行语音面试并形成可复核岗位评价的核心概念。

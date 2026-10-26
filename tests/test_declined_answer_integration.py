@@ -32,7 +32,7 @@ from test_evidence_owner_recovery_integration import (
     INTERVIEW_ID, ORGANIZATION_ID, TURN_ID, _wait_until,
 )
 from test_spoken_supplement_integration import (
-    _synthetic_tts, _speaking, _finish_playback,
+    _synthetic_tts, _speaking, _finish_playback, _audio_aligned_transcripts,
 )
 
 
@@ -240,7 +240,7 @@ def test_first_final_decline_preserves_original_audio_and_advances_once(tmp_path
             assert "supplement_check" not in acts and "question" in acts
             assert SUPPLEMENT_SPEECH["check"] not in spoken
             assert not [c for c in calls if c[0] == "supplement"]
-            assert [c[2] for c in calls if c[0] == "understanding"] == ["interview_turn_decision.v107"]
+            assert [c[2] for c in calls if c[0] == "understanding"] == ["interview_turn_decision.v131"]
             assert understanding["completion_basis"]["source"] == "explicit_server_intent"
 
             # Replay the committed journal command and an additional stale
@@ -312,6 +312,7 @@ def test_explicit_end_of_interview_saves_current_evidence_and_never_delivers_nex
 def test_end_interview_in_supplement_reply_preserves_answer_and_stops_whole_interview(tmp_path, monkeypatch):
     _semantic_provider(monkeypatch, technical=True)
     stop = "我今天不想继续面试了，请结束整场面试。"
+    _audio_aligned_transcripts(monkeypatch, [_TECHNICAL, stop, "确定结束面试。"])
     original = MockProvider.invoke
 
     async def semantic_reply(provider, capability, request, context):
@@ -327,7 +328,7 @@ def test_end_interview_in_supplement_reply_preserves_answer_and_stops_whole_inte
     monkeypatch.setattr(MockProvider, "invoke", semantic_reply)
 
     async def scenario():
-        async with _automatic_session(tmp_path, monkeypatch, [_TECHNICAL, stop, "", "", "确定结束面试。", ""], spoken_confirmation=True) as (store, runtime, channel, managed):
+        async with _automatic_session(tmp_path, monkeypatch, [""], spoken_confirmation=True) as (store, runtime, channel, managed):
             _add_next_question(store)
             _playable_speech(runtime)
             endpoint, clock = await _answer_and_confirm(runtime, channel, managed)
@@ -336,7 +337,7 @@ def test_end_interview_in_supplement_reply_preserves_answer_and_stops_whole_inte
             await _wait_until(lambda: all(c["status"] == "completed" for c in store.evidence_commands.values()))
             session = _current(runtime)
             _assert_one_automatic_answer(store, runtime, _TECHNICAL + stop + "确定结束面试。", voice_frames=5, continuation_frames=10)
-            assert session["turns"][0]["current_understanding"]["prompt_version"] == "interview_turn_decision.v112"
+            assert session["turns"][0]["current_understanding"]["prompt_version"] == "interview_turn_decision.v136"
             assert session["turns"][0]["current_understanding"]["turn_intent"] == "stop_interview"
             assert session.get("candidate_input_completion_reason") == "candidate_requested"
             assert session["turns"][0]["current_understanding"]["claims"][0]["claim"] == _TECHNICAL
@@ -347,9 +348,10 @@ def test_end_interview_in_supplement_reply_preserves_answer_and_stops_whole_inte
 
 def test_technical_body_is_still_an_answer_after_spoken_no(tmp_path, monkeypatch):
     _semantic_provider(monkeypatch, technical=True)
+    _audio_aligned_transcripts(monkeypatch, [_TECHNICAL, "没有补充了。"])
 
     async def scenario():
-        async with _automatic_session(tmp_path, monkeypatch, [_TECHNICAL, "没有补充了。", ""], spoken_confirmation=True) as (store, runtime, channel, managed):
+        async with _automatic_session(tmp_path, monkeypatch, [""], spoken_confirmation=True) as (store, runtime, channel, managed):
             _add_next_question(store)
             _playable_speech(runtime)
             await _answer_and_confirm(runtime, channel, managed)

@@ -313,13 +313,18 @@ async def test_understanding_correction_and_repair_share_three_call_limit():
 
 @pytest.mark.anyio
 async def test_repaired_probe_commits_parent_and_delivers_unique_child(tmp_path, monkeypatch):
+    from app.core.prompt.contracts import SUPPLEMENT_SPEECH
     from app.core.prompt.understanding_references import understanding_references
     from app.providers.mock.provider import MockProvider
-    from test_automatic_turn_integration import _automatic_session, _current, _assert_one_automatic_answer
+    from test_automatic_turn_integration import (
+        _automatic_session, _current, _assert_one_automatic_answer, _feed, _CONTINUATION,
+    )
     from test_declined_answer_integration import (
         _semantic_provider, _add_next_question, _playable_speech, _answer_without_confirmation, _TECHNICAL,
+        _stop_current_playback,
     )
     from test_evidence_owner_recovery_integration import TURN_ID, _wait_until
+    from test_spoken_supplement_integration import _audio_aligned_transcripts
     calls = _semantic_provider(monkeypatch, technical=True, probe=True)
     invoke, repairs = MockProvider.invoke, []
     async def repair_provider(provider, capability, request, context):
@@ -338,19 +343,31 @@ async def test_repaired_probe_commits_parent_and_delivers_unique_child(tmp_path,
         return response.model_copy(update={"data": data})
     monkeypatch.setattr(MockProvider, "invoke", repair_provider)
     body = _TECHNICAL + "我讲完了。"
-    async with _automatic_session(tmp_path, monkeypatch, [body, ""], spoken_confirmation=True) as (store, runtime, channel, managed):
+    reply = "没有补充了。"
+    _audio_aligned_transcripts(monkeypatch, [body, reply])
+    async with _automatic_session(tmp_path, monkeypatch, [""], spoken_confirmation=True) as (store, runtime, channel, managed):
         _add_next_question(store)
-        _playable_speech(runtime)
-        await _answer_without_confirmation(managed)
+        spoken = _playable_speech(runtime)
+        endpoint, clock = await _answer_without_confirmation(managed)
+        await _wait_until(lambda: endpoint.confirmation.speaking)
+        assert spoken == [SUPPLEMENT_SPEECH["check"]] and not _current(runtime)["answers"]
+        assert not any(turn.get("is_followup") for turn in _current(runtime)["turns"])
+        await _stop_current_playback(runtime, channel)
+        await _wait_until(lambda: endpoint.confirmation._supplement_question_delivered)
+        assert not _current(runtime)["answers"]
+        await _feed(managed._ingress, _CONTINUATION, 5)
+        clock.value += 1
         await _wait_until(lambda: len(_current(runtime)["answers"]) == 1, timeout=5)
         await _wait_until(lambda: any(event["type"] == "conversation.act.selected" and
             event["payload"]["act_type"] == "followup" for event in _current(runtime)["agent_events"]), timeout=5)
-        _assert_one_automatic_answer(store, runtime, body, voice_frames=5, continuation_frames=0)
+        _assert_one_automatic_answer(store, runtime, body + reply, voice_frames=5, continuation_frames=5)
         current = _current(runtime)
         children = [turn for turn in current["turns"] if turn.get("is_followup")]
-        assert len(children) == 1 and repairs == ["controlled_followup_repair.v1"]
+        assert len(children) == 1 and repairs == ["controlled_followup_repair.v1"] * 2
         child = children[0]
         assert child["parent_turn_id"] == child["root_turn_id"] == TURN_ID
         assert child["followup_depth"] == 1 and current["current_turn_id"] == child["id"]
         assert child["conversation_acts"][0]["prompt_version"] == "controlled_followup_repair.v1"
-        assert len([call for call in calls if call[0] == "understanding"]) == 1
+        assert [call[1] for call in calls if call[0] == "understanding"] == [body, body + reply]
+        assert [call for call in calls if call[0] == "supplement"] == [("supplement", reply, "finish")]
+        assert spoken.count(SUPPLEMENT_SPEECH["check"]) == 1

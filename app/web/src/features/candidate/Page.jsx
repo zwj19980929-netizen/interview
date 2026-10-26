@@ -8,7 +8,7 @@ import {
   useState,
 } from "react";
 
-import { candidateNotice, candidateConnectionNotice, candidateEntryMessage, candidateEntryFailure, understandingRecoveryState } from "./presentation.js";
+import { candidateNotice, candidateConnectionNotice, candidateStoppedPresentation, candidateEntryMessage, candidateEntryFailure, understandingRecoveryState } from "./presentation.js";
 import { CandidateQuestionContext, CandidateQuestionHistory, useCandidateQuestionHistory } from "./QuestionHistory.jsx";
 
 import { useWorkbench } from "../../core/WorkbenchProvider.jsx";
@@ -409,6 +409,7 @@ function CandidateRoom({ interview, token }) {
   const [experience, setExperience] = useState(EMPTY_EXPERIENCE);
   const completion = experience.completion || interview?.completion || null;
   const inputEnded = Boolean(completion) || ["completed", "report_generating", "report_ready"].includes(interview?.status);
+  const initiallyPaused = interview?.status === "paused";
   const [avatarReady, setAvatarReady] = useState(false);
   const [expandedTranscript, setExpandedTranscript] = useState(false);
   const [startingProblem, setStartingProblem] = useState(null);
@@ -426,10 +427,10 @@ function CandidateRoom({ interview, token }) {
   );
   const lastAvatarMetricAt = useRef(0);
   const avatarLoaded = useCallback((details) => {
-    if (!mounted.current || runtimeBlocked.current || inputEnded) return;
+    if (!mounted.current || runtimeBlocked.current || inputEnded || initiallyPaused) return;
     recordPreparedAvatarFps(details?.fps);
     setAvatarReady(true);
-  }, [inputEnded]);
+  }, [inputEnded, initiallyPaused]);
   const avatarFpsObserved = useCallback((fps) => {
     const now = Date.now();
     if (now - lastAvatarMetricAt.current < 10_000) return;
@@ -441,7 +442,7 @@ function CandidateRoom({ interview, token }) {
     }).catch(() => {});
   }, []);
   const pauseForFatalProblem = useCallback(async (error, fallbackCode = "CANDIDATE_RUNTIME_FAILED") => {
-    if (!mounted.current || inputEnded) return { pauseConfirmed: false };
+    if (!mounted.current || inputEnded || initiallyPaused) return { pauseConfirmed: initiallyPaused };
     runtimeBlocked.current = true;
     openingController.current?.abort();
     const problemCode = error?.candidateProblemCode || fallbackCode;
@@ -486,7 +487,7 @@ function CandidateRoom({ interview, token }) {
       });
       return { pauseConfirmed: false };
     }
-  }, [API, inputEnded, interview?.id, request, token]);
+  }, [API, inputEnded, initiallyPaused, interview?.id, request, token]);
 
   const fatalAvatarProblem = useCallback(
     (error) => pauseForFatalProblem(error, "AVATAR_RENDERER_FAILED"),
@@ -494,7 +495,7 @@ function CandidateRoom({ interview, token }) {
   );
 
   useEffect(() => {
-    if (inputEnded) { discardPreparedCandidateMedia(); return undefined; }
+    if (inputEnded || initiallyPaused) { discardPreparedCandidateMedia(); return undefined; }
     if (!interview?.id || !token || !avatarReady) return undefined;
     let active = true;
     let unsubscribe = () => {};
@@ -521,14 +522,14 @@ function CandidateRoom({ interview, token }) {
       runRef.current = null;
       run?.close();
     };
-  }, [avatarReady, candidateInterview, inputEnded, interview?.id, pauseForFatalProblem, token]);
+  }, [avatarReady, candidateInterview, inputEnded, initiallyPaused, interview?.id, pauseForFatalProblem, token]);
 
+  const problem = startingProblem?.recoverable === false ? startingProblem : experience.problem || startingProblem;
+  const stoppedPresentation = candidateStoppedPresentation({ experience, interview, problem });
+  const visibleStream = stoppedPresentation ? null : experience.mediaStream || previewStream;
   useEffect(() => {
-    const stream = experience.mediaStream || previewStream;
-    if (videoRef.current && stream) {
-      videoRef.current.srcObject = stream;
-    }
-  }, [experience.mediaStream, previewStream]);
+    if (videoRef.current) videoRef.current.srcObject = visibleStream;
+  }, [visibleStream]);
 
   const act = useCallback((type, payload = {}) => {
     const run = runRef.current;
@@ -556,7 +557,6 @@ function CandidateRoom({ interview, token }) {
     }
   }, [experience.connection.control, experience.currentQuestion?.turn_id]);
 
-  const problem = experience.problem || startingProblem;
   const session = experience.session || {};
   const calibration = experience.calibration || EMPTY_EXPERIENCE.calibration;
   const currentQuestion = experience.currentQuestion;
@@ -570,11 +570,10 @@ function CandidateRoom({ interview, token }) {
   const planning = experience.phase === "planning";
   const totalQuestions = adaptive ? null : Number(session.total_primary_questions ?? interview?.turns?.filter((item) => !item.is_followup).length ?? 0);
   const answered = Number(session.completed_answers ?? interview?.answers?.length ?? 0);
-  const pauseConfirmed = problem?.pauseConfirmed === true || session.status === "paused";
-  const connectionNotice = problem?.recoverable === false ? null : candidateConnectionNotice(experience);
-  const controlsReady = experience.connection.control === "connected" && !connectionNotice;
-  const notice = connectionNotice || candidateNotice(problem, pauseConfirmed, experience.phase);
-  const visibleExperience = problem?.recoverable === false ? {
+  const connectionNotice = stoppedPresentation ? null : candidateConnectionNotice(experience);
+  const controlsReady = !stoppedPresentation && experience.connection.control === "connected" && !connectionNotice;
+  const notice = stoppedPresentation?.notice || connectionNotice || candidateNotice(problem, false, experience.phase);
+  const visibleExperience = stoppedPresentation ? {
     ...experience, phase: "paused", floor: "none",
     avatar: { ...experience.avatar, status: "idle", viseme: "sil", visemeWeight: 0, gesture: "idle" },
   } : experience;
@@ -609,8 +608,8 @@ function CandidateRoom({ interview, token }) {
   return <div className="candidate-room">
     <PublicHeader>
       <div className="candidate-header-meta">
-        <span className={`connection-dot is-${experience.connection.control}`} />
-        <span>{connectionText(experience.connection)}</span>
+        <span className={`connection-dot is-${stoppedPresentation ? "disconnected" : experience.connection.control}`} />
+        <span>{stoppedPresentation?.header || connectionText(experience.connection)}</span>
         <span>{interview.record_video ? "本场录音录像" : interview.record_audio !== false ? "本场录音" : "本场不录制"}</span>
       </div>
     </PublicHeader>
@@ -630,13 +629,13 @@ function CandidateRoom({ interview, token }) {
         <aside className="candidate-device-panel" aria-label="候选人设备状态">
           <div className="candidate-camera">
             <video ref={videoRef} autoPlay muted playsInline aria-label="候选人真实自拍预览" />
-            {!experience.mediaStream && !previewStream && <div className="device-permission" role="status">
-              <strong>正在连接摄像头</strong>
-              <span>请确认能看到自己的画面</span>
+            {!visibleStream && <div className="device-permission" role="status">
+              <strong>{stoppedPresentation?.cameraTitle || "正在连接摄像头"}</strong>
+              <span>{stoppedPresentation?.cameraDetail || "请确认能看到自己的画面"}</span>
             </div>}
             <span className="camera-label">我的画面</span>
           </div>
-          <CandidateSignalList experience={experience} blocked={problem?.recoverable === false} />
+          <CandidateSignalList experience={visibleExperience} blocked={Boolean(stoppedPresentation)} stoppedDetail={stoppedPresentation?.microphoneDetail} />
           <p className="privacy-note">
             录音录像仅用于本场面试记录与复核。真人面试官加入时会明确提示。
           </p>
@@ -647,13 +646,13 @@ function CandidateRoom({ interview, token }) {
         {notice && <div className={notice.urgent ? "candidate-problem is-fatal" : "candidate-waiting-row"} role={notice.urgent ? "alert" : "status"}>
           <span><strong>{notice.title}</strong><small>{notice.detail}</small></span>
           {notice.retry && <button className="button button-secondary" type="button"
-            disabled={!controlsReady || experience.planningRetryPending || experience.understandingRetryPending
+            disabled={!controlsReady || experience.planningRetryPending || experience.understandingRetryPending || experience.questionAudioRetryPending
               || Boolean(understandingRecoveryState(problem) && !experience.evidence?.ready)}
-            onClick={() => act(notice.action || "continue_speaking")}>{experience.planningRetryPending || experience.understandingRetryPending ? "正在重试…" : notice.retryLabel || "重试"}</button>}
+            onClick={() => act(notice.action || "continue_speaking")}>{experience.planningRetryPending || experience.understandingRetryPending || experience.questionAudioRetryPending ? "正在重试…" : notice.retryLabel || "重试"}</button>}
         </div>}
 
-        <SpeechPlaybackState playback={problem?.recoverable === false || connectionNotice ? null : experience.speechPlayback} act={act} />
-        {!experience.session ? <CandidateSessionGate problem={problem} /> : calibration.status !== "completed" ? <WarmupPanel calibration={calibration} experience={visibleExperience} act={act} controlsReady={controlsReady} showState={!notice} /> : <>
+        <SpeechPlaybackState playback={stoppedPresentation || connectionNotice ? null : experience.speechPlayback} act={act} />
+        {!experience.session ? <CandidateSessionGate stoppedPresentation={stoppedPresentation} /> : calibration.status !== "completed" ? <WarmupPanel calibration={calibration} experience={visibleExperience} act={act} controlsReady={controlsReady} showState={!notice} /> : <>
           <CandidateQuestionContext history={questionHistory.history} currentQuestion={currentQuestion} />
           <div className="candidate-question-head">
             <div>
@@ -676,7 +675,7 @@ function CandidateRoom({ interview, token }) {
               <button className="button button-secondary" type="button" onClick={() => act("finish_answer")} disabled={!controlsReady || !experience.evidence?.ready || !["listening", "answer_preparing", "awaiting_supplement"].includes(visibleExperience.phase)}>
                 提前结束回答
               </button>
-              <button className="button button-secondary" type="button" onClick={() => act("request_repeat")} disabled={!controlsReady || planning || visibleExperience.phase === "understanding" || visibleExperience.phase === "paused" || Boolean(experience.captureRecovery)}>
+              <button className="button button-secondary" type="button" onClick={() => act("request_repeat")} disabled={!controlsReady || planning || experience.questionAudioRetryPending || visibleExperience.phase === "understanding" || visibleExperience.phase === "paused" || Boolean(experience.captureRecovery)}>
                 请再说一遍
               </button>
               <button className="button button-secondary" type="button" onClick={() => act("continue_speaking")} disabled={!controlsReady || problem?.recoverable === false || (!experience.endpoint.active && !["answer_preparing", "awaiting_supplement"].includes(experience.phase)) || !experience.evidence?.ready}>
@@ -692,14 +691,12 @@ function CandidateRoom({ interview, token }) {
   </div>;
 }
 
-function CandidateSessionGate({ problem }) {
+function CandidateSessionGate({ stoppedPresentation }) {
   return <div className="candidate-warmup" role="status">
     <p className="eyebrow">面试准备</p>
-    <h1>{problem?.recoverable === false ? "暂时无法进入面试" : "正在进入面试"}</h1>
-    <p>{problem?.recoverable === false
-      ? "请按上方提示操作。"
-      : "马上就好，请稍等片刻。"}</p>
-    {!problem && <span className="spinner" aria-hidden="true" />}
+    <h1>{stoppedPresentation?.gateTitle || "正在进入面试"}</h1>
+    <p>{stoppedPresentation?.gateDetail || "马上就好，请稍等片刻。"}</p>
+    {!stoppedPresentation && <span className="spinner" aria-hidden="true" />}
   </div>;
 }
 
@@ -790,22 +787,23 @@ export function AnswerRecoveryAction({ recovery, act, disabled = false }) {
   </div>;
 }
 
-export function CandidateSignalList({ experience, blocked = false }) {
+export function CandidateSignalList({ experience, blocked = false, stoppedDetail: stoppedDetailOverride }) {
   const connectionRecovery = candidateConnectionNotice(experience);
   const processingFailure = understandingRecoveryState(experience.problem);
-  const stopped = blocked || ["paused", "completed", "answer_retry_required", "planning"].includes(experience.phase)
+  const stopped = blocked || Boolean(experience.questionAudioRecovery) || ["paused", "completed", "answer_retry_required", "planning"].includes(experience.phase)
     || (experience.phase === "understanding" && (!processingFailure || experience.evidence?.ready !== true));
   const recovering = experience.captureRecovery?.status === "recovering" && !stopped;
   const local = !stopped && !connectionRecovery && experience.microphone.localDetected;
-  const stoppedDetail = blocked ? "收音已停止，请查看页面提示"
+  const stoppedDetail = stoppedDetailOverride || (blocked ? "收音已停止，请查看页面提示"
     : experience.phase === "paused" ? "面试已暂停"
     : experience.phase === "completed" ? "面试已结束"
+    : experience.questionAudioRecovery ? "请先听完追问，再开始作答"
     : experience.phase === "answer_retry_required" ? "本题收音已停止，请重试本题"
     : processingFailure ? "录音已保留，输入通道暂未就绪"
     : experience.calibration?.status === "awaiting_confirmation" ? "试音已收好，请确认下方字幕"
     : experience.calibration?.status === "confirming" ? "正在进入正式面试"
     : experience.phase === "planning" ? "面试官正在准备下一话题"
-    : "这段回答已收好，面试官正在整理";
+    : "这段回答已收好，面试官正在整理");
   return <div className="candidate-signal-list">
     <SignalState label={recovering ? "连接有些慢，正在恢复" : "麦克风"} active={local && !recovering}
       detail={stopped ? stoppedDetail : connectionRecovery ? "连接恢复期间，请稍候" : recovering ? "请稍等，已收到的回答会保留" : local ? "正在收到你的声音"

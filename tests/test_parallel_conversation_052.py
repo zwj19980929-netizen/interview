@@ -138,10 +138,12 @@ def test_final_correction_is_covered_and_projected_before_recognition_resumes():
 
 def test_stable_preview_analysis_starts_with_reception_and_is_reused_at_final():
     async def scenario():
-        endpoint, _, _, commits, spoken = setup()
+        endpoint, clock, _, commits, spoken = setup()
         capture = endpoint.capture
+        # Cost-controlled speculation starts only after three stable seconds.
+        clock.value = 3.1
         capture.release, capture.reception_gate = asyncio.Event(), asyncio.Event()
-        early = asyncio.create_task(endpoint.confirmation.step(endpoint, quiet=1.1))
+        early = asyncio.create_task(endpoint.confirmation.step(endpoint, quiet=3.1))
         try:
             await asyncio.wait_for(capture.entered.wait(), 1)
             await asyncio.wait_for(capture.reception_entered.wait(), 1)
@@ -169,10 +171,12 @@ def test_stable_preview_analysis_starts_with_reception_and_is_reused_at_final():
 @pytest.mark.parametrize("change", ["text", "confidence", "language", "segment", "provider"])
 def test_corrected_final_text_or_provenance_cannot_reuse_preview_analysis(change):
     async def scenario():
-        endpoint, _, _, commits, _ = setup()
+        endpoint, clock, _, commits, _ = setup()
         capture = endpoint.capture
+        # Cost-controlled speculation starts only after three stable seconds.
+        clock.value = 3.1
         try:
-            await endpoint.confirmation.step(endpoint, quiet=1.1)
+            await endpoint.confirmation.step(endpoint, quiet=3.1)
             await asyncio.wait_for(capture.preparation_done.wait(), 1)
             revised = capture.current_final.model_copy(deep=True)
             if change == "text":
@@ -199,11 +203,13 @@ def test_corrected_final_text_or_provenance_cannot_reuse_preview_analysis(change
 @pytest.mark.parametrize("interrupt", ["audio", "partial", "close"])
 def test_new_input_or_close_cancels_speculative_work_before_five_second_confirmation(interrupt):
     async def scenario():
-        endpoint, _, _, commits, spoken = setup()
+        endpoint, clock, _, commits, spoken = setup()
         capture = endpoint.capture
+        # Cost-controlled speculation starts only after three stable seconds.
+        clock.value = 3.1
         capture.release = asyncio.Event()
         try:
-            await endpoint.confirmation.step(endpoint, quiet=1.1)
+            await endpoint.confirmation.step(endpoint, quiet=3.1)
             await asyncio.wait_for(capture.entered.wait(), 1)
             assert not capture.snapshots
             if interrupt == "close":
@@ -224,13 +230,15 @@ def test_new_input_or_close_cancels_speculative_work_before_five_second_confirma
 
 def test_final_revision_at_commit_is_reprepared_while_listening_then_cut_again():
     async def scenario():
-        endpoint, _, _, commits, _ = setup()
+        endpoint, clock, _, commits, _ = setup()
         capture = endpoint.capture
+        # Cost-controlled speculation starts only after three stable seconds.
+        clock.value = 3.1
         initial = capture.current_final.model_copy(deep=True)
         revised = _final("这个方向我暂时不会。下一题吧。")
         capture.finals.extend([initial, revised, revised])
         try:
-            await endpoint.confirmation.step(endpoint, quiet=1.1)
+            await endpoint.confirmation.step(endpoint, quiet=3.1)
             await asyncio.wait_for(capture.preparation_done.wait(), 1)
             await endpoint.confirmation.step(endpoint, quiet=5)
             assert capture.snapshots == [False, False, False]
@@ -302,17 +310,22 @@ def test_corrected_commit_final_cannot_inherit_previews_permission_to_finish(cor
                                        understanding=understanding, followup=followup)
 
         capture = CorrectedCapture()
-        endpoint, _, _, commits, spoken = setup(capture)
+        endpoint, clock, _, commits, spoken = setup(capture)
+        clock.value = 3.1
         capture.finals.extend([capture.current_final.model_copy(deep=True), revised])
         try:
-            await endpoint.confirmation.step(endpoint, quiet=1.1)
+            await endpoint.confirmation.step(endpoint, quiet=3.1)
             await asyncio.wait_for(capture.preparation_done.wait(), 1)
             await endpoint.confirmation.step(endpoint, quiet=5)
             assert len(capture.prepares) == 2
-            assert capture.snapshots == [False, False]
+            assert capture.snapshots == [False] * (3 if corrected_intent == "answering" else 2)
             assert capture.flags == [(True, False), (True, False)]
-            assert not commits and not spoken
+            assert not commits
+            # The corrected ordinary answer now gets its own supplement
+            # question; it cannot borrow the preview's permission to submit.
+            assert spoken == (["check"] if corrected_intent == "answering" else [])
             assert not endpoint.confirmation.confirmed
+            assert not endpoint.confirmation._supplement_question_delivered
             assert capture.is_open and not capture.paused
         finally:
             await endpoint.close()
@@ -321,8 +334,10 @@ def test_corrected_commit_final_cannot_inherit_previews_permission_to_finish(cor
 
 def test_new_speech_while_resuming_revised_final_does_not_start_obsolete_reasoning():
     async def scenario():
-        endpoint, _, _, commits, _ = setup()
+        endpoint, clock, _, commits, _ = setup()
         capture = endpoint.capture
+        # Cost-controlled speculation starts only after three stable seconds.
+        clock.value = 3.1
         revised = _final("这个方向我暂时不会。下一题吧。")
         capture.finals.extend([capture.current_final.model_copy(deep=True), revised])
         original_resume = capture.resume_capture
@@ -335,7 +350,7 @@ def test_new_speech_while_resuming_revised_final_does_not_start_obsolete_reasoni
 
         capture.resume_capture = resume_and_receive_speech
         try:
-            await endpoint.confirmation.step(endpoint, quiet=1.1)
+            await endpoint.confirmation.step(endpoint, quiet=3.1)
             await asyncio.wait_for(capture.preparation_done.wait(), 1)
             await endpoint.confirmation.step(endpoint, quiet=5)
             assert len(capture.prepares) == 1, "Already revoked reasoning must not be sent to the model"

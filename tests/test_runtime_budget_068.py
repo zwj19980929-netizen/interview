@@ -34,7 +34,8 @@ class Capture(_Capture):
 @pytest.mark.parametrize("previous_reply", [False, True])
 async def test_preview_has_own_budget_and_authoritative_final_gets_full_attempt(previous_reply):
     capture = Capture()
-    endpoint, _, _, _ = _endpoint(capture=capture)
+    endpoint, clock, _, _ = _endpoint(capture=capture)
+    clock.value += 3.1
     endpoint._proposal_revision = endpoint.revision
     if previous_reply:
         endpoint.cover_transcript(_final("前一个概念已经解释完。"))
@@ -44,7 +45,7 @@ async def test_preview_has_own_budget_and_authoritative_final_gets_full_attempt(
         endpoint.prepare_stable_preview(await capture.transcript_preview())
         await _until(lambda: capture.prepares)
         assert endpoint._interaction_deadline == previous_deadline
-        assert 0 < capture.budgets[0] <= 15
+        assert 18 < capture.budgets[0] <= 20
         # An old/successful preview is optional. Rotating provider metadata
         # prevents reuse, so the authoritative request must still get 20s.
         final = capture.current_final.model_copy(update={"confidence": .85})
@@ -70,6 +71,8 @@ async def test_expired_attempt_counts_once_and_recovery_has_one_independent_budg
     endpoint.confirmation = SpokenSupplementConfirmation(speak=speak)
     endpoint.speech_started()
     endpoint.cover_transcript(capture.current_final)
+    # Exhaust the full 40s recovery window, not just its initial 20s stage.
+    endpoint._interaction_started_at = time.monotonic() - 41
     endpoint._interaction_deadline = time.monotonic() - 1
     clock.value = 6
     endpoint.start()
@@ -97,6 +100,8 @@ async def test_expired_attempt_can_retry_only_with_new_words_or_explicit_action(
     capture = Capture()
     endpoint, _, _, _ = _endpoint(capture=capture)
     endpoint.cover_transcript(capture.current_final)
+    # Exhaust the full 40s recovery window, not just its initial 20s stage.
+    endpoint._interaction_started_at = time.monotonic() - 41
     endpoint._interaction_deadline = time.monotonic() - 1
     endpoint._proposal_revision = endpoint.revision
     try:
@@ -132,6 +137,8 @@ async def test_blocked_recovery_playback_still_expires_without_retrying_understa
     endpoint.confirmation = SpokenSupplementConfirmation(speak=speak)
     endpoint.speech_started()
     endpoint.cover_transcript(capture.current_final)
+    # Exhaust the full 40s recovery window, not just its initial 20s stage.
+    endpoint._interaction_started_at = time.monotonic() - 41
     endpoint._interaction_deadline = time.monotonic() - 1
     clock.value = 6
     endpoint.start()
