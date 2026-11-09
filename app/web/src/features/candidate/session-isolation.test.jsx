@@ -172,6 +172,36 @@ describe("candidate route isolation with the real workbench loader", () => {
     expect(getUserMedia).not.toHaveBeenCalled();
   });
 
+  it("keeps the room mounted for a live terminal farewell and disables answer controls until receipt", async () => {
+    const run = makeRun();
+    let update;
+    const receipt = { interview_id: "new", status: "report_ready", submitted_at: "2026-09-23T00:00:00Z",
+      recording_retention_notice: "录音按同意范围保留。", human_review_required: true };
+    const state = { phase: "listening", floor: "candidate", session: { status: "in_progress" },
+      currentQuestion: { question_text: "合成测试问题", turn_id: "turn-current" },
+      connection: { control: "connected", media: "connected" }, microphone: { localDetected: false, level: 0 }, evidence: { ready: true },
+      serverAudio: { received: false }, captions: { forming: false, full: [], recent: [] }, endpoint: { active: false },
+      calibration: { status: "completed" }, avatar: { status: "idle" }, problem: null,
+    };
+    run.subscribe.mockImplementation(listener => { update = listener; listener(state); return () => {}; });
+    runtime.open.mockResolvedValueOnce(run);
+    await mount();
+    await deliver(0, interview("new"));
+    await act(async () => avatar().onReady({ fps: 60 }));
+    const closing = { ...state, phase: "closing", floor: "agent", currentQuestion: null, evidence: { ready: false },
+      session: { status: "report_ready", completion: receipt, completion_presentation: "closing" } };
+    await act(async () => update(closing));
+    expect(host.textContent).toContain("感谢你的参与，请听完面试官的结束说明");
+    expect(host.textContent).not.toContain("面试已提交");
+    expect(run.close).not.toHaveBeenCalled();
+    const controls = [...host.querySelectorAll("button")].filter(button => ["提前结束回答", "请再说一遍", "继续补充", "暂停面试"].includes(button.textContent));
+    expect(controls).toHaveLength(4);
+    expect(controls.every(button => button.disabled)).toBe(true);
+    await act(async () => update({ ...closing, phase: "completed", completion: receipt }));
+    expect(host.textContent).toContain("面试已提交");
+    expect(run.close).toHaveBeenCalledOnce();
+  });
+
   it.each(["success", "failure"])("ignores a previous page's late %s after the new page has loaded", async (outcome) => {
     await mount("old", "token-old");
     await navigate("new", "token-new");

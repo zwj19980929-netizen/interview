@@ -383,7 +383,7 @@ class CandidateExperienceRun {
   }
 
   async act({ type, idempotencyKey, turnId, payload = {} } = {}) {
-    if (this.closed || this.state.completion) return false;
+    if (this.closed || this.state.completion || (this.isClosingPresentation() && type !== "retry_speech")) return false;
     if (!type) throw new Error("候选人动作缺少 type");
     if (this.state.session && (this.state.connection.control !== "connected"
       || ["reconnecting", "disconnected", "recovery"].includes(this.state.connection.media))) return false;
@@ -905,6 +905,10 @@ class CandidateExperienceRun {
       if (!this.isSafetyStopped() && this.evidenceReady && this.evidenceTurnId === this.currentTranscriptTurnId()) this.flushPendingSpeechState();
       return;
     }
+    if (this.isClosingPresentation() && ["floor.changed", "speech.started", "speech.stopped", "transcript.partial", "transcript.final"].includes(event.type)) {
+      if (event.type === "floor.changed" && payload.owner === "agent") this.patch({ floor: "agent", phase: "closing" });
+      return;
+    }
     if (this.isSafetyStopped() && ["floor.changed", "speech.started", "speech.stopped", "transcript.partial", "transcript.final"].includes(event.type)) return;
     if (event.type === "floor.changed") {
       if (payload.owner === "candidate" && this.state.questionAudioRecovery) return;
@@ -1419,10 +1423,14 @@ class CandidateExperienceRun {
     await this.close("interview_completed");
   }
 
+  isClosingPresentation() {
+    return Boolean(this.state.session?.completion && this.state.session?.completion_presentation === "closing");
+  }
+
   isSafetyStopped() {
     return this.closed || Boolean(this.state.completion) || this.state.problem?.recoverable === false
       || ["paused", "completed"].includes(this.state.phase)
-      || ["paused", "completed", "cancelled", "expired", "report_ready"].includes(this.state.session?.status);
+      || (!this.isClosingPresentation() && ["paused", "completed", "cancelled", "expired", "report_ready"].includes(this.state.session?.status));
   }
 
   matchesCapture(event) {
@@ -1565,8 +1573,30 @@ class CandidateExperienceRun {
     }
   }
 
+  applyClosingSnapshot(payload) {
+    // Candidate input is durably sealed; keep only the original output path
+    // alive until the server confirms drain/failure. A fresh connection gets
+    // an ordinary completion receipt and never reopens capture.
+    window.clearTimeout(this.endpointTimer);
+    this.endpointTimer = 0;
+    this.evidenceOpen = this.evidenceReady = this.evidenceReassertPending = false;
+    this.evidenceOpenCausationId = this.evidenceTurnId = this.evidenceCaptureId = null;
+    this.speechStartSignaled = this.pendingSpeechStop = false;
+    this.answerSubmissionPending = this.answerFinishRequested = false;
+    this.captureRetryCausationId = this.understandingRetryCausationId = this.planningRetryCausationId = null;
+    this.ring?.clear();
+    if (Object.hasOwn(payload, "active_performance_id") && this.performance
+      && payload.active_performance_id !== this.performance.performance_id) this.stopPerformance("authoritative_snapshot", false);
+    this.patch({ session: payload, phase: "closing", floor: payload.floor || "none", currentQuestion: null,
+      captureRecovery: null, questionAudioRecovery: null, problem: null,
+      planningRetryPending: false, understandingRetryPending: false, questionAudioRetryPending: false,
+      endpoint: { active: false, deadlineAt: null }, evidence: { requested: false, ready: false },
+      microphone: { ...this.state.microphone, localDetected: false, level: 0 } });
+  }
+
   applySnapshot(payload) {
     if (this.closed || this.state.completion) return;
+    if (payload.completion && payload.completion_presentation === "closing") return this.applyClosingSnapshot(payload);
     if (payload.completion) return this.enterCompletion(payload.completion);
     const sessionStatus = payload.status;
     const calibrationStatus = payload.calibration_status || this.state.calibration.status;
@@ -1787,6 +1817,7 @@ class CandidateExperienceRun {
   }
 
   async ensureEvidenceOpen({ force = false } = {}) {
+    if (this.isClosingPresentation()) return;
     if (this.state.session && this.state.connection.control !== "connected") return;
     const turnId = force && this.evidenceTurnId && this.evidenceTurnId !== "__warmup__"
       ? this.evidenceTurnId
@@ -1841,6 +1872,7 @@ class CandidateExperienceRun {
   }
 
   onPcm(frame) {
+    if (this.isClosingPresentation()) return;
     if (!this.evidenceOpen) {
       // A confirmed barge-in can be signalled before the server has switched
       // the floor and acknowledged Evidence open. Preserve its matching stop
@@ -1857,7 +1889,7 @@ class CandidateExperienceRun {
   }
 
   onLevel(rms) {
-    if (this.closed || !this.state.microphone.enabled || !Number.isFinite(rms)) return;
+    if (this.closed || this.isClosingPresentation() || !this.state.microphone.enabled || !Number.isFinite(rms)) return;
     const now = this.clock();
     if (now >= this.lastMicrophoneLevelAt && now - this.lastMicrophoneLevelAt < MICROPHONE_LEVEL_INTERVAL_MS) return;
     const level = Math.max(0, Math.min(1, rms / 0.12));
@@ -1869,6 +1901,7 @@ class CandidateExperienceRun {
   }
 
   async onLocalSpeechStarted(details = {}) {
+    if (this.isClosingPresentation()) return;
     if (this.state.questionAudioRecovery) return;
     if (this.state.captureRecovery?.status === "retry_required") return;
     if (this.answerSubmissionPending || (this.state.phase === "understanding" && this.state.calibration.status === "completed")) return;
@@ -1918,6 +1951,7 @@ class CandidateExperienceRun {
   }
 
   onLocalSpeechStopped() {
+    if (this.isClosingPresentation()) return;
     if (this.state.questionAudioRecovery) return;
     if (this.state.captureRecovery?.status === "retry_required") return;
     if (this.answerSubmissionPending) return;
@@ -2053,7 +2087,7 @@ class CandidateExperienceRun {
         );
         this.finalReceivedAt = null;
       }
-      this.patch({ phase: "responding", avatar: { ...EMPTY_AVATAR, status: "speaking", performanceId: performance.performance_id } });
+      this.patch({ phase: this.isClosingPresentation() ? "closing" : "responding", avatar: { ...EMPTY_AVATAR, status: "speaking", performanceId: performance.performance_id } });
       this.tickPerformance(playback);
     };
     const onEnded = () => {
@@ -2157,7 +2191,7 @@ class CandidateExperienceRun {
             this.observeMetric("final_to_first_audio_cascade_ms", currentPerformance.startedAt - this.finalReceivedAt);
             this.finalReceivedAt = null;
           }
-          this.patch({ phase: "responding", avatar: { ...EMPTY_AVATAR, status: "speaking", performanceId: performance.performance_id } });
+          this.patch({ phase: this.isClosingPresentation() ? "closing" : "responding", avatar: { ...EMPTY_AVATAR, status: "speaking", performanceId: performance.performance_id } });
           this.tickPerformance(playback);
         },
         onFinished: () => {
@@ -2312,6 +2346,7 @@ class CandidateExperienceRun {
   }
 
   async failClosed(error) {
+    if (this.isClosingPresentation()) return this.enterCompletion(this.state.session.completion);
     if (this.runtimeFailurePending || this.closed || this.state.completion) return;
     this.runtimeFailurePending = true;
     const code = CANDIDATE_RUNTIME_PROBLEM_CODES.has(error.candidateProblemCode)

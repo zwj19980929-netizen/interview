@@ -17,6 +17,7 @@ from app.domain.adaptive_interview import (
     validate_assessment_contract,
 )
 from app.domain.question_selection import QuestionSelection, QuestionSelectionRequest
+from app.domain.primary_question_budget import MAX_PRIMARY_QUESTIONS
 from app.domain.speech_profile import freeze_interview_speech_profile, speech_profile_fingerprint
 from app.persistence.errors import ConcurrencyConflict
 from app.persistence.interface import Persistence
@@ -109,7 +110,7 @@ class InterviewPlanAssembly:
         return await self.assemble(PlanAssemblyRequest(
             role_requirement_id=None, job_position_id=job_position_id, candidate_profile_id=candidate_profile_id,
             knowledge_base_ids=tuple(knowledge_base_ids), duration_minutes=duration_minutes,
-            question_count=min(12, max(1, duration_minutes // 5)), approve=True,
+            question_count=min(MAX_PRIMARY_QUESTIONS, max(1, duration_minutes // 3)), approve=True,
             execution_schema_version=3, preparation_mode="question_bank",
             adaptive_policy={"min_root_questions": 1, "min_evidence_units_per_competency": 1},
         ), organization_id, on_progress=on_progress)
@@ -146,6 +147,16 @@ class InterviewPlanAssembly:
             )
         request = self._resolve_resume_review(request, organization_id)
         self._validate_target_scope(request, role, organization_id)
+        experience_question_snapshots = self._approved_experience_question_snapshots(
+            request.resume_review_id, organization_id
+        )
+        selection_request = request
+        if request.execution_schema_version == 2:
+            # Fixed plans execute every slot. Resume questions consume the same
+            # requested total; keep at least one position-bank question.
+            experience_question_snapshots = experience_question_snapshots[:max(0, request.question_count - 1)]
+            selection_request = replace(request,
+                question_count=request.question_count - len(experience_question_snapshots))
         default_skill_snapshot = None
         customization_version = None
         if request.use_customization_defaults:
@@ -171,7 +182,7 @@ class InterviewPlanAssembly:
                 status_code=400,
             )
 
-        dimensions, targets, dimension_weights = self._coverage_targets(role, request)
+        dimensions, targets, dimension_weights = self._coverage_targets(role, selection_request)
         candidates = await self._candidate_pool(
             role,
             request,
@@ -194,7 +205,7 @@ class InterviewPlanAssembly:
 
         selections, warnings = self._select(
             candidates,
-            request.question_count,
+            selection_request.question_count,
             dimensions,
             targets,
             dimension_weights,
@@ -224,9 +235,6 @@ class InterviewPlanAssembly:
         bank_slots = self._bank_slots(slot_drafts, candidates, organization_id)
         speech_profile_snapshot = self._interview_speech_profile(
             request.knowledge_base_ids, organization_id
-        )
-        experience_question_snapshots = self._approved_experience_question_snapshots(
-            request.resume_review_id, organization_id
         )
         summary["experience_question_count"] = len(experience_question_snapshots)
         summary["experience_question_target"] = 3
@@ -268,6 +276,7 @@ class InterviewPlanAssembly:
             # Selection relaxations are internal decisions, not missing user inputs.
             summary["selection_notes"] = summary.pop("warnings", [])
             summary["warnings"] = []
+        summary["primary_question_limit"] = min(MAX_PRIMARY_QUESTIONS, request.question_count)
         if request.skill_id and request.enterprise_skill_id and request.skill_id != request.enterprise_skill_id:
             raise ApiError("INTERVIEW_SKILL_REFERENCE_CONFLICT", "Only one optional Skill can be selected.", status_code=422)
         selected_skill_id = request.skill_id or request.enterprise_skill_id
@@ -508,6 +517,10 @@ class InterviewPlanAssembly:
                 plan["assembly_policy"] = deepcopy(payload["assembly_policy"])
 
             if editing:
+                if (plan.get("execution_schema_version") == 2
+                        and len(plan.get("bank_slots", [])) + len(plan.get("experience_question_snapshots", [])) > MAX_PRIMARY_QUESTIONS):
+                    raise ApiError("INTERVIEW_PLAN_POLICY_INVALID",
+                        "岗位题和简历题合计最多10道主问题，追问单独计算。", status_code=422)
                 self._rebalance_execution_budget(
                     plan.get("bank_slots", []),
                     plan.get("experience_question_snapshots", []),
@@ -516,7 +529,7 @@ class InterviewPlanAssembly:
                 summary = plan.setdefault("assembly_summary", {})
                 summary["manually_edited"] = True
                 summary["selected_question_count"] = len(plan["bank_slots"])
-                summary["requested_question_count"] = len(plan["bank_slots"])
+                summary["requested_question_count"] = len(plan["bank_slots"]) + len(plan.get("experience_question_snapshots", []))
                 warning = "计划执行槽位已由面试官人工编辑，覆盖摘要已按当前槽位重新标记。"
                 warnings = summary.setdefault("warnings", [])
                 if warning not in warnings:
@@ -1212,10 +1225,10 @@ class InterviewPlanAssembly:
                 "job_position_id, candidate_profile_id and knowledge_base_ids are required.",
                 status_code=422,
             )
-        if request.question_count < 1 or request.question_count > 50:
+        if type(request.question_count) is not int or request.question_count < 1 or request.question_count > MAX_PRIMARY_QUESTIONS:
             raise ApiError(
                 "INTERVIEW_PLAN_POLICY_INVALID",
-                "question_count must be between 1 and 50.",
+                "question_count must be between 1 and 10, combined across question sources.",
                 status_code=400,
             )
         policy = request.policy

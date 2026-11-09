@@ -14,11 +14,16 @@ from app.core.interaction_budget import remaining_interaction_seconds
 from app.core.prompt.interviewer_supervisor import supervisor_contract, evidence_expert_contract
 from app.core.prompt.validation import validate_structured_response
 from app.model_gateway import capabilities as cap
+from app.model_gateway.errors import ProviderError
 from app.model_gateway.schemas import ChatJSONRequest, InvocationExecutionBudget
 from app.domain.adaptive_interview import coverage_summary, budget_summary
 from app.core.time import utc_now
 from .context import assessment_contract, context_fingerprint, conversation_memory, planning_memory, planning_request_size
 from .tools import InterviewerTools, COMPANY_CONTEXT_REFERENCE, company_context
+
+_TRANSIENT_PLANNING_ERRORS = frozenset({
+    "provider_timeout", "provider_server_error", "provider_rate_limited", "provider_circuit_open",
+})
 
 
 @dataclass(frozen=True)
@@ -34,6 +39,8 @@ class NextInterviewDecision:
     tools_used: Tuple[str, ...]
     model_calls: int
     inquiry_unit_id: Optional[str] = None
+    selection_strategy: Optional[str] = None
+    fallback_reason: Optional[str] = None
 
 
 class InterviewerSupervisor:
@@ -162,7 +169,9 @@ class InterviewerSupervisor:
                     metadata={"prompt_version": contract.version, "planning_input_size": size},
                 )), timeout=remaining)
             except asyncio.TimeoutError:
-                raise ApiError("INTERVIEW_DECISION_BUDGET_EXHAUSTED", "Interview planning reached its bounded budget.", status_code=503) from None
+                # Only a timed-out model await is recoverable here. Tool limits,
+                # invalid responses and cancelled ownership remain failures.
+                raise ProviderError("provider_timeout", "The bounded planning call timed out.", retryable=True) from None
             data = response.data
             validate_structured_response(data, contract.response_schema)
             return data
@@ -207,6 +216,28 @@ class InterviewerSupervisor:
                     data["question_id"], data["reason_code"], data["transition_key"], tuple(tools_used), calls, data["inquiry_unit_id"])
         except asyncio.CancelledError:
             raise
+        except ProviderError as error:
+            if error.retryable and error.code in _TRANSIENT_PLANNING_ERRORS:
+                # The wait may have consumed the last interview seconds. Re-read
+                # budget facts before selecting anything; the service still
+                # commits through its normal owner/context/lifecycle fences.
+                current_budget = budget_summary(session, utc_now())
+                selection = None
+                if current_budget["exhausted"]:
+                    reason = "budget_exhausted"
+                elif coverage_summary(session)["sufficient"]:
+                    reason = "coverage_complete"
+                else:
+                    selection = InterviewerTools(session, skill,
+                        remaining_seconds=current_budget["remaining_seconds"]).fallback_selection()
+                    reason = "coverage_gap"
+                if selection is not None or reason in {"budget_exhausted", "coverage_complete"}:
+                    return NextInterviewDecision(session["id"], revision, fingerprint, decision_id,
+                        "select_question" if selection else "finish_interview",
+                        selection[0] if selection else None, reason, "continue" if selection else "none",
+                        tuple(tools_used), calls, selection[1] if selection else None,
+                        "approved_catalog_fallback.v1", error.code)
+            raise ApiError("INTERVIEW_DECISION_UNAVAILABLE", "面试官暂时未能准备好后续交流，请稍后重试。", status_code=503) from None
         except ApiError:
             raise
         except Exception:

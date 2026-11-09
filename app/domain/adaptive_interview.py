@@ -16,6 +16,9 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.core.errors import ApiError
 from app.core.ids import new_id
+from app.domain.primary_question_budget import (
+    MAX_PRIMARY_QUESTIONS, NORMAL_MIN_PRIMARY_QUESTIONS, primary_question_budget,
+)
 
 
 Document = Dict[str, Any]
@@ -26,8 +29,8 @@ _COVERAGE_MAX_SEARCH_SECONDS = 0.15
 class AdaptiveInterviewPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    min_root_questions: Optional[int] = Field(default=None, ge=1, le=50)
-    max_root_questions: Optional[int] = Field(default=None, ge=1, le=50)
+    min_root_questions: Optional[int] = Field(default=None, ge=1, le=MAX_PRIMARY_QUESTIONS)
+    max_root_questions: Optional[int] = Field(default=None, ge=1, le=MAX_PRIMARY_QUESTIONS)
     max_followups_per_root: int = Field(default=1, ge=0, le=3)
     max_total_followups: int = Field(default=8, ge=0, le=30)
     closing_reserve_seconds: int = Field(default=30, ge=0, le=300)
@@ -144,8 +147,11 @@ def freeze_assessment_contract(
         _invalid("The approved candidate pool cannot be empty.")
     has_units = any(candidate.get("inquiry_units") for candidate in candidates)
     available_count = sum(len(candidate.get("inquiry_units") or [None]) for candidate in candidates)
-    maximum = settings.max_root_questions or min(question_count, available_count)
-    minimum = settings.min_root_questions or min(maximum, max(1, len(dimension_weights)))
+    maximum = settings.max_root_questions or min(question_count, available_count, MAX_PRIMARY_QUESTIONS)
+    minimum = settings.min_root_questions or min(maximum, max(NORMAL_MIN_PRIMARY_QUESTIONS, len(dimension_weights)))
+    if assessment_basis is not None:
+        maximum = min(maximum, max(1, duration_minutes // 3))
+        minimum = min(maximum, NORMAL_MIN_PRIMARY_QUESTIONS)
     if maximum > available_count or minimum > maximum:
         _invalid("The root question budget exceeds the available approved pool.")
     if duration_minutes * 60 <= settings.closing_reserve_seconds:
@@ -164,12 +170,8 @@ def freeze_assessment_contract(
                      "min_evidence_roots": min(settings.min_evidence_units_per_competency,
                         competency_unit_counts[name]) if has_units else 1}
                     for name, weight in sorted(weights.items())]
-    if has_units:
+    if has_units and assessment_basis is None:
         needed = _minimum_evidence_units(competencies, candidates)
-        if assessment_basis is not None:
-            # Preparation derives a feasible budget; users do not have to solve
-            # the rubric multicover or guess how many source questions split.
-            maximum = min(50, available_count, max(needed, duration_minutes // 3))
         if needed > maximum:
             raise ApiError("ASSESSMENT_COVERAGE_BUDGET_INVALID",
                 "当前能力范围至少需要 %s 个考察单元，题数上限为 %s；请增加上限或调整每能力最低证据单元数。" % (needed, maximum),
@@ -185,7 +187,8 @@ def freeze_assessment_contract(
                    "max_total_followups": settings.max_total_followups if allow_followups else 0,
                    "max_duration_seconds": duration_minutes * 60,
                    "closing_reserve_seconds": settings.closing_reserve_seconds},
-        "coverage_policy": "answered_roots.v1", "scoring_policy": "fixed_competencies.v1",
+        "coverage_policy": "sampled_answered_roots.v1" if assessment_basis is not None else "answered_roots.v1",
+        "scoring_policy": "fixed_competencies.v1",
         "presentation_policy": "approved_inquiry_units.v1" if has_units else "complete_approved_question.v1",
         "stop_policy": "bounded_evidence.v1",
     }
@@ -308,6 +311,7 @@ def _instant(value: str) -> datetime:
 def budget_summary(session: Document, now: str) -> Document:
     contract = assessment_contract(session)
     budget = contract["budget"]
+    execution_budget = primary_question_budget(session)
     elapsed = max(0, (_instant(now) - _instant(session["started_at"])).total_seconds()) if session.get("started_at") else 0
     available = max(0, budget["max_duration_seconds"] - budget["closing_reserve_seconds"] - elapsed)
     if session.get("scheduled_end_at"):
@@ -320,9 +324,10 @@ def budget_summary(session: Document, now: str) -> Document:
                           for unit in candidate.get("inquiry_units") or [{"id": None}]
                           if (candidate["question_id"], unit["id"]) not in selected)
     return {"remaining_seconds": max(0, int(available)),
-            "remaining_root_questions": max(0, budget["max_root_questions"] - len(root_turns(session))),
+            "remaining_root_questions": max(0, execution_budget["max_root_questions"] - len(roots)),
+            "execution_question_budget": execution_budget,
             "remaining_eligible_units": remaining_units,
-            "exhausted": available <= 0 or len(root_turns(session)) >= budget["max_root_questions"] or remaining_units == 0}
+            "exhausted": available <= 0 or len(roots) >= execution_budget["max_root_questions"] or remaining_units == 0}
 
 
 def source_topic_closed(turn: Document) -> bool:
@@ -374,7 +379,8 @@ def record_decision(session: Document, payload: Document, kind: str, now: str) -
     planning = session.get("agent_runtime", {}).get("last_planning") or {}
     if planning.get("decision_id") == payload["decision_id"]:
         receipt.update({key: deepcopy(planning[key]) for key in
-                        ("reason_code", "tools_used", "model_calls", "prompt_version", "context_hash") if key in planning})
+                        ("reason_code", "tools_used", "model_calls", "prompt_version", "context_hash",
+                         "selection_strategy", "fallback_reason") if key in planning})
     session.setdefault("adaptive_decision_receipts", []).append(receipt)
 
 

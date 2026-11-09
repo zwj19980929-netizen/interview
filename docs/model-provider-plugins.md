@@ -1,5 +1,9 @@
 # 模型供应商插件化设计
 
+## 089：下一题规划的临时故障处理
+
+Provider仍只报告原始协议及结构化错误；Supervisor仅对`retryable=true`的`provider_timeout / provider_server_error / provider_rate_limited / provider_circuit_open`，以及当前有界模型await的本地超时，使用已批准候选目录继续选题。原15秒/最多3次模型调用及中央格式校验不变，不增加供应商重试或切换模型；认证、计费、Schema失败和取消不会被转换为正常答案。选题回退不适用于回答理解、STT或评分失败。保留原模型调用失败审计，并将固定策略/原因写入规划收据，不记录敏感响应。
+
 ## 087：临时转写与分析取消来源
 
 供应商协议、原始转写和模型调用上限保持。字幕partial/final投影仅作为撤销当前推进资格的通知，完整证据来源由原稳定preview/权威snapshot验证。分析取消诊断新增白名单`source=stable_evidence`，不记录候选原话；partial不再取消纯分析，也不刷新该分析的次数或时间。详见[087](provisional-transcript-preparation-087.md)。

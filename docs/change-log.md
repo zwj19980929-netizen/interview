@@ -2,6 +2,31 @@
 
 本文件记录所有会修改仓库内容的工作项。只读检查不单独登记；同一目标下的代码、测试、迁移和文档修改合并为一个工作项。状态使用 `in_progress`、`verified`、`failed` 或 `cancelled`，历史条目只追加或补充结果，不删除。
 
+## 2026-11-08 · INTERVIEW-FLOW-CONTINUITY-089
+
+- 状态：`verified（仓库全量与本机加载；真人长场次待验）`。
+- 用户要求：查明截图“下一话题暂时没准备好”的重试原因，恢复面试结束礼貌用语，将岗位题库与简历题库合计控制为8–10道主题，追问另计。开始时工作区干净，已提交的`ef5d277`作为本轮修复前基线，保留此前`4639d2b`与所有业务历史；相关源码、测试、前端和文档修改均归本项。
+- 只读现场：截图精确场次为`iv_a304dabcf1a243c7`，不是最初按截图辨识的省略字符串。07:10:45Z第9道主题答案已提交，07:10:59Z下一题规划调用出现`provider_timeout`（14203ms、单次尝试）；07:11:48Z重试规划成功，评分独立成功，未见本次回答丢失。计划9道岗位原题与3道简历原题拆成56个单元，41项能力强制覆盖需要28单元，代码将请求9题扩大为28–28；实际14道主题加2追问、约46分钟后因时间预算结束。
+- 结束语证据：07:26:30Z结束候选输入后，`_plan_next`先发带completion的snapshot，再进入告别；前端收回执立即关闭，07:26:31Z媒体断开，未创建closing act。另需覆盖评分提前完成时终态清理只等待presentation task、漏掉planning task的竞态。
+- 实施计划：在现有Supervisor seam增加仅限可恢复模型选题故障的有界连续性处理，复用已批准候选和最终事务围栏；正常结束先完成礼貌告别的送达/有界排空再发最终完成回执，刷新和断线仍能正确终态恢复；统一各入口总主题上限，禁止覆盖要求自动扩容，追问独立计数、未考察能力明确证据不足。同步接口/领域/检索评分及相关文档，先补故障复现与负例，再执行相关、完整后端与前端回归。
+- 操作边界：真实场次、录音、回答与冻结历史合同保持；不自动重放、重试、补交或重新评分截图场次。任何运行加载须在验证通过后复核媒体/owner/worker空闲并沿用安全配置；实际文件、失败、验证、加载与未完成事项结束时补记。
+
+
+- 实施与阶段验证：Supervisor可恢复四类结构化供应商故障或本次模型await超时后，重算预算，按完整批准目录现有排序提出合法单元；保留原15秒/3次、最终事务围栏与安全诊断收据。正常告别新增仅连接级closing投影和独立准备任务，收音/动作关闭而播放保留；终态清理等待实际准备，旧owner/controller晚返拒绝。统一primary_question_budget，新增冻结抽样覆盖策略`sampled_answered_roots.v1`，历史执行覆盖不重写hash；v2预算跳过报告未考察，不零分、不重配原权重。针对回退28项、预算138项、告别后端53项/前端211项分别通过，红测试据保留。前端完整529项通过，临时目录构建通过（既有大chunk提示）；完整后端仍在执行。
+- 首轮发布预检：媒体room/participant/active egress、owner、Evidence命令及非终态Outbox均0；因截图场次旧capture仍stopping而安全阻断，未停服。只读核实精确egress `EG_wVWgzaD9wTvb`已EGRESS_COMPLETE，文件封存任务8次失败后dead_letter；录制结束不等于封存成功。本轮不重放死信或改写capture。发布脚本仅对该精确capture/session/egress/deadletter绑定，在场次report_ready且输入已封闭、LiveKit按ID确认终态及全部活动为0时作不活动分类，其余记录仍阻断。
+- 发布准备：原088 runner复制为`/private/tmp/interviewer-089-release.py`，限定原API86662/worker86663及原运行摘要，配置仅内存、TTY恢复、正常TERM与无重复启动保持。本轮无Prompt/provider协议改动，发布证据改为完整后端/前端/构建与全文件集合hash，而非复用088真实模型证明；停服前、启动前、恢复及最终验收再次核验。11项隔离检查通过，无真实进程信号或环境读取。只读SQL初查使用不存在的kind列失败后改为JSON字段；一次定向测试命令引用不存在文件，随后纠正；均无业务副作用。
+
+- 首轮全量失败如实保留：588文件冻结后后端`4585 passed /32 failed /8 skipped /280.38秒`，日志`/private/tmp/interviewer-089-backend-full.log`，冻结证据另存`interviewer-089-first-tested-source.json`。没有发布。9项是旧v2测试仍把question_count当“岗位数另加简历”的合同迁移；其余大部分发现pending题遗留started_at被误计作已问题，正在修预算计数并覆盖v2混合旧字段；另3项为轻量channel替身缺新投影接口及告别独立任务的测试时间预算seam，需要保留原权限/排空断言并更新测试。不得用删除简历/下一题断言掩盖失败。
+
+- 全量失败修复：pending蓝图无论残留started_at都不计作已呈现；v2预算只取固定根题，不读取遗留自适应字段。补2项公共生命周期回归，9文件106项通过；两简历fixture仅改合计请求数1→4/1→2，保留原音频、评分、重试和下一题断言。远端轻量channel替身明确无告别权限，旧超时测试同时限定真实独立TTS准备期限，相关6文件153通过/1既有跳过。再次独立审查无阻断，588文件重冻后启动第二轮全量。
+
+- 最终冻结与验收：第二轮`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q`为`4619 passed /8 skipped /261.88秒`、退出0，日志`/private/tmp/interviewer-089-backend-full-final.log`；588文件集合与内容hash保持。前端`npm test -- --reporter=dot`为26文件529项通过，`npm run build -- --outDir /private/tmp/interviewer-089-web-dist`通过；未改变前端源码后不重复验收。构建按先不可变bundle、后原子index发布，保留全部旧bundle；61构建文件集合/内容受发布证明校验。后端231文件SHA=`d0a7f7769506bea87ad9f55cd4363f5e7b7e291d3ee4162c8ab342966a64806f`。新证明`/private/tmp/interviewer-089-test-attestation.json`绑定完整回归、构建、源码集合及原Prompt/provider无变更。340本地文档链接和diff --check通过，实际加载进行中。
+
+- 实际加载：2026-11-09T08:05:31Z（本地11月9日00:05）空闲窗口正常TERM原API86662/worker86663，启动API99185、worker/Beat99186，无强杀、无恢复分支、runner退出0。两个进程均返回231份源码及已测SHA `d0a7f7769506bea87ad9f55cd4363f5e7b7e291d3ee4162c8ab342966a64806f`，health/ready通过、worker/媒体均空闲。75份面试核心摘要前后同为`3c84f7f19b9f5c2bfb364338d953a33f2721ea8b75344425577f51973b4f347b`；例外仅精确历史未封存capture，不伪造成功。运行日志为`/private/tmp/interviewer-089-{api,worker}.log`。
+- 前端实际生效：8000静态HTML与已构建index字节一致；5174开发页面确认新的closing逻辑与合计10题限制，健康代理及runtime-release端点200并指向同一新源码摘要。前端Vite进程继续使用既有开发热更新，未声称其PID已重启；生产式静态入口已经发布新bundle，旧bundle保留。
+- 实际文件：新增`app/domain/primary_question_budget.py`；修改`adaptive_interview.py`、`interview_lifecycle.py`、`scoring_quality.py`、`schemas/api.py`，服务`interviewer_supervisor/{context,service,tools}.py`、`interviews.py`、`interview_agent.py`、`livekit_evidence_ingress.py`、`plan_assembly.py`、`reports.py`；前端candidate、agent-event-runtime、plans及对应测试、构建入口与2个新bundle。新增4个089后端测试文件，修改4个旧测试fixture/seam。同步CONTEXT、架构、接口、领域、检索评分、供应商、数据库、已知问题、开发进度、路线图及本日志。没有DDL、Prompt、供应商路由、STT或旧答案/评分改写。
+- 交付边界：588文件及61构建文件再次核对通过，保存独立Git修复提交，不push、不重写历史。已解决本次三条路径；真人语音长场次、真实网络故障与外部供应商长期表现仍待复试。历史录音`media_capture_5da560601220413b`录制已结束，但文件封存死信仍未处理；保留原记录与失败，不重放真实业务。源码回退可用`ef5d277`及更早`4639d2b`，代码回退不等于数据库回滚。
+
 ## 2026-11-08 · INTERVIEW-CONTINUITY-RELEASE-088
 
 - 状态：`verified（仓库全量、真实模型虚构样例与本机加载；真人长场次待验）`。

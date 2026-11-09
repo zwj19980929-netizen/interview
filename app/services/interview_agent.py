@@ -25,6 +25,7 @@ from app.core.interview_agent_metrics import (
 )
 from app.core.time import utc_now
 from app.domain.adaptive_interview import is_adaptive
+from app.domain.primary_question_budget import primary_question_budget
 from app.core.prompt.contracts import SUPPLEMENT_SPEECH_VERSION
 from app.core.prompt.fixed_speech import WARMUP_CONFIRMATION_SPEECH
 from app.services.fixed_speech_preparation import cached_fixed_speech, prepare_fixed_speech_for_session
@@ -145,6 +146,7 @@ class _AgentChannelHub:
                     channel.principal,
                     interview_id=channel.interview_id,
                     live_payload=live_payload,
+                    live_channel=channel,
                 )
                 channel._enqueue_event(projected)
             except Exception:
@@ -204,6 +206,7 @@ class _AgentChannelHub:
                         event,
                         channel.principal,
                         interview_id=channel.interview_id,
+                        live_channel=channel,
                     )
                     channel._enqueue_event(projected)
                     delivered += 1
@@ -283,6 +286,7 @@ class AgentChannel:
         self._endpoint_task: Optional[asyncio.Task[None]] = None
         self._planning_task: Optional[asyncio.Task[None]] = None
         self._completion_task: Optional[asyncio.Task[None]] = None
+        self._completion_preparation_task: Optional[asyncio.Task[None]] = None
         self._completion_evidence_cleanup_task: Optional[asyncio.Task[None]] = None
         self._stt: Optional[StreamingInterviewSTT] = None
         self._warmup: Optional[WarmupCalibrationStream] = None
@@ -327,7 +331,7 @@ class AgentChannel:
                 continue
             self._enqueue_event(
                 self.runtime._project_event_for_principal(
-                    event, self.principal, interview_id=self.interview_id
+                    event, self.principal, interview_id=self.interview_id, live_channel=self
                 )
             )
         if recovery_gap:
@@ -350,6 +354,7 @@ class AgentChannel:
                     gap_event,
                     self.principal,
                     interview_id=self.interview_id,
+                    live_channel=self,
                 )
             )
         fresh_snapshot = await self._queue_fresh_snapshot()
@@ -464,6 +469,9 @@ class AgentChannel:
         self._closed = True
         self._terminating = True
         self._cancel_planning()
+        preparing = self._completion_preparation_task
+        if preparing is not None and preparing is not asyncio.current_task():
+            preparing.cancel()
         failure: Optional[BaseException] = None
         if self._speech_output is not None:
             try:
@@ -1386,123 +1394,15 @@ class AgentChannel:
         if session.get("status") in {"completed", "report_generating", "report_ready"} or session.get(
             "candidate_input_completed_at"
         ):
-            from app.services.evidence_coordination import assert_current_evidence_fence
-
-            closing_evidence_session = self._evidence_session
-            closing_fence = (
-                closing_evidence_session.ownership.commit_fence()
-                if closing_evidence_session is not None and closing_evidence_session.ownership is not None
-                else None
-            )
-            closing_turn_id = session.get("current_turn_id")
-
-            def closing_is_current() -> bool:
-                if self._closed or self._terminating:
-                    return False
-                if closing_evidence_session is not None and (
-                    self._evidence_session is not closing_evidence_session
-                    or closing_evidence_session._stopped or closing_fence is None
-                ):
-                    return False
-                try:
-                    with self.runtime.persistence.transaction(self.organization_id, read_only=True) as transaction:
-                        if closing_fence is not None:
-                            assert_current_evidence_fence(transaction, closing_fence)
-                        current = transaction.interview_sessions.realtime_state(self.interview_id)
-                        if not current or current.get("current_turn_id") != closing_turn_id:
-                            return False
-                        state = current.get("agent_runtime") or {}
-                        if state.get("floor") == "human" or (state.get("takeover") or {}).get("status") == "active":
-                            return False
-                        return current.get("status") in {"completed", "report_generating", "report_ready"} or (
-                            current.get("status") == "in_progress" and bool(current.get("candidate_input_completed_at"))
-                        )
-                except ApiError:
-                    return False
-
-            runtime_state = session.get("agent_runtime") or {}
-            if runtime_state.get("completion_emitted_at"):
-                return
-            if runtime_state.get("completion_closing_performance_id"):
-                return
-            terminal_takeover = self.runtime._consume_takeover_for_terminal(
-                self.interview_id, self.organization_id
-            )
-            if terminal_takeover:
-                await self.runtime._disconnect_takeover_media(
-                    self.interview_id,
-                    terminal_takeover,
-                    self.organization_id,
-                )
+            task = self._completion_preparation_task
+            if task is None or task.done():
+                task = asyncio.create_task(self._present_completion(session, causation_id))
+                self._completion_preparation_task = task
             try:
-                await asyncio.wait_for(self.runtime.media_captures.stop_for_interview(
-                    self.interview_id,
-                    actor_id=self.principal.actor_id,
-                    organization_id=self.organization_id,
-                ), timeout=_COMPLETION_RECORDING_TIMEOUT)
-            except Exception as exc:
-                # Candidate input is already sealed. Keep recording failures
-                # visible and ensure unsettled captures have durable work;
-                # neither condition can withdraw the completion receipt.
-                _LOG.warning("Completion recording cleanup unavailable: error_type=%s", type(exc).__name__)
-                try:
-                    self.runtime.media_captures.request_finalization(
-                        self.interview_id, actor_id=self.principal.actor_id,
-                        organization_id=self.organization_id,
-                    )
-                except Exception as retry_exc:
-                    _LOG.warning("Completion recording recovery unavailable: error_type=%s", type(retry_exc).__name__)
-            # Keep the original Evidence owner through farewell preparation.
-            # Releasing it here invalidated closing_is_current and prevented
-            # both the farewell and receipt. All callers release it after the
-            # receipt, including managed callers while scoring is still queued.
-            if not closing_is_current():
-                return
-            try:
-                performance = await asyncio.wait_for(self._select_act(
-                    act_type="closing",
-                    text=(
-                        "本次面试已经完成，感谢你的时间。你的回答已按同意范围提交，"
-                        "后续将由企业人员进行最终审核。再见。"
-                    ),
-                    turn_id=None,
-                    causation_id=causation_id,
-                    evidence_refs=[],
-                    gesture="farewell",
-                ), timeout=_COMPLETION_PREPARATION_TIMEOUT)
-            except asyncio.TimeoutError:
-                performance = None
-            # None can mean lost authority, not merely unavailable TTS. A
-            # paused/replaced owner must not mint a completion receipt or arm
-            # a timer after its delayed farewell result returns.
-            if not closing_is_current():
-                return
-            if performance is None:
-                await self._finalize_completion(
-                    causation_id=causation_id,
-                    reason="farewell_expression_unavailable",
-                )
-                return
-            self.runtime._mark_completion_closing(
-                self.interview_id,
-                performance.performance_id,
-                self.organization_id,
-            )
-            timeout_ms = min(
-                10_000,
-                max(
-                    cue.at_ms + cue.duration_ms
-                    for cue in performance.visemes
-                )
-                + 2_000,
-            )
-            self._completion_task = asyncio.create_task(
-                self._completion_after_timeout(
-                    performance.performance_id,
-                    timeout_ms,
-                    causation_id,
-                )
-            )
+                await task
+            finally:
+                if self._completion_preparation_task is task:
+                    self._completion_preparation_task = None
             return
         if conversation_action_selected:
             return
@@ -1511,6 +1411,128 @@ class AgentChannel:
             await self._select_turn(current, causation_id)
         else:
             await self._set_floor(FloorOwner.NONE, "understanding", causation_id)
+
+    async def _present_completion(self, session: Dict[str, Any], causation_id: Optional[str]) -> None:
+        from app.services.evidence_coordination import assert_current_evidence_fence
+
+        closing_evidence_session = self._evidence_session
+        closing_fence = (
+            closing_evidence_session.ownership.commit_fence()
+            if closing_evidence_session is not None and closing_evidence_session.ownership is not None
+            else None
+        )
+        closing_turn_id = session.get("current_turn_id")
+
+        def closing_is_current() -> bool:
+            if self._closed or self._terminating:
+                return False
+            if closing_evidence_session is not None and (
+                self._evidence_session is not closing_evidence_session
+                or closing_evidence_session._stopped or closing_fence is None
+            ):
+                return False
+            try:
+                if closing_evidence_session is not None:
+                    closing_evidence_session.assert_controller(self)
+                with self.runtime.persistence.transaction(self.organization_id, read_only=True) as transaction:
+                    if closing_fence is not None:
+                        assert_current_evidence_fence(transaction, closing_fence)
+                    current = transaction.interview_sessions.realtime_state(self.interview_id)
+                    if not current or current.get("current_turn_id") != closing_turn_id:
+                        return False
+                    state = current.get("agent_runtime") or {}
+                    if state.get("floor") == "human" or (state.get("takeover") or {}).get("status") == "active":
+                        return False
+                    return current.get("status") in {"completed", "report_generating", "report_ready"} or (
+                        current.get("status") == "in_progress" and bool(current.get("candidate_input_completed_at"))
+                    )
+            except ApiError:
+                return False
+
+        runtime_state = session.get("agent_runtime") or {}
+        if runtime_state.get("completion_emitted_at"):
+            return
+        if runtime_state.get("completion_closing_performance_id"):
+            return
+        terminal_takeover = self.runtime._consume_takeover_for_terminal(
+            self.interview_id, self.organization_id
+        )
+        if terminal_takeover:
+            await self.runtime._disconnect_takeover_media(
+                self.interview_id,
+                terminal_takeover,
+                self.organization_id,
+            )
+        try:
+            await asyncio.wait_for(self.runtime.media_captures.stop_for_interview(
+                self.interview_id,
+                actor_id=self.principal.actor_id,
+                organization_id=self.organization_id,
+            ), timeout=_COMPLETION_RECORDING_TIMEOUT)
+        except Exception as exc:
+            # Candidate input is already sealed. Keep recording failures
+            # visible and ensure unsettled captures have durable work;
+            # neither condition can withdraw the completion receipt.
+            _LOG.warning("Completion recording cleanup unavailable: error_type=%s", type(exc).__name__)
+            try:
+                self.runtime.media_captures.request_finalization(
+                    self.interview_id, actor_id=self.principal.actor_id,
+                    organization_id=self.organization_id,
+                )
+            except Exception as retry_exc:
+                _LOG.warning("Completion recording recovery unavailable: error_type=%s", type(retry_exc).__name__)
+        # Keep the original Evidence owner through farewell preparation.
+        # Releasing it here invalidated closing_is_current and prevented
+        # both the farewell and receipt. All callers release it after the
+        # receipt, including managed callers while scoring is still queued.
+        if not closing_is_current():
+            return
+        try:
+            performance = await asyncio.wait_for(self._select_act(
+                act_type="closing",
+                text=(
+                    "本次面试已经完成，感谢你的时间。你的回答已按同意范围提交，"
+                    "后续将由企业人员进行最终审核。再见。"
+                ),
+                turn_id=None,
+                causation_id=causation_id,
+                evidence_refs=[],
+                gesture="farewell",
+            ), timeout=_COMPLETION_PREPARATION_TIMEOUT)
+        except asyncio.TimeoutError:
+            performance = None
+        # None can mean lost authority, not merely unavailable TTS. A
+        # paused/replaced owner must not mint a completion receipt or arm
+        # a timer after its delayed farewell result returns.
+        if not closing_is_current():
+            return
+        if performance is None:
+            await self._finalize_completion(
+                causation_id=causation_id,
+                reason="farewell_expression_unavailable",
+            )
+            return
+        self.runtime._mark_completion_closing(
+            self.interview_id,
+            performance.performance_id,
+            self.organization_id,
+        )
+        timeout_ms = min(
+            10_000,
+            max(
+                cue.at_ms + cue.duration_ms
+                for cue in performance.visemes
+            )
+            + 2_000,
+        )
+        self._completion_task = asyncio.create_task(
+            self._completion_after_timeout(
+                performance.performance_id,
+                timeout_ms,
+                causation_id,
+            )
+        )
+        return
 
     async def _completion_after_timeout(
         self,
@@ -1576,6 +1598,34 @@ class AgentChannel:
             await self._set_floor(FloorOwner.NONE, "completed", causation_id)
         finally:
             self._schedule_completion_evidence_cleanup()
+
+    def _completion_presentation_pending(self, session: Dict[str, Any]) -> bool:
+        """Only the original fenced controller may defer its live receipt UI.
+
+        This is a connection-specific presentation fact, never permission to
+        collect more input. Fresh connections and HTTP reads keep the durable
+        completion receipt, including when the original process is gone.
+        """
+        state = session.get("agent_runtime") or {}
+        evidence = self._evidence_session
+        if (self._closed or self._terminating or not session.get("candidate_input_completed_at")
+                or session.get("id") != self.interview_id
+                or evidence is None or getattr(evidence, "_stopped", True)
+                or session.get("status") not in {"in_progress", "completed", "report_generating", "report_ready"}
+                or state.get("completion_emitted_at") or state.get("floor") == "human"
+                or (state.get("takeover") or {}).get("status") == "active"
+                or session.get("skill_authorization_blocked")):
+            return False
+        work = (self._completion_preparation_task, self._planning_task, getattr(evidence, "_presentation_task", None))
+        if not state.get("completion_closing_performance_id") and not any(
+            task is not None and not task.done() for task in work
+        ):
+            return False
+        try:
+            evidence.assert_controller(self)
+        except ApiError:
+            return False
+        return True
 
     def _schedule_completion_evidence_cleanup(self) -> None:
         evidence = self._evidence_session
@@ -2219,6 +2269,8 @@ class AgentChannel:
             try:
                 if approval_guard is not None:
                     approval_guard()
+                if act_type == "closing" and evidence_session is not None:
+                    evidence_session.assert_controller(self)
                 if act_type == "warmup_confirmation" and evidence_session is not None:
                     # This check opens its own ownership transaction. Never
                     # nest it under the read snapshot below (SQLite locks).
@@ -3055,6 +3107,7 @@ class AgentChannel:
                 event,
                 self.principal,
                 interview_id=self.interview_id,
+                live_channel=self,
             )
         )
         # A private checkpoint still consumes a shared session sequence.
@@ -3433,7 +3486,7 @@ class InterviewAgentRuntime:
             "completed_answers": len({answer.get("turn_id") for answer in session.get("answers", [])}
                                      & {turn["id"] for turn in session.get("turns", [])
                                         if not turn.get("is_followup")}),
-            "total_primary_questions": None if is_adaptive(session) else len([item for item in session.get("turns", []) if not item.get("is_followup")]),
+            "total_primary_questions": None if is_adaptive(session) else primary_question_budget(session)["max_root_questions"],
             "execution_schema_version": 3 if is_adaptive(session) else 2,
             "dialogue_state": session.get("dialogue_state"),
             "planning_problem": deepcopy((session.get("agent_runtime") or {}).get("planning_problem")),
@@ -3638,6 +3691,7 @@ class InterviewAgentRuntime:
         *,
         interview_id: str,
         live_payload: Optional[Dict[str, Any]] = None,
+        live_channel: Optional[AgentChannel] = None,
     ) -> AgentEvent:
         """Project one event without mutating its shared persisted envelope."""
 
@@ -3646,6 +3700,8 @@ class InterviewAgentRuntime:
                 interview_id, principal.organization_id
             )
             payload = self._snapshot(session, principal)
+            if live_channel is not None and live_channel._completion_presentation_pending(session):
+                payload["completion_presentation"] = "closing"
         else:
             source = live_payload if live_payload is not None else event.payload
             restricted = (

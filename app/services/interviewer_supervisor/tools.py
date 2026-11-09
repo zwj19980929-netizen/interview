@@ -125,6 +125,16 @@ class InterviewerTools:
     def catalog(self):
         return self.catalog_page()["items"]
 
+    def fallback_selection(self):
+        """Use the full approved catalog's existing evidence ranking, not a model page."""
+        for row in self._catalog_rows():
+            if self.remaining_seconds is not None and row["expected_seconds"] > self.remaining_seconds:
+                continue
+            unit_id = (row["inquiry_units"] or [{}])[0].get("id")
+            self.require_selection(row["question_id"], unit_id)
+            return row["question_id"], unit_id
+        return None
+
     def require_selection(self, question_id: str, unit_id: Optional[str]) -> None:
         question = self.candidates.get(question_id)
         if question is None:

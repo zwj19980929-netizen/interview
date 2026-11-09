@@ -103,6 +103,9 @@ def test_terminal_evaluation_during_prepared_farewell_keeps_completion_authority
         monkeypatch.setattr(channel, "_select_act", held_farewell)
         monkeypatch.setattr(runtime.media_captures, "stop_for_interview", stop_recording)
         monkeypatch.setattr(livekit_evidence_ingress, "_TERMINAL_PRESENTATION_GRACE_SECONDS", 0.06)
+        # Closing now has its own bounded task; exercise its actual TTS limit
+        # as well as the outer cleanup wait without weakening owner assertions.
+        monkeypatch.setattr("app.services.interview_agent._COMPLETION_PREPARATION_TIMEOUT", 0.06)
         with persistence_for(store).transaction("org_default") as transaction:
             session = transaction.interview_sessions.get(saved["id"])
             session["candidate_input_completed_at"] = utc_now()

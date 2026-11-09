@@ -2444,6 +2444,16 @@ class ManagedLiveKitEvidenceSession:
         except ApiError:
             return None
 
+    def _terminal_presentation_task(self) -> Optional[asyncio.Task]:
+        source = self._channel or self._event_source
+        preparing = getattr(source, "_completion_preparation_task", None)
+        if preparing is not None and not preparing.done():
+            return preparing
+        planning = getattr(source, "_planning_task", None)
+        if planning is not None and not planning.done():
+            return planning
+        return self._presentation_task
+
     async def _finish_terminal_presentation(self) -> None:
         """Allow a bounded farewell setup before releasing its live owner.
 
@@ -2452,14 +2462,21 @@ class ManagedLiveKitEvidenceSession:
         set ``_stopped`` immediately and cancel the presentation through their
         existing paths; this grace must never restore that lost authority.
         """
-        task = self._presentation_task
+        task = self._terminal_presentation_task()
         source = self._channel or self._event_source
         ownership = self.ownership
+        was_channel_work = task is not None and task in (getattr(source, "_planning_task", None), getattr(source, "_completion_preparation_task", None))
         if task is None or task is asyncio.current_task():
             return
 
         def current_terminal_state() -> Optional[Dict[str, Any]]:
-            if self._presentation_task is not task:
+            # Finished channel work clears its slot; a different live task
+            # may never inherit the old wait's right to finalize completion.
+            if was_channel_work:
+                current = self._terminal_presentation_task()
+                if current is not task and current is not None and not current.done():
+                    return None
+            elif self._presentation_task is not task:
                 return None
             return self._terminal_controller_state(source, ownership)
 
@@ -2488,7 +2505,7 @@ class ManagedLiveKitEvidenceSession:
         Pending scores can keep the interview in progress. They do not justify
         cancelling a presentation that is still returning from receipt emission.
         """
-        task = self._presentation_task
+        task = self._terminal_presentation_task()
         if task is None or task is asyncio.current_task():
             return
         await self._await_presentation_task(task)
@@ -2497,7 +2514,12 @@ class ManagedLiveKitEvidenceSession:
 
     async def _await_presentation_task(self, task: asyncio.Task[None]) -> None:
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=_TERMINAL_PRESENTATION_GRACE_SECONDS)
+            source = self._channel or self._event_source
+            grace = _TERMINAL_PRESENTATION_GRACE_SECONDS
+            if task in (getattr(source, "_planning_task", None), getattr(source, "_completion_preparation_task", None)):
+                from app.services.interview_agent import _COMPLETION_RECORDING_TIMEOUT, _COMPLETION_PREPARATION_TIMEOUT
+                grace = max(grace, _COMPLETION_RECORDING_TIMEOUT + _COMPLETION_PREPARATION_TIMEOUT + 1.0)
+            await asyncio.wait_for(asyncio.shield(task), timeout=grace)
         except asyncio.TimeoutError:
             task.cancel()
             # A misbehaving provider may suppress cancellation. It must not
@@ -2515,6 +2537,11 @@ class ManagedLiveKitEvidenceSession:
     def _detach_presentation_task(self, task: asyncio.Task[None]) -> None:
         if self._presentation_task is task:
             self._presentation_task = None
+        source = self._channel or self._event_source
+        if task is getattr(source, "_planning_task", None):
+            source._planning_task = None
+        if task is getattr(source, "_completion_preparation_task", None):
+            source._completion_preparation_task = None
         task.add_done_callback(lambda completed: None if completed.cancelled() else completed.exception())
 
     async def _cancel_presentation_bounded(self, task: asyncio.Task[None]) -> None:

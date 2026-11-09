@@ -144,7 +144,7 @@ function PlanDetail({ planId, onUpdated, onBack, onCreate }) {
       {plan.status === "approved" && <div className="plans-callout is-ready" role="status"><div><strong>计划已启用，可以安排面试</strong><p>到面试会话页创建预约，选择这位候选人和本计划。</p></div><a className="button button-secondary" href="#interviews">去安排面试 <span aria-hidden="true">→</span></a></div>}
       <div className="plans-detail-layout">
         <section className="plans-section" aria-label="计划考察内容">
-          <header><h2>{modern ? "面试问题" : "原定考察安排"}</h2><p>{modern ? "每次只围绕一个重点交流。展开评分依据，可以查看具体考察点。" : "这份计划按创建时的题序进行，保留原有安排。"}</p></header>
+          <header><h2>{modern ? "候选问题池" : "原定考察安排"}</h2><p>{modern ? "下列内容供面试官选择，不会全部提问。岗位题和简历题合计最多 10 道主问题，追问单独计算；未考察的能力会在报告中注明证据不足。" : "这份计划保留原有题序和评分安排，实际提问受合计最多 10 道主问题的限制；追问单独计算。"}</p></header>
           {modern ? questions.map((question, index) => <section className="plans-question-group" key={question.question_id}>
             <div className="plans-question-head"><span className="plans-question-number">{String(index + 1).padStart(2, "0")}</span><div><h3>{question.frozen_question?.title || `考察方向 ${index + 1}`}</h3><p>{question.source_type === "resume_experience" ? "来自简历经历" : "来自岗位题库"} · {question.inquiry_units?.length || 0} 个可选问题</p></div></div>
             <ol className="plans-question-list">{(question.inquiry_units || []).map((unit) => <li className="plans-question-item" key={unit.id}>

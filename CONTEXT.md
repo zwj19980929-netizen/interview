@@ -1,5 +1,9 @@
 # Interviewer Domain
 
+## 089：整场主题预算与告别呈现
+
+主题指非追问的正式根轮次，两类来源合计正常8–10题，追问独立计数；原题拆分单元属于可选范围，不是全部必须问完。历史批准合同与当前执行题数限制是两种事实，未问能力只代表证据不足。`completion_presentation=closing`只表示原有效连接还在播放告别，不表示候选输入重新开放或完成回执失效。选题模型临时故障恢复仍是批准范围内的提案，不是回答理解或评分结果。
+
 ## 2026-11-02 · 交流控制与未评估证据（086）
 
 退出请求只代表需要询问是否结束；独立退出确认是已实际送达的问题和之后新回复形成的服务端证据，不是技术完成依据。PreparedCandidateExit不含技术理解或claims。确认后本题的原始发言和录音记为exit_evidence/not_evaluated，报告以unassessed_retained_evidence供人工复核，不计作拒答、零分或已完成答案；已完成题维持原评分。见[086](docs/conversation-control-autonomy-086.md)。

@@ -8,6 +8,9 @@ from app.core.ids import new_id
 from app.core.time import utc_now
 from app.domain.candidate_runtime import CANDIDATE_RUNTIME_PROBLEM_REASONS, runtime_pause_epoch
 from app.domain.evaluation_evidence import evidence_fingerprint
+from app.domain.primary_question_budget import (
+    apply_primary_question_budget, primary_question_budget, started_primary_question_count,
+)
 from app.domain.adaptive_interview import (
     append_adaptive_question, assessment_contract, budget_summary, coverage_summary,
     closed_source_question_ids, is_adaptive, record_decision, validate_decision,
@@ -170,6 +173,7 @@ class InterviewSessionLifecycle:
         session["status"] = "in_progress"
         session["started_at"] = session.get("started_at") or now
         session["interruption"] = None
+        self._apply_primary_question_budget(session, now, events)
         turn = self._first_turn_with_status(session, ("asking", "pending"))
         if turn is not None:
             turn["status"] = "asking"
@@ -404,6 +408,7 @@ class InterviewSessionLifecycle:
             self._invalid("SELECT_NEXT requires execution schema version 3.")
         if not validate_decision(session, payload, "select_next"):
             return
+        self._apply_primary_question_budget(session, now, events)
         turn = append_adaptive_question(session, payload.get("question_id"), payload["decision_id"], now,
                                         inquiry_unit_id=payload.get("inquiry_unit_id"))
         record_decision(session, payload, "select_next", now)
@@ -428,6 +433,7 @@ class InterviewSessionLifecycle:
             allowed.update({"scheduled", "waiting"})
         if session.get("status") not in allowed or session.get("candidate_input_completed_at"):
             self._invalid("Candidate input has already ended or cannot be ended from this state.")
+        self._apply_primary_question_budget(session, now, events)
         coverage = coverage_summary(session) if adaptive else {
             "sufficient": False, "missing_required_competencies": [],
             "reason": "candidate_requested_before_fixed_plan_completion",
@@ -1091,8 +1097,16 @@ class InterviewSessionLifecycle:
             self._emit(session, events, "interview.awaiting_next_decision", {}, now)
 
     def _next_playable_turn(self, session: Document, now: str, events: List[Document]) -> Optional[Document]:
+        self._apply_primary_question_budget(session, now, events)
         while True:
             turn = self._first_turn_with_status(session, ("pending",))
+            if (turn is not None and not turn.get("is_followup")
+                    and started_primary_question_count(session) >= primary_question_budget(session)["max_root_questions"]):
+                turn.update(status="skipped", skip_reason="primary_question_budget_exhausted", completed_at=now)
+                self._emit(session, events, "turn.skipped", {
+                    "turn_id": turn["id"], "reason": turn["skip_reason"],
+                }, now)
+                continue
             if turn is None or not turn.get("deferred_speech"):
                 return turn
             prepared = turn.get("speech_preparation") or {}
@@ -1104,6 +1118,11 @@ class InterviewSessionLifecycle:
             self._emit(session, events, "turn.skipped", {
                 "turn_id": turn["id"], "reason": turn["skip_reason"], "source_type": "resume_experience",
             }, now)
+
+    def _apply_primary_question_budget(self, session: Document, now: str, events: List[Document]) -> None:
+        applied = apply_primary_question_budget(session, now)
+        if applied is not None:
+            self._emit(session, events, "interview.question_budget_applied", applied, now)
 
     @staticmethod
     def _has_unresolved_evaluations(session: Document) -> bool:

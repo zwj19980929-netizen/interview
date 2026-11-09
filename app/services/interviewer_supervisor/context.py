@@ -80,6 +80,7 @@ def context_fingerprint(session: Dict[str, Any]) -> str:
         "takeover": {key: (session.get("agent_runtime", {}).get("takeover") or {}).get(key)
                      for key in ("lease_id", "version", "status", "expires_at")},
         "contract": assessment_contract(session),
+        "execution_question_budget": session.get("execution_question_budget"),
         "skill_snapshot": (session.get("plan_snapshot") or {}).get("enterprise_skill_snapshot"),
         "company_context": (session.get("plan_snapshot") or {}).get("company_context"),
         "agenda": session.get("agenda"), "competency_evidence": session.get("competency_evidence"),

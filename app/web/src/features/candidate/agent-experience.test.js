@@ -3355,6 +3355,66 @@ describe("completed candidate media lifecycle", () => {
     await run.close();
   });
 
+  it.each(["in_progress", "completed", "report_generating", "report_ready"])("keeps the current farewell audible when a %s snapshot seals input", async status => {
+    const { run, socket, media, captureResource, mediaCallbacks, liveSink, capture, ring } = await openPlaybackHarness();
+    socket.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", candidateSnapshot())) });
+    const closing = { ...candidateSnapshot(), status, current_turn_id: null, current_question: null,
+      completion: receipt, completion_presentation: "closing", floor: "none" };
+    socket.emit("message", { data: JSON.stringify(candidateEvent(2, "session.snapshot", closing)) });
+    await flushPlaybackEvents();
+    expect(run.getSnapshot()).toMatchObject({ completion: null, phase: "closing", evidence: { ready: false } });
+    expect(media.close).not.toHaveBeenCalled();
+    expect(socket.readyState).toBe(WebSocket.OPEN);
+    expect(await run.act({ type: "finish_answer" })).toBe(false);
+    expect(await run.act({ type: "pause" })).toBe(false);
+    const before = socket.sent.length;
+    await capture.onSpeechStarted();
+    capture.onSpeechStopped();
+    capture.onPcm(new ArrayBuffer(640));
+    expect(ring.append).not.toHaveBeenCalled();
+    expect(socket.sent).toHaveLength(before);
+    const performance = { ...livePerformance(), turn_id: null };
+    socket.emit("message", { data: JSON.stringify({ ...candidateEvent(3, "avatar.performance.started", performance), turn_id: null, replayability: "transient" }) });
+    const track = liveTrack(performance);
+    mediaCallbacks.onRemoteAudioTrack(track, { trackSid: track.sid, trackName: performance.live_audio.track_name }, { identity: performance.live_audio.publisher_identity });
+    await flushPlaybackEvents();
+    const packet = new Uint8Array(976), view = new DataView(packet.buffer);
+    view.setUint32(0, 0x49415331); view.setUint32(4, 1); view.setUint32(8, 0); view.setUint32(12, 24000);
+    mediaCallbacks.onApprovedAudioData(packet, { identity: performance.live_audio.publisher_identity, metadata: '{"role":"approved_expression"}' }, `interviewer.approved-pcm.${performance.live_audio.output_id}`);
+    liveSink.progress({ consumed: 480, renderedUntil: 1, firstRenderStart: 0, producing: true, drained: false });
+    expect(run.getSnapshot()).toMatchObject({ phase: "closing", avatar: { status: "speaking", performanceId: performance.performance_id } });
+    socket.emit("message", { data: JSON.stringify(candidateEvent(4, "session.snapshot", { ...closing, active_performance_id: performance.performance_id })) });
+    await flushPlaybackEvents();
+    expect(run.getSnapshot().avatar.performanceId).toBe(performance.performance_id);
+    expect(liveSink.close).not.toHaveBeenCalled();
+    expect(media.close).not.toHaveBeenCalled();
+    socket.emit("message", { data: JSON.stringify(candidateEvent(5, "completed", receipt)) });
+    await flushPlaybackEvents();
+    expect(run.getSnapshot()).toMatchObject({ completion: receipt, phase: "completed" });
+    expect(media.close).toHaveBeenCalledOnce();
+    expect(captureResource.close).toHaveBeenCalledOnce();
+    await run.close();
+  });
+
+  it("uses the sealed-input receipt when farewell playback fails instead of pausing the finished interview", async () => {
+    const { run, socket, media, mediaCallbacks, request } = await openPlaybackHarness();
+    const performance = { ...livePerformance(), turn_id: null }, track = liveTrack(performance);
+    try {
+      socket.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", {
+        ...candidateSnapshot(), current_turn_id: null, current_question: null, floor: "agent", completion: receipt, completion_presentation: "closing",
+      })) });
+      socket.emit("message", { data: JSON.stringify({ ...candidateEvent(2, "avatar.performance.started", performance), turn_id: null, replayability: "transient" }) });
+      mediaCallbacks.onRemoteAudioTrack(track, { trackSid: track.sid, trackName: performance.live_audio.track_name }, { identity: performance.live_audio.publisher_identity });
+      await flushPlaybackEvents();
+      vi.useFakeTimers();
+      mediaCallbacks.onRemoteAudioTrackRemoved(track);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(run.getSnapshot()).toMatchObject({ completion: receipt, phase: "completed", problem: null });
+      expect(runtimeProblemCalls(request)).toHaveLength(0);
+      expect(media.close).toHaveBeenCalledOnce();
+    } finally { await run.close(); vi.useRealTimers(); }
+  });
+
   it("restores completion from a fresh snapshot without requiring the old completed event", async () => {
     const { run, socket, media, captureResource } = await openPlaybackHarness();
     socket.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", {

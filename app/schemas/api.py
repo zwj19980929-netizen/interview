@@ -213,7 +213,7 @@ class InterviewPlanGenerateRequest(BaseModel):
     job_position_id: str = Field(min_length=1)
     candidate_profile_id: str = Field(min_length=1)
     knowledge_base_ids: List[str] = Field(min_length=1)
-    question_count: int = Field(default=8, ge=1, le=50)
+    question_count: int = Field(default=8, ge=1, le=10)
     strategy: InterviewPlanStrategy = Field(default_factory=InterviewPlanStrategy)
     resume_review_id: Optional[str] = None
     approve: bool = False

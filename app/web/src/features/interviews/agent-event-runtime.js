@@ -92,7 +92,7 @@ const CANDIDATE_SNAPSHOT_KEYS = Object.freeze([
   "supplement_confirmation",
   "answer_preparation",
   "question_audio_recovery",
-  "completion",
+  "completion", "completion_presentation",
   "execution_schema_version", "dialogue_state", "planning_problem", "runtime_problem_code",
 ]);
 
@@ -347,6 +347,12 @@ function validateSnapshot(payload, audience) {
     !isPlainObject(payload.completion)
     || !validatePayload("completed", payload.completion, audience).ok
     || payload.completion.interview_id !== payload.interview_id
+  )) return invalidPayload("session.snapshot");
+  if (payload.completion_presentation !== undefined && (
+    payload.completion_presentation !== "closing" || !payload.completion
+    || !["in_progress", "completed", "report_generating", "report_ready"].includes(payload.status)
+    || payload.current_turn_id != null || payload.current_question != null
+    || !["none", "agent", "candidate"].includes(payload.floor)
   )) return invalidPayload("session.snapshot");
   const allowed = audience === "candidate" ? CANDIDATE_SNAPSHOT_KEYS : ENTERPRISE_SNAPSHOT_KEYS;
   if (!hasOnlyKeys(payload, allowed)) return invalid("AGENT_EVENT_ROLE_PROJECTION_INVALID", "snapshot contains fields outside its audience projection");

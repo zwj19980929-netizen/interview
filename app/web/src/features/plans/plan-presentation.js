@@ -14,9 +14,11 @@ export function planDate(value, withTime = false) {
 }
 
 export function planRange(plan) {
-  if (plan.execution_schema_version !== 3) return `${(plan.bank_slots?.length || 0) + (plan.experience_question_ids?.length || 0)} 道问题`;
+  if (plan.execution_schema_version !== 3) return `${Math.min(10, (plan.bank_slots?.length || 0) + (plan.experience_question_ids?.length || 0))} 道主问题`;
   const budget = plan.assessment_contract?.budget;
-  return budget?.min_root_questions && budget?.max_root_questions ? `${budget.min_root_questions}–${budget.max_root_questions} 个话题` : "根据面试情况选择话题";
+  if (!budget?.min_root_questions || !budget?.max_root_questions) return "合计最多 10 道主问题";
+  const minimum = Math.min(10, budget.min_root_questions), maximum = Math.min(10, budget.max_root_questions);
+  return minimum === maximum ? `${maximum} 道主问题` : `${minimum}–${maximum} 道主问题`;
 }
 
 export const planStatusLabels = { draft: "待审阅", approved: "已启用", archived: "已归档" };

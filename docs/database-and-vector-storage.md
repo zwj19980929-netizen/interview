@@ -1,5 +1,7 @@
 # 数据库与向量存储设计
 
+089：既有InterviewSession JSON新增可选`execution_question_budget`，以及预算应用生命周期事件、v2未考察原因；选题收据保留`selection_strategy`和`fallback_reason`安全诊断。均走组织事务及原版本比较，没有新表、索引或DDL；历史终态和冻结合同不批量迁移。连接级`completion_presentation=closing`只在实时投影出现，不持久化，也不授权新连接恢复作答。
+
 079：非流式ModelInvocation终态审计补`cancelled`及可选安全关联/时间/取消字段，沿用现有JSON持久化与组织事务，无新表、索引或DDL。开始事件只写结构化运行日志，避免将一次attempt重复统计为两次调用；取消不表示成功计费或供应商故障。历史调用审计不回填猜测原因，不修改候选音频、回答或评分。验证证据见[操作日志079](change-log.md)。
 
 078（仓库与本机已验证）：既有InterviewSession JSON中的answer_preparation增加blocked和白名单失败诊断；新evidence.retry_processing沿原命令幂等、租约及当前capture/control校验。准备组合证明仅在进程内，提交仍以原事务验证权威final和上下文，不新增表或迁移。详见[078](answer-recovery-and-reuse-078.md)。

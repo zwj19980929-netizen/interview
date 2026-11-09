@@ -629,6 +629,7 @@ def test_revocation_cross_instance_envelope_is_safe_and_remote_channel_stops_out
             self._enqueue_event = Mock()
             self._terminate_transport = Mock()
             self._stop_revoked_skill_output = AsyncMock(return_value=True)
+            self._completion_presentation_pending = Mock(return_value=False)
 
     async def run():
         result = await runtime.publish_skill_revocation("revocation_live")

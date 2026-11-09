@@ -141,7 +141,7 @@ function PlanCreateForm({ onCreated, onCancel, initialRoleId, initialCandidateId
             <label className="field"><span>面试时长</span><select className="form-select" name="duration_minutes" value={duration} onChange={(event) => setDuration(event.target.value)}>
               {[15, 30, 45, 60, 90].map((value) => <option key={value} value={value}>{value} 分钟</option>)}
             </select></label>
-            <p className="form-hint">时间是上限，面试官会根据回答和考察进展收尾。</p>
+            <p className="form-hint">岗位题和简历题合计通常问 8–10 道主问题，最多 10 道；追问单独计算。短场次或可用材料较少时会减少题量，时间是整场上限。</p>
             <div className="plans-prepare-customization" aria-label="默认面试定制">
               <strong>面试定制</strong>
               <p>{customization?.status === "ready"

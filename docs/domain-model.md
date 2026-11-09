@@ -1,6 +1,16 @@
 # 领域模型
 
-## 086：退出控制与技术答案分离（仓库已验证，未加载）
+## 089：主题预算与告别投影
+
+主题为非followup的正式根轮次，岗位和简历来源共用总量；追问是零独立权重子轮次，不占8–10道主题预算。候选原题及其拆分单元属于可选范围，不能自动转成必须全部询问的数量。执行总上限不改写历史冻结合同或既有答案；预算到达后在当前回答完成的边界收口，未考察的能力保持insufficient_evidence，不制造零分或覆盖充分事实。
+
+`candidate_input_completed_at`是候选输入已结束的持久事实，礼貌告别是否仍播放属于独立的连接呈现状态。实时快照可携带仅连接级的`completion_presentation="closing"`，保留完成回执但阻止原前端提前关闭播放器；它不持久化、不使会话重新可作答、不迁移给新连接。最终播放排空或有界失败后正常发出completed。见[接口设计089](api-design.md)和[操作日志089](change-log.md)。
+
+`InterviewSession.execution_question_budget`为可选JSON事实：`policy_version=combined_primary_questions.v1`、`max_root_questions`、`frozen_max_root_questions`、`applied_at`。仅当历史冻结上限超过10时，在首次启动/合法题间生命周期事务写入一次，并追加`interview.question_budget_applied`；它参与规划上下文指纹，不修改冻结合同hash，已终态历史不回填。v2超额且未开始的根题标记`skipped / primary_question_budget_exhausted`，保留权重与已答追问，报告作未评估处理。
+
+规划收据与`agent_runtime.last_planning`可追加安全诊断`selection_strategy=approved_catalog_fallback.v1`及白名单`fallback_reason`；不保存原始供应商响应或异常正文，不改变批准题目的范围。
+
+## 086：退出控制与技术答案分离（仓库与本机已验证）
 
 来源有效的接话结果只允许请求独立退出确认，不形成CandidateAnswer。确认问题实际送达后，新的权威确认回复经分类和owner/capture/final复核，可形成仅进程内的PreparedCandidateExit；它没有技术claims、评分或回答分类。最终事务封存本题原始发言与音频证据为`turn.exit_evidence`并记录退出确认，沿既有END_CANDIDATE_INPUT结束收音。未完成题保留原文供人工复核，不能伪造拒答或零分；报告明确区分已答题与退出时未评估的保留发言。新字段参与媒体保留、隐私清理与租户隔离，无新表或DDL。
 

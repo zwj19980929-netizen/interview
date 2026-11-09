@@ -30,6 +30,16 @@ describe("ordered AgentEvent runtime", () => {
       expect(validateAgentEvent(event(1, "session.snapshot", { ...candidateSnapshot(), completion: { ...completion, ...change } }), { audience: "candidate" }).ok).toBe(false);
     }
   });
+  it("bounds closing presentation to ended input without granting capture or human-floor authority", () => {
+    const completion = { interview_id: "iv_1", status: "submitted_for_human_review", submitted_at: "2026-09-23T00:00:00Z", recording_retention_notice: "已停止采集。", human_review_required: true };
+    const snapshot = { ...candidateSnapshot(), current_turn_id: null, current_question: null, floor: "agent", completion, completion_presentation: "closing" };
+    const validate = value => validateAgentEvent(event(1, "session.snapshot", value)).ok;
+    expect(validate(snapshot)).toBe(true);
+    for (const change of [{ completion: null }, { completion_presentation: true }, { completion_presentation: "pending" },
+      { status: "paused" }, { floor: "human" }, { current_turn_id: "turn_1" }, { current_question: candidateSnapshot().current_question }]) {
+      expect(validate({ ...snapshot, ...change })).toBe(false);
+    }
+  });
   it("accepts only fixed runtime diagnostic codes in a paused snapshot", () => {
     const snapshot = { ...candidateSnapshot(), status: "paused", runtime_problem_code: "AUDIO_TRACK_LOST" };
     expect(validateAgentEvent(event(1, "session.snapshot", snapshot), { audience: "candidate" }).ok).toBe(true);

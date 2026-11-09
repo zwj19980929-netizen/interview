@@ -1637,6 +1637,9 @@ class InterviewService:
                 "tools_used": list(proposal.tools_used), "model_calls": proposal.model_calls,
                 "prompt_version": SUPERVISOR_VERSION, "context_hash": proposal.context_fingerprint,
             }
+            if proposal.selection_strategy is not None:
+                session["agent_runtime"]["last_planning"].update(
+                    selection_strategy=proposal.selection_strategy, fallback_reason=proposal.fallback_reason)
             decision, _ = self._decide_and_persist(transaction, session, command, organization_id)
             return decision.session
 

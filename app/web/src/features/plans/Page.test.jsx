@@ -53,6 +53,22 @@ beforeEach(() => {
 });
 afterEach(async () => { await act(async () => root.unmount()); host.remove(); vi.restoreAllMocks(); });
 
+it("shows one combined execution limit for a larger frozen pool without editing the plan", async () => {
+  const historical = plan();
+  historical.assessment_contract.budget.min_root_questions = 28;
+  historical.assessment_contract.budget.max_root_questions = 28;
+  const original = JSON.stringify(historical);
+  wb.request = vi.fn(async () => historical);
+  await detail();
+  expect(host.querySelector(".plans-summary-grid").textContent).toContain("10 道主问题");
+  const content = host.querySelector('[aria-label="计划考察内容"]');
+  expect(content.textContent).toContain("候选问题池");
+  expect(content.textContent).toContain("不会全部提问");
+  expect(content.textContent).toContain("岗位题和简历题合计最多 10 道主问题，追问单独计算");
+  expect(JSON.stringify(historical)).toBe(original);
+  expect(wb.request.mock.calls.some(([, options]) => options?.method)).toBe(false);
+});
+
 it("distinguishes candidates sharing a role and opens a draft through its own route", async () => {
   wb.data.candidates.push({ id: "candidate_2", name: "候选人乙" });
   wb.data.plans.push({ ...plan(), id: "plan_2", candidate_profile_id: "candidate_2", status: "approved" });

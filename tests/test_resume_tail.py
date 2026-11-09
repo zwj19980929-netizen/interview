@@ -40,7 +40,7 @@ async def setup_plan():
                 'evidence_refs': [{'label': f'项目{i}', 'evidence': '合成简历证据'}],
                 'speech_status': 'deferred', 'speech_asset_id': None})
     request = PlanAssemblyRequest(role_requirement_id=role['id'], job_position_id=position['id'],
-        candidate_profile_id=candidate['id'], knowledge_base_ids=(kb['id'],), question_count=1,
+        candidate_profile_id=candidate['id'], knowledge_base_ids=(kb['id'],), question_count=4,
         policy=PlanAssemblyPolicy(allow_followups=False), approve=True)
     assembly = InterviewPlanAssembly(store)
     plan = await assembly.assemble(request)

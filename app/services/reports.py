@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from app.core.errors import ApiError
 from app.core.ids import new_id
+from app.domain.primary_question_budget import has_budget_skipped_questions
 from app.domain.scoring_quality import DISPUTE_FLAGS, evaluation_answers, project_evaluation, project_report, is_unresolved_evaluation
 from app.domain.adaptive_interview import adaptive_score_summary, interrupted_fixed_plan_summary, is_adaptive
 from app.core.time import utc_now
@@ -171,16 +172,19 @@ class ReportService:
                                 strengths=["关键点覆盖较好"] if score >= 75 else [],
                                 risks=["存在未覆盖关键点，建议人工复核"] if score < 75 else [],
                                 followup_suggestions=["针对缺失关键点安排人工追问"] if score < 75 else [])
-        elif interview.get("candidate_input_completion_reason") == "candidate_requested":
+        elif interview.get("candidate_input_completion_reason") == "candidate_requested" or has_budget_skipped_questions(interview):
             document.update(interrupted_fixed_plan_summary(interview, question_evaluations))
-            document["candidate_input_completion_reason"] = "candidate_requested"
+            budget_limited = has_budget_skipped_questions(interview)
+            document["candidate_input_completion_reason"] = "budget_exhausted" if budget_limited else "candidate_requested"
             document["skipped_questions"] = [
                 {"turn_id": turn["id"], "question_id": turn.get("question_id"),
                  "reason": turn.get("skip_reason", "not_assessed"), "counts_toward_score": False}
                 for turn in interview.get("turns", []) if turn.get("status") == "skipped"
             ]
             if document["coverage_status"] != "sufficient":
-                document.update(strengths=[], risks=["候选人主动结束，计划中部分题目未考察；保留已取得的评分证据。"],
+                notice = ("达到整场主问题上限，计划中部分题目未考察；不计零分，保留原权重与已取得的评分证据。"
+                          if budget_limited else "候选人主动结束，计划中部分题目未考察；保留已取得的评分证据。")
+                document.update(strengths=[], risks=[notice],
                                 followup_suggestions=["结合未考察范围与已有证据人工复核。"])
         retained = self._retained_exit_evidence(interview)
         if retained:

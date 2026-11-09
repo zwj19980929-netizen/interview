@@ -2,6 +2,7 @@
 from copy import deepcopy
 from math import isfinite
 
+from app.domain.primary_question_budget import has_budget_skipped_questions
 from app.domain.speech_quality import minimum_reported_confidence, transcript_is_verified, transcript_identity
 from app.domain.adaptive_interview import adaptive_score_summary, interrupted_fixed_plan_summary, is_adaptive
 
@@ -123,7 +124,8 @@ def project_report(report, session):
         result.update(adaptive_score_summary(session, result.get("question_evaluations", [])))
         if result["coverage_status"] != "sufficient":
             result.update(job_fit_level="insufficient_evidence", recommendation="insufficient_evidence")
-    elif not unavailable and session.get("candidate_input_completion_reason") == "candidate_requested":
+    elif not unavailable and (session.get("candidate_input_completion_reason") == "candidate_requested"
+                              or has_budget_skipped_questions(session)):
         result.update(interrupted_fixed_plan_summary(session, result.get("question_evaluations", [])))
     elif not unavailable and (result.get("overall_score") is None or restored):
         plan = {item["question_snapshot_id"]: item for item in session.get("plan_snapshot", {}).get("question_snapshots", [])}

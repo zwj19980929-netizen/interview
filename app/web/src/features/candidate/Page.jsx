@@ -407,8 +407,9 @@ function InvitationPage() {
 function CandidateRoom({ interview, token }) {
   const { API, request } = useWorkbench();
   const [experience, setExperience] = useState(EMPTY_EXPERIENCE);
+  const closing = !experience.completion && experience.session?.completion_presentation === "closing";
   const completion = experience.completion || interview?.completion || null;
-  const inputEnded = Boolean(completion) || ["completed", "report_generating", "report_ready"].includes(interview?.status);
+  const inputEnded = !closing && (Boolean(completion) || ["completed", "report_generating", "report_ready"].includes(interview?.status));
   const initiallyPaused = interview?.status === "paused";
   const [avatarReady, setAvatarReady] = useState(false);
   const [expandedTranscript, setExpandedTranscript] = useState(false);
@@ -571,7 +572,7 @@ function CandidateRoom({ interview, token }) {
   const totalQuestions = adaptive ? null : Number(session.total_primary_questions ?? interview?.turns?.filter((item) => !item.is_followup).length ?? 0);
   const answered = Number(session.completed_answers ?? interview?.answers?.length ?? 0);
   const connectionNotice = stoppedPresentation ? null : candidateConnectionNotice(experience);
-  const controlsReady = !stoppedPresentation && experience.connection.control === "connected" && !connectionNotice;
+  const controlsReady = !closing && !stoppedPresentation && experience.connection.control === "connected" && !connectionNotice;
   const notice = stoppedPresentation?.notice || connectionNotice || candidateNotice(problem, false, experience.phase);
   const visibleExperience = stoppedPresentation ? {
     ...experience, phase: "paused", floor: "none",
@@ -656,8 +657,8 @@ function CandidateRoom({ interview, token }) {
           <CandidateQuestionContext history={questionHistory.history} currentQuestion={currentQuestion} />
           <div className="candidate-question-head">
             <div>
-              <p className="eyebrow">{planning ? "稍作停顿" : currentQuestion?.is_followup ? "基于你刚才回答的追问" : adaptive ? `交流话题 ${currentQuestion?.order || answered + 1}` : `正式问题 ${currentQuestion?.order || answered + 1}`}</p>
-              <h1>{planning ? "面试官正在准备下一话题…" : currentQuestion?.question_text || "面试官正在组织下一句话…"}</h1>
+              <p className="eyebrow">{closing ? "本场交流已完成" : planning ? "稍作停顿" : currentQuestion?.is_followup ? "基于你刚才回答的追问" : adaptive ? `交流话题 ${currentQuestion?.order || answered + 1}` : `正式问题 ${currentQuestion?.order || answered + 1}`}</p>
+              <h1>{closing ? "感谢你的参与，请听完面试官的结束说明。" : planning ? "面试官正在准备下一话题…" : currentQuestion?.question_text || "面试官正在组织下一句话…"}</h1>
             </div>
             <CandidateProgress answered={answered} totalQuestions={totalQuestions} adaptive={adaptive} />
           </div>
@@ -790,13 +791,14 @@ export function AnswerRecoveryAction({ recovery, act, disabled = false }) {
 export function CandidateSignalList({ experience, blocked = false, stoppedDetail: stoppedDetailOverride }) {
   const connectionRecovery = candidateConnectionNotice(experience);
   const processingFailure = understandingRecoveryState(experience.problem);
-  const stopped = blocked || Boolean(experience.questionAudioRecovery) || ["paused", "completed", "answer_retry_required", "planning"].includes(experience.phase)
+  const stopped = blocked || Boolean(experience.questionAudioRecovery) || ["paused", "completed", "closing", "answer_retry_required", "planning"].includes(experience.phase)
     || (experience.phase === "understanding" && (!processingFailure || experience.evidence?.ready !== true));
   const recovering = experience.captureRecovery?.status === "recovering" && !stopped;
   const local = !stopped && !connectionRecovery && experience.microphone.localDetected;
   const stoppedDetail = stoppedDetailOverride || (blocked ? "收音已停止，请查看页面提示"
     : experience.phase === "paused" ? "面试已暂停"
     : experience.phase === "completed" ? "面试已结束"
+    : experience.phase === "closing" ? "作答已结束，正在播放结束说明"
     : experience.questionAudioRecovery ? "请先听完追问，再开始作答"
     : experience.phase === "answer_retry_required" ? "本题收音已停止，请重试本题"
     : processingFailure ? "录音已保留，输入通道暂未就绪"
@@ -886,6 +888,7 @@ function phaseText(phase) {
     responding: "面试官正在回应，可随时开口打断",
     paused: "面试已暂停",
     completed: "面试已完成",
+    closing: "面试官正在结束本场交流",
   }[phase] || "请稍等片刻");
 }
 
@@ -901,6 +904,7 @@ function phaseDetail(phase, formal) {
     answer_retry_required: "点击“重试本题”后，再回答一次。",
     understanding: "这段回答已收好，请等面试官回应后再说。",
     planning: "这段回答已保留，请稍等面试官继续。",
+    closing: "你的回答已提交，无需继续作答。感谢你的时间。",
     responding: "如果想补充，可以直接开口。",
     paused: "请联系面试安排人协助恢复。",
   }[phase] || "请稍等片刻。");
