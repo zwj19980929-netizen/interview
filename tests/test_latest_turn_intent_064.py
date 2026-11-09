@@ -216,8 +216,8 @@ def test_updated_contracts_separate_latest_scope_from_technical_evidence():
     contract = prompt_contract("interview_turn_decision", {"semantic_first": True,
         "transcript": "我想一下。这题我不会。", "capability_points": ["恢复"]})
     text = "\n".join(message.content for message in contract.messages)
-    assert contract.version == "interview_turn_decision.v129"
-    assert "semantic_turn.v19" in text and "current_speech" in text
+    assert contract.version == "interview_turn_decision.v149"
+    assert "semantic_turn.v23" in text and "current_speech" in text
     assert "不需要再要求候选人重复说" in text and "必须stop_interview" in text
     assert "概念提问、重读请求、思考、不会和结束控制本身都不构成技术claim" in text
 
@@ -294,7 +294,7 @@ def test_legacy_resolved_context_changes_memory_but_never_the_output_authority(p
     assert contract.version == expected and contract.response_schema == legacy.response_schema
     content = "\n".join(message.content for message in contract.messages)
     assert "current_speech" in content and "不能将该旧问题再作为clarification_target" in content
-    assert "semantic_turn.v19" not in content and "semantic_turn.v20" not in content
+    assert "semantic_turn.v23" not in content and "semantic_turn.v24" not in content
     schema = contract.response_schema["properties"].get("understanding", contract.response_schema)
     assert "turn_intent" not in schema["properties"] and "completion_basis" not in schema["properties"]
 

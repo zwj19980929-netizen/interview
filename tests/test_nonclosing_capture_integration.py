@@ -216,10 +216,10 @@ def test_late_stable_sentence_reconsiders_same_quiet_audio_revision_without_a_cu
     asyncio.run(scenario())
 
 
-def test_new_voice_revokes_preview_preparation_without_cutting_or_losing_tail(tmp_path, monkeypatch):
+def test_new_voice_revokes_preview_progress_but_retains_bounded_analysis_without_losing_tail(tmp_path, monkeypatch):
     async def scenario():
         state = _ControlledTranscript()
-        entered, cancelled = asyncio.Event(), asyncio.Event()
+        entered, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
         original_prepare = InterviewEvidenceChain.prepare_decision
         calls = 0
 
@@ -230,7 +230,7 @@ def test_new_voice_revokes_preview_preparation_without_cutting_or_losing_tail(tm
             if calls == 1:
                 entered.set()
                 try:
-                    await asyncio.Event().wait()
+                    await release.wait()
                 except asyncio.CancelledError:
                     cancelled.set()  # late successful upstream return must be fenced
             return decision
@@ -241,9 +241,22 @@ def test_new_voice_revokes_preview_preparation_without_cutting_or_losing_tail(tm
             await _silence_until(managed._ingress, entered.is_set)
             _no_domain_answer(store, runtime)
             assert state.finishes == 0
+            endpoint = managed._answer_endpoint
+            preparation = endpoint._confirmed_preparation
+            deadline = endpoint._confirmed_preparation_deadline
+            revision = endpoint.revision
             state.tail = True
             await _feed(managed._ingress, _CONTINUATION, 10)
-            await _wait_until(cancelled.is_set)
+            assert endpoint.revision > revision
+            assert endpoint._proposal_revision != endpoint.revision
+            assert endpoint._confirmed_preparation is preparation and not preparation.done()
+            assert endpoint._confirmed_preparation_deadline == deadline
+            assert not cancelled.is_set()
+            release.set()
+            await asyncio.wait_for(asyncio.shield(preparation), 1)
+            # Even an upstream success arriving after acoustic revocation
+            # cannot seal the stale prefix while newer audio has an ASR tail.
+            assert not cancelled.is_set()
             _no_domain_answer(store, runtime)
             assert state.finishes == 0 and len(state.raw_streams) == 1
             state.append(_SUFFIX)

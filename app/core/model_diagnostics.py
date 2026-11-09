@@ -28,7 +28,7 @@ _CANCEL_REASONS = frozenset({
 })
 _EVENTS = frozenset({"attempt_started", "attempt_finished", "operation_started", "operation_finished",
                      "scope_started", "scope_finished", "scope_cancel_requested", "audit_failed",
-                     "understanding_rejected", "understanding_failed"})
+                     "understanding_rejected", "understanding_failed", "correction_applied"})
 _FAILURE_REASONS = frozenset({
     "unknown", "timeout", "unavailable", "invalid_result", "retry_exhausted", "non_retryable",
     "call_budget_exhausted", "wire_schema_invalid", "reference_resolution_invalid",
@@ -38,6 +38,7 @@ _FAILURE_REASONS = frozenset({
     "claim_evidence_undeclared", "clarification_target_contract_invalid", "clarification_targets_conversation_control",
     "company_question_contract_invalid", "company_question_covers_technical_evidence", "completion_action_invalid",
     "completion_basis_required", "completion_basis_unexpected", "completion_confidence_insufficient",
+    "company_question_span_invalid", "clarification_focus_not_verbatim",
     "completion_followup_permission_invalid", "completion_has_unresolved_ambiguity", "completion_intent_content_mismatch",
     "content_none_has_technical_evidence", "declined_answer_completion_scope_invalid", "declined_answer_has_technical_content",
     "detail_claim_binding_invalid", "detail_rationale_missing", "difficulty_escalation", "evidence_binding_invalid",
@@ -80,7 +81,7 @@ def safe_model_diagnostic_fields(fields: dict) -> dict:
                                   or re.fullmatch(r"provider_[a-z_]{1,64}", value)) else "unknown"
         elif key == "operation" and isinstance(value, str) and value in {"infer", "prepare_decision", "confirmed_prepare", "speculative_prepare", "speculative_wait", "confirmed_wait"}:
             safe[key] = value
-        elif key == "source" and isinstance(value, str) and value in {"audio", "client", "transcript"}:
+        elif key == "source" and isinstance(value, str) and value in {"audio", "client", "transcript", "stable_evidence"}:
             safe[key] = value
         elif key == "failure_source" and isinstance(value, str) and value in {"provider", "schema_or_content", "semantic", "control"}:
             safe[key] = value

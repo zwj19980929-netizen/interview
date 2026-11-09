@@ -1,5 +1,25 @@
 # Interviewer Domain
 
+## 2026-11-02 · 交流控制与未评估证据（086）
+
+退出请求只代表需要询问是否结束；独立退出确认是已实际送达的问题和之后新回复形成的服务端证据，不是技术完成依据。PreparedCandidateExit不含技术理解或claims。确认后本题的原始发言和录音记为exit_evidence/not_evaluated，报告以unassessed_retained_evidence供人工复核，不计作拒答、零分或已完成答案；已完成题维持原评分。见[086](docs/conversation-control-autonomy-086.md)。
+
+## 085：澄清与理解失败
+
+“内容待澄清”只表示发言存在实际含义疑点，不等于答案缺知识点或候选不会。已送达澄清的来源由服务端固定，模型理解新解释；“结果校验失败”与“供应商不可用”是不同恢复类别。实施状态见[085](docs/followup-clarification-085.md)。
+
+## 084：补充交流
+
+“补充交流决策”只判断当前新发言希望如何继续：提问、澄清、跑题、等待和结束各有正常路径。“无法确认结束”保持对话开放，不等同回答分析失败。“补充阶段”来自实际送达及服务端确认，不能从历史肯定词推断。详见[084](docs/supplement-dialogue-routing-084.md)。
+
+## 083：有界纠错接续
+
+**Pending correction**：仅进程内、绑定完整证据/语境/模式/合同的固定校验原因，用于剩余调用的纠错，不是已验证理解、完成许可或新模型额度。预分析的一次局部额度不能丢弃正式准备仍可使用的匹配原因；新输入或来源变化不能借用旧原因。见[083](docs/bounded-correction-continuation-083.md)。
+
+## 081：保留分析与推进资格
+
+**Retained preparation**：证据不变时可继续完成的唯一有界纯分析，不因短暂音频撤销而重复调用；读取结果仍核对当前完整来源与语境。**Recovery review**：正常恢复通知ACK之后的一次性重新取final机会，不是完成确认或提交授权。详见[081](docs/answer-preparation-cancellation-081.md)。
+
 ## 079：模型处理诊断
 
 **ModelCallScope**：进程内一次等待/处理阶段的诊断关联上下文，包含父作用域与受控取消来源；不是授权、模型调用次数或持久会话状态。**Cancelled ModelInvocation**：调用方撤销后的终态审计，不等于供应商超时、失败计费或自动重试许可。见[操作日志079](docs/change-log.md)。

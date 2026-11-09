@@ -1,5 +1,13 @@
 # 接口设计
 
+## 086：已确认退出的证据处理（仓库已验证，未加载）
+
+候选外部接口仍沿服务端语音、实际送达和独立退出确认。进程内证据完成结果区分`exit_confirmed`与答案accepted，不为退出控制发送answer.accepted或evaluation.queued；既有退出生命周期及结束快照通知驱动客户端收尾。客户端payload不能提供退出准备对象或制造确认。未完成题的保留发言不计为拒答/零分，报告列明未评估待复核。
+
+## 085：回答处理失败分类（仓库与本机已验证）
+
+沿用现有事件与快照协议：两次模型结果校验失败进入`retry_required`，候选可显式`retry_answer_processing`；真正不可重试的供应商故障仍为`blocked/contact_support`。不新增候选文本提交入口，不把重试视为完成许可。细节见[085](followup-clarification-085.md)。
+
 ### ANSWER-RECOVERY-AND-REUSE-078（仓库与本机已验证）
 
 回答处理重试与`continue_speaking`继续补充分开。新增当前题/当前capture绑定的`retry_answer_processing`控制操作，映射durable `evidence.retry_processing`，只允许恢复已有回答的失败步骤，不重开采集、不撤销仍有效的补充确认、不直接授予答案提交或退出许可。自动恢复与显式重试遵守单任务执行约束；新的技术内容、转写修正、失权、换题及终态使旧准备失效。重复处理合并，旧capture、暂停、已作答、失权与终态拒绝；前端仅由当前causation匹配的恢复拒绝解除pending。

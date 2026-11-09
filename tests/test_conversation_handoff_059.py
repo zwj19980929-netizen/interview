@@ -48,21 +48,21 @@ async def test_invitation_retains_answer_and_respects_real_followup_decision(sel
 
 @pytest.mark.anyio
 async def test_supplement_classifier_uses_bounded_server_context_but_only_fresh_evidence():
-    gateway = Gateway({"intent": "finish", "confidence": .95, "evidence_id": "E1"})
-    result = await _service(gateway).classify_supplement_reply("是的。", "org_default",
+    gateway = Gateway({"intent": "finish", "confidence": .95, "evidence_id": "E1", "reply_text": ""})
+    result = await _service(gateway).classify_supplement_reply("我已经说完了。", "org_default",
         prior_confirmation=True, preceding_text="已讲完。" * 400, question="确认完成吗？" * 200)
     request = gateway.requests[0]
     context = json.loads(request.messages[-1].content)
     assert context["prior_confirmation"] is True
     assert len(context["preceding_text"]) <= 1000 and len(context["question"]) <= 600
-    assert context["evidence"] == {"E1": "是的。"}
-    assert request.metadata["prompt_version"] == "supplement_reply.v5"
-    assert result["evidence_quote"] == "是的。"
+    assert context["evidence"] == {"E1": "我已经说完了。"}
+    assert request.metadata["prompt_version"] == "supplement_reply.v6"
+    assert result["evidence_quote"] == "我已经说完了。"
 
 
 @pytest.mark.anyio
 async def test_previous_confirmation_cannot_be_cited_as_new_finish_authority():
-    gateway = Gateway({"intent": "finish", "confidence": .95, "evidence_id": "E2"})
+    gateway = Gateway({"intent": "finish", "confidence": .95, "evidence_id": "E2", "reply_text": ""})
     with pytest.raises(StructuredResponseValidationError):
         await _service(gateway).classify_supplement_reply("对。", "org_default",
             prior_confirmation=True, preceding_text="已经讲完了。")
@@ -85,17 +85,24 @@ def test_followup_selects_one_focus_before_wording_the_final_question(purpose):
     from app.core.prompt.contracts import FOLLOWUP_SINGLE_FOCUS_INSTRUCTION
     contract = prompt_contract(purpose, {"semantic_first": True, "transcript": "我记录请求号。",
         "capability_points": ["幂等处理"]})
-    assert contract.messages[-1].role == "system"
-    assert contract.messages[-1].content == FOLLOWUP_SINGLE_FOCUS_INSTRUCTION
-    assert "rationale只说明这一个焦点" in contract.messages[-1].content
-    assert "不给答案选项" in contract.messages[-1].content
+    if purpose == "interview_turn_decision":
+        policy = contract.messages[0]
+        assert [message for message in contract.messages if message.role == "system"] == [policy]
+        assert policy.content.endswith(FOLLOWUP_SINGLE_FOCUS_INSTRUCTION)
+    else:
+        policy = contract.messages[-1]
+        assert policy.content == FOLLOWUP_SINGLE_FOCUS_INSTRUCTION
+    assert policy.role == "system"
+    assert sum(message.content.count(FOLLOWUP_SINGLE_FOCUS_INSTRUCTION) for message in contract.messages) == 1
+    assert "rationale只说明这一个焦点" in policy.content
+    assert "不给答案选项" in policy.content
     schema = contract.response_schema["properties"].get("followup", contract.response_schema)
     assert "不能罗列多个" in schema["properties"]["rationale"]["description"]
     order = list(schema["properties"])
     assert order == schema["required"]
     assert order.index("rationale") < order.index("question_text")
     assert order.index("evidence_id" if purpose == "interview_turn_decision" else "evidence_quote") < order.index("rationale")
-    assert "虽然只有一个问号" in contract.messages[-1].content
+    assert "虽然只有一个问号" in policy.content
 
 
 @pytest.mark.parametrize("purpose", ["interview_turn_understanding", "interview_turn_decision"])

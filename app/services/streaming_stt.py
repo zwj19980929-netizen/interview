@@ -27,6 +27,7 @@ from app.persistence.interface import Persistence
 from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
 from app.services.interviews import InterviewService
+from app.services.candidate_exit_confirmation import PreparedCandidateExit
 from app.services.agent_expression_audio import AgentExpressionAudioService
 from app.services.evidence_media import (
     DurableEvidenceMedia,
@@ -361,9 +362,10 @@ class StreamingInterviewSTT:
                     raise ApiError("TURN_DECISION_STALE", "Audio arrived after snapshot.", status_code=409) from exc
                 raise
             if prepared_decision is not None:
-                self.interviews.assert_prepared_streaming_decision(
-                    prepared_decision, self.stream.confirmed_final(), self.organization_id,
-                )
+                validate = (self.interviews.assert_prepared_streaming_exit
+                            if isinstance(prepared_decision, PreparedCandidateExit)
+                            else self.interviews.assert_prepared_streaming_decision)
+                validate(prepared_decision, self.stream.confirmed_final(), self.organization_id)
 
     async def resume_capture(self) -> None:
         if isinstance(self.stream, ContinuousSTT):
@@ -430,27 +432,34 @@ class StreamingInterviewSTT:
                                     retryable=False)
             final = next(item for item in events if item.type == "transcript.final")
             self._assert_commit_allowed()
-            result = await self.interviews.submit_streaming_answer(
-                self.interview_id,
-                {
-                    "turn_id": self.turn_id,
-                    "audio_uri": recording.audio_uri,
-                    "content_type": recording.mime_type,
-                    "final_transcript": final.text,
-                    "confidence": final.confidence,
-                    "language": final.language,
-                    "duration_seconds": recording.duration_seconds if recording.duration_seconds is not None else int(payload.get("duration_seconds", 0)),
-                    "recording_started_at": recording.started_at,
-                    "recording_finished_at": recording.finished_at,
-                    "provider": final.provider.model_dump() if final.provider else {},
-                    "segments": [item.model_dump() for item in final.segments],
-                    "media_evidence": self._media_evidence_payload(complete=True),
-                },
-                self.organization_id,
-                evidence_fence=self.commit_fence,
-                prepared_decision=prepared_decision,
-            )
+            submission = {
+                "turn_id": self.turn_id,
+                "audio_uri": recording.audio_uri,
+                "content_type": recording.mime_type,
+                "final_transcript": final.text,
+                "confidence": final.confidence,
+                "language": final.language,
+                "duration_seconds": recording.duration_seconds if recording.duration_seconds is not None else int(payload.get("duration_seconds", 0)),
+                "recording_started_at": recording.started_at,
+                "recording_finished_at": recording.finished_at,
+                "provider": final.provider.model_dump() if final.provider else {},
+                "segments": [item.model_dump() for item in final.segments],
+                "media_evidence": self._media_evidence_payload(complete=True),
+            }
+            if isinstance(prepared_decision, PreparedCandidateExit):
+                result = await self.interviews.submit_confirmed_exit(
+                    self.interview_id, submission, self.organization_id,
+                    evidence_fence=self.commit_fence, prepared_exit=prepared_decision,
+                )
+            else:
+                result = await self.interviews.submit_streaming_answer(
+                    self.interview_id, submission, self.organization_id,
+                    evidence_fence=self.commit_fence, prepared_decision=prepared_decision,
+                )
         except (ProviderError, StopIteration) as exc:
+            if isinstance(prepared_decision, PreparedCandidateExit):
+                # A repaired transcript cannot inherit an old exit permission.
+                raise
             if getattr(exc, "code", None) == "provider_final_transcript_missing":
                 # No valid transcript is not an answer. Do not manufacture
                 # semantics through a development/batch fallback on silence.
@@ -503,6 +512,9 @@ class StreamingInterviewSTT:
         self.evidence_media_writer = None
         self.last_result = result
         response = [item.model_dump() for item in events]
+        if result.get("exit_confirmed"):
+            await self._abort_dialogue()
+            return response
         if not result.get("accepted", True):
             response.append(self._non_answer_event(result))
             await self._abort_dialogue()

@@ -68,7 +68,7 @@ def test_reception_prompt_projects_only_safe_delivery_status():
     assert [row["delivery_status"] for row in history] == ["interrupted", "unknown"]
     assert not any("performance_id" in row for row in history)
     contract = reception_contract(source)
-    assert contract.version == "conversation_reception.v9"
+    assert contract.version == "conversation_reception.v10"
     assert "只有delivered" in contract.messages[0].content
     assert source == before
 

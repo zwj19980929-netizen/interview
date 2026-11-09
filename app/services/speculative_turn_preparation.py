@@ -17,8 +17,9 @@ from app.core.model_diagnostics import (
 
 class SpeculativeTurnPreparation:
     def __init__(self, prepare: Callable, identity: Callable, *, timeout: float = 15.0,
-                 diagnostic_context: Any = None) -> None:
+                 diagnostic_context: Any = None, on_done: Any = None) -> None:
         self._prepare, self._identity, self._timeout = prepare, identity, timeout
+        self._on_done = on_done
         self._diagnostic_context = {
             key: (diagnostic_context or {}).get(key) for key in ("interview_id", "turn_id", "capture_id")
         }
@@ -28,22 +29,24 @@ class SpeculativeTurnPreparation:
         self._diagnostic_cancelled_tasks = WeakSet()
         self._tasks = set()
 
-    def start(self, preview: Any) -> None:
+    def start(self, preview: Any) -> Any:
         if preview is None or getattr(preview, "has_unstable_tail", True) or not preview.text.strip():
             return
         key = self._identity(preview)
         if key == self._key:
-            return  # An unchanged failed preview must not create a retry loop.
+            return self._task  # An unchanged failed preview cannot buy a retry.
         self.cancel()
         self._key = key
+        predecessors = self.pending_tasks
         with model_call_scope(**self._diagnostic_context, stage="answer_preparation", inherit=False) as scope:
-            task = asyncio.create_task(self._run(preview.model_copy(deep=True), scope))
+            task = asyncio.create_task(self._run(preview.model_copy(deep=True), scope, predecessors))
         self._task = task
         self._scope = scope
         self._tasks.add(task)
-        task.add_done_callback(self._done)
+        task.add_done_callback(lambda done: self._done(done, preview))
+        return task
 
-    async def _run(self, preview: Any, scope: Any) -> Any:
+    async def _run(self, preview: Any, scope: Any, predecessors: tuple = ()) -> Any:
         remaining = remaining_interaction_seconds()
         timeout = min(self._timeout, remaining) if remaining is not None else self._timeout
         fields = {**safe_model_call_context(scope=scope), "operation": "speculative_prepare",
@@ -52,8 +55,13 @@ class SpeculativeTurnPreparation:
         started = time.monotonic()
         outcome, reason = "success", None
         record_model_diagnostic("scope_started", **fields, outcome="started")
+        async def prepare():
+            if predecessors:
+                await asyncio.gather(*(asyncio.shield(task) for task in predecessors), return_exceptions=True)
+            return await self._prepare(preview, semantic_first=True)
+
         try:
-            result = await diagnosed_wait_for(self._prepare(preview, semantic_first=True), timeout=timeout,
+            result = await diagnosed_wait_for(prepare(), timeout=timeout,
                                               stage="answer_preparation", timeout_reason="speculative_timeout")
             problem = getattr(getattr(result, "understanding", None), "problem", None)
             if problem is not None:
@@ -88,14 +96,32 @@ class SpeculativeTurnPreparation:
         """Keep failure accounting tied to the work, not its later waiter."""
         return self._scope
 
+    @property
+    def has_preparation(self) -> bool:
+        return self._task is not None
+
+    def owns(self, task: asyncio.Task) -> bool:
+        return task is self._task
+
+    @property
+    def pending_tasks(self) -> tuple:
+        """Include invalidated work that is still unwinding cancellation."""
+        return tuple(task for task in self._tasks if not task.done())
+
+    def ready(self, snapshot: Any) -> Any:
+        """Read successful work without creating another timed waiter."""
+        if self.matching(snapshot) and self._task.done():
+            return self._task.result()
+        return None
+
     async def take(self, snapshot: Any, *, include_failed: bool = False) -> Any:
         if not self.matching(snapshot, include_failed=include_failed):
             return None
         # Revoking this waiter does not manufacture a result or commit. The
-        # endpoint cancels the owned task as soon as new input is observed.
+        # endpoint cancels owned work only when its evidence is superseded.
         return await asyncio.shield(self._task)
 
-    def cancel(self, *, reason: str = "superseded", source: Any = None) -> None:
+    def cancel(self, *, reason: str = "superseded", source: Any = None) -> Any:
         task, self._task = self._task, None
         scope, self._scope = self._scope, None
         self._key = None
@@ -106,11 +132,14 @@ class SpeculativeTurnPreparation:
                 record_model_diagnostic("scope_cancel_requested", **safe_model_call_context(scope=scope),
                                         cancel_reason=scope.cancel_reason, source=source)
             task.cancel()
+        return task
 
-    def _done(self, task: asyncio.Task) -> None:
+    def _done(self, task: asyncio.Task, preview: Any) -> None:
         self._tasks.discard(task)
         if not task.cancelled():
             task.exception()  # Consume abandoned failures without logging speech.
+        if self._on_done is not None:
+            self._on_done(task, preview)
 
     async def close(self) -> None:
         self.cancel(reason="capture_closed")

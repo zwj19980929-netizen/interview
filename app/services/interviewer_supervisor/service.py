@@ -65,7 +65,10 @@ class InterviewerSupervisor:
 
     async def prepare_turn(self, utterance: Any, turn: Dict[str, Any], session: Dict[str, Any]):
         from app.services.conversation_input_context import conversation_input_context
+        from app.services.supplement_context import supplement_context
         context = conversation_memory(session)
+        context["supplement_context"] = supplement_context(session, turn,
+            completion_confirmed=session.get("_answer_completion_confirmed") is True)
         context["input_context"] = conversation_input_context(session, turn, utterance.text,
             segments=utterance.stt_segments, source_capture=utterance.audio_uri)
         self._add_content_clarification(context, session, utterance.text)
@@ -78,7 +81,10 @@ class InterviewerSupervisor:
     async def prepare_preview(self, preview: Any, turn: Dict[str, Any], session: Dict[str, Any], *, snapshot_ref: str):
         from app.services.conversation_input_context import conversation_input_context
         from app.domain.speech_quality import transcript_confidence_segments
+        from app.services.supplement_context import supplement_context
         context = conversation_memory(session)
+        context["supplement_context"] = supplement_context(session, turn,
+            completion_confirmed=session.get("_answer_completion_confirmed") is True)
         text = preview.text.strip()
         context["input_context"] = conversation_input_context(session, turn, text,
             segments=transcript_confidence_segments(text, preview.segments), source_capture=snapshot_ref)

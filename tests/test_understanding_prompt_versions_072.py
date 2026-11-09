@@ -61,7 +61,8 @@ async def test_all_affected_branches_are_versioned_validated_and_audited_with_hi
     contract = prompt_contract(purpose, context)
     old_number = old_understanding if purpose == "interview_turn_understanding" else old_decision
     old_version = f"{purpose}.v{old_number}"
-    assert contract.version == f"{purpose}.v{old_number + 24}"
+    current_offset = 44 if semantic else 24
+    assert contract.version == f"{purpose}.v{old_number + current_offset}"
     messages = "\n".join(message.content for message in contract.messages)
     assert ("semantic_controls.v3" in messages) is semantic
     assert "semantic_controls.v2" not in messages

@@ -67,17 +67,19 @@ def _semantic_provider(monkeypatch, *, technical=False, probe=False, explicit_fi
     async def invoke(provider, capability, request, context):
         if capability != "llm.chat_json" or request.purpose != "interview_turn_understanding":
             return await original(provider, capability, request, context)
-        if request.metadata.get("prompt_version") == "conversation_reception.v9":
+        if request.metadata.get("prompt_version") == "conversation_reception.v10":
             return await original(provider, capability, request, context)
         if request.metadata.get("prompt_version") == "candidate_exit_reply.v1":
             reply = json.loads(request.messages[-1].content)["new_reply"]
             data = {"intent": "continue" if "继续" in reply else "confirm", "confidence": .98,
                     "evidence_quote": list(understanding_references(reply, [])["evidence"].values())[-1]}
             calls.append(("exit_confirmation", reply, data["intent"]))
-        elif request.metadata.get("prompt_version") == "supplement_reply.v5":
+        elif request.metadata.get("prompt_version") in {"supplement_reply.v5", "supplement_reply.v6"}:
             reply = json.loads(request.messages[-1].content)["reply"]
             intent = "continue" if "再想想" in reply else "finish"
             data = {"intent": intent, "confidence": .98, "evidence_id": "E1"}
+            if request.metadata.get("prompt_version") == "supplement_reply.v6":
+                data["reply_text"] = ""
             calls.append(("supplement", reply, intent))
         else:
             transcript = request.metadata["transcript"]
@@ -192,7 +194,8 @@ async def _confirm_pending_exit(runtime, channel, managed, clock):
         current = _current(runtime)
         raise AssertionError(str({"phase": endpoint.confirmation.phase, "failures": endpoint._prepare_failures,
             "runtime": current["agent_runtime"], "events": current["agent_events"][-5:]})) from None
-    assert not _current(runtime)["answers"]
+    current = _current(runtime)
+    assert not any(answer.get("turn_id") == current["current_turn_id"] for answer in current["answers"])
     assert not _current(runtime).get("candidate_input_completed_at")
     selected = [event for event in _current(runtime)["agent_events"] if event["type"] == "conversation.act.selected"]
     assert selected[-1]["payload"]["text"] == EXIT_CONFIRMATION_SPEECH
@@ -207,7 +210,33 @@ async def _confirm_pending_exit(runtime, channel, managed, clock):
     await _wait_until(lambda: endpoint.confirmation._exit_question_delivered)
     await _feed(managed._ingress, _CONTINUATION, 5)
     clock.value += 1
-    assert managed._capture_id == capture_id or len(_current(runtime)["answers"]) == 1
+    assert managed._capture_id == capture_id or _current(runtime).get("candidate_input_completed_at")
+
+
+def _assert_retained_exit_evidence(store, runtime, text, *, voice_frames, continuation_frames, answers_before):
+    """A confirmed exit preserves the full recording without inventing an answer."""
+    session = _current(runtime)
+    assert session["answers"] == answers_before
+    turn = session["turns"][0]
+    evidence = turn["exit_evidence"]
+    assert evidence["raw_transcript"] == evidence["final_transcript"] == text
+    assert evidence["assessment_status"] == "not_evaluated"
+    assert evidence["transcript_source"] == "server_streaming"
+    assert evidence["media_evidence"]["complete"] is True
+    assert turn.get("current_understanding") is None
+    assert turn["candidate_exit_confirmation"]["state"] == "confirmed"
+    assert [item["text"] for item in turn["utterances"]] == [text]
+    seals = [item for item in store.evidence_commands.values() if item["command_type"] == "evidence.seal"]
+    assert len(seals) == 1 and seals[0]["status"] == "completed"
+    assert seals[0]["payload"]["endpoint"] == "prepared_turn"
+    recording = read_managed_audio(persistence_for(store), ORGANIZATION_ID, evidence["audio_uri"])
+    with wave.open(io.BytesIO(recording), "rb") as wav:
+        assert (wav.getframerate(), wav.getnchannels(), wav.getsampwidth()) == (16_000, 1, 2)
+        samples = array("h", wav.readframes(wav.getnframes()))
+    assert samples.count(8192) == voice_frames * 320
+    assert samples.count(16384) == continuation_frames * 320
+    assert set(samples) <= {0, 8192, 16384}
+    assert not any(item["kind"] == "answer.evaluate" for item in store.outbox_work_items.values())
 
 
 @pytest.mark.parametrize("body", ["我不知道，这题先到这里吧。", "我现在没有补充了。"])
@@ -240,7 +269,7 @@ def test_first_final_decline_preserves_original_audio_and_advances_once(tmp_path
             assert "supplement_check" not in acts and "question" in acts
             assert SUPPLEMENT_SPEECH["check"] not in spoken
             assert not [c for c in calls if c[0] == "supplement"]
-            assert [c[2] for c in calls if c[0] == "understanding"] == ["interview_turn_decision.v131"]
+            assert [c[2] for c in calls if c[0] == "understanding"] == ["interview_turn_decision.v151"]
             assert understanding["completion_basis"]["source"] == "explicit_server_intent"
 
             # Replay the committed journal command and an additional stale
@@ -295,13 +324,14 @@ def test_explicit_end_of_interview_saves_current_evidence_and_never_delivers_nex
         body = _TECHNICAL + "我不想继续面试了，请结束整场面试。"
         async with _automatic_session(tmp_path, monkeypatch, [body, "", "", "确定结束面试。", ""], spoken_confirmation=True) as (store, runtime, channel, managed):
             _add_next_question(store)
+            answers_before = deepcopy(_current(runtime)["answers"])
             _playable_speech(runtime)
             await _answer_and_confirm_exit(runtime, channel, managed)
             await _wait_until(lambda: bool(_current(runtime).get("candidate_input_completed_at")), timeout=5)
+            await _wait_until(lambda: all(c["status"] == "completed" for c in store.evidence_commands.values()))
             session = _current(runtime)
-            assert len(session["answers"]) == 1
-            assert session["answers"][0]["raw_transcript"] == body + "确定结束面试。"
-            assert session["turns"][0]["current_understanding"]["turn_intent"] == "stop_interview"
+            _assert_retained_exit_evidence(store, runtime, body + "确定结束面试。",
+                voice_frames=5, continuation_frames=5, answers_before=answers_before)
             assert session["current_turn_id"] is None
             assert not [event for event in session["agent_events"] if event["type"] == "conversation.act.selected"
                         and event["turn_id"] == _NEXT_TURN_ID]
@@ -330,17 +360,17 @@ def test_end_interview_in_supplement_reply_preserves_answer_and_stops_whole_inte
     async def scenario():
         async with _automatic_session(tmp_path, monkeypatch, [""], spoken_confirmation=True) as (store, runtime, channel, managed):
             _add_next_question(store)
+            answers_before = deepcopy(_current(runtime)["answers"])
             _playable_speech(runtime)
             endpoint, clock = await _answer_and_confirm(runtime, channel, managed)
             await _confirm_pending_exit(runtime, channel, managed, clock)
             await _wait_until(lambda: bool(_current(runtime).get("candidate_input_completed_at")), timeout=5)
             await _wait_until(lambda: all(c["status"] == "completed" for c in store.evidence_commands.values()))
             session = _current(runtime)
-            _assert_one_automatic_answer(store, runtime, _TECHNICAL + stop + "确定结束面试。", voice_frames=5, continuation_frames=10)
-            assert session["turns"][0]["current_understanding"]["prompt_version"] == "interview_turn_decision.v136"
-            assert session["turns"][0]["current_understanding"]["turn_intent"] == "stop_interview"
+            _assert_retained_exit_evidence(store, runtime, _TECHNICAL + stop + "确定结束面试。",
+                voice_frames=5, continuation_frames=10, answers_before=answers_before)
             assert session.get("candidate_input_completion_reason") == "candidate_requested"
-            assert session["turns"][0]["current_understanding"]["claims"][0]["claim"] == _TECHNICAL
+            assert _TECHNICAL in session["turns"][0]["exit_evidence"]["final_transcript"]
             assert not [event for event in session["agent_events"] if event["type"] == "conversation.act.selected"
                         and event["turn_id"] == _NEXT_TURN_ID]
     asyncio.run(scenario())

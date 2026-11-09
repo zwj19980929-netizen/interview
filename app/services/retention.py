@@ -609,8 +609,10 @@ class RetentionService:
         )
         local_audio_uris: Set[str] = set()
         for interview in interviews:
-            for answer in interview.get("answers", []):
-                audio_uri = answer.get("audio_uri")
+            recordings = [*interview.get("answers", []),
+                          *(turn.get("exit_evidence") or {} for turn in interview.get("turns", []))]
+            for recording in recordings:
+                audio_uri = recording.get("audio_uri")
                 if isinstance(audio_uri, str) and audio_uri.startswith("private-file://"):
                     file_ids.add(audio_uri.removeprefix("private-file://"))
                 elif isinstance(audio_uri, str) and audio_uri.startswith("/media/"):
@@ -695,6 +697,7 @@ class RetentionService:
             item["utterances"] = []
             item["current_understanding"] = None
             item["conversation_acts"] = []
+            item.pop("exit_evidence", None)
             # Includes the original candidate prefix and question ranges, so
             # it follows the same retention boundary as utterances/answers.
             item.pop("company_question_exchanges", None)

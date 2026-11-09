@@ -8,7 +8,7 @@ from test_prepared_turn_decision import Gateway, _service
 
 def test_reception_distinguishes_unrelated_narration_from_a_social_request():
     contract = prompt_contract("conversation_reception", {"text": "我昨天去山里看了日出。我说完了。"})
-    assert contract.version == "conversation_reception.v9"
+    assert contract.version == "conversation_reception.v10"
     system = contract.messages[0].content
     assert "叙述跑题本身不是向你提出请求" in system
     assert "内容无关不等于转写不清" in system

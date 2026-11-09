@@ -5,7 +5,7 @@ import re
 from app.core.prompt.understanding_references import understanding_references
 from app.model_gateway.schemas import ChatMessage
 
-RECEPTION_VERSION = "conversation_reception.v9"
+RECEPTION_VERSION = "conversation_reception.v10"
 RECEPTION_SPEECH_VERSION = "conversation_reception_speech.v4"
 RECEPTION_SPEECH = {
     "idle_check": "我还在听。需要一点时间，或希望我再解释一下题目，都可以告诉我。",
@@ -28,7 +28,7 @@ def reception_repeat(question):
 
 RECEPTION_KINDS = [
     "wait", "continue", "presence", "repeat", "question_clarification", "transcript_correction",
-    "audio_problem", "pause", "unclear", "interview_dialogue", "other",
+    "audio_problem", "pause", "unclear", "interview_dialogue", "stop_interview", "other",
 ]
 RECEPTION_REPLY_LIMIT = 180
 RECEPTION_HISTORY_LIMIT = 16
@@ -131,16 +131,25 @@ def reception_contract(context):
             "interview_dialogue：其它需要接话的面试交流，例如紧张需要安抚、申请先讲思路或换种表达、"
             "询问交流方式和面试流程。interview_dialogue不包括无关话题，也不负责提醒跑题。"
             "other：普通技术回答、清楚但偏离题目的叙述、请求聊与面试无关的话题、没有交流请求的自言自语、"
-            "明确跳题/结束话题/结束整场以及公司反问。所有偏题发言都由正式理解路径统一处理，"
+            "明确跳题/结束话题以及公司反问。所有偏题发言都由正式理解路径统一处理，"
             "这里kind=other且reply_text为空；不要生成拉回话题的追问、劝告或回应。"
             "叙述跑题本身不是向你提出请求，不能据此插话；是否答非所问交给正式理解和评分路径。"
             "内容无关不等于转写不清，不要要求候选人重说、拼写术语或纠正已清楚表达的内容。"
             "同一句先说无关内容、最后明确说完或不再回答，必须other，reply_text为空，"
             "不能用拉回话题的回复截住当前完成请求；只结束本题不等于结束整场面试。"
             "本人明确说‘我不会’、‘这题我不会’、‘这道题答不上来’而没有要求继续思考，同样属于other；"
-            "不要沿用preceding_text里先前的‘想一下’而回复慢慢想。‘我已经说完了’、‘我们结束面试吧’也必须other。"
-            "明确结束整场必须交给正式语义与生命周期路径，不能用wait、pause或安抚回应截住。"
+            "不要沿用preceding_text里先前的‘想一下’而回复慢慢想。‘我已经说完了’也必须other。"
             "这些由后续专门路径处理，reply_text必须为空，不插话、不擅自问是否补充。"
+            "stop_interview：候选人本人现在想提前结束整场面试，允许自然、委婉、道歉或询问式表达；"
+            "例如‘我们结束面试吧’、‘不好意思，今天我想就到这里’、‘可以结束面试了吗’。"
+            "一句包含技术回答和退出请求时，以最后有效请求判断，技术内容仍由服务端保留；"
+            "技术机制讲得不完整或术语含义不明，不妨碍识别本人当前是否想退出。"
+            "stop_interview的reply_text必须为空，只提议服务端发起独立退出确认，不是退出许可；"
+            "不得自行确认已经退出、生成确认问题或等待完整技术分析才提出该请求。"
+            "引用、假设、否认、过去曾想退出以及随后改口继续，不是当前退出请求；"
+            "单题讲完、不会本题、跳题或暂停也不等于退出整场。通读new_speech并核对最后有效请求，"
+            "evidence_id必须指向new_speech内支持本人当前退出请求的实际原文，不能引用历史或面试官话语。"
+            "明确结束整场不能用wait、pause或安抚回应截住；只有实际独立确认和服务端校验才能结束。"
             "候选人回答后邀请核实、请你提出尚有疑问的地方，是交还话轮并允许正式追问，也用other，"
             "reply_text为空；不要用interview_dialogue或question_clarification接管这次发言，"
             "以免阻断正式回答完成与追问决策。引用或假设中的邀请按整句实际含义理解。"
@@ -204,14 +213,17 @@ def validate_reception_response(data, schema, *, current_speech=None):
 
     if not math.isfinite(data["confidence"]):
         reject("reception_confidence_invalid", "$.confidence")
-    if current_speech is not None and data["kind"] != "other":
+    if data["kind"] == "stop_interview":
+        from app.core.prompt.candidate_exit import validate_exit_request_source
+        validate_exit_request_source(data, current_speech)
+    elif current_speech is not None and data["kind"] != "other":
         from app.core.prompt.semantic_turn import _explicit_control_conflict
         if _explicit_control_conflict(current_speech, "thinking", "none"):
             reject("reception_current_control_conflict", "$.kind")
     reply = data["reply_text"]
     if data["kind"] != "repeat" and data.get("repeat_target") is not None:
         reject("reception_repeat_target_without_repeat", "$.repeat_target")
-    if data["kind"] in {"other", "repeat"}:
+    if data["kind"] in {"other", "repeat", "stop_interview"}:
         if reply != "":
             reject("reception_silent_kind_has_reply")
     elif not reply.strip():

@@ -13,6 +13,7 @@ from test_automatic_turn_integration import _automatic_session, _current, _feed,
 from test_declined_answer_integration import _add_next_question, _NEXT_TURN_ID, _playable_speech, _confirm_pending_exit
 from test_evidence_owner_recovery_integration import TURN_ID, _wait_until
 from test_spoken_supplement_integration import _audio_aligned_transcripts, _finish_playback
+from test_exit_evidence_086 import _assert_retained_exit
 
 
 _QUESTION = "持久检查点是什么意思？"
@@ -38,7 +39,8 @@ def _dialogue_provider(monkeypatch, *, ending, misread_fast_finish=False):
             value = json.loads(request.messages[-1].content)
             assert value["reply"] == _SUPPLEMENT_REPLY
             evidence_id = next(key for key, text in value["evidence"].items() if text == _SUPPLEMENT_REPLY)
-            data = {"intent": "finish", "confidence": .98, "evidence_id": evidence_id}
+            data = {"intent": "finish", "confidence": .98, "evidence_id": evidence_id,
+                    "reply_text": ""}
             calls.append({"stage": "supplement", "current_speech": value["reply"]})
         elif version.startswith("conversation_reception."):
             value = json.loads(request.messages[-1].content)
@@ -162,16 +164,22 @@ def test_real_endpoint_explanation_wait_then_current_finish_completes_once(
                 assert not _current(runtime)["answers"]
                 await _feed(managed._ingress, _CONTINUATION, 5)
                 clock.value += 1.1
-            await _wait_until(lambda: len(_current(runtime)["answers"]) == 1, timeout=5)
             if expected_intent == "stop_interview":
                 await _wait_until(lambda: bool(_current(runtime).get("candidate_input_completed_at")), timeout=5)
+                await _wait_until(lambda: all(command["status"] == "completed" for command in store.evidence_commands.values()))
+            else:
+                await _wait_until(lambda: len(_current(runtime)["answers"]) == 1, timeout=5)
             current = _current(runtime)
             root = next(turn for turn in current["turns"] if turn["id"] == TURN_ID)
-            assert root["current_understanding"]["turn_intent"] == expected_intent
-            assert current["answers"][0]["final_transcript"] == _QUESTION + _WAIT + body + (
+            expected_text = _QUESTION + _WAIT + body + (
                 "确定结束面试。" if expected_intent == "stop_interview" else
                 _SUPPLEMENT_REPLY if expected_intent == "finish_answer" else "")
-            assert current["answers"][0]["media_evidence"]["complete"] is True
+            if expected_intent == "stop_interview":
+                _assert_retained_exit(store, runtime, expected_text, voice_frames=5, continuation_frames=15)
+            else:
+                assert root["current_understanding"]["turn_intent"] == expected_intent
+                assert current["answers"][0]["final_transcript"] == expected_text
+                assert current["answers"][0]["media_evidence"]["complete"] is True
             assert not [act for act in root["conversation_acts"] if act.get("act_type") == "clarification"]
             assert spoken.count(_WAIT_REPLY) == (2 if acknowledged_finish else 1), "The old waiting request must not shadow the newest finish"
             seals = [command for command in store.evidence_commands.values() if command["command_type"] == "evidence.seal"]

@@ -90,15 +90,33 @@ def test_slow_understanding_keeps_capture_resumed_and_new_input_revokes_result(n
             await _until(lambda: capture.resumes > 0)
             assert not capture.paused
             assert not processing.done() and not commits
+            preparation = endpoint._confirmed_preparation
+            deadline = endpoint._confirmed_preparation_deadline
+            revision = endpoint.revision
             if new_input == "audio":
                 endpoint.observe_audio(b"\x00\x40" * 320)
             else:
                 endpoint.observe_transcript(capture.current_final.text + "不对，我还要补充。")
-            await asyncio.wait_for(capture.preparation_cancelled.wait(), 1)
-            capture.release.set()
+            assert endpoint.revision > revision
             with pytest.raises(ApiError) as raised:
-                await processing
+                await asyncio.wait_for(processing, 1)
             assert raised.value.code == "TURN_DECISION_STALE"
+            # Audio and provisional subtitles both revoke progression while
+            # the original pure analysis remains bounded and side-effect free.
+            assert endpoint._confirmed_preparation is preparation and not preparation.done()
+            assert endpoint._confirmed_preparation_deadline == deadline
+            assert not capture.preparation_cancelled.is_set()
+            if new_input == "audio":
+                capture.release.set()
+                await asyncio.wait_for(asyncio.shield(preparation), 1)
+                await asyncio.wait_for(capture.preparation_done.wait(), 1)
+                assert not capture.preparation_cancelled.is_set()
+            else:
+                changed = _final(capture.current_final.text + "不对，我还要补充。")
+                endpoint.cover_transcript(changed)
+                await asyncio.wait_for(capture.preparation_cancelled.wait(), 1)
+                assert endpoint._confirmed_preparation is None
+                capture.release.set()
             assert not commits and not spoken
             assert capture.is_open and not capture.paused
         finally:
@@ -201,7 +219,7 @@ def test_corrected_final_text_or_provenance_cannot_reuse_preview_analysis(change
 
 
 @pytest.mark.parametrize("interrupt", ["audio", "partial", "close"])
-def test_new_input_or_close_cancels_speculative_work_before_five_second_confirmation(interrupt):
+def test_audio_retains_bounded_speculation_but_text_or_close_cancels_before_confirmation(interrupt):
     async def scenario():
         endpoint, clock, _, commits, spoken = setup()
         capture = endpoint.capture
@@ -212,15 +230,39 @@ def test_new_input_or_close_cancels_speculative_work_before_five_second_confirma
             await endpoint.confirmation.step(endpoint, quiet=3.1)
             await asyncio.wait_for(capture.entered.wait(), 1)
             assert not capture.snapshots
+            revision = endpoint.revision
+            preparation = endpoint.preparation._task
+            deadline = endpoint._interaction_deadline
             if interrupt == "close":
                 await endpoint.close()
             elif interrupt == "partial":
                 endpoint.observe_transcript(capture.current_final.text + "不过我可以尝试一下。")
             else:
                 endpoint.observe_audio(b"\x00\x40" * 320)
-            await asyncio.wait_for(capture.preparation_cancelled.wait(), 1)
-            capture.release.set()
-            await asyncio.sleep(0)
+            with pytest.raises(ApiError) as raised:
+                endpoint.assert_current()
+            assert raised.value.code == "TURN_DECISION_STALE"
+            if interrupt in {"audio", "partial"}:
+                assert endpoint.revision > revision
+                assert endpoint.preparation._task is preparation and not preparation.done()
+                assert endpoint._interaction_deadline == deadline
+                assert not capture.preparation_cancelled.is_set()
+            if interrupt == "audio":
+                capture.release.set()
+                await asyncio.wait_for(asyncio.shield(preparation), 1)
+                assert endpoint.preparation.matching(capture.current_final)
+                # A late pure result alone neither cuts recognition nor speaks
+                # or commits. Only a complete changed final discards it.
+                await endpoint.confirmation.step(endpoint, quiet=0)
+                assert not capture.snapshots and not commits and not spoken
+                endpoint.observe_transcript(capture.current_final.text + "不过我可以尝试一下。")
+                assert endpoint.preparation.matching(capture.current_final)
+                endpoint.cover_transcript(_final(capture.current_final.text + "不过我可以尝试一下。"))
+            else:
+                if interrupt == "partial":
+                    endpoint.cover_transcript(_final(capture.current_final.text + "不过我可以尝试一下。"))
+                await asyncio.wait_for(capture.preparation_cancelled.wait(), 1)
+                capture.release.set()
             assert not endpoint.preparation.matching(capture.current_final)
             assert not commits and not spoken
         finally:

@@ -105,13 +105,23 @@ async def test_contract_rejection_and_budget_exhaustion_are_distinct_without_ext
     invalid = _data()
     invalid["understanding"]["claims"][0]["evidence_id"] = "PRIVATE_INVALID_REFERENCE"
     gateway = Gateway(invalid)
-    with answer_processing_budget(AnswerProcessingBudget(limit=1)):
-        understanding, followup = await _service(gateway).prepare_decision(utterance, turn, interview)
+    service = _service(gateway)
+    budget = AnswerProcessingBudget(limit=1)
+    with answer_processing_budget(budget):
+        understanding, followup = await service.prepare_decision(utterance, turn, interview)
+        assert understanding.problem.reason_code == "wire_schema_invalid"
+        assert understanding.problem.source == "schema_or_content"
+        assert not followup["selected"]
+        # The completed call retains its actual rejection. A later attempt
+        # against the spent allowance is distinct and cannot invoke a model.
+        blocked, blocked_followup = await service.prepare_decision(utterance, turn, interview)
     assert len(gateway.requests) == 1
-    assert understanding.problem.reason_code == "call_budget_exhausted"
-    assert not followup["selected"]
+    assert budget.used == 1
+    assert blocked.problem.reason_code == "call_budget_exhausted"
+    assert not blocked_followup["selected"]
     assert any(r.get("event", "").endswith("understanding_rejected") for r in diagnostics)
-    assert any(r.get("failure_reason") == "call_budget_exhausted" for r in diagnostics)
+    failures = [r for r in diagnostics if r.get("event", "").endswith("understanding_failed")]
+    assert [r["failure_reason"] for r in failures] == ["wire_schema_invalid", "call_budget_exhausted"]
     assert "PRIVATE_INVALID_REFERENCE" not in json.dumps(diagnostics)
 
 

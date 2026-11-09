@@ -74,6 +74,7 @@ def test_utterance_rejects_incomplete_source_and_approved_speech_cannot_supply_a
 @pytest.mark.parametrize("technical", [False, True])
 async def test_clear_completion_after_delivered_clarification_does_not_upgrade_technical_quality(technical):
     text, before, data = unresolved_response(technical=technical)
+    data["clarification_target"] = {"resolution": "same_focus_unresolved", "source_ref": "C1"}
     reply = text[len(before):]
     utterance, turn, interview = _speech([before, reply], [.3, .99])
     turn["allow_followup"] = False
@@ -92,6 +93,7 @@ async def test_clear_completion_after_delivered_clarification_does_not_upgrade_t
 @pytest.mark.parametrize("quality,segments", [(.3, True), (None, True), (.99, False)])
 async def test_uncertain_current_completion_still_requires_clarification(quality, segments):
     text, before, data = unresolved_response()
+    data["clarification_target"] = {"resolution": "same_focus_unresolved", "source_ref": "C1"}
     utterance, turn, interview = _speech([before, text[len(before):]], [.3, quality])
     if not segments:
         utterance = utterance.model_copy(update={"stt_segments": []})
@@ -194,6 +196,6 @@ def test_control_projection_is_pure_and_prompt_keeps_strict_provider_compatible_
     assert projected["completion_basis"] == raw["completion_basis"] and projected["claims"] == raw["claims"]
     contract = prompt_contract("interview_turn_understanding", {"semantic_first": True,
         "transcript": "我用幂等键。下一题吧。", "capability_points": ["幂等键"]})
-    assert contract.version == "interview_turn_understanding.v98"
+    assert contract.version == "interview_turn_understanding.v118"
     assert "semantic_controls.v3" in "".join(message.content for message in contract.messages)
     assert {"suggested_action", "followup_allowed", "completion_basis"} <= set(contract.response_schema["required"])

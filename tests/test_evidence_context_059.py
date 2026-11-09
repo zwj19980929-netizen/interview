@@ -6,9 +6,9 @@ import pytest
 
 from app.core.errors import ApiError
 from app.model_gateway.schemas import StableTranscriptPreview
-from app.repositories.memory import InMemoryStore
-from app.services.interview_evidence import InterviewEvidenceChain
 from test_answer_endpoint import _endpoint, _final
+from test_answer_reuse_078 import _append, _delivered
+from test_preparation_fences_081 import _chain
 
 
 @pytest.mark.anyio
@@ -32,34 +32,50 @@ async def test_confirmed_stable_preview_keeps_semantic_understanding_mode():
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("invalidated", [None, "capture", "revoked", "owner"])
-async def test_confirmation_context_is_fenced_before_and_after_inference(invalidated):
-    chain = InterviewEvidenceChain(InMemoryStore(), "synthetic_interview")
+async def test_confirmation_context_is_fenced_before_and_after_inference(tmp_path, monkeypatch, invalidated):
+    harness = _chain(tmp_path, monkeypatch)
+    chain = harness.chain
+    _delivered(harness.stream.interviews)
+    final = _append(harness.final, "对。")
+    harness.stream.stream = SimpleNamespace(_final=final)
     entered, release = asyncio.Event(), asyncio.Event()
     calls, guards = [], []
-    allowed = True
+    original_guard = harness.stream.commit_guard
     def guard():
         guards.append(True)
-        if not allowed:
-            raise ApiError("TURN_DECISION_STALE", "Owner changed", status_code=409)
+        original_guard()
     async def classify(reply, org, **kwargs):
         calls.append((reply, org, kwargs))
         entered.set()
-        await release.wait()
+        await asyncio.wait_for(release.wait(), 1)
         return {"intent": "unclear", "confidence": .4}
-    chain._stt = SimpleNamespace(_assert_commit_allowed=guard,
-        interviews=SimpleNamespace(conversation=SimpleNamespace(classify_supplement_reply=classify)))
+    harness.stream.commit_guard = guard
+    monkeypatch.setattr(harness.stream.interviews.conversation, "classify_supplement_reply", classify)
     task = asyncio.create_task(chain.classify_supplement_reply("对。", prior_confirmation=True,
-        preceding_text="我已经说完了。", question="还有需要补充的吗？"))
-    await entered.wait()
-    if invalidated == "capture": chain._stt = None
-    elif invalidated == "revoked": chain.revoke_audio_input()
-    elif invalidated == "owner": allowed = False
-    release.set()
-    if invalidated:
-        with pytest.raises(ApiError) as error: await task
-        assert error.value.code == "TURN_DECISION_STALE"
-    else:
-        assert (await task)["intent"] == "unclear"
-        assert len(guards) == 2
-    assert calls == [("对。", "org_default", {"prior_confirmation": True,
-        "preceding_text": "我已经说完了。", "question": "还有需要补充的吗？"})]
+        preceding_text="我已经说完了。", question="还有需要补充的吗？",
+        final=final, boundary_final=harness.final))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        if invalidated == "capture": chain._stt = None
+        elif invalidated == "revoked": chain.revoke_audio_input()
+        elif invalidated == "owner": assert harness.coordinator.release(harness.owner)
+        release.set()
+        if invalidated:
+            with pytest.raises(ApiError) as error: await asyncio.wait_for(task, 1)
+            assert error.value.code == ("EVIDENCE_OWNER_FENCED" if invalidated == "owner" else "TURN_DECISION_STALE")
+        else:
+            assert (await asyncio.wait_for(task, 1))["intent"] == "unclear"
+            assert len(guards) == 2
+        assert len(calls) == 1
+        reply, organization, context = calls[0]
+        assert (reply, organization) == ("对。", "org_default")
+        assert context["prior_confirmation"] is True
+        assert context["preceding_text"] == "我已经说完了。"
+        assert context["conversation_context"]["stage"] == "awaiting_reply"
+        assert context["conversation_context"]["reply_target"] == "supplement_question"
+        assert context["question"] == context["conversation_context"]["last_delivered_utterance"]
+        assert not harness.stream.interviews.get_interview("iv_binding")["answers"]
+    finally:
+        release.set()
+        if not task.done(): task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

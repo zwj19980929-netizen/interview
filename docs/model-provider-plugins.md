@@ -1,5 +1,25 @@
 # 模型供应商插件化设计
 
+## 087：临时转写与分析取消来源
+
+供应商协议、原始转写和模型调用上限保持。字幕partial/final投影仅作为撤销当前推进资格的通知，完整证据来源由原稳定preview/权威snapshot验证。分析取消诊断新增白名单`source=stable_evidence`，不记录候选原话；partial不再取消纯分析，也不刷新该分析的次数或时间。详见[087](provisional-transcript-preparation-087.md)。
+
+## 2026-11-02 · 接话合同v10（086）
+
+conversation_reception.v10新增silent kind=stop_interview，reply_text必须为空；模型只能识别当前请求，统一Schema和E来源校验通过后才允许提出独立确认。候选的新确认仍走candidate_exit_reply.v1的严格来源合同；实际结束由服务端事务决定，不再调用完整答案模型。接话继续使用一次4秒、零供应商重试；正常答案的原调用与限时策略不变。厂商协议、路由配置、ASR和原始转写未改。见[086](conversation-control-autonomy-086.md)。
+
+## 085：内容澄清结构化输出（仓库与本机已验证）
+
+理解118–125/组合149–156采用单条首位system指令；已送达澄清的target为resolved、same_focus_unresolved+C1、new_focus_unresolved+E/焦点的严格联合对象。统一Schema与解析器恢复既有canonical结构并继续执行语义校验；provider不承担业务纠错。来源不匹配提供专门中央纠错指令，正常首次成功不增加外呼。单次18秒、共享两次完整调用及20/40秒整体期限保持。见[085](followup-clarification-085.md)。
+
+## 084：补充交流合同
+
+supplement_reply.v6扩展轻量交流意图与有界接话文本，中央Schema及引用校验先于业务路由。一次provider尝试、原8秒provider限时和10秒外层等待保持；生成表达记录实际v6来源。完整语义指令更新为v21/v22；semantic理解v110–117、组合决策v141–148，非semantic106–109/137–140和全部历史读取兼容保持。按真实补充阶段说明授权，completion_basis校验保留。供应商、ASR和音色不变，见[084](supplement-dialogue-routing-084.md)。
+
+## 083：跨准备阶段接续已有纠错合同
+
+统一理解校验产生的固定错误原因可在精确来源/合同约束下，由预分析带到正式准备的剩余一次调用，使用`app/core/prompt/`中已有的版本化纠错指令。不缓存或直接采用未校验响应，不改变供应商适配器、模型路由、18秒请求限制或单attempt配置；仍共用两次完整调用预算。正常路径不增加请求，实际纠错是否采用通过安全诊断核验。详见[083](bounded-correction-continuation-083.md)。
+
 ## 079：非流式调用开始与取消审计
 
 非流式`invoke`的attempt开始/结束输出安全结构化诊断，使用`invocation_id + attempt + fallback_index`及`diagnostic_scope_id/parent_scope_id`关联端点和理解阶段。记录配置请求期限、实际执行期限、交互剩余时间及耗时；`CancelledError`补`status=cancelled`终态审计后原样传播，不重试、不fallback、不增加断路器失败。正常供应商超时仍是`failed/provider_timeout`，不能把调用方撤销写成供应商失败。取消来源由实际取消方标注；未取得来源时保留`caller_cancelled`，由关联的外层timeout或输入撤销事件解释，不猜测网络子阶段。开始事件不增加数据库attempt行；诊断写入失败不吞掉取消。范围仅新增观测，不改模型、路由、Prompt和时间策略。验证见[操作日志079](change-log.md)。

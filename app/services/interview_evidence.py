@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional
 
 from app.core.errors import ApiError
+from app.core.answer_processing_budget import answer_correction_binding
 from app.domain.evidence_coordination import EvidenceCommitFence
 from app.domain.speech_quality import transcript_confidence_segments
 from app.persistence.interface import Persistence
@@ -385,19 +387,78 @@ class InterviewEvidenceChain:
         stream._assert_commit_allowed()
         return result
 
+    def _supplement_dialogue_context(self, stream: Any) -> Any:
+        """Freeze only public dialogue for the prompt, full context for fences."""
+        from app.services.dialogue_history import recent_turn_dialogue
+        from app.services.dialogue_focus import question_for_repeat, clarification_for_repeat
+        from app.services.supplement_context import supplement_context
+
+        session = stream.interviews.get_interview(self.interview_id, self.organization_id)
+        turn = stream.interviews.lifecycle.require_active_turn(session, stream.turn_id, allowed_statuses=("asking",))
+        supplement = supplement_context(session, turn)
+        turns = session.get("turns", [])
+        index = next(index for index, item in enumerate(turns) if item["id"] == turn["id"])
+        history = []
+        for previous in turns[max(0, index - 1):index + 1]:
+            for item in recent_turn_dialogue(session, previous, max_acts=6):
+                if item["speaker"] == "interviewer" and item.get("delivery_status") != "delivered":
+                    continue
+                history.append({"role": item["speaker"], **{key: value for key, value in item.items() if key != "speaker"}})
+        delivered = [item for item in history if item["role"] == "interviewer" and item.get("turn_id") == turn["id"]]
+        clarification = clarification_for_repeat(turn)
+        if clarification not in {item["text"] for item in delivered}:
+            clarification = ""
+        root = next((item for item in turns if item["id"] == turn.get("root_turn_id")), turn)
+        context = {"stage": supplement["stage"], "current_question": question_for_repeat(turn),
+            "root_question": question_for_repeat(root), "last_clarification": clarification,
+            "last_delivered_utterance": delivered[-1]["text"] if delivered else "", "history": history[-8:],
+            "reply_target": ("supplement_question" if delivered[-1].get("act_id") == supplement.get("question_act_id")
+                             else "other_delivered_speech") if delivered else "unknown",
+            "process_facts": {"duration_minutes": (session.get("plan_snapshot") or {}).get("duration_minutes")}}
+        return context, supplement.get("question", ""), stream.interviews._prepared_context_fingerprint(session, turn)
+
     async def classify_supplement_reply(self, reply: str, *, prior_confirmation: bool = False,
-                                        preceding_text: str = "", question: str = "") -> Any:
+                                        preceding_text: str = "", question: str = "",
+                                        final: Any = None, boundary_final: Any = None) -> Any:
         stream = self._stt
         if stream is None or self._input_revoked:
             raise ApiError("AGENT_EVIDENCE_NOT_OPEN", "Evidence is not open.", status_code=409)
         stream._assert_commit_allowed()
+        turn_id, generation, recognizer = stream.turn_id, stream._capture_generation, stream.stream
+
+        def evidence_identity() -> Any:
+            # Observe existing snapshots only. Do not cut, resume, correct or
+            # otherwise operate the recognizer to classify conversation.
+            values = (final, boundary_final, getattr(recognizer, "_final", None))
+            return tuple(hashlib.sha256(json.dumps(value.model_dump(mode="json"), sort_keys=True,
+                ensure_ascii=False).encode("utf-8")).hexdigest() if value is not None else None for value in values)
+
+        if final is not None or boundary_final is not None:
+            if final is None or boundary_final is None:
+                raise ApiError("TURN_DECISION_STALE", "A complete reply boundary is required.", status_code=409)
+            stream.interviews._require_streaming_final(final)
+            stream.interviews._require_streaming_final(boundary_final)
+            from app.services.spoken_supplement import _speech_since
+            if _speech_since(final, boundary_final, boundary_final.text.strip()) != reply:
+                raise ApiError("TURN_DECISION_STALE", "Reply no longer matches its source.", status_code=409)
+        frozen_evidence = evidence_identity()
+        if final is not None and frozen_evidence[2] is not None and frozen_evidence[0] != frozen_evidence[2]:
+            raise ApiError("TURN_DECISION_STALE", "Reply source changed before classification.", status_code=409)
+        context, delivered_question, context_fingerprint = self._supplement_dialogue_context(stream)
+        if final is not None and context["stage"] != "awaiting_reply":
+            raise ApiError("TURN_DECISION_STALE", "Supplement question has not been delivered.", status_code=409)
         result = await stream.interviews.conversation.classify_supplement_reply(
             reply, self.organization_id, prior_confirmation=prior_confirmation,
-            preceding_text=preceding_text, question=question,
+            preceding_text=preceding_text, question=delivered_question or question,
+            conversation_context=context,
         )
-        if stream is not self._stt or self._input_revoked:
+        if (stream is not self._stt or self._input_revoked or stream.turn_id != turn_id
+                or stream._capture_generation != generation or stream.stream is not recognizer
+                or evidence_identity() != frozen_evidence):
             raise ApiError("TURN_DECISION_STALE", "Capture changed.", status_code=409)
         stream._assert_commit_allowed()
+        if self._supplement_dialogue_context(stream)[2] != context_fingerprint:
+            raise ApiError("TURN_DECISION_STALE", "Conversation changed.", status_code=409)
         return result
 
     async def classify_exit_reply(self, reply: str) -> Any:
@@ -410,6 +471,19 @@ class InterviewEvidenceChain:
             raise ApiError("TURN_DECISION_STALE", "Capture changed.", status_code=409)
         stream._assert_commit_allowed()
         return result
+
+    def prepare_exit_decision(self, final: Any, *, exit_confirmation: Any) -> Any:
+        """Bind a delivered control confirmation to this live evidence owner."""
+        stream = self._stt
+        if stream is None or self._input_revoked:
+            raise ApiError("TURN_DECISION_STALE", "Capture is no longer active.", status_code=409)
+        stream._assert_commit_allowed()
+        prepared = stream.interviews.prepare_streaming_exit(
+            self.interview_id, stream.turn_id, final, self.organization_id,
+            exit_confirmation=exit_confirmation,
+        )
+        stream._assert_commit_allowed()
+        return replace(prepared, capture_binding=stream)
 
     async def prepare_decision(self, final: Any, *, completion_confirmed: bool = False,
                                semantic_first: bool = False, exit_confirmation: Any = None,
@@ -427,18 +501,45 @@ class InterviewEvidenceChain:
             checkpoint["stream_id"], checkpoint["capture_revision"],
             checkpoint["last_sealed_frame_sequence"],
         )
-        prepared = await stream.interviews.prepare_streaming_decision(
-            self.interview_id, stream.turn_id, final, self.organization_id,
-            snapshot_ref=snapshot_ref,
-            completion_confirmed=completion_confirmed,
-            semantic_first=semantic_first,
-            exit_confirmation=exit_confirmation,
-            content_clarification=content_clarification,
-        )
+        fence = self.commit_fence.model_dump_json() if self.commit_fence is not None else None
+
+        def correction_guard() -> None:
+            if stream is not self._stt or self._input_revoked:
+                raise ApiError("TURN_DECISION_STALE", "Capture changed.", status_code=409)
+            if (self.commit_fence.model_dump_json() if self.commit_fence is not None else None) != fence:
+                raise ApiError("TURN_DECISION_STALE", "Capture ownership changed.", status_code=409)
+            stream._assert_commit_allowed()
+
+        with answer_correction_binding((stream, fence), guard=correction_guard):
+            prepared = await stream.interviews.prepare_streaming_decision(
+                self.interview_id, stream.turn_id, final, self.organization_id,
+                snapshot_ref=snapshot_ref,
+                completion_confirmed=completion_confirmed,
+                semantic_first=semantic_first,
+                exit_confirmation=exit_confirmation,
+                content_clarification=content_clarification,
+            )
         if stream is not self._stt or self._input_revoked:
             raise ApiError("TURN_DECISION_STALE", "Capture changed.", status_code=409)
         stream._assert_commit_allowed()
         return replace(prepared, capture_binding=stream)
+
+    def assert_preparation_current(self, prepared: Any, transcript: Any, **kwargs: Any) -> None:
+        """Retained reasoning stays bound to the live authoritative capture.
+
+        This does not seal audio, certify completeness or authorize a commit.
+        Check the external owner guard before the service opens a read scope.
+        """
+        stream = self._stt
+        if (stream is None or self._input_revoked
+                or getattr(prepared, "capture_binding", None) is not stream
+                or prepared.interview_id != self.interview_id
+                or prepared.turn_id != stream.turn_id):
+            raise ApiError("TURN_DECISION_STALE", "Capture changed since preparation.", status_code=409)
+        stream._assert_commit_allowed()
+        stream.interviews.assert_streaming_preparation_current(
+            prepared, transcript, self.organization_id, **kwargs,
+        )
 
     def confirm_prepared_decision(self, prepared: Any, base_final: Any,
                                   delivered_boundary_final: Any, final: Any, *,

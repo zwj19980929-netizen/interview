@@ -1586,9 +1586,7 @@ class AgentChannel:
         async def release() -> None:
             # Completion can be emitted from the presentation task itself.
             # Wait for it to return before stop() cancels presentation work.
-            presentation = evidence._presentation_task
-            if presentation is not None and not presentation.done():
-                await asyncio.gather(asyncio.shield(presentation), return_exceptions=True)
+            await evidence._wait_for_presentation_cleanup()
             if self._evidence_session is not evidence:
                 return
             try:

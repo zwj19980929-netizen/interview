@@ -18,6 +18,7 @@ def _case(*, composite=True, intent="answer", reply=REPLY, delivered=False):
         "current_speech_start": 0, "current_speech": text, "responded_exchanges": []}}
     if delivered:
         dialogue["content_clarification"] = _clarification_context(before, reply)
+        data["clarification_target"] = {"resolution": "same_focus_unresolved", "source_ref": "C1"}
     interview.update(_semantic_first=True, _interviewer_context=dialogue)
     return text, before, data, utterance, turn, interview
 

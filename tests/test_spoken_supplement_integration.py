@@ -35,10 +35,10 @@ def _synthetic_confirmed_understanding(monkeypatch):
     async def invoke(provider, capability, request, context):
         response = await original(provider, capability, request, context)
         if request.metadata.get("prompt_version") not in {
-            "interview_turn_understanding.v98", "interview_turn_understanding.v100",
-            "interview_turn_understanding.v99", "interview_turn_understanding.v101",
-            "interview_turn_decision.v129", "interview_turn_decision.v131",
-            "interview_turn_decision.v130", "interview_turn_decision.v132",
+            "interview_turn_understanding.v118", "interview_turn_understanding.v120",
+            "interview_turn_understanding.v119", "interview_turn_understanding.v121",
+            "interview_turn_decision.v149", "interview_turn_decision.v151",
+            "interview_turn_decision.v150", "interview_turn_decision.v152",
         }:
             return response
         transcript = request.metadata.get("transcript", "")
@@ -240,7 +240,7 @@ def test_five_second_check_then_spoken_no_submits_original_answer_with_no_button
                 ("committed", _current(runtime)["id"], TURN_ID),
             ]
             assert _current(runtime)["turns"][0]["current_understanding"]["prompt_version"] in {
-                "interview_turn_understanding.v100", "interview_turn_understanding.v101", "interview_turn_decision.v132",
+                "interview_turn_understanding.v120", "interview_turn_understanding.v121", "interview_turn_decision.v152",
             }
             understanding = _current(runtime)["turns"][0]["current_understanding"]
             assert understanding["turn_intent"] == "finish_answer" and understanding["followup_allowed"]

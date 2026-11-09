@@ -171,6 +171,7 @@ async def prepare_unresolved():
         tx.interview_sessions.update(current, expected_version=current["version"])
     _, _, data = unresolved_response()
     data["missing_point_ids"] = ["P1"]
+    data["clarification_target"] = {"resolution": "same_focus_unresolved", "source_ref": "C1"}
     service.conversation.gateway = Gateway(data)
     final = _final(text)
     prepared = await service.prepare_streaming_decision("iv_binding", "turn_binding", final,
@@ -267,7 +268,14 @@ def synthetic_provider(monkeypatch):
         data["missing_point_ids"] = list(refs["capabilities"])
         finished = text.endswith(REPLY)
         data["completion_basis"] = {"source": "explicit_server_intent", "evidence_ids": list(refs["evidence"])[-1:]}
-        if not finished:
+        if finished:
+            schema = request.json_schema
+            if "understanding" in schema["properties"]:
+                schema = schema["properties"]["understanding"]
+            assert any(branch["properties"]["resolution"]["enum"] == ["same_focus_unresolved"]
+                       for branch in schema["properties"]["clarification_target"]["anyOf"])
+            data["clarification_target"] = {"resolution": "same_focus_unresolved", "source_ref": "C1"}
+        else:
             data.update(intent="clarification_request", turn_intent="clarify", suggested_action="clarify",
                         confidence=.6, completion_basis=None)
         calls.append((finished, text))
@@ -355,8 +363,9 @@ def test_unresolved_candidate_exit_requires_fresh_confirmation_and_preserves_ans
     from app.core.prompt.candidate_exit import EXIT_CONFIRMATION_SPEECH
     from app.providers.mock.provider import MockSTTStream
     from test_automatic_turn_integration import (
-        _automatic_session, _current, _feed, _CONTINUATION, _assert_one_automatic_answer,
+        _automatic_session, _current, _feed, _CONTINUATION,
     )
+    from test_exit_evidence_086 import _assert_retained_exit
     from test_declined_answer_integration import (
         _TECHNICAL, _add_next_question, _playable_speech, _answer_without_confirmation,
         _stop_current_playback, _NEXT_TURN_ID,
@@ -460,16 +469,12 @@ def test_unresolved_candidate_exit_requires_fresh_confirmation_and_preserves_ans
             await _wait_until(lambda: managed._stopped and not ingress.connected)
 
             current = _current(runtime)
-            _assert_one_automatic_answer(store, runtime, body + reply, voice_frames=5, continuation_frames=5)
-            answer = current["answers"][0]
-            understanding = current["turns"][0]["current_understanding"]
-            assert answer["raw_transcript"] == answer["final_transcript"] == body + reply
-            assert understanding["intent"] == "answer_unresolved"
-            assert understanding["turn_intent"] == "stop_interview"
-            assert [claim["claim"] for claim in understanding["claims"]] == [_TECHNICAL]
-            assert [claim["evidence_quote"] for claim in understanding["claims"]] == [_TECHNICAL]
-            assert understanding["ambiguities"] == ["蓝桥的实际含义无法核实。"]
-            assert understanding["clarification_target"]["focus_quote"] == "蓝桥"
+            retained = _assert_retained_exit(store, runtime, body + reply,
+                voice_frames=5, continuation_frames=5)
+            # Exit preserves the unresolved words and technical body for human
+            # review; it does not manufacture a completed, assessed answer.
+            assert _TECHNICAL in retained["raw_transcript"] and "任务转到蓝桥，蓝桥。" in retained["raw_transcript"]
+            assert ("understanding", body + reply) not in calls
             assert current["candidate_input_completion_reason"] == "candidate_requested"
             assert current["candidate_exit_confirmed_at"] and channel._evidence_session is None
             assert not any(event["type"] == "conversation.act.selected" and event["turn_id"] == _NEXT_TURN_ID

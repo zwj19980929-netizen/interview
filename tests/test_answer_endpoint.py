@@ -183,7 +183,7 @@ def test_explicit_finish_is_optional_override_not_required_for_automatic_flow():
     asyncio.run(scenario())
 
 
-def test_new_voice_cancels_slow_prepare_and_discards_late_result():
+def test_new_voice_retains_slow_prepare_but_new_words_discard_its_late_result():
     async def scenario():
         capture = _Capture()
         entered, cancelled = asyncio.Event(), asyncio.Event()
@@ -204,12 +204,14 @@ def test_new_voice_cancels_slow_prepare_and_discards_late_result():
         await entered.wait()
         clock.value += 1
         endpoint.observe_audio(b"\0\x40" * 320)
-        await cancelled.wait()
         await _until(lambda: capture.resumes and "answer_listening" in notices)
-        assert not commits and "answer_listening" in notices
+        assert not cancelled.is_set() and not commits
         capture.prepare_impl = None
         capture.current_final = _final("合成回答结束。还有补充。")
+        endpoint.observe_transcript(capture.current_final.text)
+        assert not cancelled.is_set() and not commits
         clock.value += 0.8
+        await asyncio.wait_for(cancelled.wait(), 1)
         await _until(lambda: commits)
         assert len(commits) == 1 and commits[0].text.endswith("还有补充。")
         assert len(capture.prepares) == 2

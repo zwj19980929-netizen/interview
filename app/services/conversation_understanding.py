@@ -12,7 +12,10 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from app.domain.speech_quality import limit_semantic_confidence, control_evidence_confidence, transcript_confidence_segments
 from app.domain.adaptive_interview import is_adaptive, assessment_contract
 from app.core.ids import new_id
-from app.core.answer_processing_budget import consume_answer_model_call
+from app.core.answer_processing_budget import (
+    consume_answer_model_call, new_correction_attempt, remember_answer_correction,
+    deferred_answer_correction, answer_model_call_budget_exhausted,
+)
 from app.core.model_diagnostics import diagnosed_wait_for, record_model_diagnostic, safe_model_call_context
 from app.core.prompt.contracts import prompt_contract, understanding_canonical_schema, supplement_reply_canonical_schema
 from app.core.prompt.semantic_turn import (
@@ -178,9 +181,16 @@ class ConversationUnderstandingService:
             stage = "understanding_content"
             dialogue = context.get("interviewer_context") or {}
             if semantic_first:
+                # This flag comes only from the already validated joint wire
+                # branch; source resolution has checked its exact new E/focus.
+                new_scope = bool(references.get("clarification_sources")
+                    and isinstance(raw.get("clarification_target"), dict)
+                    and raw["clarification_target"].get("resolution") == "new_focus_unresolved")
                 data = normalize_ambiguous_completion(data, utterance.text,
                     input_context=dialogue.get("input_context"),
-                    content_clarification=dialogue.get("content_clarification"))
+                    content_clarification=dialogue.get("content_clarification"),
+                    new_clarification_scope=new_scope,
+                    completion_ranges=completion_reference_ranges(raw, references) if new_scope else None)
                 validate_structured_response(data, self._canonical_schema(semantic_first))
             self._validate_understanding_content(data, utterance.text, context["capability_points"],
                 input_context=dialogue.get("input_context"), exit_confirmation=dialogue.get("exit_confirmation"),
@@ -268,7 +278,9 @@ class ConversationUnderstandingService:
             "interviewer_context": interview.get("_interviewer_context") or {},
         }
         contract = prompt_contract("interview_turn_understanding", context)
-        references = understanding_references(utterance.text, capability_points)
+        references = understanding_references(utterance.text, capability_points,
+            clarification_context=((context.get("interviewer_context") or {}).get("content_clarification")
+                                   if semantic_first else None))
         if deterministic:
             data = {
                 "intent": deterministic.intent,
@@ -289,35 +301,46 @@ class ConversationUnderstandingService:
                 "latency_ms": 0,
             }
         else:
+            base_request = ChatJSONRequest(
+                organization_id=interview.get("organization_id", "org_default"),
+                purpose="interview_turn_understanding",
+                messages=contract.messages,
+                json_schema=contract.response_schema,
+                temperature=0.0,
+                max_output_tokens=1800,
+                execution_budget=InvocationExecutionBudget(timeout_s=18, max_provider_retries=0,
+                                                           max_provider_attempts=1),
+                metadata={
+                    "prompt_version": contract.version,
+                    "interview_id": interview["id"],
+                    "turn_id": turn["id"],
+                    "transcript": utterance.text,
+                    "capability_points": capability_points,
+                },
+            )
+            correction = new_correction_attempt(base_request)
             for attempt in range(1, 3):
-                if not consume_answer_model_call():
+                if attempt > 1 and correction is not None:
+                    correction = correction.following_attempt()
+                if not consume_answer_model_call(correction=correction):
                     return self._safe_failure_understanding(
                         utterance, turn, capability_points, source="provider", retryable=False,
                         reason_code="call_budget_exhausted", attempts=attempt, prompt_version=contract.version,
                     )
+                if correction is not None and correction.correction_reason is not None:
+                    contract = prompt_contract("interview_turn_understanding", {**context, "correction_reason": correction.correction_reason})
+                    record_model_diagnostic("correction_applied", **safe_model_call_context(base_request.metadata),
+                        attempt=attempt, failure_reason=correction.correction_reason)
+                request = base_request.model_copy(update={"messages": contract.messages,
+                    "json_schema": contract.response_schema,
+                    "metadata": {**base_request.metadata, "prompt_version": contract.version}})
                 stage = "provider"
                 request_id = None
                 try:
                     response = await diagnosed_wait_for(
                         self.gateway.invoke(
                             cap.LLM_CHAT_JSON,
-                            ChatJSONRequest(
-                                organization_id=interview.get("organization_id", "org_default"),
-                                purpose="interview_turn_understanding",
-                                messages=contract.messages,
-                                json_schema=contract.response_schema,
-                                temperature=0.0,
-                                max_output_tokens=1800,
-                                execution_budget=InvocationExecutionBudget(timeout_s=18, max_provider_retries=0,
-                                                                           max_provider_attempts=1),
-                                metadata={
-                                    "prompt_version": contract.version,
-                                    "interview_id": interview["id"],
-                                    "turn_id": turn["id"],
-                                    "transcript": utterance.text,
-                                    "capability_points": capability_points,
-                                },
-                            ),
+                            request,
                         ),
                         timeout=20.0,
                         stage="answer_understanding", timeout_reason="understanding_timeout",
@@ -347,7 +370,11 @@ class ConversationUnderstandingService:
                         "understanding_contract_rejected", exc, stage=stage, attempt=attempt,
                         interview_id=interview.get("id"), turn_id=turn.get("id"), provider_request_id=request_id,
                     )
-                if attempt == 2:
+                remember_answer_correction(correction, reason)
+                continuation = deferred_answer_correction(correction, reason)
+                if continuation is not None:
+                    raise continuation
+                if attempt == 2 or answer_model_call_budget_exhausted():
                     return self._safe_failure_understanding(
                         utterance, turn, capability_points, source="schema_or_content",
                         retryable=False, reason_code=reason, attempts=attempt,
@@ -430,26 +457,24 @@ class ConversationUnderstandingService:
     async def classify_supplement_reply(
         self, reply: str, organization_id: str, *, prior_confirmation: bool = False,
         preceding_text: str = "", question: str = "",
+        conversation_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if not isinstance(reply, str) or not reply.strip() or len(reply) > 100000:
             raise ValueError("A bounded nonempty server reply is required")
         contract = prompt_contract("supplement_reply", {
             "reply": reply, "prior_confirmation": prior_confirmation,
             "preceding_text": preceding_text, "question": question,
+            "conversation_context": conversation_context,
         })
         response = await self.gateway.invoke(cap.LLM_CHAT_JSON, ChatJSONRequest(
             organization_id=organization_id, purpose="interview_turn_understanding",
             messages=contract.messages, json_schema=contract.response_schema,
             temperature=0, max_output_tokens=350,
-            execution_budget=InvocationExecutionBudget(timeout_s=8, max_provider_retries=0),
+            execution_budget=InvocationExecutionBudget(timeout_s=8, max_provider_retries=0, max_provider_attempts=1),
             metadata={"prompt_version": contract.version},
         ))
-        validate_structured_response(response.data, contract.response_schema)
-        references = understanding_references(reply, [])
-        data = {"intent": response.data["intent"], "confidence": response.data["confidence"],
-                "evidence_quote": references["evidence"][response.data["evidence_id"]]}
-        validate_structured_response(data, supplement_reply_canonical_schema())
-        return data
+        from app.core.prompt.supplement_reply import validate_supplement_reply
+        return validate_supplement_reply(response.data, contract.response_schema, reply=reply)
 
     async def classify_exit_reply(self, reply: str, organization_id: str) -> Dict[str, Any]:
         """Classify fresh authoritative speech after a delivered exit question.
@@ -536,7 +561,9 @@ class ConversationUnderstandingService:
             return understanding, decision
 
         capability_points = self._capability_points(turn)
-        references = understanding_references(utterance.text, capability_points)
+        references = understanding_references(utterance.text, capability_points,
+            clarification_context=((interview.get("_interviewer_context") or {}).get("content_clarification")
+                                   if interview.get("_semantic_first") is True else None))
         context = {
             "question_text": turn.get("question_spoken_text")
             or turn.get("question_snapshot", {}).get("question_text", ""),
@@ -555,38 +582,49 @@ class ConversationUnderstandingService:
             ],
         }
         contract = prompt_contract("interview_turn_decision", context)
+        base_request = ChatJSONRequest(
+            organization_id=interview.get("organization_id", "org_default"),
+            purpose="interview_turn_understanding",
+            messages=contract.messages,
+            json_schema=contract.response_schema,
+            temperature=0.0,
+            max_output_tokens=2000,
+            execution_budget=InvocationExecutionBudget(timeout_s=18, max_provider_retries=0,
+                                                       max_provider_attempts=1),
+            metadata={
+                "prompt_version": contract.version,
+                "interview_id": interview["id"],
+                "turn_id": turn["id"],
+                "transcript": utterance.text,
+                "capability_points": capability_points,
+                "previously_probed_ids": context["previously_probed_ids"],
+                "difficulty": scope["difficulty"],
+            },
+        )
+        correction = new_correction_attempt(base_request)
         for attempt in range(1, 3):
-            if not consume_answer_model_call():
+            if attempt > 1 and correction is not None:
+                correction = correction.following_attempt()
+            if not consume_answer_model_call(correction=correction):
                 failed = self._safe_failure_understanding(
                     utterance, turn, capability_points, source="provider", retryable=False,
                     reason_code="call_budget_exhausted", attempts=attempt, prompt_version=contract.version,
                 )
                 return failed, self._no_followup("understanding_unavailable", scope["policy"])
+            if correction is not None and correction.correction_reason is not None:
+                contract = prompt_contract("interview_turn_decision", {**context, "correction_reason": correction.correction_reason})
+                record_model_diagnostic("correction_applied", **safe_model_call_context(base_request.metadata),
+                    attempt=attempt, failure_reason=correction.correction_reason)
+            request = base_request.model_copy(update={"messages": contract.messages,
+                "json_schema": contract.response_schema,
+                "metadata": {**base_request.metadata, "prompt_version": contract.version}})
             stage = "provider"
             request_id = None
             try:
                 response = await diagnosed_wait_for(
                     self.gateway.invoke(
                         cap.LLM_CHAT_JSON,
-                        ChatJSONRequest(
-                            organization_id=interview.get("organization_id", "org_default"),
-                            purpose="interview_turn_understanding",
-                            messages=contract.messages,
-                            json_schema=contract.response_schema,
-                            temperature=0.0,
-                            max_output_tokens=2000,
-                            execution_budget=InvocationExecutionBudget(timeout_s=18, max_provider_retries=0,
-                                                                       max_provider_attempts=1),
-                            metadata={
-                                "prompt_version": contract.version,
-                                "interview_id": interview["id"],
-                                "turn_id": turn["id"],
-                                "transcript": utterance.text,
-                                "capability_points": capability_points,
-                                "previously_probed_ids": context["previously_probed_ids"],
-                                "difficulty": scope["difficulty"],
-                            },
-                        ),
+                        request,
                     ),
                     timeout=max(.001, deadline - asyncio.get_running_loop().time() - _DEADLINE_RESERVE),
                     stage="turn_decision", timeout_reason="decision_timeout",
@@ -630,7 +668,11 @@ class ConversationUnderstandingService:
                     path="$.understanding" if getattr(exc, "understanding_stage", stage).startswith("understanding_") else "$",
                     interview_id=interview.get("id"), turn_id=turn.get("id"), provider_request_id=request_id,
                 )
-            if attempt == 2:
+            remember_answer_correction(correction, reason)
+            continuation = deferred_answer_correction(correction, reason)
+            if continuation is not None:
+                raise continuation
+            if attempt == 2 or answer_model_call_budget_exhausted():
                 failed = self._safe_failure_understanding(
                     utterance, turn, capability_points, source="schema_or_content",
                     retryable=False, reason_code=reason, attempts=attempt,
@@ -1187,7 +1229,7 @@ class ConversationUnderstandingService:
             data["suggested_action"] = "clarify"
             return min(confidence, .64)
         if (data["ambiguities"] and data["intent"] in {"answer", "clarification_request"}
-                and data.get("turn_intent") != "thinking"):
+                and data.get("turn_intent") not in {"thinking", "pause", "repeat"}):
             data["suggested_action"] = "clarify"
             return min(confidence, 0.64)
         return confidence

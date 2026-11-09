@@ -134,8 +134,8 @@ async def test_optional_reference_resolution_failure_does_not_repeat_understandi
                 raise KeyError("private_response_marker")
             return super().__getitem__(key)
 
-    def references(*args):
-        result = original(*args)
+    def references(*args, **kwargs):
+        result = original(*args, **kwargs)
         result["evidence"] = UnavailableOptionalReference(result["evidence"])
         return result
 

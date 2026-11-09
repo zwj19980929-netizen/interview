@@ -112,12 +112,14 @@ def test_background_failure_from_superseded_words_cannot_charge_new_evidence():
     async def scenario():
         endpoint, _, _, commits, _ = setup()
         old = _final("合成回答。没有了。")
-        release = asyncio.Event()
+        changed = _final(old.text + "新的真实补充。")
+        release, cancelled = asyncio.Event(), asyncio.Event()
 
         async def prepare(transcript):
             try:
                 await release.wait()
             except asyncio.CancelledError:
+                cancelled.set()
                 await release.wait()
             return endpoint.capture.prepared(transcript)
 
@@ -125,8 +127,16 @@ def test_background_failure_from_superseded_words_cannot_charge_new_evidence():
         endpoint.capture.prepare_impl = prepare
         task = asyncio.create_task(_attempt(endpoint, old))
         await _until(lambda: endpoint.capture.prepares)
-        endpoint.observe_transcript(old.text + "新的真实补充。")
+        preparation = endpoint._confirmed_preparation
+        endpoint.observe_transcript(changed.text)
         await task
+        assert endpoint._confirmed_preparation is preparation and not preparation.done()
+        assert not cancelled.is_set() and not commits
+        # A provisional subtitle cannot supersede the input of pure work.
+        # Its authoritative final does, and a late old failure stays discarded.
+        endpoint.cover_transcript(changed)
+        assert endpoint._confirmed_preparation is None
+        await asyncio.wait_for(cancelled.wait(), 1)
         release.set()
         await _until(lambda: not endpoint._preparation_tasks)
         assert endpoint._prepare_failures == 0 and not commits

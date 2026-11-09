@@ -2,11 +2,180 @@
 
 本文件记录所有会修改仓库内容的工作项。只读检查不单独登记；同一目标下的代码、测试、迁移和文档修改合并为一个工作项。状态使用 `in_progress`、`verified`、`failed` 或 `cancelled`，历史条目只追加或补充结果，不删除。
 
-## 2026-10-26 · BASELINE-COMMIT-080
+## 2026-11-08 · INTERVIEW-CONTINUITY-RELEASE-088
 
 - 状态：`in_progress`。
+- 授权与顺序：用户要求先将当前代码提交为 Git 回退基线，再开始面试连续性修复。先完整保留当前 081–087 源码、测试和文档，不修改业务实现；本条登记后执行基线提交，提交号及结果随后补记。提交仅保存代码，不包含被忽略的数据库、录音、凭据和运行日志，也不等同于正在运行的 085 服务版本。
+- 现场依据：`iv_61e524acabdf44bb` 第三交流的临时一字识别假设取消 4.199 秒完整分析，假设随后撤回；重算剩余 8.922 秒而超时，恢复被 `call_budget_exhausted` 拒绝。运行日志仍为旧取消行为及 reception v9；仓库 087 已修、086/087 尚未加载。本轮只读复验 087 两份测试为 25 passed/1.04 秒。
+- 第一批范围：保存可回退基线，复核既有 086/087 修复及源码一致性，补齐实际运行版本核验和必要验收；只有确认媒体/证据/后台任务空闲且具备允许的启动配置后才更新运行服务。保持原始语音、评分、供应商、时间/调用额度和最终提交门禁。延期分析推进与进程交流检查点属后续独立交付，不混入本次发布。
+- 操作约束与验收：不自动恢复、重试、提交或重放用户真实场次，不读取或输出未授权的进程环境/凭据，不在活动面试中重启。完成相关及全量回归、独立审查、运行状态核验后补记实际文件、命令、结果与未完成项；失败和审批限制如实保留。
+
+## 2026-11-03 · PROVISIONAL-TRANSCRIPT-PREPARATION-087
+
+- 状态：`in_progress（仓库全量已验证；运行加载待授权）`。
+- 目标与依据：用户要求解决临时转写增加一个字后又撤回却取消完整分析的问题。现场`iv_284b5421f1304100`第6交流09:15:54Z的非final一字假设触发transcript取消，7.952秒分析丢失；09:15:55Z该假设撤回，正式重算仅剩8.596秒而超时，恢复被两次调用额度拒绝。修复临时假设与权威证据变化的生命周期区分；沿用已读11份设计文档与模块边界，保留081–086增量及Git基线。
+- 实施边界：临时输入立即撤销旧等待者及推进/确认权限，但纯分析可在原截止时间内保留；只有重新取得完整且匹配的权威final、来源/语境/owner/capture复核后才能复用。真实内容改变、失权、关闭及模式改变仍不得使用旧结果。不得以文本相同代替完整证据身份，不退款、不增加模型次数/超时，不修改ASR、Prompt、评分或供应商配置。
+- 验证与运行：先用纯合成的临时增加→撤回和真实新增对照复现，再覆盖未决假设期间禁止提交、来源失效、预算与有界清理，进行相关和完整回归。真实库只读、不重放或提交现场材料；服务环境读取许可仍未收到，本轮不绕过审批读取环境或重启。独立worker评分超时不纳入此窄修复。实际文件、失败、结果及未完成事项随后补记。
+- 初步实现：生产仅改`app/services/answer_endpoint.py`与`app/core/model_diagnostics.py`。字幕不再取消owned准备或选择新预算key；完整final与无未决尾巴的稳定preview共享精确身份核对，差异取消来源为白名单stable_evidence。旧等待者、确认、纠错推进资格仍即时撤销；完整来源、语境、owner/capture与事务门禁保持。
+- 阶段验证：新增`tests/test_provisional_preparation_087.py`改前15失败，修改后扩展16通过；红绿日志provisional-complete-red.log/provisional-green-second.log保留。相关首轮187通过/4失败，四项旧测试把仅文字通知视为确定内容变化；在三份旧测试文件里明确提供新权威final或推进实际snapshot时机后，保留取消/唯一提交/旧结果拒绝断言，相关第二轮219通过/7.43秒。诊断去敏与取消、087组合48通过/1.00秒，覆盖新固定source允许、任意source文字丢弃。相对086仅两份生产源码变化，独立只读审查未发现权限或提交阻断；真实识别适配器集成与剩余验收另补。
+- 整链与边界验证：新增`tests/test_provisional_ingress_087.py`7项，采用真实DashScope→ValidatedSTTStream→ContinuousSTT→Endpoint和合成消息/模型替身；formal/speculative撤回均复用一次调用，真正新final拒绝旧结果，退出确认不因撤回恢复。零PCM可能使旧preview看似稳定，但真实task-finished ACK前绝不提交；未撤回partial在ACK后进入新final并重新分析。首个零PCMfixture对preview稳定性的预期不成立，保留最终取证门禁验证并补这两个反例，没有改ASR。该文件与相关4文件101通过/3.72秒。
+- 扩大检查与修正：额外相关首轮110通过/8失败（`/private/tmp/interviewer-087-fences-related.log`）。其中5项旧预期在`test_preparation_failure_budget.py`、`test_confirmed_preparation_liveness.py`、`test_parallel_conversation_052.py`中改为partial保留、权威不同final才取消，安全断言保留。另3项`test_recovery_episode_066.py`暴露实际兼容回归：无轻量接话能力时，处理耗尽后无法再核验真正新回答；没有改这3项断言。修正`spoken_supplement.py`为只在新文字提示和原静音门槛后核验一次完整final，麦克风噪声不得反复切流，只有新final可选择新预算key，连续失败次数保持。新增边界先1失败后扩展两种semantic模式通过；最终8文件105通过/8.22秒，日志`interviewer-087-fences-final.log`，独立审查无阻断。
+- 冻结与全量：最终相对086仅`app/core/model_diagnostics.py`、`app/services/answer_endpoint.py`、`app/services/spoken_supplement.py`三份生产文件变化，9份测试变化（含2份新增），无删除旧源码。483份app/tests/main Python文件冻结至`/private/tmp/interviewer-087-tested-source-sha256.json`；正在运行`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q`，日志`/private/tmp/interviewer-087-backend-full.log`。此后只补文档，不改待验收源码。以上失败均发生于合成测试，未读启动环境、外呼真实模型、重启或修改业务记录。
+- 首轮完整结果：`4540 passed /1 failed /8 skipped /265.64秒`，唯一失败是`test_automatic_turn_integration.py::test_new_voice_cancels_held_preparation_without_closing_capture_or_losing_tail`在活动音频仅产生partial时就等待纯任务取消，合成时钟尚未进入静音取证。独立单项同样复现，确认是旧取消时机预期；不能通过提前取消生产任务迁就它。保留首轮日志`interviewer-087-backend-first.log`与首轮源码摘要`interviewer-087-first-tested-source-sha256.json`。仅调整该测试为活动语音不取消、不seal/提交，静音后真实snapshot证明新增内容再取消，并保留原完整PCM和唯一答案断言；生产源码不改，定向通过后重新冻结并验收。
+- 最终重新验收：上述自动提交整链文件2通过/2.08秒，日志`interviewer-087-automatic-integration-green.log`。483份重新冻结源码与首轮相比仅该测试文件不同，三份生产代码完全一致；相对086现在10份测试变化（含2份新增）。第二轮同命令完整后端正在运行，未在运行中修改源码，也未加载服务。
+- 最终完整结果：`4541 passed /8 skipped /260.79秒`、退出码0，日志`/private/tmp/interviewer-087-backend-full.log`；8项为既有环境跳过。25项新增087测试覆盖临时撤回、真实新增、来源/语境/owner/capture门禁、原期限、调用数、真实协议ACK和兼容取证；诊断参数化额外覆盖来源白名单。未改前端，不重复构建。最终483份Python源码与冻结摘要、文档链接和diff检查结果保存`/private/tmp/interviewer-087-verification.json`。
+- 交付与未完成事项：本轮完成上述三份生产文件和十份测试文件，新增[087设计](provisional-transcript-preparation-087.md)并同步架构、供应商、已知问题、进度、路线图和本日志。未提交或推送Git，基线和081–086增量保留；未改变真实场次/语音/模型配置，未读取启动环境或重启API/worker。086与087仍未加载；此前读取含凭据启动环境的自动审批拒绝仍待用户明确许可。加载和真人响应表现未验收，不标closed；若撤销仅撤087增量并保留早期工作与业务记录。
+
+## 2026-11-02 · CONVERSATION-CONTROL-AUTONOMY-086
+
+- 状态：`in_progress（仓库全量已验证；真实模型验证与运行加载待授权）`。
+- 授权与目标：用户要求交流更自主、不要因非预期发言僵硬失败；以当前纯退出请求被完整技术答案合同阻断为入口，将来源有效的交流控制与技术内容分析解耦，沿用已有等待、解释、重读等接话能力。已按序复核设计文档并沿用codebase-design技能；保留Git基线`6e6daed`与081–085增量，ASR、评分、原始转写及真实供应商配置不改。
+- 现场：`iv_0c8e968bd904440e`的当前退出原话与STT最终文本SHA完全一致。预分析2.757秒后因新临时转写取消且占用一次调用；正式分析5.782秒正常返回却选用不自洽的`answer_unresolved`组合，被`unresolved_answer_contract_invalid`拒绝，剩余7.681秒时两次实际调用已耗尽。worker同期正常。无原始响应，不断言具体哪一伴随字段有误，也不把Prompt表述风险当作已证实因果。
+- 实施与验证边界：复用轻量接话识别当前控制请求，完整Schema、原文来源及当前final/owner/capture验证后只允许发起独立退出确认，不授予退出或提交许可；取消/改口/引用/否定/假设及混合技术内容必须保留原门禁。补合同、真实入口/临时SQLite、失败和调用次数回归，先复现再实施；正常回答不增加串行模型调用。真实DB只读，不重放候选材料、不自动重试或提交现场场次。实际修改、测试、失败和加载结果随后补记。
+
+- 实际实现：独立确认后的退出也脱离完整技术分析，使用PreparedCandidateExit和完整Evidence事务；当前未完成题保存exit_evidence，报告新增unassessed_retained_evidence、Retention删除覆盖。已先更新接口和领域文档，再实现内部提交接口，无新增外部客户端写权限、无DDL。
+- 阶段测试：新runtime红16/绿7→23绿，审查补充故障后停止切流回归后24绿；接话合同红44/绿1→45绿，相关16文件367绿；新临时SQLite24项及旧提交/报告组合48绿，旧runtime六文件106绿，真实媒体/LiveKit3项绿。日志均保留/private/tmp/interviewer-086-*。SQLite首轮12项失败为同步测试缺event loop，改测试async后通过；整链首轮失败是终态事件名/故意失权的teardown断言，均保留。未加载中间版本。
+- 审查修复：退出分类两次失败后虽然不再外呼但仍高频切STT快照，已按当前revision停止切流，新输入/显式重试才能续接；未返还答案分析额度。另复核原文撤回反例与真实媒体提交围栏。
+- 自动审批限制：真实模型合成探针及原配置加载前需要读取API/worker启动环境，工具审查拒绝，指出环境含凭据且缺明确授权。整条命令未执行，无环境读取/模型外呼/服务修改；已说明原因并提出明确选择，继续不依赖该许可的本地实现与测试。
+
+- 首轮全量进行中发现旧整场退出测试仍期待创建当前答案，正在保留核心断言并按独立未评估留存迁移。同时发现真实终态回收竞态：无新评分时直接进入report_generating，journal裸异步stop可抢在告别送达前释放owner，清理失败还可能泄露异常消息。此项不能通过改旧期待掩盖，正在统一终态回收调度并补无pending评分的延迟播完/超时/清理失败回归；首次全量及只读诊断日志保留。
+
+- 首轮完整结果：冻结480份源码/测试，`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q`得到4480 passed /12 failed /8 skipped /261.55秒。保留first-backend-full.log与first-source-sha256.json。9项失败是旧退出应创建答案或pending评分的测试前提，按未评估证据保留且不放宽PCM/送达/唯一seal门禁；其中原退出终态清理错误另证实真实竞态。两项runtime预算回归发现无reception能力或只有麦克风噪音仍切final，已改仅有轻量能力且新稳定证据才检查：旧068+新086组合33绿。旧退出4文件与真实Evidence文件组合73绿。终态回收实际修复及第二轮全量另补。
+
+- 终态竞态首轮修复及核心回归45通过（terminal-race-green-third.log），覆盖有/无存量pending评分、drain/timeout、清理失败不重复receipt和无controller异常去敏。control-step独立复查补同文字由unstable变stable仍可触发、噪音不反复切流，068+086共34通过。第二轮481份源码全量运行到828通过/2跳过/52.83秒，独立审查发现owner失效但provider抑制取消时仍可能无界等待，于是仅正常Ctrl-C中止该pytest，不操作API/worker；interrupted-backend-full.log及源码摘要保留。补本地有界释放且不借successor权限，再验收；未将中断算通过。
+
+- 终态清理收尾：统一有界等待、取消与本地释放，修复失权自清理以及已发送完成通知后channel waiter仍等待旧provider任务的两处死等；保留告别实际播完/超时流程，不允许旧owner或旧controller写入新会话，也不重复发送完成通知。扩大验证时5条旧投影测试因正常完成task引用被过早清空失败，已收紧为只分离仍抑制取消的未完成任务，原投影测试未改。最终终态与投影组合68 passed/25.12秒，控制与预算组合35 passed/3.03秒，两组独立审查无剩余阻断；日志receipt-cleanup-bounded-final.log与control-budget-final.log。退出回复额度按确认问题和原始final绑定，只有metadata变化不能续购调用。
+- 最终回归开始：重新冻结481份app/tests/main Python源码至`/private/tmp/interviewer-086-tested-source-sha256.json`，再次执行完整后端，日志`/private/tmp/interviewer-086-backend-full.log`。此阶段仅文档继续补记；未发真实模型请求、未读取进程环境、未重启API/worker。
+
+- 最终完整回归：同命令得到`4515 passed /8 skipped /254.87秒`、退出码0；481份源码集合及内容与测试前冻结摘要完全一致，323个本地文档链接有效，`git diff --check`通过。前端未改，本轮未重复前端测试或构建；本地语义替身与故障注入不等于真实模型或真人响应时间验收。最终源码一致性及文档检查结果保存到`/private/tmp/interviewer-086-verification.json`。
+- 实际修改范围：本项生产改动涉及`app/core/prompt/{candidate_exit,conversation_reception}.py`、gateway/mock版本注册，以及`app/services/{answer_endpoint,candidate_exit_confirmation,interview_agent,interview_evidence,interviews,livekit_evidence_ingress,reports,retention,spoken_supplement,streaming_stt}.py`；新增五个086测试文件并适配旧退出与v10合同测试。新增086设计说明，同步架构、接口、领域、评分、供应商、CONTEXT、问题、进度、路线图和本日志。没有新增公共候选写接口、数据库迁移或ASR识别算法调整。
+- 剩余事项与副作用：自动审批要求的环境读取授权尚未收到，因此未做真实模型探针、未加载API/worker；运行中的版本仍是此前版本。真实场次未重放、补写、恢复、重试或提交，现有Git基线与081–085工作区增量保留，未新增commit/push。后续需授权后完成真实模型虚构样例、空闲预检、原配置重启及健康验证；若回退，仅撤086增量并保留历史日志与业务数据，不能覆盖前序修复。
+
+## 2026-10-27 · FOLLOWUP-CLARIFICATION-085
+
+- 状态：`verified（仓库全量、真实模型合成与本机加载；真人及生产待验）`。
+- 授权与约束：用户明确要求修复追问澄清后失败并重启服务；沿用已按序阅读的11份项目文档，保留基线`6e6daed`及081–084全部增量。语音识别、原始转写、评分标准和供应商配置保持；正常成功路径不增加模型调用，单次18秒、初始20秒、恢复总40秒、同来源两次完整调用上限保持。
+- 现场证据：`iv_6ce6c03808984157`的追问针对“问推理结果”发出澄清，13:09:27Z送达；解释后两次完整模型调用6.391秒/6.143秒均成功返回，但均被`unresolved_clarification_source_invalid`拒绝，尚余7.112秒时被投影为服务不可用。原模型响应未保存，不推测具体错误字段。上一场`iv_d4a3cfcb93b449df`则为首次字段冲突后内部纠错仅剩7.368秒被20秒总期限取消，随后虽开启40秒恢复窗口却已耗尽两次调用。
+- 实施范围：把已送达澄清来源与回复边界由服务端稳定绑定，完整合同保留证据、真实新完成语及送达门禁；补齐版本化针对性纠错和最小疑点交流规则，区分理解不充分与真正无法理解；统一有界纠错续接预算，区分模型结果拒绝与供应商不可用。新增合同、真实入口/临时SQLite及恢复回归，合成材料验证，不重放真实候选回答。
+- 验证与加载：先复现再修复，完成相关及全量检查、前端构建与源码冻结后正常重启API/worker；加载前核验实际服务和活动会话，保留原环境、日志及业务记录，不自动提交/重试/恢复现场场次。实际文件、命令、失败、结果与未完成边界结束时补充。
+
+- 修前复现与初步验证：固定澄清来源新合同回归先15失败/5通过（`/private/tmp/interviewer-085-source-red.log`）；真实临时SQLite新链先3失败/2通过，已送达/owner失效门禁保持拒绝。前端源码未改，现有完整回归`npm test -- --reporter=dot`为521通过/26文件/2.67秒（`interviewer-085-frontend.log`）。只读运行预检首次仍有有效owner，随后自然释放；最新唯一worker空闲、LiveKit0参会者、有效owner0，正式加载前会复核。此时尚未重启。
+
+- 真实模型首轮失败留痕：6类纯虚构材料全部在约4.7–6.8秒返回且无合同错误，但仅2/6满足语义预期：两条清楚但不充分的回答被误澄清、未解决旧疑点时丢既有claim、新疑点误选旧C1。4个失败例再次诊断均复现，确认模型把知识机制缺失当含义不明，并将已消除的旧focus用于新歧义；日志`interviewer-085-model-probe.log`、`interviewer-085-diagnostic-probe.log`及结果均保留。仅只读加载模型配置、隔离内存审计，没有真实候选内容/业务写入。未加载此中间版本；正在按阶段重排判断指引，不能把Schema通过当语义验收。前端临时构建通过，原有大bundle提示保持。
+
+
+- 第二轮与传输对照：重排阶段指引后4例只有保留旧claim的1例通过，日志`interviewer-085-phase2-probe.log`，仍未加载。对相同虚构材料仅合并全部system指令为连续首条后，两个清楚但不充分的回答转为正常answer、未解决旧焦点保留claim，3/4通过；新疑点仍错误引用旧C1。日志`interviewer-085-single-system-probe.log`。确认需要修复指令排列并继续核查结构化来源分支，不能继续仅追加Prompt；所有对照仍在内存、无候选数据或服务重启。
+
+
+- 后续真实模型证据：反转target的anyOf分支、给C1附带固定focus两次内存对照都未修复新疑点误选旧来源，未采用这两项无效变更（`interviewer-085-reversed-union-probe.log`、`interviewer-085-visible-focus-probe.log`）。单system布局和C1描述自洽检查落盘后，按实际optional上下文的v120六例5/6通过；新疑点第二次仍把“旧词已解释但新词未知”并在一段歧义描述中而错误结束，证明仅要求描述提及旧focus不足（`interviewer-085-final-probe.log`，原结果保留）。继续验证先判明确澄清状态再选intent的wire合同，禁止扩展关键词猜测或程序替换模型焦点；此时尚未重启。
+
+
+- 首轮全量：476份应用/测试/main源码冻结，`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q`得到`4373 passed /7 failed /8 skipped /248.04s`。保留`interviewer-085-first-backend-full.log`与首轮哈希；4项旧阶段布局断言已按单system中的严格顺序适配并整文件76绿，另外3项正在核对布局及末次诊断原因。未把失败标为完成、尚未加载。
+
+
+- 首轮全量失败收尾：其余3项核实为旧测试替身/期待：059组合指令按分散message定位、optional_followup包装函数没透传新增clarification_context、079把真实末次合同原因仍期待为额度耗尽。只适配四个旧测试文件，保留单次/两次调用上限、后续追问隔离、日志去敏和严格顺序等安全断言；后三文件40通过，066文件76通过。生产不因这些失败改动。字段前置、独立clarification_resolution两个内存实验仍失败（日志evidence-first/resolution-first及纯合成raw诊断均保留）；正在将澄清关系与来源合为严格判别联合对象，防止状态与焦点各自合法却组合矛盾。
+
+
+- 联合来源与控制根因：将resolution和来源置于同一个判别联合target后，实际模型三例的来源全部正确；旧词已解释/仍不明各一次约6.4秒通过。新疑点首条raw已给new_focus_unresolved+新E/新focus、completion_basis=null和clarify，却因服务端仅凭finish_answer派生next再次冲突；第二次才错凑待核实结束。日志`interviewer-085-joint-object-network-probe.log`，纯合成raw留作证据。正在接入严格联合target和“新疑点尚未澄清只撤销提交权限”的中央投影；不猜换焦点、不添加完成依据，已有依据必须验证后才可撤销。此前联合探针沙箱无网络得到provider_unavailable，保留日志，不当模型结论；经工具审查准许的真实网络探针无真实业务写入。
+
+
+- 最终生产候选与真实模型：联合target三态严格解析后，新scope只撤销完成权限并保留原文/主张/完成话轮意图；撤销前验证原完成依据，raw E发生位置必须晚于已送达澄清及当前speech边界，包含旧/新同文结束语回归。后置歧义策略保留pause/repeat/等待/独立退出优先。删除中间无效的“歧义描述包含旧词”门禁，不以关键词猜测新旧关系。独立审查未发现阻断。
+- 实际v120六类虚构追问最终全部通过：清楚但不充分、简短回答、解释成功、同一旧疑点仍不明、仍在思考、旧词已解但新词未知；全部一次调用，4.846–6.610秒，日志`interviewer-085-accepted-probe.log`及结果JSON。新疑点保留2项claim并明确clarify、无problem。228份应用/main源码已冻结到`interviewer-085-accepted-probe-source-sha256.json`，真实配置只读、审计隔离内存。样例不保证任意自然语言识别或长期延迟；最终全量与实际加载结果另补。
+- 真实临时SQLite最终14项通过（`interviewer-085-joint-sqlite-final.log`）：simple/composite新疑点只澄清不提交、旧/新可靠主张保留、旧basis及同文旧E拒绝、owner撤销，以及等待/退出/暂停/重读。原联合结构未实现时7失败/3通过红测保留。安全绑定和真正provider故障的恢复接口测试继续保留。
+
+
+- 最终合同的旧fixture迁移：source54项和SQLite14项通过，但联合回归发现066旧成功替身仍输出旧target，缺少resolution（202通过/9失败）。刚启动的全量在11.07秒又复现072两条同类旧wire（248通过/2失败），因此通过该pytest会话Ctrl-C正常中止，未操作API/worker。中止日志/源码摘要保留`interviewer-085-interrupted-*`。正在定向迁移全部content_clarification成功替身；负例和真实语义/唯一提交/送达断言不放宽。生产及已通过的真实模型验收源码仍冻结，全部替身迁移完成再重跑全量。
+
+
+- 旧测试全部收尾：066语义恢复文件76项通过；涉及content_clarification的另外10文件262项通过（`interviewer-085-legacy-source-green.log`），仅迁移三个文件的有效成功wire，新增严格断言请求Schema确实提供same分支。所有负例与原有行为门禁保持。统一源合同54项通过；冻结476份应用/测试/main源码后已重新启动完整后端同命令，最终结果另补。
+- 实际生产文件（相对084冻结）：`app/core/answer_processing_budget.py`，`app/core/prompt/{contracts,semantic_turn,understanding_references,validation}.py`，`app/domain/interview_agent.py`，`app/model_gateway/gateway.py`，`app/providers/mock/provider.py`，`app/services/{answer_endpoint,conversation_understanding}.py`。理解118–125、组合149–156、semantic_turn23/24登记保留历史版本；Provider真实协议、ASR及原始转写、前端和评分标准未改。新增四个085测试文件；旧合同版本/单system布局/成功wire/错误类别测试按新合同适配，保留原有安全与业务断言。同步架构、接口、领域、供应商、CONTEXT、问题、进度、路线图与085专项说明。
+
+- 第二次完整回归与最后fixture：全量得到`4389 passed /1 failed /8 skipped /251.22s`，唯一失败为068旧成功替身在已送达澄清上下文仍返回null target；按严格联合Schema改为`resolution=resolved`，保留原无重复澄清、新完成语、独立补充确认和真实提交断言，整文件`6 passed /3.97s`（`interviewer-085-off-topic-integration-green.log`）。失败全量及摘要保留为`interviewer-085-second-{backend-full.log,tested-source-sha256.json}`。228份已通过真实模型验收的应用源码保持一致，重新冻结476份源码/测试并启动最终完整回归，尚未重启服务。
+
+- 最终全量通过：同命令最终`4390 passed /8 skipped /249.23s`、exit0（`interviewer-085-backend-full.log`），476份源码/测试集合及摘要完全匹配，228份真实模型验收的生产源码也保持一致；验收记录`interviewer-085-verification.json`。前端521项及临时目录构建已通过；8项为原有环境跳过。独立只读审查无阻断；10份相关文档297个本地链接与`git diff --check`通过。新一轮加载预检确认唯一worker空闲、媒体0参与者、有效owner0，API健康就绪。接下来按用户授权重启API/worker并记录实际结果；不自动重试或提交真实场次。
+
+- 实际加载完成：2026-10-29T04:52Z（本地10月28日21:52）再次确认无媒体参与者、有效owner0、唯一worker空闲；保留各自原环境，正常TERM旧worker91720及12个相关进程、旧API91719及2个相关进程，无强杀。新API20700、worker/Beat20701启动并一次探测通过：health/ready均200、ready=true、前端5174页面与代理200、worker唯一pong且active/reserved/scheduled均0。日志确认API startup complete、worker ready，无ERROR或Traceback。
+- 数据与运行证据：71份面试/答案/评分业务文档的核心逐字段摘要前后完全一致；仅排除根级`version/updated_at/heartbeats/last_activity_at/agent_events/agent_runtime/lifecycle_events`，不声称整文档无变化。媒体最终1空房间/0参与者，未自动重试、恢复、提交或重放现场回答。脚本/结果/逐字段摘要保存在`/private/tmp/interviewer-085-reload.py`、`interviewer-085-reload.log`、`interviewer-085-reload-result.json`、`interviewer-085-core-{before,after}-fields.json`；运行日志为`interviewer-085-{api,worker}.log`。旧日志及所有中间失败记录保留。
+- 交付与边界：085已加载，ASR、原始转写、评分规则与供应商配置未改；正常首次成功不增加调用，两次实际调用及18/20/40秒限时保持。真人追问复试、供应商长期稳定性及8项外部环境验收待完成，不标closed，不承诺任意自然语言或固定端到端速度。Git基线仍为`6e6daed`，081–085增量保留工作区，未另提交或push。若回退只撤085增量并于空闲时重新加载，保留此前修复和业务数据。
+
+## 2026-10-27 · SUPPLEMENT-DIALOGUE-ROUTING-084
+
+- 状态：`verified（仓库全量、真实模型合成样例与本机加载；真人及生产待验）`。
+- 授权与约束：用户要求从根源处理补充确认后的任意反问、跑题和不确定回复，明确先不改语音识别，沿用响应速度要求。按顺序复核11份项目文档与已使用的codebase-design技能，先登记再编辑；保留基线`6e6daed`和081–083全部增量。不得改写候选转写、扩展自动提交权限或靠延长18/20/40秒及增加完整调用次数绕过问题。
+- 现场依据：`iv_abdc524d35de41a9`补充问题08:30:27Z已送达；接话3.237秒未选中、补充分类2.238秒合法返回unclear，完整理解仅剩14.195秒后超时；第二次11.199秒返回被`completion_basis_required`拒绝后两次额度耗尽，剩8.641秒。恢复后同revision/同回复哈希又重复补充分类。083已生效，但本次首失败是timeout、第二次才有格式原因，不能套用预分析校验失败接续的既有验收。worker无关联任务/异常；不从未保存的模型响应猜测具体误分类。
+- 根因范围：补充交流路由与累计答案理解耦合，合法unclear落入昂贵全量分析；真实阶段已询问补充但未确认结束时，未确认Prompt仍固定声明尚未询问。计划用当前新回复和真实服务端语境统一有界交流决策，非完成的提问/澄清/跑题保持对话，只有需要正式结束/题目控制的请求进入原有提交校验；恢复接回已有准备不重复分类。统一Prompt/Schema必须集中、版本化、校验后使用，原owner/capture/送达/final/退出确认及答案事务门禁保留。
+- 验证与运行：补完整实时入口的红→绿复现，覆盖小调用计时、未知/非法输出、结束/新技术补充/反问/公司问题/跑题/退出/跳题、重复恢复、输入与owner变化、真实临时SQLite唯一提交。现有业务闭环全量与源码冻结后，按既有重启授权仅在零参会者/零有效owner/worker空闲时加载。真实库只读，不重放用户材料、不自动恢复/重试/提交该场；实际文件、失败、验证、加载及未完成边界结束时补齐。
+
+- 实施中验证：新增真实补充阶段回归先19项失败，补齐投影、Prompt和指纹后已通过；确认内部asking→transcribing不应改变已送达事实并加入专门回归。root初轮路由18项中14通过/4失败，均为082旧测试仍期待多余reception调用，按新单次路由更新精确次数；首次接口拼接未完成时旧整链5失败/43通过，失败保留于`interviewer-084-routing-related.log`。未加载服务、未操作真实场次。
+- 实际模型首轮：只读加载现有模型配置到隔离内存，对7句虚构话语调用v6；术语定义、一般词义、跑题、明确结束、退出及公司问题6项符合预期，耗时1.573–2.554秒。最近话语为术语解释时“嗯，好吧”被误判finish，证明仅把最近话语放入Prompt不足；此失败没有送达、提交或真实业务写入。保留`/private/tmp/interviewer-084-model-probe.log`及result.json，正在完善确认对象约束，不能将首轮6/7当验收通过。
+
+- 独立整链对照与审查：使用保存的083原Spoken路由单独加载到临时测试进程，12条新增正常交流场景均红，表现为多余reception/full或错误路由；当前新路由通过，原文件从未覆盖回仓库。额外发现resume期间final已变但分类前仅冻结各自旧值、以及本地送达旗标过期时可让新未送达问题之后的finish进入confirmed准备，两处都有临时SQLite红复现；现中央chain要求起点final与识别器final完整一致、真实stage=awaiting_reply，并在等待后复核来源/owner/context。未绕过安全门禁。
+- 模型与确认对象修正：中央上下文增加服务端reply_target与最近实际送达语句，明确历史补充问题不等于当前回应对象，孤立附和不得finish；无需新增关键词意图分类或额外网络调用。最终相同7类虚构发言全部通过；解释后附和为interview_dialogue，普通词义为question_clarification。第二轮日志`interviewer-084-model-probe-second.log`，多数约2秒，明确结束一项7.149秒；真实模型延迟有波动，不能用这批样例保证任意真人会话均在2秒。源配置只读加载，所有审计及熔断写入隔离内存，无真实业务写入。
+- 阶段整合验证：`test_supplement_dialogue_084`、`test_supplement_reply_contract_084`、`test_supplement_phase_084`、真实spoken ingress及081/082相关组合`134 passed/11.42s`，日志`interviewer-084-final-related.log`；合同与历史兼容84项另绿，与前项重叠不累加。旧测试中metadata变更原设.9被真实保守聚合归一到相同值，改成.81并断言完整identity确实变化，保留“变化不可复用”断言；先前失败日志保留。正在完成最后旧fixture兼容及全量冻结，尚未加载084。
+
+- 冻结与最终检查：相对083的467份源码，新增中央supplement_reply模块、supplement_context投影及3个084测试文件，共472份冻结到`/private/tmp/interviewer-084-tested-source-sha256.json`。084生产修改仅涉及Prompt/contracts/semantic、领域版本登记、gateway/mock版本登记、understanding/evidence/supervisor/interviews、spoken路由和ingress表达版本；ContinuousSTT/StreamingSTT、Provider实现、18/20/40秒与AnswerEndpoint源文件相对083未改变。059旧裸替身已换真实临时SQLite上下文并为异步等待加1秒上限，5项通过。独立审查未发现剩余安全阻断；不确定的低置信回复保留原固定补充澄清，不凭自然附和创建许可。
+- 加载前只读预检：API health/ready=200且ready=true，唯一worker pong且active/reserved/scheduled均0，LiveKit一间空房/0参会者、有效未释放owner=0。日志`interviewer-084-preflight.log`。完整后端正以`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q`运行，日志`interviewer-084-backend-full.log`；此时尚未重启，加载前还将复核空闲。
+
+- 首次完整回归：472份冻结源码运行全量得到`4281 passed/26 failed/8 skipped/266.84s`，保留日志`interviewer-084-backend-first.log`及首轮摘要`interviewer-084-first-tested-source-sha256.json`，未加载服务。16项为072旧测试的当前semantic版本仍断言98–105/129–136；6项为059旧精确参数断言没有新增的完整final/boundary；4项为064真自动链的合成MockProvider仍输出v5三字段，缺v6必填reply_text，统一校验正确拒绝后测试等待答案超时。分别修正三个测试文件的版本、完整来源断言和finish合成响应字段，生产保持冻结；历史兼容、唯一答案/单seal及完成证据断言不删减。定向与完整第二轮结果另补。
+
+- 最终仓库验收：三个旧测试文件各自32/10/8项通过；与首轮冻结比较，仅此三个测试改变，生产源码完全一致。第二轮完整同命令`4307 passed/8 skipped/247.74s`、exit0，日志`/private/tmp/interviewer-084-backend-full.log`。472份源码集合及内容与最终摘要完全相同，验收记录`interviewer-084-verification.json`；文档本地链接和`git diff --check`通过。前端未改，不重复构建。正在按既有授权再次空闲复核并正常重启API/worker，真实合成样例通过仍不代表真人或生产全部验收。
+
+- 实际加载与复核：2026-10-27T09:29Z确认API91719、worker/Beat91720已运行；加载前再次media0参会者、有效owner0、唯一worker空闲，保留原进程环境，正常TERM旧83114及12个相关进程、旧83113及2个相关进程，无强杀。新API health/ready=200且ready=true、前端5174页面/代理200、唯一worker pong且active/reserved/scheduled=0、media0参会者；新API/worker日志ERROR/Traceback均0。worker启动首轮探测未就绪，第二次通过，未再次重启。69份面试/答案/评分核心字段摘要前后完全一致（仅排除既有运行事件、心跳和版本等易变根字段），没有自动恢复、重试、提交或改写用户场次。
+- 最终证据与边界：运行日志`/private/tmp/interviewer-084-api.log`、`interviewer-084-worker.log`；加载脚本/结果/逐字段摘要`interviewer-084-reload.py`、`interviewer-084-reload-result.json`、`interviewer-084-core-{before,after}-fields.json`；失败首轮和原083日志均保留。源码没有改ASR/转写、模型路由、音色、评分规则或超时额度。新模型Prompt与小路由已加载；真人完整会话与外部服务长期可靠性仍待复试，不标closed。Git基线仍为用户先前要求保存的`6e6daed`，084及081–083增量保留在工作区，未额外提交或push；若需回退只撤084增量并保留历史记录及业务数据。
+
+## 2026-10-26 · BOUNDED-CORRECTION-CONTINUATION-083
+
+- 状态：`verified（仓库全量回归与本机加载；真人响应时间及外部供应商待验）`。
+- 授权与目标：用户要求在保证响应速度的同时修复预分析到正式准备之间丢失纠错原因的问题。沿用已按顺序阅读的11份项目文档与codebase-design技能；保留Git基线`6e6daed`及081/082全部增量。先登记工作项，再实施和验证，不重放真实候选材料。
+- 现场依据：`iv_e0f5eb6e754442fe`首题`turn_a55e887caf1a4c99`在2026-10-27T04:39:36Z和04:39:49Z两次模型请求成功（13.040秒、12.593秒），均被`completion_has_unresolved_ambiguity`拒绝；预分析局部一次额度阻止纠错、原错误被预算错误覆盖，正式请求又重建原合同，两次完整请求哈希相同。最终共享额度耗尽时仍剩14.962秒，尚无答案/评分/outbox。本场未进入082补充回复分支。两个独立内存合成复现当前与旧基线相同行为，单次服务内部的纠错对照可成功；具体实际疑点未被日志保存，不作推断。
+- 范围与速度约束：在统一准备/预算seam内保留有精确请求及语境约束的安全纠错原因，使剩余一次真实调用执行已有版本化纠错合同；维持预分析最多一次、同文本共享两次完整调用、18/20/40秒及实际提交门禁，不通过延长限时、增加调用或跳过校验换成功。正常路径不得新增请求、等待或持久化I/O；过期、输入/语境/模式变化不可误用纠错状态。
+- 验证计划：先写端点→真实理解服务→合成网关的失败复现，验证第二次实际带纠错指令及有界时延；覆盖两种理解合同、纠错再失败、证据/语境/确认模式变化、取消/owner/capture失效、真实临时SQLite与唯一提交。相关回归及完整后端后再核对冻结源码；仅在参会者为0且worker空闲时按既有授权加载，运行、失败和未完成结果结束时补齐。
+- 实际实现：仅在082冻结源码上修改`app/core/{answer_processing_budget,model_diagnostics}.py`及`app/services/{answer_endpoint,conversation_understanding,interview_evidence,interviews}.py`六文件。现有共享额度保留一次性固定纠错原因，实际capture/owner、完整STT/语境/模式与原请求摘要须匹配；成功扣次后领取，晚返旧请求沿首次generation拒绝内部重试，不退款。新增安全`model.correction_applied`事件；保留原Prompt版本/内容、Provider配置、外部接口、Schema、数据库、评分和18/20/40秒限制。普通首次请求不增加数据库守卫读取；原因保留不使用独立的20秒失效期，实际外呼仍受当时剩余期限约束。
+- 定向验证：新增`tests/test_correction_{budget,continuation,continuation_sqlite}_083.py`共43项。独立完整链路改前先7失败/4通过，扩展后9失败/9通过；SQLite独立改前4失败/8通过，失败均指向第二次未收到纠错。修复后三个新文件全绿，最后追加晚返旧任务generation回归后与相关14文件共`278 passed/3.53s`，日志`/private/tmp/interviewer-083-related.log`。独立组合117通过及审查30通过与上述重叠，不累加。合成网关只有实际收到既有纠错指令和固定原因才返回合法内容；两种合同均验证真实临时SQLite唯一提交、失败无第三次、正常一次、第一拒绝后第二调用在0.5秒内接续且不等一秒退避、当前到期禁止外呼及来源失效。全部使用合成材料。
+- 审查与冻结：审查补齐两项既有领域原因白名单、跨预算/重复领取拒绝、confirmation语境仅存摘要、抗取消晚返代次保护；无未解决阻断。与082的464份源码逐一比较，除上述六生产文件及三新增测试外完全相同，081/082增量保持。467份Python源码/测试冻结至`/private/tmp/interviewer-083-tested-source-sha256.json`；`git diff --check`通过，完整后端正在运行。只读空闲预检health/ready均200且ready=true、唯一worker pong且active/reserved/scheduled均0、媒体房间0/参会者0，记录`/private/tmp/interviewer-083-preflight.log`；加载时必须再查。
+- 首次完整回归：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q`为`4201 passed/2 failed/8 skipped/247.55s`，未加载服务。两失败均为082补充顺序测试同一时间断言的两个参数，执行顺序、唯一提交、单次分析和共同deadline断言已通过；实际`257.798447375 - 237.798447375`产生浮点舍入而不严格等于20。生产仍直接设置`deadline = started_at + 20`且源码未改变。保留失败日志为`/private/tmp/interviewer-083-backend-first.log`与初次源码摘要为`interviewer-083-first-tested-source-sha256.json`；将测试改为严格比较`deadline == started_at + 20`，不放宽时限、调用次数或业务校验，定向再验证后重跑全量。所有失败均为合成测试，无运行服务或真实数据副作用。
+- 首轮修正与速度证据：独立审查确认差值误差分别为±2.842e-14秒，仅修改`tests/test_supplement_reply_order_082.py`一处绝对deadline比较；该整文件与三个083新文件共`47 passed/1.56s`（`interviewer-083-final-target.log`）。467份最终源码摘要相对首轮只有该测试变化，生产文件完全一致，完整第二轮进行中。另以148643字节纯合成中央合同请求测量新请求摘要及额度记录，100次预热后1000次P50=0.311ms/P95=0.344ms，未发网络请求；结果`/private/tmp/interviewer-083-local-overhead.json`只代表这段本地运算，不包含业务语境、STT、数据库、真实模型或端到端时延。初次临时测量脚本误从包根导入`prompt_contract`而ImportError，未运行测量或产生副作用；改用实际contracts模块后完成。
+- 最终仓库验收：完整第二轮同命令得到`4203 passed/8 skipped/246.53s`、exit0，日志`/private/tmp/interviewer-083-backend-full.log`。8项仍为既有环境跳过；467份Python源码/测试的集合及内容与最终冻结摘要完全一致，验收记录`/private/tmp/interviewer-083-verification.json`。文档本地链接检查及`git diff --check`通过；未改前端，不重复前端构建。正在按既有重启授权再次核验零参会者、零未释放有效owner与worker空闲后加载，实际运行结果随后补记。
+- 实际加载：2026-10-27T05:12Z再次确认媒体0参会者、有效未释放owner=0、唯一worker空闲，保留各自原环境并正常TERM旧worker75028及其12个相关进程、API75027及其2个相关进程，无强杀。新API83113、worker/Beat83114于05:12:50Z复核：health/ready=200且ready=true、前端5174页面/代理200、唯一worker pong且active/reserved/scheduled均0、媒体仍0参会者；两份新日志无ERROR或Traceback。启动后首次worker探测未确认就绪（细节受抑制、未定位具体原因），第二次探测通过，未二次重启；保留此探测失败。执行记录`/private/tmp/interviewer-083-reload.log`、结果`interviewer-083-reload-result.json`、运行日志`interviewer-083-{api,worker}.log`。
+- 数据与交付边界：加载前后68份业务文档的逐字段核心摘要相同，排除的仅为根级`version/updated_at/heartbeats/last_activity_at/agent_events/agent_runtime/lifecycle_events`，字段摘要保存在`interviewer-083-core-{before,after}-fields.json`，不声称整文档完全不变。截图场次仍in_progress、首题asking、0答案，owner已由原流程释放；本轮未点击重试、恢复或提交真实场次，未重放候选材料。467份运行源码再次核对一致，Git基线`6e6daed`及081/082增量均保留，本次未另提交或push。新增[083说明](bounded-correction-continuation-083.md)并同步架构、领域、供应商、CONTEXT、已知问题、开发进度、路线图和本日志。真实模型纠错成功率、真人端到端速度及长期可靠性仍须实际复试，不标closed；若回退仅撤083增量并于空闲时重新加载，保留业务数据与早期修复。
+
+## 2026-10-26 · SUPPLEMENT-REPLY-ORDER-082
+
+- 状态：`verified（仓库全量回归与本机加载；真人复试及外部生产待验）`。
+- 现场与目标：用户复试`iv_a9a74c4b4b88434f`第7交流`turn_582a5eb2b2574701`仍显示处理重试。081日志明确02:04:36Z语义分析v131成功耗11497ms，02:04:39Z补充分类finish后再次v132完整分析，仅剩约5647ms；02:04:44Z交互超时，02:04:45Z恢复时同文本调用额度耗尽。前6份回答已评分完成，worker无本场失败。本场后由用户主动暂停，不自动恢复或提交。
+- 根因与范围：已送达补充问题后发生题目解释交流，旧准备与新边界/语境不匹配而正确拒绝复用；`listening`分支仍先完整语义分析再分类补充回复，导致确认模式下重复推理。保留081增量及Git基线`6e6daed`；沿用已读设计文档与codebase-design边界，修正编排顺序和对应预计算门槛，先判断已送达补充问题后的新回复，再按现有确认/不确定/退出/公司问题分支处理完整证据，不扩展receipt权限、不增加时限或次数。
+- 验证与运行：先用合成材料复现，再覆盖新技术补充+结束、纯结束、未送达问题、空回复、低置信度、退出/澄清、旧来源及真实提交围栏；运行相关与完整回归，同步架构、问题、进度、路线图。真实DB只读，先完成验证；若按既有授权加载，仅在无参会者且worker空闲时进行并保留实际加载记录。实际文件与结果结束时补充。
+- 实际文件：082仅增量修改`app/services/spoken_supplement.py`，新增`tests/test_supplement_reply_{order,guards,sqlite}_082.py`及[082说明](supplement-reply-order-082.md)，同步架构、已知问题、进度、路线图和本日志。081既有增量保留，API、Prompt、Schema、数据库结构、评分及调用预算均未变化。
+- 定向验证：order新增4项改前全部失败、改后通过，红测试日志`/private/tmp/interviewer-082-order-red.log`保留；与guards及原补充确认、078收据、073提交、语义端点、接话和081恢复共9文件`152 passed/17.20s`，日志`/private/tmp/interviewer-082-order-target.log`。新增SQLite4项经过真实临时数据库、EvidenceChain、持久owner和提交事务；隔离进程模拟旧顺序明确多一次未确认分析而预期失败，恢复当前源码后与078、073、081围栏共`84 passed/2.28s`。两组数字重叠，不累加；082新测试共26项，未重放真实场次。
+- 独立审查：逐项与081的460份冻结文件核对，唯一既有生产文件差异为`spoken_supplement.py`的资格判断及两个调用点；剔除该增量后源码摘要精确还原081。接话优先、静音、退出/定向澄清、问题实际送达、完整final、低置信度、新输入撤销及最终事务门禁保留，无未解决阻断项。`git diff --check`通过；含`main.py`的464份Python文件冻结至`/private/tmp/interviewer-082-tested-source-sha256.json`后运行完整后端，结果另补。
+- 完整回归：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q`首次全量即`4160 passed/8 skipped/269.50s`，日志`/private/tmp/interviewer-082-backend-full.log`；464份Python文件与测试前冻结摘要一致。新增26项全通过，8项为既有环境跳过；无前端修改，不重复前端构建。空闲预检API健康与就绪200、唯一worker pong且active/reserved/scheduled均0、1个空媒体房间/0参会者，记录`/private/tmp/interviewer-082-preflight.log`。
+- 实际加载：沿用此前用户重启授权，再次确认空闲并保留原进程环境后，优雅退出API64521与worker64522及其子进程，无强制终止。2026-10-27T02:23Z复核新API75027、worker75028，health/ready及前端5174页面/代理均200、唯一worker pong且三种队列计数为0、媒体0参会者；新API/worker日志无ERROR或Traceback，464份源码摘要仍匹配。记录`/private/tmp/interviewer-082-reload.log`及`interviewer-082-reload-result.json`，运行日志`interviewer-082-api.log`、`interviewer-082-worker.log`。
+- 数据及边界：加载前后67份业务文档的逐字段核心摘要完全一致；明确排除会被连接/心跳正常更新的根字段`version/updated_at/heartbeats/last_activity_at/agent_events/agent_runtime/lifecycle_events`，逐字段哈希留存在`/private/tmp/interviewer-082-core-{before,after}-fields.json`，不声称整文档不变。现场场次仍paused、6份答案、第7交流asking；未重放候选内容、点击重试、恢复面试或提交答案。082新代码全量与空闲加载无失败；改前及模拟旧顺序的合成失败作为回归证据保留。待用户真人复试核验本路径时延和长期外部供应商表现，不标记closed；既有Git基线`6e6daed`不变，081/082增量留在工作区，未推送远端。
+
+## 2026-10-26 · ANSWER-PREPARATION-CANCELLATION-081
+
+- 状态：`verified（仓库全量回归与本机加载；真人长场次及外部生产待验）`。
+- 授权与起点：用户要求先提交既有代码再实施前轮优化；基线已独立提交`6e6daed`（142文件），提交后工作区干净。沿用并按顺序复核11份设计文档，应用codebase-design技能集中准备任务生命周期与复用检查。
+- 现场依据：`iv_262fb51631ee45e7`的两次分析在1966ms/678ms被`input_changed/source=audio`撤销，随后20秒窗口耗尽；恢复提示与静音等待消耗约15秒，下一次因共享两次调用额度耗尽而失败。已加载079诊断明确了原因，不归为供应商18秒超时或worker失败。
+- 实施范围：音频活动立即撤销推进/提交资格，但为不变证据保留唯一有界准备；新转写、完整证据/语境/采集/所有权变化废弃旧结果。成功结果同步复用；恢复通知与纯后台准备并行，通知后免除无必要的再次静音等待。保留18/20/40秒、两次实际调用上限、真实补充/退出确认及最终提交fence，不退款、不无界续期。
+- 验证与运行边界：增加音频干扰、真实补充、上下文变化、后台失败计数、播放期间恢复及关闭清理的故障注入/集成验收，再运行相关和全量回归。真实业务库只读，不重放候选材料或自动重试/提交场次；先完成代码验证，活动面试期间不重启。实际文件、失败记录、验证结果与加载状态结束时补齐。
+- 实际文件：修改`app/services/{answer_endpoint,speculative_turn_preparation,spoken_supplement,interview_evidence,interviews}.py`；新增`tests/test_{answer_preparation_cancellation,preparation_context,preparation_fences,recovery_overlap}_081.py`，更新`tests/test_answer_endpoint.py`中音频与真实转写的取消合同。同步架构、领域、CONTEXT、问题/进度/路线图和本日志，新增[081说明](answer-preparation-cancellation-081.md)。无前端、API、Prompt、Provider、评分规则或DDL改动。
+- 故障复现与修复留痕：保留准备首批6项改前5失败/1通过；复用seam的15项改前失败；通知选中/播放各状态5项曾因对话指纹变化失败；并行恢复2项改前失败，通知选择前/后异常追加2项先失败后通过。独立审查另复现正式与投机反向重复调用、到期旧任务误被恢复复用、已取消投机清理未等待及旧任务回调错误归属，均加入回归后修复。旧endpoint测试原要求audio取消Provider，已改为音频保留且真实转写变化后取消，仍验证旧结果不能提交。故障注入全为合成材料，没有外部调用或真实业务数据副作用。详细临时日志保留在`/private/tmp/interviewer-081-*.log`。
+- 阶段验收：四组081新增测试独立复核`75 passed/1.55s`；包含079诊断、078预算与恢复、确认复用、非关闭端点、语义端点和通知组合的13文件命令`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q tests/test_answer_preparation_cancellation_081.py tests/test_answer_diagnostics_079.py tests/test_understanding_diagnostics_079.py tests/test_confirmation_preparation_reuse.py tests/test_confirmed_preparation_liveness.py tests/test_preparation_failure_budget.py tests/test_nonclosing_answer_endpoint.py tests/test_answer_endpoint.py tests/test_semantic_turn_endpoint.py tests/test_answer_recovery_078.py tests/test_answer_budget_semantics_078.py tests/test_preparation_context_081.py tests/test_recovery_overlap_081.py`为`184 passed/11.41s`（数字与75重叠，不累加），日志`/private/tmp/interviewer-081-cancellation-target4.log`。`git diff --check`通过；460份Python源码/测试冻结到`/private/tmp/interviewer-081-tested-source-sha256.json`，完整后端回归正在运行。
+- 加载预检：只读确认API54007健康200、worker54008唯一节点pong且active/reserved/scheduled均0、LiveKit一空房间/0参会者。沿用用户之前重启授权，全量通过后再次确认空闲再加载；临时脚本保留原进程环境且不输出凭据。当前预检未重启或提交真实场次。
+- 首轮完整回归：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q`得到`4128 passed/6 failed/8 skipped/266.84s`，日志`/private/tmp/interviewer-081-backend-full.log`。失败涉及3项旧音频取消断言，以及权威final更正后的恢复、接话处理deadline和快速失败恢复时序；未视为验收通过，未加载运行服务。逐项核对真实逻辑与旧测试时序后再跑全量，修正结果另补。
+- 首轮修正：生产源码未再变更。`tests/test_nonclosing_capture_integration.py`及`tests/test_parallel_conversation_052.py`更新audio保留但禁止推进、真实转写/关闭取消、完整音频唯一答案断言，两文件`24 passed/6.73s`；`tests/test_nonclosing_continuous_stt.py`、`tests/test_reception_arbitration_060.py`与`tests/test_recovery_episode_066.py`等待后台失败完成/退避建立后再推进合成时钟，容许并行恢复快速跨过中间计数，仍严格核验最终调用及取消上限。后者与新增准备/通知测试共`69 passed/13.13s`（`/private/tmp/interviewer-081-full-regression-fixes.log`），独立三整文件`33 passed/12.90s`，无未解决审查项。首次源码快照保留为`/private/tmp/interviewer-081-first-tested-source-sha256.json`；最终快照460份仅上述5测试文件变化，完整第二轮回归进行中。
+- 最终仓库验收：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -q`得到`4134 passed/8 skipped/261.95s`，exit0，日志`/private/tmp/interviewer-081-backend-verified.log`。8项为既有外部环境跳过；前端未修改，不重复构建。下一步再次核对460份源码及空闲状态后按既有授权加载，运行验收结果另补。
+- 实际加载：2026-10-26T10:01Z再次确认唯一worker空闲、LiveKit无参会者，保留原进程环境并优雅关闭API54007/worker54008，启动API64521/worker64522。首次启动后子进程探测exit1（敏感输出受抑制，未获得具体异常）；进程持续存活且日志显示startup/worker ready，未再次重启。随后独立复核health/ready/前端/前端代理均200、ready=true、无失败检查；worker唯一节点pong且active/reserved/scheduled均0，媒体2空房间/0参会者。460份源码/测试仍与全量通过的哈希一致。日志`/private/tmp/interviewer-081-{api,worker}.log`，验证摘要`/private/tmp/interviewer-081-reload-result.json`。
+- 数据核对与限制：重启前后均66份interview记录，但整文档SHA不一致；观察到浏览器自动重连在10:01:55Z追加`interview.participant_ready`及持续心跳/version更新。预检仅保存整文档摘要，不能据此声称逐字段完全不变；截图场次仍0答案/1个asking轮次，新的API日志没有该场次模型处理事件。本轮没有主动重放、重试、确认或提交真实候选答案，没有变更凭据。保留此差异与首次探测失败记录，不把整文档对比记为通过。
+- 交付：基线`6e6daed`已独立提交，本次081优化保留工作区供审阅，未push。仓库及本机加载完成；真人复试和外部供应商长期可靠性仍待观察，不标closed。回退应只撤081增量并在空闲时重新加载，保留基线及所有业务记录。
+
+## 2026-10-26 · BASELINE-COMMIT-080
+
+- 状态：`verified`。
 - 授权与目标：用户要求先提交之前代码，再实施音频取消与恢复流程优化。本工作项只将当前069–079的源码、测试、文档及已有前端构建资源保存为独立Git基线，不包含后续优化。
 - 起点与验证：当前分支`dev`，HEAD `bde6e2c`；当前456份Python源码/测试与079全量4059通过/8跳过时的哈希一致。保留既有全部修改，按明确文件范围暂存，检查暂存diff，不纳入运行数据库、录音、凭据或临时日志；不推送远端、不重启服务。提交结果随后在本日志补记。
+- 实际结果：`git add -- CONTEXT.md app docs tests`、`git diff --cached --check`及暂存路径检查通过；`git commit -m "fix: preserve interview recovery and diagnostics baseline"`生成`6e6daed`，共142文件，提交后工作区干净。未推送、未改变业务数据与运行服务；本条完成状态随后续081日志更新保存，提交本身包含原in_progress登记。
 
 ## 2026-10-26 · ANSWER-DIAGNOSTICS-RELOAD-079
 

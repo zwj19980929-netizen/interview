@@ -271,11 +271,16 @@ async def test_full_review_deadline_cancels_work_and_never_creates_a_polling_inf
         endpoint.confirmation.floor_returned(endpoint)
         clock.value += 1.1
         await _until(lambda: "understanding_unavailable" in notices)
-        await asyncio.sleep(.15)
+        # The owned speculative task now reports its failure before the
+        # reconciliation waiter resumes. Honor that failure's bounded backoff.
+        clock.value += 2
+        await _until(lambda: endpoint._prepare_failures == capture.cancelled == 2)
+        await _until(lambda: not endpoint.preparation._tasks and endpoint._inference_task is None)
         count = len(capture.prepares)
         clock.value += 600
         await asyncio.sleep(.2)
         assert count == len(capture.prepares) == capture.cancelled == 2
+        assert endpoint.preparation_blocked and endpoint._prepare_failures == 2
         assert endpoint.confirmation._reception_review is None
         assert not endpoint.preparation._tasks and endpoint._inference_task is None
         assert spoken == ["reception_wait"] and not commits and capture.is_open

@@ -98,6 +98,7 @@ def unresolved_response(*, technical=False, reply=REPLY):
 @pytest.mark.parametrize("technical", [True, False])
 async def test_fragmented_content_can_finish_after_a_real_clarification_without_becoming_a_decline(composite, technical):
     text, before, data = unresolved_response(technical=technical)
+    data["clarification_target"] = {"resolution": "same_focus_unresolved", "source_ref": "C1"}
     utterance, turn, interview = _input()
     utterance = utterance.model_copy(update={"text": text})
     turn["allow_followup"] = composite
@@ -197,6 +198,7 @@ async def test_repeated_missing_clarification_proof_has_precise_safe_failure_and
 @pytest.mark.anyio
 async def test_low_acoustic_confidence_revokes_even_model_clear_unresolved_completion():
     text, before, data = unresolved_response()
+    data["clarification_target"] = {"resolution": "same_focus_unresolved", "source_ref": "C1"}
     utterance, turn, interview = _input()
     utterance = utterance.model_copy(update={"text": text, "stt_confidence": .6})
     turn["allow_followup"] = False
@@ -268,7 +270,8 @@ async def test_waiting_keeps_prior_technical_ambiguity_and_claims_without_anothe
     reply = "再等一下，我还没有说完。"
     text, before, data = unresolved_response(technical=technical, reply=reply)
     data.update(intent="answer" if technical else "not_finished", turn_intent="thinking", completion_basis=None,
-                suggested_action="continue_listening")
+                suggested_action="continue_listening",
+                clarification_target={"resolution": "same_focus_unresolved", "source_ref": "C1"})
     utterance, turn, interview = _input()
     utterance = utterance.model_copy(update={"text": text})
     turn["allow_followup"] = composite
@@ -361,16 +364,22 @@ def test_complete_unresolved_none_prompt_example_is_a_valid_source_bound_contrac
 @pytest.mark.parametrize("delivered", [True, False])
 @pytest.mark.parametrize("composite", [True, False])
 def test_prompt_states_current_delivered_clarification_phase_after_general_rules(delivered, composite):
+    from app.core.prompt.contracts import _interview_turn_decision, _interview_turn_understanding
+
     text, before, _ = unresolved_response()
     context = {"transcript": text, "capability_points": ["幂等键", "确认序号"], "semantic_first": True,
                "interviewer_context": {"content_clarification": _clarification_context(before)} if delivered else {}}
     contract = prompt_contract("interview_turn_decision" if composite else "interview_turn_understanding", context)
-    phase_indexes = [index for index, message in enumerate(contract.messages)
-                     if message.content.startswith("本轮内容澄清阶段：")]
-    assert len(phase_indexes) == 1
-    phase = contract.messages[phase_indexes[0]].content
-    assert phase_indexes[0] > next(index for index, message in enumerate(contract.messages)
-                                 if "本轮采用语义优先接话合同" in message.content)
+    original = (_interview_turn_decision if composite else _interview_turn_understanding)(context)
+    assert contract.messages[0].role == "system"
+    assert [message for message in contract.messages if message.role == "system"] == [contract.messages[0]]
+    assert contract.messages[1:] == [message for message in original.messages if message.role != "system"]
+    policy = contract.messages[0].content
+    marker = "本轮内容澄清阶段："
+    assert sum(message.content.count(marker) for message in contract.messages) == 1
+    phase_index = policy.index(marker)
+    assert policy.index("本轮采用语义优先接话合同") < phase_index
+    phase = policy[phase_index:]
     if delivered:
         assert "已提供已送达的content_clarification" in phase and "播完后的新回复" in phase
         assert "thinking/continue_listening" in phase and "仍需独立退出确认" in phase

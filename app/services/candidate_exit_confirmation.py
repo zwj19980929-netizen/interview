@@ -1,10 +1,25 @@
 """Validate the server's separate, source-bound withdrawal exchange."""
 from copy import deepcopy
+from dataclasses import dataclass
 import hashlib
+from typing import Any
 
 from app.core.errors import ApiError
 from app.core.prompt.candidate_exit import EXIT_CONFIRMATION_SPEECH, EXIT_CONFIRMATION_SPEECH_VERSION
 from app.services.conversation_delivery import selected_events
+
+
+@dataclass(frozen=True)
+class PreparedCandidateExit:
+    """Private control proof, deliberately without an answer understanding."""
+
+    interview_id: str
+    turn_id: str
+    text: str
+    stt_fingerprint: str
+    context_fingerprint: str
+    exit_confirmation: dict[str, Any]
+    capture_binding: Any = None
 
 
 def text_hash(text):
@@ -50,3 +65,22 @@ def confirmed_exit_receipt(context, transcript, *, confirmed_at):
             "question_act_id": context["question_act_id"], "capture_id": context["capture_id"],
             "transcript_sha256": context["transcript_sha256"],
             "request_sha256": text_hash(context["request_text"]), "reply_sha256": text_hash(context["reply_text"])}
+
+
+def validated_delivered_exit_context(session, turn, transcript, context):
+    """Require an actual delivered question for the independent exit effect.
+
+    Legacy answer preparations retain their original runtime delivery gate.
+    This new control path additionally checks the durable delivery receipt;
+    an old delivered selection cannot cover a later unplayed selection.
+    """
+    context = validated_exit_context(session, turn, transcript, context)
+    if context is None or context["decision"] != "confirm":
+        raise ApiError("EXIT_CONFIRMATION_REQUIRED", "A fresh confirmed withdrawal is required.", status_code=409)
+    selections = [event for event in selected_events(session, turn)
+                  if (event.get("payload") or {}).get("act_id") == context["question_act_id"]]
+    latest = max(selections, key=lambda item: item.get("session_sequence", 0), default={})
+    delivery = latest.get("delivery") or {}
+    if delivery.get("status") != "delivered" or not delivery.get("performance_id"):
+        raise ApiError("EXIT_CONFIRMATION_REQUIRED", "The withdrawal question was not delivered.", status_code=409)
+    return context

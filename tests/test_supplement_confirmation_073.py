@@ -230,7 +230,7 @@ async def test_supplement_reminder_propagates_ownership_loss():
 
 
 @pytest.mark.anyio
-async def test_uncertain_reply_gets_one_full_review_without_recursing_into_the_same_reply():
+async def test_uncertain_reply_does_not_spend_full_analysis_or_grant_completion():
     endpoint, confirmation, spoken, commits = setup()
     try:
         await answer(endpoint, confirmation)
@@ -238,12 +238,14 @@ async def test_uncertain_reply_gets_one_full_review_without_recursing_into_the_s
 
         async def uncertain(words, **kwargs):
             endpoint.capture.replies.append(words)
-            return {"intent": "unclear", "confidence": .9, "evidence_quote": words}
+            return {"intent": "unclear", "confidence": .9, "evidence_quote": words,
+                    "reply_text": "我想先确认一下，你刚才是希望我怎么配合？", "repeat_target": None}
 
         endpoint.capture.classify_supplement_reply = uncertain
         await reply(endpoint, confirmation, BODY + "我再说一句相关的内容。")
         assert endpoint.capture.replies == ["我再说一句相关的内容。"]
-        assert len(endpoint.capture.prepares) == 2
+        assert len(endpoint.capture.prepares) == 1
+        assert endpoint._prepare_failures == 0 and not confirmation.confirmed
         assert spoken == ["check", "clarify"] and not commits
     finally:
         await endpoint.close()
@@ -251,7 +253,7 @@ async def test_uncertain_reply_gets_one_full_review_without_recursing_into_the_s
 
 @pytest.mark.anyio
 @pytest.mark.parametrize("exit_reply", ["是的，确定结束。", "不了，我继续。"])
-async def test_uncertain_supplement_reply_routes_real_audio_to_separate_exit_confirmation(tmp_path, monkeypatch, exit_reply):
+async def test_supplement_exit_request_routes_real_audio_to_separate_exit_confirmation(tmp_path, monkeypatch, exit_reply):
     from copy import deepcopy
     from app.core.prompt.contracts import SUPPLEMENT_SPEECH
     from app.core.prompt.candidate_exit import EXIT_CONFIRMATION_SPEECH
@@ -262,6 +264,7 @@ async def test_uncertain_supplement_reply_routes_real_audio_to_separate_exit_con
         _playable_speech, _answer_without_confirmation, _stop_current_playback, _TECHNICAL)
     from test_evidence_owner_recovery_integration import _wait_until
     from test_spoken_supplement_integration import _audio_aligned_transcripts
+    from test_exit_evidence_086 import _assert_retained_exit
 
     _semantic_provider(monkeypatch, technical=True)
     original = MockProvider.invoke
@@ -274,9 +277,9 @@ async def test_uncertain_supplement_reply_routes_real_audio_to_separate_exit_con
             return response
         version = request.metadata.get("prompt_version", "")
         data = deepcopy(response.data)
-        if version == "supplement_reply.v5":
+        if version in {"supplement_reply.v5", "supplement_reply.v6"}:
             requests.append("supplement")
-            data.update(intent="unclear", confidence=.95)
+            data.update(intent="stop_interview", confidence=.95, reply_text="")
         elif version.startswith(("interview_turn_understanding.", "interview_turn_decision.")):
             requests.append("understanding")
             text = request.metadata["transcript"]
@@ -315,9 +318,10 @@ async def test_uncertain_supplement_reply_routes_real_audio_to_separate_exit_con
         clock.value += 1
         if exit_reply == "是的，确定结束。":
             await _wait_until(lambda: bool(_current(runtime).get("candidate_input_completed_at")), timeout=5)
-            current = _current(runtime)
-            assert len(current["answers"]) == 1
-            assert current["answers"][0]["raw_transcript"] == body + exit_request + exit_reply
+            await _wait_until(lambda: all(command["status"] == "completed" for command in store.evidence_commands.values()))
+            _assert_retained_exit(store, runtime, body + exit_request + exit_reply,
+                voice_frames=5, continuation_frames=10)
+            assert requests.count("understanding") == 1, "An exit confirmation must not repeat technical analysis"
         else:
             await _wait_until(lambda: not endpoint.confirmation._exit_waiting)
             assert not _current(runtime)["answers"]

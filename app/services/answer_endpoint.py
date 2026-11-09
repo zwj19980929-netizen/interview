@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from copy import deepcopy
 import hashlib
 import inspect
 import math
 import logging
 import time
-from weakref import WeakSet
+from weakref import WeakKeyDictionary, WeakSet
 from array import array
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Optional
@@ -19,7 +20,9 @@ from app.core.interaction_budget import interaction_deadline, remaining_interact
 from app.core.model_diagnostics import (
     current_model_call_scope, diagnosed_wait_for, model_call_scope, record_model_diagnostic, safe_model_call_context,
 )
-from app.core.answer_processing_budget import AnswerProcessingBudget, answer_processing_budget
+from app.core.answer_processing_budget import (
+    AnswerProcessingBudget, AnswerCorrectionContinuation, answer_processing_budget, require_answer_correction,
+)
 from app.core.interview_agent_metrics import measure_interview_agent_stage, observe_interview_agent_metric
 from app.services.capture_recovery import CaptureFailure, classify_capture_failure
 from app.model_gateway.errors import ProviderError
@@ -44,6 +47,7 @@ class _PreparationAttempt:
     evidence_key: str
     failure_recorded: bool = False
     diagnostic_scope: Any = field(default_factory=current_model_call_scope, repr=False)
+    discarded: bool = False
 
 
 class _SpeculativeModelAllowance(AnswerProcessingBudget):
@@ -51,6 +55,10 @@ class _SpeculativeModelAllowance(AnswerProcessingBudget):
     def __init__(self, shared: AnswerProcessingBudget, on_consume: Callable[[], None]) -> None:
         super().__init__(limit=1)
         self.shared, self.on_consume = shared, on_consume
+
+    @property
+    def correction_budget(self) -> AnswerProcessingBudget:
+        return self.shared.correction_budget
 
     def consume(self) -> bool:
         if self.used >= self.limit or not self.shared.consume():
@@ -118,7 +126,8 @@ class AnswerEndpoint:
         self._terminal_provider_failure = False
         self._speculative_model_used = False
         self._speculative_preparing = False
-        self._speculative_terminal_recorded = False
+        self._speculative_attempt: Optional[_PreparationAttempt] = None
+        self._speculative_attempts = WeakKeyDictionary()
         self._understanding_recovery_active = False
         self._manual_retry_notice_pending = False
         self._preparation_budget_text = ""
@@ -143,6 +152,7 @@ class AnswerEndpoint:
         self._confirmed_preparation_scope = None
         self._confirmed_preparation_identity: Any = None
         self._confirmed_preparation_capture: Any = None
+        self._confirmed_preparation_kwargs: Optional[dict] = None
         self._confirmed_preparation_deadline = 0.0
         self._confirmed_preparation_attempt: Optional[_PreparationAttempt] = None
         self._preparation_tasks: set[asyncio.Task] = set()
@@ -151,9 +161,11 @@ class AnswerEndpoint:
         self.max_recovery_attempts = 3
         self.recovery_timeout = max(0.01, min(15.0, recovery_timeout))
         self.recovery_backoff = max(0.0, min(0.5, recovery_backoff))
-        self.preparation = SpeculativeTurnPreparation(self._call_speculative_decision, self._identity,
+        self.preparation = SpeculativeTurnPreparation(self._call_speculative_decision,
+                                                      lambda value: (self.capture, self._identity(value)),
                                                       timeout=_SPECULATIVE_PREPARATION_TIMEOUT,
-                                                      diagnostic_context=self._diagnostic_context)
+                                                      diagnostic_context=self._diagnostic_context,
+                                                      on_done=self._speculative_finished)
 
     def start(self) -> None:
         self._started_at = self.clock()
@@ -185,9 +197,12 @@ class AnswerEndpoint:
             return
         if source in {"audio", "client"}:
             self._refresh_missing_final_origin()
-        self.preparation.cancel(reason="input_changed", source=source)
         if source == "transcript":
-            self._discard_confirmed_preparation(reason="input_changed", source=source)
+            # Subtitle hypotheses revoke authority immediately, but are not
+            # evidence that the stable input of an owned analysis changed.
+            # Keep that pure work within its original bound until a complete
+            # snapshot reconciles its identity; it cannot advance this turn.
+            self._invalidate_answer_corrections()
         self.revision += 1
         if (self.confirmation and self.confirmation.confirmed) or (
                 self._inference_task is not None and not self._inference_task.cancelled()):
@@ -210,16 +225,15 @@ class AnswerEndpoint:
     def observe_transcript(self, text: str) -> None:
         """Server ASR can revoke a proposal even when acoustic VAD missed speech.
 
-        A hypothesis is only an invalidation signal here, never answer evidence
-        or completion approval. Repeated cumulative subtitles do not restart
-        the silence clock.
+        A hypothesis revokes the current waiter and completion authority, not
+        owned pure analysis. Only stable/full evidence can supersede that
+        work or select its budget. Repeated subtitles do not restart silence.
         """
         text = text.strip()
         if text and self._covered_server_transcript.startswith(text):
             return
         if text and text != self._last_server_transcript:
             self._last_server_transcript = text
-            self._use_preparation_budget(text)
             if self.confirmation is not None:
                 self.confirmation.transcript_changed()
             self.speech_started(source="transcript")
@@ -233,11 +247,22 @@ class AnswerEndpoint:
         if final is not None:
             self._begin_interaction(final.text)
             self._use_preparation_budget(final.text)
-            if (self._confirmed_preparation is not None
-                    and self._identity(final) != self._confirmed_preparation_identity):
-                self._discard_confirmed_preparation()
+            self._reconcile_preparation_evidence(final)
             self._covered_server_transcript = final.text.strip()
             self._last_server_transcript = self._covered_server_transcript
+
+    def _reconcile_preparation_evidence(self, snapshot: Any) -> None:
+        """Supersede pure work only with full evidence, never subtitle text."""
+        changed = (self.preparation.has_preparation
+                   and not self.preparation.matching(snapshot, include_failed=True))
+        confirmed_changed = (self._confirmed_preparation is not None
+                             and self._identity(snapshot) != self._confirmed_preparation_identity)
+        if changed or confirmed_changed:
+            self._invalidate_answer_corrections()
+        if changed:
+            self.preparation.cancel(reason="input_changed", source="stable_evidence")
+        if confirmed_changed:
+            self._discard_confirmed_preparation(reason="input_changed", source="stable_evidence")
 
     def request_finish(self) -> None:
         self._interaction_deadline = None
@@ -247,6 +272,7 @@ class AnswerEndpoint:
         self._blocked_revision = None
         self._blocked_preview = None
         self._reset_preparation_budget()
+        self._invalidate_answer_corrections()
         self._model_budgets.clear()
         if self._last_voice is None:
             self._last_voice = self.clock() - self.min_silence_seconds
@@ -258,6 +284,7 @@ class AnswerEndpoint:
         self._manual_retry_notice_pending = self._understanding_recovery_active
         self._reset_missing_final_budget()
         self._reset_preparation_budget()
+        self._invalidate_answer_corrections()
         self._model_budgets.clear()
         self.speech_started()
         if self.confirmation is not None and not self.confirmation.speaking:
@@ -276,6 +303,7 @@ class AnswerEndpoint:
         if not self._recovery_retryable:
             return False
         self._interaction_deadline = None
+        self._invalidate_answer_corrections()
         self._model_budgets.clear()
         self._reset_preparation_budget()
         self._manual_retry_notice_pending = True
@@ -374,20 +402,24 @@ class AnswerEndpoint:
                     continue
                 quiet = self.clock() - (self._last_voice if self._last_voice is not None else self._started_at)
                 if self.confirmation is not None:
-                    if (self.confirmation.phase == "listening" or (
+                    if ((self._confirmed_preparation_kwargs or {}).get("completion_confirmed") and (
+                            self.confirmation.phase == "listening" or (
                             self.confirmation.speaking
-                            and self.confirmation._after_speech == "listening")):
+                            and self.confirmation._after_speech == "listening"))):
                         self._discard_confirmed_preparation()
                     # A blocked understanding attempt still owns any selected
                     # recovery playback. Maintain its ACK watchdog so missing
                     # playback completion cannot leave microphone echo gated.
                     if (not self.confirmation.speaking and (
-                            self.preparation_blocked or self._blocked_revision == self.revision
-                            and not (not self.preparation_blocked and self.confirmation.idle_check_due(quiet))
+                            self._blocked_revision == self.revision and not self.preparation_blocked
+                            and not self.confirmation.idle_check_due(quiet)
                             or self.clock() < self._retry_at)):
                         continue
                     try:
-                        await self.confirmation.step(self, quiet)
+                        if self.preparation_blocked and not self.confirmation.speaking:
+                            await self.confirmation.control_step(self, quiet)
+                        else:
+                            await self.confirmation.step(self, quiet)
                     except ApiError as exc:
                         if exc.code == "TURN_DECISION_STALE":
                             if not self._closed and not self.confirmation.speaking:
@@ -450,6 +482,56 @@ class AnswerEndpoint:
             raise
         finally:
             await self._close_preparations()
+
+    async def _propose_exit(self, final: Any) -> None:
+        """Commit a delivered exit handshake without inventing answer semantics."""
+        if getattr(self, "_exit_committing", False):
+            return
+        self._exit_committing = True
+        stage = "snapshot"
+        recovery_handled = False
+        try:
+            self.assert_current()
+            if final is None or self.confirmation is None:
+                return
+            context = self.confirmation.exit_context(final)
+            if not context or context.get("decision") != "confirm":
+                return
+            current = await self.capture.transcript_snapshot(resume=False)
+            self.assert_current()
+            self._observe_final_snapshot(current)
+            if current is None or self._identity(current) != self._identity(final):
+                self.confirmation.confirmed = False
+                self.confirmation._confirmed_final = None
+                self.confirmation._exit_context = self.confirmation._exit_context_final = None
+                if current is not None:
+                    await self.capture.resume_capture()
+                    await self.confirmation._ask_exit(self, current, clarify=True)
+                return
+            prepared = self.capture.prepare_exit_decision(current, exit_confirmation=context)
+            self.assert_current()
+            self.preparation.cancel()
+            self._discard_confirmed_preparation()
+            stage = "commit"
+            # This local transaction has its own bounded window, independent
+            # of the technical answer's expired model budget.
+            with measure_interview_agent_stage("decision_commit_ms"):
+                await asyncio.wait_for(self.commit(prepared, self.assert_current), timeout=self.recovery_timeout)
+        except ApiError as exc:
+            self.trace("exit_proposal_rejected", stage=stage, cause_code=exc.code, revision=self.revision)
+            if exc.code != "TURN_DECISION_STALE":
+                recovery_handled = True
+                await self._recover_capture(exc, stage)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _LOG.warning("Exit proposal failed: stage=%s error_type=%s", stage, type(exc).__name__)
+            recovery_handled = True
+            await self._recover_capture(exc, stage)
+        finally:
+            self._exit_committing = False
+            if not recovery_handled and not self._closed and self.capture.is_open:
+                await self.capture.resume_capture()
 
     async def _propose(self, *, final_snapshot: Any = None, prepared_decision: Any = None,
                        recognition_resumed: bool = False) -> None:
@@ -678,33 +760,78 @@ class AnswerEndpoint:
             raise ApiError("TURN_DECISION_STALE", "This capture already used speculative preparation.", status_code=409)
         self._speculative_preparing = True
         key = hashlib.sha256(transcript.text.strip().encode("utf-8")).hexdigest()
-        shared = self._model_budgets.setdefault(key, AnswerProcessingBudget(limit=2))
+        shared = self._model_budgets.setdefault(key, AnswerProcessingBudget(limit=2, defer_corrections=True))
         allowance = _SpeculativeModelAllowance(shared, lambda: setattr(self, "_speculative_model_used", True))
         try:
             with answer_processing_budget(allowance):
-                prepared = await self.capture.prepare_decision(transcript, **kwargs)
-            problem = prepared.understanding.problem
-            if (problem is not None and getattr(problem, "source", None) == "provider"
-                    and not problem.retryable and getattr(problem, "reason_code", None) != "call_budget_exhausted"):
-                self._record_preparation_failure(_PreparationAttempt(self._preparation_budget_epoch, key), problem=problem)
-                self._speculative_terminal_recorded = self._preparation_failure_notice_pending = True
-            return prepared
-        except ProviderError as exc:
-            if not exc.retryable:
-                self._record_preparation_failure(_PreparationAttempt(self._preparation_budget_epoch, key), problem=exc)
-                self._speculative_terminal_recorded = self._preparation_failure_notice_pending = True
-            raise
+                return await self.capture.prepare_decision(transcript, **kwargs)
         finally:
             self._speculative_preparing = False
+
+    def _record_speculative_failure(self, attempt: _PreparationAttempt, problem: Any,
+                                    transcript: Any, capture: Any) -> None:
+        if (self._closed or capture is not self.capture or not self.preparation.has_preparation
+                or getattr(problem, "code", None) == "TURN_DECISION_STALE"):
+            return
+        terminal = (getattr(problem, "retryable", True) is False
+                    and getattr(problem, "reason_code", None) != "call_budget_exhausted")
+        if not terminal and (self._interaction_started_at is None
+                             or transcript.text.strip() != self._interaction_text):
+            # A preview can precede the first authoritative interaction. Its
+            # failure is charged when that interaction adopts the same words.
+            return
+        if getattr(problem, "reason_code", None) == "call_budget_exhausted":
+            shared = self._model_budgets.get(attempt.evidence_key)
+            if shared is not None and shared.used < shared.limit:
+                problem = SimpleNamespace(source="provider", retryable=True, reason_code="call_budget_exhausted")
+        self._record_preparation_failure(attempt, problem=problem,
+                                         interaction_expired=isinstance(problem, InteractionBudgetExpired))
+
+    def _speculative_finished(self, task: asyncio.Task, transcript: Any) -> None:
+        if (task.cancelled() or not self.preparation.owns(task)
+                or not self.preparation.matching(transcript, include_failed=True)):
+            return
+        error = task.exception()
+        problem = error if error is not None else task.result().understanding.problem
+        if problem is None:
+            return
+        attempt = self._speculative_attempts.get(task)
+        if attempt is None:
+            return
+        self._record_speculative_failure(attempt, problem, transcript, self.capture)
 
     async def _call_prepare_decision(self, transcript: Any, **kwargs: Any) -> Any:
         # Stable previews, authoritative calls and schema repair share one
         # mutable allowance. VAD revisions and provider reconnections do not
         # replenish it; exact evidence checks remain separate from this ledger.
         key = hashlib.sha256(transcript.text.strip().encode("utf-8")).hexdigest()
-        budget = self._model_budgets.setdefault(key, AnswerProcessingBudget(limit=2))
+        budget = self._model_budgets.setdefault(key, AnswerProcessingBudget(limit=2, defer_corrections=True))
         with answer_processing_budget(budget):
             return await self.capture.prepare_decision(transcript, **kwargs)
+
+    def _preparation_kwargs(self, transcript: Any, *, semantic_first: bool = False) -> dict:
+        kwargs = ({"semantic_first": True} if semantic_first else
+                  {"completion_confirmed": True} if self.confirmation and self.confirmation.confirmed else {})
+        if kwargs.get("completion_confirmed") and getattr(self.confirmation, "semantic_first", False):
+            kwargs["semantic_first"] = True
+        for name in ("exit_confirmation", "content_clarification"):
+            method = "exit_context" if name == "exit_confirmation" else "content_clarification_context"
+            get_context = getattr(self.confirmation, method, None)
+            context = get_context(transcript) if callable(get_context) else None
+            if context is not None:
+                kwargs[name] = context
+                kwargs["semantic_first"] = True
+        return deepcopy(kwargs)
+
+    def _validate_preparation(self, prepared: Any, transcript: Any, kwargs: dict) -> None:
+        validate = getattr(self.capture, "assert_preparation_current", None)
+        if callable(validate):
+            try:
+                validate(prepared, transcript, **kwargs)
+            except Exception:
+                self.preparation.cancel()
+                self._discard_confirmed_preparation()
+                raise
 
     async def _prepare_transcript(self, transcript: Any, *, semantic_first: bool = False) -> Any:
         with measure_interview_agent_stage("understanding_prepare_ms"):
@@ -714,32 +841,21 @@ class AnswerEndpoint:
                 self._blocked_revision = self.revision
                 raise ApiError("UNDERSTANDING_RETRY_EXHAUSTED", "New server words or an explicit retry are required.",
                                status_code=503)
-            kwargs = ({"semantic_first": True} if semantic_first else
-                      {"completion_confirmed": True} if self.confirmation and self.confirmation.confirmed else {})
-            if kwargs.get("completion_confirmed") and getattr(self.confirmation, "semantic_first", False):
-                # Explicit completion can prepare a stable preview before the
-                # final cut. Keep the same semantic schema as the final path.
-                kwargs["semantic_first"] = True
-            exit_context = (self.confirmation.exit_context(transcript)
-                            if callable(getattr(self.confirmation, "exit_context", None)) else None)
-            if exit_context is not None:
-                kwargs["exit_confirmation"] = exit_context
-                kwargs["semantic_first"] = True
-            content_context = (self.confirmation.content_clarification_context(transcript)
-                               if callable(getattr(self.confirmation, "content_clarification_context", None)) else None)
-            if content_context is not None:
-                kwargs["content_clarification"] = content_context
-                kwargs["semantic_first"] = True
-            if (semantic_first and exit_context is None and content_context is None
+            kwargs = self._preparation_kwargs(transcript, semantic_first=semantic_first)
+            if (kwargs == {"semantic_first": True}
                     and self.preparation.matching(transcript, include_failed=True)):
                 preview_failure = None
                 preview_scope = self.preparation.diagnostic_scope
+                preview_attempt = self._speculative_attempt
                 try:
-                    prepared = await self._infer(self.preparation.take(transcript, include_failed=True),
-                                                 timeout=_SPECULATIVE_PREPARATION_TIMEOUT,
-                                                 operation="speculative_wait")
+                    prepared = self.preparation.ready(transcript)
+                    if prepared is None:
+                        prepared = await self._infer(self.preparation.take(transcript, include_failed=True),
+                                                     timeout=_SPECULATIVE_PREPARATION_TIMEOUT,
+                                                     operation="speculative_wait")
                     self.assert_current()
                     if prepared is not None and prepared.understanding.problem is None:
+                        self._validate_preparation(prepared, transcript, kwargs)
                         observe_interview_agent_metric("stt_preview_reused", 1)
                         return prepared
                     preview_failure = prepared.understanding.problem if prepared is not None else None
@@ -761,100 +877,164 @@ class AnswerEndpoint:
                             # remaining shared allowance.
                             preview_failure = SimpleNamespace(source="provider", retryable=True,
                                                               reason_code="call_budget_exhausted")
-                    attempt = _PreparationAttempt(self._preparation_budget_epoch, self._preparation_budget_key,
-                                                  diagnostic_scope=preview_scope)
-                    if not self._speculative_terminal_recorded:
+                    attempt = preview_attempt or _PreparationAttempt(
+                        self._preparation_budget_epoch, self._preparation_budget_key, diagnostic_scope=preview_scope)
+                    if not attempt.failure_recorded:
                         self._record_preparation_failure(attempt, problem=preview_failure,
                             interaction_expired=isinstance(preview_failure, InteractionBudgetExpired))
                     await self._publish_preparation_failure()
                     if self.preparation_blocked:
                         raise ApiError("UNDERSTANDING_RETRY_EXHAUSTED", "Preparation recovery is unavailable.", status_code=503)
-            if semantic_first or not kwargs or (getattr(transcript, "type", None) != "transcript.final"
-                              or not getattr(transcript, "is_final", False)):
-                self._discard_confirmed_preparation()
+            task = self._successful_preparation(transcript, kwargs)
+            if task is not None:
+                return task.result()
+            if (self._interaction_deadline <= time.monotonic()
+                    and not self._preparation_matches(transcript, kwargs)):
                 attempt = _PreparationAttempt(self._preparation_budget_epoch, self._preparation_budget_key)
                 try:
+                    # Preserve the zero-remaining diagnostic without starting
+                    # a provider task or renewing the interaction window.
                     return await self._infer(self._call_prepare_decision(transcript, **kwargs), timeout=45,
                                              preparation_attempt=attempt, operation="prepare_decision")
                 except asyncio.TimeoutError as exc:
-                    self._record_preparation_failure(attempt, interaction_expired=isinstance(exc, InteractionBudgetExpired))
+                    self._record_preparation_failure(attempt, interaction_expired=True)
                     raise
-            identity = self._identity(transcript)
-            if (self._confirmed_preparation_identity != identity
-                    or self._confirmed_preparation_capture is not self.capture):
-                self._discard_confirmed_preparation()
-            task = self._confirmed_preparation
-            if self._completed_confirmed_preparation(transcript) is not None:
-                # The deadline bounds inference, not the lifetime of its
-                # successful result. Reading ready work must not introduce a
-                # cancellable waiter; the caller still fences this fresh final.
-                return task.result()
-            if task is None:
-                attempt = _PreparationAttempt(self._preparation_budget_epoch, self._preparation_budget_key)
-                with interaction_deadline(self._interaction_deadline):
-                    # The retained preparation owns its own scope. Cancelling
-                    # a later shielded waiter must not label this live work as
-                    # cancelled by new input when it deliberately continues.
-                    with model_call_scope(**self._diagnostic_context, stage="answer_preparation",
-                                          revision=self.revision, inherit=False) as scope:
-                        task = asyncio.create_task(self._bounded_confirmed_preparation(transcript))
-                self._confirmed_preparation_scope = scope
-                attempt.diagnostic_scope = scope
-                self._confirmed_preparation = task
-                self._confirmed_preparation_identity = identity
-                self._confirmed_preparation_capture = self.capture
-                self._confirmed_preparation_attempt = attempt
-                self._confirmed_preparation_deadline = (
-                    min(time.monotonic() + _CONFIRMED_PREPARATION_TIMEOUT, self._interaction_deadline)
-                )
-                self._preparation_tasks.add(task)
-                task.add_done_callback(lambda done: self._preparation_finished(done, attempt))
+            task = self._ensure_preparation(transcript, kwargs)
             attempt = self._confirmed_preparation_attempt
             remaining = self._confirmed_preparation_deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 self._record_preparation_failure(attempt, interaction_expired=True)
-                self._discard_confirmed_preparation()
+                self._discard_confirmed_preparation(reason="interaction_timeout", cancel=False)
                 raise InteractionBudgetExpired()
             # A sound revokes this waiter and commit eligibility immediately.
             # Keep at most one bounded, side-effect-free model preparation; a
             # fresh complete snapshot must match every field before reuse.
             try:
-                return await self._infer(self._wait_confirmed_preparation(task), timeout=remaining,
-                                         operation="confirmed_wait")
+                prepared = await self._infer(self._wait_confirmed_preparation(task), timeout=remaining,
+                                             operation="confirmed_wait" if kwargs.get("completion_confirmed")
+                                             else "prepare_decision")
+                if prepared.understanding.problem is None:
+                    self._validate_preparation(prepared, transcript, kwargs)
+                return prepared
+            except AnswerCorrectionContinuation as continuation:
+                # The rejected provider call has finished. Charge that failure
+                # once, then start the one correction with the original 40s
+                # recovery deadline rather than the old task's inherited 20s.
+                self._record_preparation_failure(attempt, problem=continuation)
+                self.assert_current()
+                continuation.assert_current()
+                if self._confirmed_preparation is task:
+                    self._discard_confirmed_preparation()
+                with require_answer_correction(continuation):
+                    return await self._prepare_transcript(transcript, semantic_first=semantic_first)
             except asyncio.TimeoutError as exc:
                 self._record_preparation_failure(attempt, interaction_expired=isinstance(exc, InteractionBudgetExpired))
+                if self._confirmed_preparation is task:
+                    self._discard_confirmed_preparation(reason="interaction_timeout" if isinstance(exc, InteractionBudgetExpired)
+                                                        else "preparation_timeout",
+                                                        cancel=self._confirmed_preparation_deadline > time.monotonic())
                 raise
+
+    def _preparation_matches(self, transcript: Any, kwargs: dict) -> bool:
+        return (self._confirmed_preparation is not None
+                and self._confirmed_preparation_capture is self.capture
+                and self._confirmed_preparation_identity == self._identity(transcript)
+                and self._confirmed_preparation_kwargs == kwargs)
+
+    def _successful_preparation(self, transcript: Any, kwargs: dict) -> Optional[asyncio.Task]:
+        task = self._confirmed_preparation
+        if (not self._preparation_matches(transcript, kwargs) or not task.done() or task.cancelled()
+                or task.exception() is not None or task.result().understanding.problem is not None):
+            return None
+        self._validate_preparation(task.result(), transcript, kwargs)
+        return task
+
+    def _ensure_preparation(self, transcript: Any, kwargs: dict) -> asyncio.Task:
+        if not self._preparation_matches(transcript, kwargs):
+            self._discard_confirmed_preparation()
+        task = self._confirmed_preparation
+        if task is not None:
+            return task
+        # The same endpoint owns one bounded preparation. Context or evidence
+        # changes cannot leave speculative and authoritative requests running.
+        self.preparation.cancel()
+        predecessors = tuple(self._preparation_tasks) + self.preparation.pending_tasks
+        attempt = _PreparationAttempt(self._preparation_budget_epoch, self._preparation_budget_key)
+        frozen_kwargs = deepcopy(kwargs)
+        with interaction_deadline(self._interaction_deadline):
+            with model_call_scope(**self._diagnostic_context, stage="answer_preparation",
+                                  revision=self.revision, inherit=False) as scope:
+                task = asyncio.create_task(self._bounded_confirmed_preparation(
+                    transcript.model_copy(deep=True), frozen_kwargs, predecessors))
+        self._confirmed_preparation_scope = scope
+        attempt.diagnostic_scope = scope
+        self._confirmed_preparation = task
+        self._confirmed_preparation_identity = self._identity(transcript)
+        self._confirmed_preparation_capture = self.capture
+        self._confirmed_preparation_kwargs = frozen_kwargs
+        self._confirmed_preparation_attempt = attempt
+        self._confirmed_preparation_deadline = min(time.monotonic() + _CONFIRMED_PREPARATION_TIMEOUT,
+                                                   self._interaction_deadline)
+        self._preparation_tasks.add(task)
+        task.add_done_callback(lambda done: self._preparation_finished(done, attempt))
+        return task
+
+    def start_recovery_preparation(self, final: Any) -> bool:
+        """Prepare only; a fresh final and the normal caller still own progress."""
+        if (self._closed or not self.capture.is_open or self.preparation_blocked
+                or self._proposal_revision != self.revision
+                or getattr(final, "type", None) != "transcript.final" or not getattr(final, "is_final", False)):
+            return False
+        self._begin_interaction(final.text)
+        self._use_preparation_budget(final.text)
+        kwargs = self._preparation_kwargs(final, semantic_first=True)
+        if kwargs == {"semantic_first": True} and self.preparation.matching(final):
+            ready = self.preparation.ready(final)
+            if ready is not None:
+                self._validate_preparation(ready, final, kwargs)
+            return True
+        if self._successful_preparation(final, kwargs) is not None:
+            return True
+        if (self._preparation_matches(final, kwargs)
+                and self._confirmed_preparation_deadline <= time.monotonic()):
+            self._record_preparation_failure(self._confirmed_preparation_attempt, problem=asyncio.TimeoutError(),
+                                             interaction_expired=self._interaction_deadline <= time.monotonic())
+            self._discard_confirmed_preparation(reason="preparation_timeout", cancel=False)
+            if self.preparation_blocked:
+                return False
+        if self._interaction_deadline <= time.monotonic():
+            return False
+        budget = self._model_budgets.get(self._preparation_budget_key)
+        if (not self._preparation_matches(final, kwargs) and budget is not None
+                and budget.used >= budget.limit):
+            return False
+        self._ensure_preparation(final, kwargs)
+        return True
 
     def _completed_confirmed_preparation(self, transcript: Any) -> Optional[asyncio.Task]:
         task = self._confirmed_preparation
         if (not self.confirmation or not self.confirmation.confirmed
                 or getattr(transcript, "type", None) != "transcript.final"
                 or not getattr(transcript, "is_final", False)
-                or self._confirmed_preparation_capture is not self.capture
-                or self._confirmed_preparation_identity != self._identity(transcript)
-                or task is None or not task.done() or task.cancelled()
-                or task.exception() is not None
-                or task.result().understanding.problem is not None):
+                or task is None):
             return None
-        return task
+        return self._successful_preparation(transcript, self._preparation_kwargs(transcript))
 
-    async def _bounded_confirmed_preparation(self, transcript: Any) -> Any:
-        kwargs = {"completion_confirmed": True}
-        if getattr(self.confirmation, "semantic_first", False):
-            kwargs["semantic_first"] = True
-        exit_context = (self.confirmation.exit_context(transcript)
-                        if callable(getattr(self.confirmation, "exit_context", None)) else None)
-        if exit_context is not None:
-            kwargs["exit_confirmation"] = exit_context
-        content_context = (self.confirmation.content_clarification_context(transcript)
-                           if callable(getattr(self.confirmation, "content_clarification_context", None)) else None)
-        if content_context is not None:
-            kwargs["content_clarification"] = content_context
+    async def _bounded_confirmed_preparation(self, transcript: Any, kwargs: dict,
+                                             predecessors: tuple = ()) -> Any:
+        async def prepare():
+            # Cancelling a waiter never starts a second provider call. Even a
+            # slow cancellation must release its owned work before recovery.
+            if predecessors:
+                await asyncio.gather(*(asyncio.shield(task) for task in predecessors), return_exceptions=True)
+            return await self._call_prepare_decision(transcript, **kwargs)
+
         return await diagnosed_wait_for(
-            self._call_prepare_decision(transcript, **kwargs),
+            prepare(),
             timeout=min(_CONFIRMED_PREPARATION_TIMEOUT, remaining_interaction_seconds()
                         if remaining_interaction_seconds() is not None else _CONFIRMED_PREPARATION_TIMEOUT),
-            stage="answer_preparation", timeout_reason="confirmed_timeout",
+            stage="answer_preparation", timeout_reason="confirmed_timeout" if kwargs.get("completion_confirmed")
+            else "preparation_timeout",
         )
 
     @staticmethod
@@ -873,6 +1053,8 @@ class AnswerEndpoint:
         if task.cancelled():
             return True
         error = task.exception()
+        if attempt.discarded:
+            return True
         failed = error is not None or task.result().understanding.problem is not None
         if failed and not (isinstance(error, ApiError) and error.code == "TURN_DECISION_STALE"):
             self._record_preparation_failure(attempt, problem=(task.result().understanding.problem if error is None else
@@ -880,16 +1062,25 @@ class AnswerEndpoint:
                 interaction_expired=isinstance(error, InteractionBudgetExpired))
         return failed
 
-    def _discard_confirmed_preparation(self, *, reason: str = "superseded", source: Optional[str] = None) -> None:
+    def _discard_confirmed_preparation(self, *, reason: str = "superseded", source: Optional[str] = None,
+                                        cancel: bool = True) -> None:
         task, self._confirmed_preparation = self._confirmed_preparation, None
         scope, self._confirmed_preparation_scope = self._confirmed_preparation_scope, None
         self._confirmed_preparation_identity = None
         self._confirmed_preparation_capture = None
+        self._confirmed_preparation_kwargs = None
         self._confirmed_preparation_deadline = 0.0
-        self._confirmed_preparation_attempt = None
+        attempt, self._confirmed_preparation_attempt = self._confirmed_preparation_attempt, None
         if task is not None and not task.done():
-            self._mark_task_cancellation(task, scope, reason, source=source)
-            task.cancel()
+            if attempt is not None:
+                attempt.discarded = True
+            if cancel:
+                self._mark_task_cancellation(task, scope, reason, source=source)
+                task.cancel()
+            elif scope is not None:
+                # Its own deadline already began cancellation. A second
+                # cancel can detach slow provider cleanup from wait_for.
+                scope.cancel(reason)
 
     async def _close_preparations(self) -> None:
         await self.preparation.close()
@@ -1017,8 +1208,15 @@ class AnswerEndpoint:
             self._interaction_deadline = self._interaction_started_at + _INTERACTION_PREPARATION_TIMEOUT
 
     def prepare_stable_preview(self, preview: Any) -> None:
+        if preview is None or getattr(preview, "has_unstable_tail", True) or not preview.text.strip():
+            return
+        # Reconcile before the one-speculation/owned-formal-work early exits.
+        # New stable evidence must revoke stale work even when it cannot buy
+        # another speculative call. A transient tail does not do so.
+        self._reconcile_preparation_evidence(preview)
         quiet = self.clock() - (self._last_voice if self._last_voice is not None else self._started_at)
-        if (self._speculative_model_used or self._speculative_preparing or self._terminal_provider_failure
+        if (self._confirmed_preparation is not None or self._speculative_model_used
+                or self._speculative_preparing or self._terminal_provider_failure
                 or quiet < _SPECULATIVE_SILENCE_SECONDS):
             return
         if getattr(self.confirmation, "content_clarification_active", False):
@@ -1026,15 +1224,18 @@ class AnswerEndpoint:
             # reply proof. The formal final path supplies and validates it.
             self.preparation.cancel()
             return
-        if preview is None or getattr(preview, "has_unstable_tail", True) or not preview.text.strip():
-            return
         if (preview.text.strip() == self._interaction_text and self._interaction_deadline is not None
                 and time.monotonic() >= self._interaction_deadline):
             return  # Speculation cannot bypass an expired attempt for these words.
         # Speculation may precede the authoritative final by speech, silence or
         # provider rotation. Its own bound must not spend the final's budget.
         with interaction_deadline(time.monotonic() + _SPECULATIVE_PREPARATION_TIMEOUT):
-            self.preparation.start(preview)
+            task = self.preparation.start(preview)
+        if task is not None and task not in self._speculative_attempts:
+            attempt = _PreparationAttempt(self._preparation_budget_epoch,
+                hashlib.sha256(preview.text.strip().encode("utf-8")).hexdigest(),
+                diagnostic_scope=self.preparation.diagnostic_scope)
+            self._speculative_attempts[task] = self._speculative_attempt = attempt
 
     async def _recover_capture(self, exc: BaseException, stage: str) -> None:
         self.failure = classify_capture_failure(exc, stage)
@@ -1124,6 +1325,8 @@ class AnswerEndpoint:
                                     interaction_expired: bool = False) -> None:
         evidence_key = self._preparation_budget_key
         if attempt is not None:
+            if attempt.discarded:
+                return
             if attempt.failure_recorded:
                 if (interaction_expired and attempt.budget_epoch == self._preparation_budget_epoch
                         and attempt.evidence_key == self._preparation_budget_key):
@@ -1142,8 +1345,11 @@ class AnswerEndpoint:
         reason = str(getattr(problem, "reason_code", "") or getattr(problem, "code", "")).lower()
         allowed = {"call_budget_exhausted", "provider_timeout", "provider_auth_failed", "provider_billing_required",
                    "provider_rate_limited", "provider_circuit_open", "provider_unavailable"}
-        self._recovery_reason = reason if reason in allowed else "timeout" if (interaction_expired
-                                  or isinstance(problem, asyncio.TimeoutError)) else "unavailable"
+        self._recovery_reason = (
+            "invalid_result" if getattr(problem, "source", None) == "schema_or_content" else
+            reason if reason in allowed else
+            "timeout" if interaction_expired or isinstance(problem, asyncio.TimeoutError) else "unavailable"
+        )
         if problem is not None and not getattr(problem, "retryable", reason not in {
                 "provider_auth_failed", "provider_authentication_failed", "provider_billing_required",
                 "provider_forbidden", "provider_configuration_invalid", "provider_route_missing"}):
@@ -1152,7 +1358,11 @@ class AnswerEndpoint:
                     or isinstance(problem, ProviderError) or reason in {"provider_auth_failed", "provider_authentication_failed",
                         "provider_billing_required", "provider_forbidden", "provider_configuration_invalid", "provider_route_missing"}):
                 self._terminal_provider_failure = True
-            self._recovery_retryable = reason == "call_budget_exhausted"
+            # Content rejection stops automatic calls for these words, while
+            # an explicit processing retry may renew the same saved evidence.
+            # Permanent provider failures retain their separate hard block.
+            self._recovery_retryable = (reason == "call_budget_exhausted"
+                                       or getattr(problem, "source", None) == "schema_or_content")
             if not self._recovery_retryable and reason not in allowed:
                 self._recovery_reason = "non_retryable"
         if evidence_key != self._preparation_budget_key:
@@ -1247,8 +1457,13 @@ class AnswerEndpoint:
                     except Exception as state_error:
                         _LOG.warning("Capture failure state unavailable: error_type=%s", type(state_error).__name__)
 
+    def _invalidate_answer_corrections(self) -> None:
+        for budget in self._model_budgets.values():
+            budget.invalidate_corrections()
+
     async def close(self) -> None:
         self._closed = True
+        self._invalidate_answer_corrections()
         self.revision += 1
         task, self._task = self._task, None
         if task is not None and task is not asyncio.current_task():

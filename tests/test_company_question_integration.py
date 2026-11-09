@@ -21,17 +21,19 @@ def provider(monkeypatch, *, blocked_reply=None):
     calls = []
     async def invoke(instance, capability, request, context):
         version = request.metadata.get("prompt_version")
-        if version == "conversation_reception.v9":
+        if version == "conversation_reception.v10":
             return await original(instance, capability, request, context)
         if version == "company_question_reply.v1":
             calls.append(("company", json.loads(request.messages[-1].content)))
             if blocked_reply is not None:
                 await blocked_reply.wait()
             data = {"status": "supported", "citations": [{"reference_id": "company:context", "quote": FACT}]}
-        elif version == "supplement_reply.v5":
+        elif version in {"supplement_reply.v5", "supplement_reply.v6"}:
             value = json.loads(request.messages[-1].content)
             calls.append(("supplement", value))
             data = {"intent": "company_question" if QUESTION in value["reply"] else "finish", "confidence": .99, "evidence_id": "E1"}
+            if version == "supplement_reply.v6":
+                data["reply_text"] = ""
         elif capability == "llm.chat_json" and request.purpose == "interview_turn_understanding":
             text, points = request.metadata["transcript"], request.metadata["capability_points"]
             calls.append(("understanding", text))

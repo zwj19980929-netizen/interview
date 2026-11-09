@@ -9,8 +9,14 @@ import re
 
 
 SEMANTIC_TURN_INSTRUCTION = (
-    "本轮采用语义优先接话合同semantic_turn.v19。服务端尚未向候选人询问是否补充，"
+    "本轮采用语义优先接话合同semantic_turn.v23。服务端尚未授予本次回答的独立结束许可，"
     "不得假定已发生独立确认。分别判断answer_content与turn_intent，不按关键词匹配。"
+    "是否询问过补充以服务端supplement_context为准，不从候选原文或旧对话猜测。"
+    "not_delivered表示当前补充问题没有有效送达证明，不能把选中、播放中或中断当作已经问完；"
+    "awaiting_reply表示当前补充问题已送达，正在等待本人回复，不能再声称尚未询问。"
+    "已送达不等于已确认：提问术语、重读、普通交流、继续补充或含糊回复都不构成结束许可。"
+    "confirmed只能来自本次调用既有的服务端确认授权；阶段上下文本身不能替代确认门禁，"
+    "也不能补造completion_basis、抹掉最新问题、等待请求或实际技术内容。"
     "answer_content描述是否能从原文提取含义确定的专业claims，不是得分：technical/partial必须有真实claims；"
     "none表示没有可确定的技术主张，允许原文有无法理解的技术尝试，不等于没有开口、不会或拒答。"
     "另外，清楚陈述与本题无关的内容时使用intent=off_topic；跑题是相关性判断，不是识别失败、语义不明或知识拒答。"
@@ -39,6 +45,10 @@ SEMANTIC_TURN_INSTRUCTION = (
     "累计原文保留交流记录，但概念提问、重读请求、思考、不会和结束控制本身都不构成技术claim；"
     "面试官的解释也不能变成候选人的技术主张。只从候选人实际陈述的做法、经验或判断提取claims。"
     "回答不充分不等于没有回答；结尾拒绝继续只关闭后续交流，不能抹掉前面的实际回答。"
+    "回答不充分、缺少实施步骤或没有解释原因，不等于技术含义无法确定；这些缺口属于missing或后续技术追问，"
+    "不能因此要求解释整段回答或拼写术语。结合题目及全文已经能确定含义的口语、省略或音近词，"
+    "保留实际原文并正常提取claims，不机械要求候选人拼写。只有影响理解的真实歧义才澄清，"
+    "clarification_target只选最小实际疑点，不把整段可理解回答当作焦点，也不提供标准答案、替换选项或解题步骤。"
     "有可确定的实际内容时claims及evidence_ids必须非空，通常intent=answer；若满足下述待核实收尾条件，"
     "则使用answer_unresolved并同样保留这些claims。如果同时要求换题，使用answer+partial/technical+finish_topic。"
     "只有全文没有实际回答、没有未解决技术疑点且本人明确不再作答，才可能answer_declined。"
@@ -136,9 +146,9 @@ SEMANTIC_TURN_INSTRUCTION = (
 # A real supplement reply permits completing this answer. It must still be
 # understood semantically so a request to stop the whole interview survives.
 SEMANTIC_CONFIRMED_TURN_INSTRUCTION = SEMANTIC_TURN_INSTRUCTION.replace(
-    "本轮采用语义优先接话合同semantic_turn.v19。服务端尚未向候选人询问是否补充，"
+    "本轮采用语义优先接话合同semantic_turn.v23。服务端尚未授予本次回答的独立结束许可，"
     "不得假定已发生独立确认。",
-    "本轮采用语义接话合同semantic_turn.v20。服务端已取得本次回答的真实结束确认，"
+    "本轮采用语义接话合同semantic_turn.v24。服务端已取得本次回答的真实结束确认，"
     "确认来源由服务端保证，不能从静音或普通陈述伪造。"
     "‘没有补充了’只结束本次回答；已有技术回答时，确认回复的‘没有’、‘补充完了’使用"
     "finish_answer且followup_allowed=true。不能因为否定补充就写finish_topic或拒绝后续追问。"
@@ -160,6 +170,17 @@ SEMANTIC_CONTROL_CORRECTION_INSTRUCTION = (
 def semantic_content_correction_instruction(reason_code):
     """Only fixed diagnostics may select centrally governed recovery guidance."""
     return {
+        "unresolved_clarification_source_invalid": (
+            "上次待核实收尾的澄清来源没有绑定实际已送达的原焦点。"
+            "若服务端提供C1且同一原疑点仍未解决，clarification_target只选{resolution:same_focus_unresolved,source_ref:C1}，"
+            "不要重写原焦点、扩大旧证据或把新回复当成旧疑点来源。C1不能用于claims或completion_basis。"
+            "先在联合对象中明确resolution：不能把不同新疑点绑定same_focus_unresolved/C1。"
+            "新回复已说明或纠正原疑点且无其它疑点则选{resolution:resolved}、ambiguities=[]，正常理解并保留全部可靠claims；"
+            "若出现不同的新疑点，选{resolution:new_focus_unresolved,evidence_id:该疑点E编号,focus_quote:新疑点原词}，"
+            "继续澄清，不能借旧送达记录收尾，也不能为过校验给描述补入已解决的旧词。"
+            "completion_basis只能选播完后的新回复中真实完成语；仍在等待、提问或继续作答不得结束。"
+            "没有有效C1时不得自造来源，未解决疑点使用clarify并等待真实澄清。"
+        ),
         "clarification_targets_conversation_control": (
             "上次把清楚的开始回答或等待请求误当作技术疑点。按当前交流语境重新判断，"
             "不能要求候选人解释或拼写这些流程用语；没有真实疑点时clarification_target=null、ambiguities=[]。"
@@ -226,19 +247,49 @@ def content_clarification_instruction(clarification_context=None):
     if delivered:
         return (
             "本轮内容澄清阶段：服务端已提供已送达的content_clarification记录。"
-            "仅当该记录的reply_text是实际澄清播完后的新回复，且本人现在明确坚持结束本次回答，"
-            "才可用answer_unresolved+finish_answer保留疑点收尾，completion_basis引用这个新回复。"
+            + _CONTENT_CLARIFICATION_REASONING_ORDER +
+            "现在先比较原focus_quote与reply_text：新回复已解释原词含义时，旧疑点已解决，不能再选C1；"
+            "若没有别的真实疑点，选{resolution:resolved}、ambiguities=[]并正常理解。"
+            "若原焦点仍未解决，才可选{resolution:same_focus_unresolved,source_ref:C1}；保留旧请求中可独立理解的全部claims，"
+            "不能只概括当前解释或结束语，也不能因同一句里另有疑点而丢掉已确定的内容。"
+            "若新回复解释了旧词却引入不同未知词，旧C1不适用：改用新疑点所在E编号和最小focus_quote，"
+            "保留已确定claims、completion_basis=null、suggested_action=clarify，不得借旧问题的送达证明结束新疑点。"
+            "例如旧话‘先登记订单编号，再交给古帕’，问过古帕后新话‘古帕是复核队列，接着还要过莫达，我说完了’，"
+            "必须保留登记编号和复核队列两项已确定主张；新疑点是莫达，"
+            "clarification_target使用{resolution:new_focus_unresolved,evidence_id:新回复的E编号,focus_quote:莫达}而不是C1，先澄清莫达。"
+            "相反，若新话‘古帕暂时解释不清，我已经说完了’，原焦点仍未解才选C1，"
+            "answer_unresolved+partial并保留登记编号的claim，不得清空为none。"
+            "仅当同一原焦点仍未解决、该记录reply_text确为澄清播完后的新回复且本人现在明确坚持结束，"
+            "才可answer_unresolved+finish_answer收尾，completion_basis仅引用这个新回复。"
             "新回复仍在思考或没讲完就thinking/continue_listening；仍在纠正识别就correction/clarify，不能因已有记录强制结束。"
             "明确退出整场则stop_interview并仍需独立退出确认；不要把这次内容澄清视作退出确认。"
         )
     return (
         "本轮内容澄清阶段：服务端尚未提供有效的已送达content_clarification记录。"
+        + _CONTENT_CLARIFICATION_REASONING_ORDER +
+        "可理解的partial回答按正常answer处理，明确说完可finish_answer/next；不要因为当前还没有内容澄清记录就先制造疑点。"
         "本轮禁止answer_unresolved+finish_answer；先前选中过回应、提示中的示例和候选人说完了都不证明澄清已实际播完。"
-        "首次技术残片加完成语应具体clarify，合法非提交组合是clarification_request+finish_answer+clarify、"
+        "仅在已确认存在影响原话含义的真实歧义时，首次技术残片加完成语应具体clarify，合法非提交组合是clarification_request+finish_answer+clarify、"
         "confidence低于0.65、followup_allowed=false、completion_basis=null，保留非空ambiguities、原文target和可确定的claims；"
         "不能猜答案、改成拒答或要求重复整段。这个限制仅针对结束本次回答："
         "本人明确请求退出整场时仍可answer_unresolved+stop_interview提议独立退出确认，无须先解释技术残片。"
     )
+
+
+_CONTENT_CLARIFICATION_REASONING_ORDER = (
+    "请严格按以下顺序理解，而不是先判断回答够不够好："
+    "第一，从累计完整原文逐项提取可独立理解且未撤回的做法、经验或判断为claims；同一句的一个词不明，"
+    "不妨碍保留其余已经清楚的主张。第二，区分知识缺失和语言歧义："
+    "没有说明组件品牌、实现细节、机制、原因、步骤或如何满足题目要求，只属于回答不充分，"
+    "放入missing或后续技术追问；只要能理解实际陈述，就不能将这些缺失列为ambiguities或降低语义confidence。"
+    "‘缓存’‘数据库’‘队列’等一般技术类别本身含义清楚，没给出具体产品或作用细节不构成歧义。"
+    "例如被问并发安全，答‘我把订单编号存入数据库，我说完了’，已经有一项明确做法，应answer+partial、"
+    "保留存储编号的claim、ambiguities=[]、target=null；没说锁或事务是知识缺口，不能要求解释‘数据库’或整句话。"
+    "只有无法确定原话到底指什么的片段才是真实歧义，例如‘登记编号后交给古帕’中的古帕；"
+    "登记编号仍是可靠claim，最小疑点仅古帕。第三，逐个核对当前新回复是否消除了旧疑点，"
+    "不要机械沿用历史焦点或把不同新疑点绑定旧来源。最后才根据当前真实完成语、等待或交流请求决定动作；"
+    "完成语不能证明技术含义清楚，澄清记录也不能替代本人当前完成许可。"
+)
 
 
 CURRENT_SPEECH_INSTRUCTION = (
@@ -468,10 +519,14 @@ def validate_unresolved_completion(data, transcript, clarification_context=None)
         raise SemanticContractError("unresolved_clarification_required", "$.intent")
     request, reply, focus = context["request_text"], context["reply_text"], context["focus_quote"]
     target = data.get("clarification_target") or {}
-    if (not transcript.startswith(request) or transcript[len(request):].strip() != reply.strip()
-            or focus not in request or target.get("focus_quote") != focus
-            or not target.get("evidence_quote") or target["evidence_quote"] not in request):
-        raise SemanticContractError("unresolved_clarification_source_invalid", "$.clarification_target")
+    if not transcript.startswith(request):
+        raise SemanticContractError("unresolved_clarification_source_invalid", "$.content_clarification.request_text")
+    if transcript[len(request):].strip() != reply.strip():
+        raise SemanticContractError("unresolved_clarification_source_invalid", "$.content_clarification.reply_text")
+    if focus not in request or target.get("focus_quote") != focus:
+        raise SemanticContractError("unresolved_clarification_source_invalid", "$.clarification_target.focus_quote")
+    if not target.get("evidence_quote") or target["evidence_quote"] not in request:
+        raise SemanticContractError("unresolved_clarification_source_invalid", "$.clarification_target.evidence_quote")
     start = len(request)
     while start < len(transcript) and transcript[start].isspace():
         start += 1
@@ -498,7 +553,8 @@ SERVER_CONTROL_DERIVATION_INSTRUCTION = (
 )
 
 
-def normalize_ambiguous_completion(data, transcript, *, input_context=None, content_clarification=None):
+def normalize_ambiguous_completion(data, transcript, *, input_context=None, content_clarification=None,
+                                   new_clarification_scope=False, completion_ranges=None):
     """Revoke a conflicting first completion, never infer a new permission.
 
     Canonical shape validation precedes this projection. Validate the original
@@ -507,6 +563,9 @@ def normalize_ambiguous_completion(data, transcript, *, input_context=None, cont
     still run on the projected result. Delivered clarification is handled by
     its separate, source-bound unresolved-completion contract, not re-opened.
     """
+    if new_clarification_scope:
+        return _normalize_new_clarification_completion(data, transcript, input_context=input_context,
+            content_clarification=content_clarification, completion_ranges=completion_ranges)
     target, basis = data.get("clarification_target"), data.get("completion_basis")
     if (data.get("turn_intent") != "finish_answer"
             or data.get("intent") not in {"answer", "clarification_request"}
@@ -527,6 +586,57 @@ def normalize_ambiguous_completion(data, transcript, *, input_context=None, cont
     if (not target["evidence_quote"].strip() or target["evidence_quote"] not in transcript
             or not target["focus_quote"].strip() or target["focus_quote"] not in target["evidence_quote"]):
         return data  # The unchanged result must still fail the domain validator.
+    result = deepcopy(data)
+    result.update(intent="clarification_request", completion_basis=None,
+                  confidence=min(data["confidence"], .64))
+    return derive_semantic_controls(result)
+
+
+def _normalize_new_clarification_completion(data, transcript, *, input_context, content_clarification,
+                                          completion_ranges):
+    """Revoke only completion of a separately source-validated new doubt.
+
+    The caller has validated the joint wire branch and resolved its exact E
+    evidence. Preserve all meaning/source fields. A delivered question about
+    another focus cannot authorize this one, even if the speaker has finished.
+    """
+    if (data.get("turn_intent") != "finish_answer"
+            or data.get("intent") not in {"answer", "clarification_request", "answer_unresolved"}):
+        return data
+    target, basis = data.get("clarification_target"), data.get("completion_basis")
+    context = content_clarification or {}
+    request, reply = context.get("request_text"), context.get("reply_text")
+    if (not isinstance(request, str) or not isinstance(reply, str) or not reply.strip()
+            or not transcript.startswith(request) or transcript[len(request):].strip() != reply.strip()
+            or not target or not data.get("ambiguities")
+            or target.get("focus_quote") == context.get("focus_quote")
+            or not target.get("focus_quote") or not target.get("evidence_quote")
+            or target["evidence_quote"] not in transcript or target["focus_quote"] not in target["evidence_quote"]):
+        raise SemanticContractError("unresolved_clarification_source_invalid", "$.clarification_target.resolution")
+    if basis is not None:
+        # Check the original ending claim before revoking it. Only the known
+        # new-ambiguity/ordinary-answer mismatch may be normalized away.
+        try:
+            validate_semantic_turn(data, transcript)
+        except SemanticContractError as exc:
+            if exc.reason_code != "completion_has_unresolved_ambiguity":
+                raise
+        if any(not quote.strip() or quote not in transcript or quote not in data["evidence_quotes"]
+               for quote in basis["evidence_quotes"]):
+            raise SemanticContractError("semantic_completion_evidence_invalid", "$.completion_basis.evidence_quotes")
+        # Quote equality cannot distinguish an old E from the same words said
+        # again. Require every selected occurrence to follow the real receipt.
+        current_scope = _current_speech_scope(transcript, input_context)
+        scope_start = max(len(request), current_scope[0]) if current_scope else len(request)
+        scope_end = min(len(transcript), current_scope[1]) if current_scope else len(transcript)
+        if (not completion_ranges or any(not (scope_start <= start < end <= scope_end)
+                                         for start, end in completion_ranges)):
+            raise CurrentSpeechContractError()
+    validate_current_speech(data, transcript, input_context)
+    validate_current_speech(data, transcript, {
+        "version": "conversation_input_context.v1", "current_speech_start": len(request),
+        "current_speech": reply, "responded_exchanges": [],
+    })
     result = deepcopy(data)
     result.update(intent="clarification_request", completion_basis=None,
                   confidence=min(data["confidence"], .64))

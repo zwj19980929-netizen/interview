@@ -111,9 +111,17 @@ def test_new_server_words_replace_ready_cache_before_commit():
     async def scenario():
         endpoint, _, _, commits, _ = setup()
         original = _final("合成技术回答。没有了。")
-        await _prime(endpoint, original)
+        prepared = await _prime(endpoint, original)
+        preparation = endpoint._confirmed_preparation
         changed = _final(original.text + "再补充一点，失败任务需要幂等重试。现在说完了。")
         endpoint.observe_transcript(changed.text)
+        assert endpoint._confirmed_preparation is preparation
+        assert preparation.result() is prepared
+        assert not endpoint.confirmation.confirmed and not commits
+        with pytest.raises(ApiError) as stale:
+            endpoint.assert_current()
+        assert stale.value.code == "TURN_DECISION_STALE"
+        endpoint.cover_transcript(changed)
         assert endpoint._confirmed_preparation is None
         endpoint._proposal_revision = endpoint.revision
         await endpoint.confirmation._accept_finish(endpoint, changed)

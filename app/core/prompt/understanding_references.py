@@ -10,23 +10,52 @@ from copy import deepcopy
 from app.core.prompt.semantic_turn import SemanticContractError
 
 
-def understanding_references(transcript, capability_points):
+def _delivered_clarification_source(transcript, context):
+    """Resolve a caller-validated receipt only when its exact text still fits.
+
+    This does not establish delivery or ownership. The service validates those
+    facts before passing the private context, and rechecks them before commit.
+    """
+    fields = {"version", "request_text", "focus_quote", "reply_text", "question_act_id", "delivered"}
+    if (not isinstance(context, dict) or set(context) != fields
+            or context.get("version") != "content_clarification.v1" or context.get("delivered") is not True
+            or any(not isinstance(context.get(key), str) or not context[key].strip()
+                   for key in fields - {"delivered"})
+            or len(context["question_act_id"]) > 128 or len(context["focus_quote"]) > 80):
+        return None
+    request, reply, focus = (context[key] for key in ("request_text", "reply_text", "focus_quote"))
+    if (not transcript.startswith(request) or transcript[len(request):].strip() != reply.strip()
+            or focus not in request):
+        return None
+    # The exact asked-about phrase is itself sufficient verbatim source for a
+    # clarification target. It stays valid even across sentence/chunk splits or
+    # repeated occurrences; it is never a claim or completion evidence ID.
+    return len(request), {"focus_quote": focus, "evidence_quote": focus}
+
+
+def understanding_references(transcript, capability_points, *, clarification_context=None):
     spans = []
     offsets = []
-    for match in re.finditer(r"[^。！？!?\n]+[。！？!?\n]*|[。！？!?\n]+", transcript):
-        text = match.group().strip()
-        base = match.start() + len(match.group()) - len(match.group().lstrip())
-        for start in range(0, len(text), 240):
-            raw = text[start:start + 240]
-            span = raw.strip()
-            if span:
-                spans.append(span)
-                offsets.append(base + start + len(raw) - len(raw.lstrip()))
-    return {
+    source = _delivered_clarification_source(transcript, clarification_context)
+    boundary = source[0] if source is not None else len(transcript)
+    for part, origin in ((transcript[:boundary], 0), (transcript[boundary:], boundary)):
+        for match in re.finditer(r"[^。！？!?\n]+[。！？!?\n]*|[。！？!?\n]+", part):
+            text = match.group().strip()
+            base = origin + match.start() + len(match.group()) - len(match.group().lstrip())
+            for start in range(0, len(text), 240):
+                raw = text[start:start + 240]
+                span = raw.strip()
+                if span:
+                    spans.append(span)
+                    offsets.append(base + start + len(raw) - len(raw.lstrip()))
+    result = {
         "evidence": {"E%d" % (index + 1): text for index, text in enumerate(spans)},
         "offsets": {"E%d" % (index + 1): offset for index, offset in enumerate(offsets)},
         "capabilities": {"P%d" % (index + 1): text for index, text in enumerate(capability_points)},
     }
+    if source is not None:
+        result["clarification_sources"] = {"C1": source[1]}
+    return result
 
 
 def resolve_understanding_references(data, references):
@@ -43,10 +72,34 @@ def resolve_understanding_references(data, references):
     if basis:
         basis["evidence_quotes"] = _evidence_quotes(basis.pop("evidence_ids"), references)
     target = result.get("clarification_target")
+    if references.get("clarification_sources"):
+        if not isinstance(target, dict):
+            raise SemanticContractError("unresolved_clarification_source_invalid", "$.clarification_target")
+        resolution = target.pop("resolution", None)
+        fixed = references["clarification_sources"]["C1"]
+        if resolution == "resolved":
+            if target or result.get("ambiguities"):
+                raise SemanticContractError("unresolved_clarification_source_invalid", "$.clarification_target.resolution")
+            result["clarification_target"] = target = None
+        elif resolution == "same_focus_unresolved":
+            if target != {"source_ref": "C1"} or not result.get("ambiguities"):
+                raise SemanticContractError("unresolved_clarification_source_invalid", "$.clarification_target.resolution")
+        elif resolution == "new_focus_unresolved":
+            if (set(target) != {"evidence_id", "focus_quote"} or not result.get("ambiguities")
+                    or target["focus_quote"] == fixed["focus_quote"]):
+                raise SemanticContractError("unresolved_clarification_source_invalid", "$.clarification_target.resolution")
+        else:
+            raise SemanticContractError("unresolved_clarification_source_invalid", "$.clarification_target.resolution")
     if target:
-        target["evidence_quote"] = references["evidence"][target.pop("evidence_id")]
-        if target["focus_quote"] not in target["evidence_quote"]:
-            raise SemanticContractError("clarification_focus_not_verbatim", "$.clarification_target.focus_quote")
+        if "source_ref" in target:
+            fixed = (references.get("clarification_sources") or {}).get(target["source_ref"])
+            if set(target) != {"source_ref"} or fixed is None:
+                raise SemanticContractError("unresolved_clarification_source_invalid", "$.clarification_target")
+            result["clarification_target"] = deepcopy(fixed)
+        else:
+            target["evidence_quote"] = references["evidence"][target.pop("evidence_id")]
+            if target["focus_quote"] not in target["evidence_quote"]:
+                raise SemanticContractError("clarification_focus_not_verbatim", "$.clarification_target.focus_quote")
     result["evidence_quotes"] = _evidence_quotes(result.pop("evidence_ids"), references)
     for claim in result["claims"]:
         claim["evidence_quote"] = references["evidence"][claim.pop("evidence_id")]

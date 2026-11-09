@@ -6,6 +6,7 @@ answer commit run; only synthetic provider output and media transport are used.
 
 import asyncio
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -80,12 +81,24 @@ def completed_events(runtime):
 
 @pytest.mark.parametrize("default_cleanup", [False, True])
 @pytest.mark.parametrize("finish_by", ["drained", "timeout"])
-def test_candidate_stop_finishes_speech_receipt_and_ingress_before_scoring(tmp_path, monkeypatch, default_cleanup, finish_by):
+@pytest.mark.parametrize("pending_score", [False, True])
+def test_candidate_stop_finishes_speech_receipt_and_ingress_before_scoring(tmp_path, monkeypatch, default_cleanup, finish_by, pending_score):
     _semantic_provider(monkeypatch, technical=True, stop_interview=True)
 
     async def scenario():
         async with _automatic_session(tmp_path, monkeypatch, [BODY, "", "", EXIT_REPLY, ""], spoken_confirmation=True) as (store, runtime, channel, managed):
             _add_next_question(store)
+            if pending_score:
+                with persistence_for(store).transaction(ORGANIZATION_ID) as tx:
+                    session = tx.interview_sessions.get(INTERVIEW_ID)
+                    previous = {**deepcopy(session["turns"][0]), "id": "earlier", "order": 0,
+                                "root_turn_id": "earlier", "status": "evaluating", "conversation_acts": []}
+                    session["turns"].append(previous)
+                    session["answers"].append({"id": "earlier_answer", "turn_id": "earlier",
+                        "evaluation_status": "pending", "raw_transcript": "先前已经提交的回答",
+                        "final_transcript": "先前已经提交的回答"})
+                    tx.interview_sessions.update(session, expected_version=session["version"])
+            answers_before = deepcopy(_current(runtime)["answers"])
             spoken = _playable_speech(runtime)
             ingress = managed._ingress
             stopped_recordings = []
@@ -102,9 +115,14 @@ def test_candidate_stop_finishes_speech_receipt_and_ingress_before_scoring(tmp_p
             monkeypatch.setattr(channel, "_after_formal_evidence_finished", after)
             await _answer_and_confirm_exit(runtime, channel, managed)
             await _wait_until(lambda: bool(_current(runtime)["agent_runtime"].get("completion_closing_performance_id")))
+            await _wait_until(lambda: managed._presentation_task.done())
+            # Terminal report generation can race the audio-drained event.
+            # Give owner polling time to run while the farewell is still live.
+            await asyncio.sleep(.05)
             assert len(stopped_recordings) == 1
             assert not completed_events(runtime)
             assert not managed._stopped, "Farewell must keep its original expression owner"
+            assert ingress.connected and channel._evidence_session is managed
             if finish_by == "drained":
                 await _stop_current_playback(runtime, channel)
             else:
@@ -114,9 +132,13 @@ def test_candidate_stop_finishes_speech_receipt_and_ingress_before_scoring(tmp_p
             session = _current(runtime)
             assert session["candidate_input_completion_reason"] == "candidate_requested"
             assert session["candidate_exit_confirmed_at"]
-            assert session["status"] == "in_progress", "Pending scoring must not keep candidate media alive"
-            assert session["answers"][0]["evaluation_status"] != "completed"
-            assert session["answers"][0]["raw_transcript"] == BODY + EXIT_REPLY
+            assert session["status"] == ("in_progress" if pending_score else "report_generating")
+            assert session["answers"] == answers_before, "Exit must not invent a pending technical answer"
+            evidence = session["turns"][0]["exit_evidence"]
+            assert evidence["raw_transcript"] == evidence["final_transcript"] == BODY + EXIT_REPLY
+            assert evidence["assessment_status"] == "not_evaluated"
+            assert evidence["media_evidence"]["complete"] is True
+            assert session["turns"][0].get("current_understanding") is None
             assert len(completed_events(runtime)) == 1
             assert completed_events(runtime)[0]["replayability"] == "replayable"
             assert completed_events(runtime)[0]["payload"]["human_review_required"] is True
@@ -280,7 +302,7 @@ def test_late_farewell_after_owner_release_cannot_emit_playback_or_completion(tm
             assert len(started_before_release) == 1, "The exit confirmation was actually played"
             managed.supervisor.coordinator.release(managed.ownership)
             released.set()
-            await _wait_until(lambda: managed._presentation_task.done())
+            await _wait_until(lambda: managed._presentation_task is None or managed._presentation_task.done())
             assert not completed_events(runtime)
             assert not _current(runtime)["agent_runtime"].get("completion_closing_performance_id")
             assert [event for event in _current(runtime)["agent_events"]

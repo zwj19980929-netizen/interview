@@ -182,7 +182,42 @@ class ReportService:
             if document["coverage_status"] != "sufficient":
                 document.update(strengths=[], risks=["候选人主动结束，计划中部分题目未考察；保留已取得的评分证据。"],
                                 followup_suggestions=["结合未考察范围与已有证据人工复核。"])
+        retained = self._retained_exit_evidence(interview)
+        if retained:
+            document["unassessed_retained_evidence"] = retained
+            document["manual_review_required"] = True
+            notice = "退出时的原始发言和录音已保留，尚未评估；请人工复核，不将其视作未作答或计零分。"
+            document["scope_notice"] = " ".join(value for value in (document.get("scope_notice"), notice) if value)
+            document["risks"].append(notice)
         return project_report(document, interview)
+
+    @staticmethod
+    def _retained_exit_evidence(interview):
+        """Expose retained speech as unassessed material, never a scored answer."""
+        from app.services.candidate_exit_confirmation import text_hash
+
+        retained = []
+        for turn in interview.get("turns", []):
+            evidence = turn.get("exit_evidence") or {}
+            receipt = turn.get("candidate_exit_confirmation") or {}
+            text = evidence.get("final_transcript")
+            utterance = next((item for item in turn.get("utterances", [])
+                              if item.get("utterance_id") == evidence.get("utterance_id")), {})
+            if (evidence.get("version") != "candidate_exit_evidence.v1"
+                    or evidence.get("assessment_status") != "not_evaluated"
+                    or not isinstance(text, str) or not text.strip()
+                    or receipt.get("state") != "confirmed" or not receipt.get("confirmed_at")
+                    or receipt.get("transcript_sha256") != text_hash(text.strip())
+                    or utterance.get("authoritative") is not True or utterance.get("is_final") is not True
+                    or utterance.get("text") != text.strip() or utterance.get("audio_uri") != evidence.get("audio_uri")):
+                continue
+            retained.append({"turn_id": turn["id"], "question_id": turn.get("question_id"),
+                "root_turn_id": turn.get("root_turn_id") or turn["id"],
+                "question_text": turn.get("question_spoken_text", ""),
+                "utterance_id": evidence["utterance_id"], "final_transcript": text,
+                "assessment_status": "not_evaluated", "counts_toward_score": False,
+                "human_review_required": True, "retained_at": evidence.get("retained_at")})
+        return retained
 
     @staticmethod
     def _question_chain(interview, root, evidence_answer_ids):
@@ -278,6 +313,7 @@ class ReportService:
                 "risks",
                 "followup_suggestions",
                 "question_evaluations",
+                "unassessed_retained_evidence",
                 "generated_at",
             ]
             writer = csv.DictWriter(output, fieldnames=fields)
@@ -296,6 +332,7 @@ class ReportService:
                     "risks": json.dumps(report.get("risks", []), ensure_ascii=False),
                     "followup_suggestions": json.dumps(report.get("followup_suggestions", []), ensure_ascii=False),
                     "question_evaluations": json.dumps(report.get("question_evaluations", []), ensure_ascii=False),
+                    "unassessed_retained_evidence": json.dumps(report.get("unassessed_retained_evidence", []), ensure_ascii=False),
                     "generated_at": report["generated_at"],
                 }
             )

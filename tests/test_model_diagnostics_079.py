@@ -198,13 +198,16 @@ async def test_success_and_preflight_failure_have_safe_attempt_events_without_ex
     assert adapter.calls == 1
 
 
-def test_diagnostic_allowlist_drops_sensitive_payload_and_untrusted_categories(events):
+@pytest.mark.parametrize("source", ["stable_evidence", "private source text"])
+def test_diagnostic_allowlist_drops_sensitive_payload_and_untrusted_categories(events, source):
     diagnostics.record_model_diagnostic("understanding_rejected", interview_id="iv_safe", turn_id="turn_safe",
+        source=source,
         failure_reason="private rejected answer", validation_stage="private rejected answer",
         schema_path="$.understanding.claims[37]", attempt=1, transcript="private transcript",
         messages=[{"content": "private prompt"}], response={"body": "private output"}, api_key="never-logged",
         exception="private exception", provider_request_id="private request with spaces")
-    assert events == [{"event": "model.understanding_rejected", "at": events[0]["at"],
+    allowed_source = {"source": source} if source == "stable_evidence" else {}
+    assert events == [{"event": "model.understanding_rejected", "at": events[0]["at"], **allowed_source,
                        "interview_id": "iv_safe", "turn_id": "turn_safe", "failure_reason": "unknown",
                        "validation_stage": "unknown", "schema_path": "$.understanding.claims[]", "attempt": 1}]
 

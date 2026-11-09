@@ -273,8 +273,13 @@ def test_new_voice_cancels_held_preparation_without_closing_capture_or_losing_ta
                 # The provider fixture must not invent the next stream's words.
                 await _feed(managed._ingress, _SILENCE, 5)
                 assert not cancelled.is_set()
+                preparation = managed._answer_endpoint._confirmed_preparation
                 await _feed(managed._ingress, _CONTINUATION, 10)
-                await _wait_until(cancelled.is_set)
+                # Active audio and its provisional subtitles revoke progress,
+                # while pure analysis waits for stable/full evidence to change.
+                assert not cancelled.is_set()
+                assert managed._answer_endpoint._confirmed_preparation is preparation
+                assert preparation is not None and not preparation.done()
                 assert managed._capture_id == capture_id
                 assert managed.evidence_open and managed.chain.is_open
                 assert _current(runtime)["agent_runtime"]["floor"] == "candidate"
@@ -283,6 +288,9 @@ def test_new_voice_cancels_held_preparation_without_closing_capture_or_losing_ta
                             if item["command_type"] == "evidence.seal"]
 
                 clock.value = 2
+                # The real endpoint now obtains the complete changed final;
+                # only this boundary cancels the old prefix analysis.
+                await _silence_until(managed._ingress, cancelled.is_set)
                 await _silence_until(managed._ingress, lambda: len(_current(runtime)["answers"]) == 1)
                 await _wait_until(lambda: all(item["status"] == "completed"
                                              for item in store.evidence_commands.values()))

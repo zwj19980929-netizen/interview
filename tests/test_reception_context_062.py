@@ -24,7 +24,7 @@ async def test_service_keeps_formal_child_root_and_explanation_separate():
     assert result["repeat_target"] == "current_question"
     assert len(gateway.requests) == 1
     request = gateway.requests[0]
-    assert request.metadata["prompt_version"] == "conversation_reception.v9"
+    assert request.metadata["prompt_version"] == "conversation_reception.v10"
     context = json.loads(request.messages[-1].content)
     assert context["current_question"] == "你如何检查召回结果是否相关？"
     assert context["root_question"] == "请介绍知识问答系统。"

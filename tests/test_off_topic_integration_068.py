@@ -17,6 +17,7 @@ from test_declined_answer_integration import (
 from test_evidence_owner_recovery_integration import _wait_until
 from test_declined_answer_evaluation import session_for, question, persist
 from test_off_topic_semantics_068 import BODY, FINISH, TEXT, off_topic_response
+from test_exit_evidence_086 import _assert_retained_exit
 
 
 SUPPLEMENT_REPLY = "没有补充了。"
@@ -55,11 +56,13 @@ def _provider(monkeypatch, *, technical=False, relevant=False, stop=False, incon
             data = {"intent": "confirm", "confidence": .98,
                     "evidence_quote": list(understanding_references(reply, [])["evidence"].values())[-1]}
             calls.append(("exit", reply))
-        elif version == "supplement_reply.v5":
+        elif version in {"supplement_reply.v5", "supplement_reply.v6"}:
             reply = json.loads(request.messages[-1].content)["reply"]
             if reply != SUPPLEMENT_REPLY:
                 return await original(provider, capability, request, context)
             data = {"intent": "finish", "confidence": .98, "evidence_id": "E1"}
+            if version == "supplement_reply.v6":
+                data["reply_text"] = ""
             calls.append(("supplement", reply))
         elif version.startswith(("interview_turn_understanding.", "interview_turn_decision.")):
             transcript = request.metadata["transcript"]
@@ -70,6 +73,10 @@ def _provider(monkeypatch, *, technical=False, relevant=False, stop=False, incon
             output_schema = request.json_schema["properties"].get("understanding", request.json_schema)
             if "company_question" in output_schema["properties"]:
                 envelope["understanding"]["company_question"] = None
+            if "anyOf" in output_schema["properties"]["clarification_target"]:
+                assert envelope["understanding"]["ambiguities"] == []
+                assert envelope["understanding"]["clarification_target"] is None
+                envelope["understanding"]["clarification_target"] = {"resolution": "resolved"}
             data = envelope if "understanding" in request.json_schema["properties"] else envelope["understanding"]
             calls.append(("understanding", transcript))
         else:
@@ -141,10 +148,9 @@ def test_off_topic_withdrawal_requires_a_delivered_separate_question_and_fresh_a
             await _wait_until(lambda: bool(_current(runtime).get("candidate_input_completed_at")), timeout=5)
             await _wait_until(lambda: all(c["status"] == "completed" for c in store.evidence_commands.values()))
             session = _current(runtime)
-            _assert_one_automatic_answer(store, runtime, body + "确定结束面试。", voice_frames=5, continuation_frames=5)
-            assert session["current_turn_id"] is None and session["turns"][0]["current_understanding"]["intent"] == "off_topic"
-            assert session["turns"][0]["current_understanding"]["completion_basis"]["evidence_quotes"] == ["确定结束面试。"]
-            assert session["turns"][0]["current_understanding"]["claims"] == []
+            _assert_retained_exit(store, runtime, body + "确定结束面试。", voice_frames=5, continuation_frames=5)
+            assert session["current_turn_id"] is None
+            assert session["candidate_input_completion_reason"] == "candidate_requested"
             assert [call for call in calls if call[0] == "exit"] == [("exit", "确定结束面试。")]
             assert not any(event["turn_id"] == _NEXT_TURN_ID for event in session["agent_events"]
                 if event["type"] == "conversation.act.selected")

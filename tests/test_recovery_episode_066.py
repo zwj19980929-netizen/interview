@@ -71,7 +71,10 @@ async def advance_to_failure(endpoint, clock, count):
     # than mistaking its later spent flag for an already selected output.
     expects_recovery_speech = count == 1 and endpoint.confirmation._failure_spoken_identity is None
     clock.value += 10
-    await _until(lambda: endpoint._prepare_failures == count)
+    # Recovery now runs during the notice: a fast second failure can finish
+    # before this observer sees the first count. Final assertions still bound
+    # the entire episode to exactly two actual attempts.
+    await _until(lambda: endpoint._prepare_failures >= count)
     await _until(lambda: endpoint._inference_task is None)
     # The first failure speaks once. Acknowledge delivery before asking the
     # real endpoint loop to attempt the next request.
@@ -79,6 +82,7 @@ async def advance_to_failure(endpoint, clock, count):
         await _until(lambda: endpoint.confirmation.speaking)
     if endpoint.confirmation.speaking:
         endpoint.confirmation.floor_returned(endpoint)
+    await _until(lambda: not endpoint._preparation_failure_notice_pending)
     await asyncio.sleep(.02)
 
 

@@ -39,7 +39,9 @@ from app.domain.evidence_coordination import (
 )
 from app.persistence.provider import persistence_for
 from app.realtime_bus import realtime_event_bus
-from app.services.evidence_coordination import EvidenceOwnershipCoordinator, assert_current_evidence_fence
+from app.services.evidence_coordination import (
+    EvidenceOwnershipCoordinator, assert_current_evidence_fence, assert_current_evidence_control,
+)
 from app.services.evidence_command_journal import EvidenceCommandJournal
 from app.services.browser_audio_backfill import BrowserAudioBackfill
 from app.services.interview_evidence import (
@@ -82,6 +84,7 @@ _TERMINAL_INTERVIEW_STATUSES = frozenset(
 )
 _PARTIAL_PROJECTION_CAPACITY = 16
 _TERMINAL_PRESENTATION_GRACE_SECONDS = 5.0
+_PRESENTATION_CANCEL_GRACE_SECONDS = 0.1
 
 
 @dataclass(frozen=True)
@@ -138,6 +141,8 @@ class ManagedLiveKitEvidenceSession:
         self._renewal_task: Optional[asyncio.Task[None]] = None
         self._executor_task: Optional[asyncio.Task[None]] = None
         self._owner_recovery_task: Optional[asyncio.Task[None]] = None
+        self._terminal_stop_task: Optional[asyncio.Task[None]] = None
+        self._terminal_release_task: Optional[asyncio.Task[None]] = None
         self._command_wake = asyncio.Event()
         # Warm-up is disposable, but its endpoint command and the receive-only
         # track fail on different tasks. A local epoch lets the media failure
@@ -691,7 +696,7 @@ class ManagedLiveKitEvidenceSession:
             }, turn_id))
 
         async def speak(kind: str, guard: Any, *, focus_quote: str = "", reply_text: str = "",
-                        repeat_target: str = "current_question") -> bool:
+                        repeat_target: str = "current_question", reply_prompt_version: str = "") -> bool:
             guard()
             if self._capture_id != capture_id or self._stopped:
                 raise ApiError("TURN_DECISION_STALE", "Capture changed.", status_code=409)
@@ -769,7 +774,8 @@ class ManagedLiveKitEvidenceSession:
                 performance = await source._select_act(
                     act_type="conversation_acknowledgement", text=text,
                     turn_id=turn_id, causation_id=None, evidence_refs=[], gesture="listen",
-                    approval_guard=guard, prompt_version=RECEPTION_VERSION if reply_text else RECEPTION_SPEECH_VERSION,
+                    approval_guard=guard,
+                    prompt_version=(reply_prompt_version or RECEPTION_VERSION) if reply_text else RECEPTION_SPEECH_VERSION,
                     dialogue_question=request_kind == "question_clarification",
                     on_playback_selected=lambda: self._answer_endpoint.confirmation.playback_selected(self._answer_endpoint),
                 )
@@ -1317,7 +1323,7 @@ class ManagedLiveKitEvidenceSession:
                             self.interview_id, self.organization_id
                         )
                     ):
-                        asyncio.create_task(self.stop("interview_completed"))
+                        self._schedule_terminal_cleanup()
                         return
                     self._command_wake.clear()
                     try:
@@ -1364,7 +1370,7 @@ class ManagedLiveKitEvidenceSession:
                 ),
             )
             if self._interview_is_terminal():
-                asyncio.create_task(self.stop("interview_completed"))
+                self._schedule_terminal_cleanup()
             return
         session = self.supervisor.interviews.get_interview(
             self.interview_id, self.organization_id
@@ -1382,7 +1388,7 @@ class ManagedLiveKitEvidenceSession:
             ),
         )
         if session.get("status") in _TERMINAL_INTERVIEW_STATUSES:
-            asyncio.create_task(self.stop("interview_completed"))
+            self._schedule_terminal_cleanup()
 
     async def _apply_claimed_command(
         self, claimed: ClaimedEvidenceCommand
@@ -2372,6 +2378,72 @@ class ManagedLiveKitEvidenceSession:
             if self._owner_recovery_task is asyncio.current_task():
                 self._owner_recovery_task = None
 
+    def _schedule_terminal_cleanup(self) -> None:
+        """Let the completion receipt own live farewell cleanup exactly once.
+
+        Reporting may start immediately after an exit with no pending scores.
+        Terminal database status therefore does not mean farewell audio has
+        drained. The channel already owns that bounded drain/timeout contract.
+        """
+        running = self._terminal_stop_task
+        if self._stopped or (running is not None and not running.done()):
+            return
+
+        async def cleanup() -> None:
+            try:
+                ownership = self.ownership
+                await self._finish_terminal_presentation()
+                if self._stopped:
+                    return
+                source = self._channel or self._event_source
+                state = self._terminal_controller_state(source, ownership)
+                if state is not None:
+                    if state.get("completion_emitted_at"):
+                        # A completed cleanup task may represent a retryable
+                        # failure. Do not turn competing terminal observations
+                        # into extra attempts behind the channel's back.
+                        if source._completion_evidence_cleanup_task is None:
+                            source._schedule_completion_evidence_cleanup()
+                        return
+                    if state.get("completion_closing_performance_id"):
+                        # The channel's audio-drained callback or its bounded
+                        # timeout will emit the receipt and release this owner.
+                        return
+                # No live completion controller remains. The presentation
+                # seam has already bounded/cancelled its work before release.
+                await self.stop("interview_completed")
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                _LOG.warning("Terminal Evidence cleanup unavailable: error_type=%s", type(exc).__name__)
+
+        self._terminal_stop_task = asyncio.create_task(cleanup())
+
+    def _terminal_controller_state(
+        self, source: Optional["AgentChannel"], ownership: Optional[EvidenceOwnershipGrant],
+    ) -> Optional[Dict[str, Any]]:
+        """A local channel reference cannot grant a superseded owner authority."""
+        if (self._stopped or source is None or source._closed or source._terminating
+                or self._channel is not source or source._evidence_session is not self
+                or ownership is None):
+            return None
+        control = self._control_grants.get(id(source))
+        if control is None:
+            return None
+        try:
+            with self.persistence.transaction(self.organization_id, read_only=True) as transaction:
+                assert_current_evidence_fence(transaction, ownership.commit_fence())
+                assert_current_evidence_control(transaction, control)
+                session = transaction.interview_sessions.get(self.interview_id)
+                if not session or session.get("status") not in _TERMINAL_INTERVIEW_STATUSES:
+                    return None
+                state = session.get("agent_runtime") or {}
+                if state.get("floor") == "human" or (state.get("takeover") or {}).get("status") == "active":
+                    return None
+                return state
+        except ApiError:
+            return None
+
     async def _finish_terminal_presentation(self) -> None:
         """Allow a bounded farewell setup before releasing its live owner.
 
@@ -2383,45 +2455,18 @@ class ManagedLiveKitEvidenceSession:
         task = self._presentation_task
         source = self._channel or self._event_source
         ownership = self.ownership
-        if task is None or task is asyncio.current_task() or source is None or ownership is None:
+        if task is None or task is asyncio.current_task():
             return
-        fence = ownership.commit_fence()
 
         def current_terminal_state() -> Optional[Dict[str, Any]]:
-            if self._stopped or source._closed or source._terminating:
+            if self._presentation_task is not task:
                 return None
-            if self._presentation_task is not task or self.ownership is None:
-                return None
-            try:
-                with self.persistence.transaction(self.organization_id) as transaction:
-                    assert_current_evidence_fence(transaction, fence)
-                    session = transaction.interview_sessions.get(self.interview_id)
-                    if not session or session.get("status") not in _TERMINAL_INTERVIEW_STATUSES:
-                        return None
-                    state = session.get("agent_runtime") or {}
-                    if (state.get("takeover") or {}).get("status") == "active":
-                        return None
-                    return state
-            except ApiError:
-                return None
+            return self._terminal_controller_state(source, ownership)
 
         if current_terminal_state() is None:
+            await self._cancel_presentation_bounded(task)
             return
-        try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=_TERMINAL_PRESENTATION_GRACE_SECONDS)
-        except asyncio.TimeoutError:
-            task.cancel()
-            # A misbehaving provider may suppress cancellation. It must not
-            # hold terminal cleanup indefinitely; the stopped/owner fence in
-            # the expression seam rejects any eventual late result.
-            await asyncio.wait({task}, timeout=0.1)
-        except asyncio.CancelledError:
-            if not task.cancelled():
-                raise
-        except Exception:
-            # The answer is already committed. Failure to speak a farewell
-            # must still leave the candidate with its completion receipt.
-            pass
+        await self._await_presentation_task(task)
         state = current_terminal_state()
         if state is not None and not (
             state.get("completion_emitted_at") or state.get("completion_closing_performance_id")
@@ -2434,18 +2479,63 @@ class ManagedLiveKitEvidenceSession:
                 # The completion marker is durable even if its live fanout
                 # fails; normal snapshot/replay recovery remains available.
                 pass
-        if not task.done() and self._presentation_task is task:
+        if not task.done():
+            self._detach_presentation_task(task)
+
+    async def _wait_for_presentation_cleanup(self) -> None:
+        """Bound an already-issued receipt's cleanup without changing authority.
+
+        Pending scores can keep the interview in progress. They do not justify
+        cancelling a presentation that is still returning from receipt emission.
+        """
+        task = self._presentation_task
+        if task is None or task is asyncio.current_task():
+            return
+        await self._await_presentation_task(task)
+        if not task.done():
+            self._detach_presentation_task(task)
+
+    async def _await_presentation_task(self, task: asyncio.Task[None]) -> None:
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=_TERMINAL_PRESENTATION_GRACE_SECONDS)
+        except asyncio.TimeoutError:
+            task.cancel()
+            # A misbehaving provider may suppress cancellation. It must not
+            # hold terminal cleanup indefinitely; the stopped/owner fence in
+            # the expression seam rejects any eventual late result.
+            await asyncio.wait({task}, timeout=_PRESENTATION_CANCEL_GRACE_SECONDS)
+        except asyncio.CancelledError:
+            if not task.cancelled():
+                raise
+        except Exception:
+            # The answer is already committed. Failure to speak a farewell
+            # must still leave the candidate with its completion receipt.
+            pass
+
+    def _detach_presentation_task(self, task: asyncio.Task[None]) -> None:
+        if self._presentation_task is task:
             self._presentation_task = None
-            task.add_done_callback(lambda completed: None if completed.cancelled() else completed.exception())
+        task.add_done_callback(lambda completed: None if completed.cancelled() else completed.exception())
+
+    async def _cancel_presentation_bounded(self, task: asyncio.Task[None]) -> None:
+        """Invalidated output cannot hold owner shutdown by suppressing cancel."""
+        task.cancel()
+        await asyncio.wait({task}, timeout=_PRESENTATION_CANCEL_GRACE_SECONDS)
+        if not task.done():
+            self._detach_presentation_task(task)
+        elif not task.cancelled():
+            # Retain normally completed work for lifecycle observability.
+            task.exception()
 
     async def stop(self, reason: str) -> None:
         if self._stopped:
             return
         if reason == "interview_completed":
-            previous = getattr(self, "_terminal_stop_task", None)
+            previous = self._terminal_release_task
             if previous is not None and previous is not asyncio.current_task() and not previous.done():
+                await asyncio.shield(previous)
                 return
-            self._terminal_stop_task = asyncio.current_task()
+            self._terminal_release_task = asyncio.current_task()
             await self._finish_terminal_presentation()
             if self._stopped:
                 return
@@ -2454,8 +2544,7 @@ class ManagedLiveKitEvidenceSession:
         if self._answer_endpoint is not None:
             await self._answer_endpoint.close()
         if self._presentation_task is not None and not self._presentation_task.done():
-            self._presentation_task.cancel()
-            await asyncio.gather(self._presentation_task, return_exceptions=True)
+            await self._cancel_presentation_bounded(self._presentation_task)
         await self._shutdown_partial_projection()
         expiry = self._expiry_task
         self._expiry_task = None
@@ -2932,8 +3021,7 @@ class ManagedLiveKitEvidenceSession:
         if self._answer_endpoint is not None:
             await self._answer_endpoint.close()
         if self._presentation_task is not None and self._presentation_task is not asyncio.current_task():
-            self._presentation_task.cancel()
-            await asyncio.gather(self._presentation_task, return_exceptions=True)
+            await self._cancel_presentation_bounded(self._presentation_task)
 
         if self._stopped:
             return

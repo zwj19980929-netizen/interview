@@ -112,6 +112,87 @@ def _source_error(reason, path="$.evidence_quote"):
     )
 
 
+_EXIT_REQUEST_SIGNAL = re.compile(
+    r"退出|(?:结束|停止|终止)[^，,。.!！?？]{0,10}面试|不想[^，,。.!！?？]{0,10}面试|不面了|"
+    r"\b(?:quit|withdraw|exit)\b|\b(?:end|stop)[^,.!?]{0,24}\binterview\b", re.I,
+)
+_EXIT_REQUEST_CONFLICT = re.compile(
+    r"如果|假如|假设|要是|比如|例如|举例|(?:别人|客户|用户|同事|他|她)(?:刚才)?(?:说|问)|"
+    r"我(?:之前|刚才|昨天)(?:只是)?说|"
+    r"(?:不|别|不要|不用|不能|暂不|先不|还不|没有|并非|不是)(?:再|要|想|是|说|确认|确定|立即|现在|提前|真的|选择|决定|了|要我|让我){0,3}(?:结束|退出|停止|确认|确定)|"
+    r"(?:识别|转写|字幕).{0,8}(?:错|不对|不是|有问题)|(?:我没说|不是我说|没听清)|"
+    r"\b(?:if|unless|suppose|hypothetically)\b|"
+    r"\b(?:not|don't|do not|never)\s+(?:want to\s+)?(?:end|quit|stop|exit|withdraw)\b",
+    re.I,
+)
+_EXIT_REQUEST_RETRACTION = re.compile(
+    r"(?:我|我们|咱们)(?:还是|现在|仍然|要|想|决定|希望|还想|还要){0,3}(?:继续|接着)(?:说|回答|面试|作答|(?=[。.!！,，;；]|$))|"
+    r"(?:^|[。.!！,，;；])\s*(?:不对[，,]?\s*)?(?:继续|接着)(?:回答|面试|作答)|"
+    r"(?:让我|我)(?:还是|再)?(?:再)?想(?:一)?(?:想|下)|"
+    r"我(?:还)?(?:没|没有)(?:说|讲|回答)完|"
+    r"(?:先|暂时)?暂停(?:一会|一下|片刻)|(?:下一题|跳过这题|跳过本题)|"
+    r"\bI\s+(?:still\s+)?(?:want to\s+|will\s+)?continue\b", re.I,
+)
+
+
+def validate_exit_request_source(data, current_speech):
+    """Reject contradictions in a model-selected request, without granting exit.
+
+    This is deliberately separate from the stricter confirmation contract:
+    a natural request may itself be a question. Its only outcome is permission
+    to *ask* the existing independent confirmation, subject to runtime fences.
+    Source IDs preserve occurrence identity, including quotations spanning E
+    boundaries. Technical conditions before the selected request are not a
+    veto, nor can a local word match ever supply the model's stop intent.
+    """
+    if not isinstance(current_speech, str) or not current_speech.strip():
+        _source_error("exit_request_source_invalid", "$.evidence_id")
+    references = understanding_references(current_speech, [])
+    evidence_id = data.get("evidence_id")
+    source = references["evidence"].get(evidence_id)
+    if source is None:
+        _source_error("exit_request_source_invalid", "$.evidence_id")
+    start = references["offsets"][evidence_id]
+    end = start + len(source)
+    masked = _QUOTES.sub(lambda match: " " * len(match.group()), current_speech)
+    visible = masked[start:end]
+    if (not visible.strip(" \t\r\n。.!！?？,，:：;；")
+            or (_CONFIRM_SIGNAL.search(source) and not _CONFIRM_SIGNAL.search(visible))):
+        _source_error("exit_request_source_invalid", "$.evidence_id")
+
+    clauses = list(re.finditer(r"[^，,。.!！?？\n;；]+", visible))
+    request_clauses = [clause for clause in clauses if _EXIT_REQUEST_SIGNAL.search(clause.group())]
+    # Choosing the latest candidate clause checks explicit corrections within
+    # the same E without treating an earlier hypothetical technical scenario
+    # as the scope of the candidate's later independent real request.
+    selected = request_clauses[-1:] or clauses
+    if request_clauses:
+        index = clauses.index(selected[0])
+        previous = clauses[index - 1].group().strip() if index else ""
+        # A comma does not end an unfinished conditional: “if X, end the
+        # interview” remains hypothetical. A prior technical sentence or an
+        # already stated consequent (if X then retry, I want to leave) must
+        # not reject an independent request later in this evidence sentence.
+        if (re.match(r"(?:如果|假如|假设|要是|\bif\b|\bunless\b)", previous, re.I)
+                and not re.search(r"就|则|\bthen\b", previous, re.I)):
+            _source_error("exit_request_conflict", "$.kind")
+    for clause in selected:
+        if _EXIT_REQUEST_CONFLICT.search(clause.group()):
+            _source_error("exit_request_conflict", "$.kind")
+    scope_start = start + (selected[-1].start() if selected else 0)
+    tail = masked[scope_start:]
+    if _EXIT_REQUEST_RETRACTION.search(tail):
+        _source_error("exit_request_conflict", "$.kind")
+    # Rejections after the selected occurrence supersede it. Quoted examples
+    # have already been masked; unrelated technical if-clauses are irrelevant.
+    for clause in re.finditer(r"[^，,。.!！?？\n;；]+", masked[end:]):
+        value = clause.group()
+        if (_EXIT_REQUEST_CONFLICT.search(value)
+                and (_EXIT_REQUEST_SIGNAL.search(value)
+                     or re.search(r"(?:识别|转写|字幕).{0,8}(?:错|不对|不是|有问题)|我没说|不是我说", value))):
+            _source_error("exit_request_conflict", "$.kind")
+
+
 def validate_exit_reply_response(data, reply, schema=None):
     """Reject unsupported grants; no local text rule ever grants confirmation."""
     validate_structured_response(data, schema or exit_reply_schema())

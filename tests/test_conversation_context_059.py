@@ -125,19 +125,29 @@ async def test_new_reply_reclassifies_with_prior_confirmed_words_but_never_prior
     endpoint.capture.prepare_impl = slow
     try:
         await ask(endpoint, clock, spoken)
+        original_boundary = endpoint.confirmation._boundary_final
+        assert original_boundary == _final("合成回答结束。")
         prior_final = _final("合成回答结束。" + prior)
         endpoint.capture.current_final = prior_final
         endpoint.observe_transcript(prior_final.text)
         clock.value += 1
         await _until(lambda: len(endpoint.capture.prepares) == 1)
+        confirmed_boundary = endpoint.confirmation._boundary_final
+        assert confirmed_boundary == prior_final
 
         current = _final(prior_final.text + fresh)
         endpoint.capture.current_final = current
         endpoint.observe_transcript(current.text)
         clock.value += 1
         await _until(lambda: len(requests) == 2)
-        assert requests == [(prior, {}), (fresh, {"prior_confirmation": True, "preceding_text": prior,
-                                               "question": SUPPLEMENT_SPEECH["check"]})]
+        assert requests == [
+            (prior, {"final": prior_final, "boundary_final": original_boundary}),
+            (fresh, {"final": current, "boundary_final": confirmed_boundary,
+                     "prior_confirmation": True, "preceding_text": prior,
+                     "question": SUPPLEMENT_SPEECH["check"]}),
+        ]
+        assert requests[0][1]["boundary_final"] is original_boundary
+        assert requests[1][1]["boundary_final"] is confirmed_boundary
         if next_speech:
             await _until(lambda: len(spoken) == 2)
             assert spoken == ["check", next_speech] and not commits
