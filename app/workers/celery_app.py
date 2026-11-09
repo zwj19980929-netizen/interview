@@ -1,6 +1,29 @@
+from app.core.runtime_release import runtime_release_snapshot
+
+import json
+import logging
 import os
 
 from celery import Celery
+from celery.signals import worker_ready
+from celery.worker.control import inspect_command
+
+
+@worker_ready.connect(weak=False)
+def log_runtime_release(sender=None, **kwargs):
+    """Emit only fixed-shape startup metadata; diagnostics cannot stop work."""
+    try:
+        logging.getLogger(__name__).info(
+            "runtime_release %s", json.dumps(runtime_release_snapshot("worker"), sort_keys=True)
+        )
+    except Exception:
+        pass
+
+
+@inspect_command()
+def runtime_release(state, **kwargs):
+    """Read the worker's frozen bootstrap identity without scheduling work."""
+    return runtime_release_snapshot("worker")
 
 
 BROKER_URL = os.getenv("INTERVIEWER_CELERY_BROKER_URL", "redis://127.0.0.1:6379/2")

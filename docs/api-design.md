@@ -1,6 +1,12 @@
 # 接口设计
 
-## 086：已确认退出的证据处理（仓库已验证，未加载）
+## 088：运行版本核验（仓库与本机已验证）
+
+新增管理员只读 `GET /api/v1/admin/runtime-release`，沿用 admin RBAC。响应为 `schema=runtime-release.v1`、进程身份（随机 instance_id、pid、started_at、role）和启动源码快照（status、sha256、file_count）。源码范围只包含后端 `app/**/*.py` 与根 `main.py`，排除 `app/web`、`node_modules`、`__pycache__`；不读取配置环境、凭据、数据库、媒体或日志，也不返回绝对路径和源码正文。快照在应用/worker 引导时冻结，后续查询不能因磁盘代码更新而冒充新运行版本；不可读取时返回 unavailable 和空摘要，不影响原健康/就绪及正在进行的面试。API 与 Celery 只读 inspect 命令 `runtime_release` 使用同一计算规则；prefork 子进程具有独立进程身份，继承已冻结源码快照。发布前冻结源码并对照验收摘要，启动快照不代表后续动态加载代码的完整证明。
+
+本端点不提供升级、重启、重试或答案提交权限，不能替代实际语音链路和生产 readiness 验收。`/healthz` 响应保持不变，代码版本不匹配仅作为发布核验失败，不直接暂停面试。部署与验证记录见[操作日志088](change-log.md)。
+
+## 086：已确认退出的证据处理（仓库与本机已验证，加载记录见088）
 
 候选外部接口仍沿服务端语音、实际送达和独立退出确认。进程内证据完成结果区分`exit_confirmed`与答案accepted，不为退出控制发送answer.accepted或evaluation.queued；既有退出生命周期及结束快照通知驱动客户端收尾。客户端payload不能提供退出准备对象或制造确认。未完成题的保留发言不计为拒答/零分，报告列明未评估待复核。
 

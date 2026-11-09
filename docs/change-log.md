@@ -4,15 +4,28 @@
 
 ## 2026-11-08 · INTERVIEW-CONTINUITY-RELEASE-088
 
-- 状态：`in_progress`。
+- 状态：`verified（仓库全量、真实模型虚构样例与本机加载；真人长场次待验）`。
 - 授权与顺序：用户要求先将当前代码提交为 Git 回退基线，再开始面试连续性修复。先完整保留当前 081–087 源码、测试和文档，不修改业务实现；本条登记后执行基线提交，提交号及结果随后补记。提交仅保存代码，不包含被忽略的数据库、录音、凭据和运行日志，也不等同于正在运行的 085 服务版本。
 - 现场依据：`iv_61e524acabdf44bb` 第三交流的临时一字识别假设取消 4.199 秒完整分析，假设随后撤回；重算剩余 8.922 秒而超时，恢复被 `call_budget_exhausted` 拒绝。运行日志仍为旧取消行为及 reception v9；仓库 087 已修、086/087 尚未加载。本轮只读复验 087 两份测试为 25 passed/1.04 秒。
 - 第一批范围：保存可回退基线，复核既有 086/087 修复及源码一致性，补齐实际运行版本核验和必要验收；只有确认媒体/证据/后台任务空闲且具备允许的启动配置后才更新运行服务。保持原始语音、评分、供应商、时间/调用额度和最终提交门禁。延期分析推进与进程交流检查点属后续独立交付，不混入本次发布。
 - 操作约束与验收：不自动恢复、重试、提交或重放用户真实场次，不读取或输出未授权的进程环境/凭据，不在活动面试中重启。完成相关及全量回归、独立审查、运行状态核验后补记实际文件、命令、结果与未完成项；失败和审批限制如实保留。
+- 基线已完成：`4639d2b307c2c3223e876c802a60ba6e50b8c5e6`（`dev`）保存 107 个文件，提交后工作区干净；随后创建 `codex/interview-continuity-088` 修复分支。路径与凭据模式检查无命中，`git diff --check`通过。首轮 Git 写入被沙箱拒绝（index.lock），未修改索引；按用户提交授权升级后提交成功，没有 push、reset 或历史重写。
+- 运行核验方案：保留 `/healthz` 与 readiness 语义；新增管理员只读运行身份端点，以及同源的 worker inspect 身份。源码摘要只在进程引导时冻结，查询不重新读取磁盘，不包含环境、凭据、候选资料或源码正文；发布时对照已测试 manifest。身份只是启动源码快照，仍要求发布期间源码不变，不能宣称是任意动态模块的内存证明。
+- 阶段实施与验证：新增独立运行身份 module、离线 manifest CLI、管理员只读端点、Celery inspect及启动安全日志；首轮针对性 `PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider tests/test_runtime_release_088.py tests/test_runtime_release_api_088.py tests/test_auth_audit.py tests/test_api_responses.py tests/test_deployment_readiness.py tests/test_provisional_preparation_087.py tests/test_provisional_ingress_087.py tests/test_conversation_control_086.py tests/test_terminal_cleanup_086.py -q` 为103 passed/5.90秒，日志`/private/tmp/interviewer-088-targeted.log`。独立审查要求补API日志handler异常不阻断启动，以及真实新解释器导入API/worker后的冻结摘要对照，正在补齐后再冻结全量；未改变业务模型或会话状态。
+- 只读运行预检：旧API20700/worker20701仍在线，health/ready为200，唯一worker active/reserved/scheduled=0，LiveKit rooms/participants/active egress=0，数据库有效owner和非终态命令/Outbox=0。截图场次已由原运行流程进入report_ready，本项未操作其生命周期。旧重载脚本和源码验收临时文件已不存在，不能假设Git基线087就是正在运行085的精确快照；原配置安全复用和最终加载仍待完成。
+- 最终源码与回归：独立审查的两项补充已完成，API日志handler异常红绿验证及真实新解释器API/worker导入对照覆盖在088共24项测试中。冻结487份app/tests/main Python文件到`/private/tmp/interviewer-088-tested-source.json`后，完整`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q`为`4565 passed /8 skipped /260.10秒`、退出码0，日志`/private/tmp/interviewer-088-backend-full.log`。冻结后所有文件内容一致；后端230份源码摘要为`4bf99b0f8240174607abb1b1e7230effca2f385fea800b5dfdf5f25d9c745d3e`。8项为既有环境跳过；前端未改，不重复构建。
+- 发布预检失败与修正：本轮明确限定两旧PID、仅内存保留原配置的工具升级已获批。临时脚本最初遇到Darwin环境终止符/解释器名称检查不匹配，均在停止服务之前退出；修正解析边界与允许的解释器名称后继续。随后媒体门禁发现一个0参与者、0录制房间；核对现有readiness实现证明是`/readyz`自行创建并离开的`readiness-evidence-ingress`。只排除该精确名称且无人房间，所有其他房间、任何参与者和录制继续阻断，不删除媒体房间。修正后只读预检通过：真实房间/参与者/录制、worker三种任务计数、有效owner、未完成证据命令和Outbox均为0，74份面试核心文档摘要`c2beb8bd2b310051dacaa7ea1f9c4c1897157ea4da13fb056052c5511b95ff55`。以上预检未重启服务或提交答案。
+- 探针审查：真实模型探针尚未执行时，独立审查指出直接`get_store()`会让虚构样例写真实调用审计/熔断状态；正在改为只读加载最小供应商配置后以内存存储运行，避免探针影响现网熔断。旧脚本未运行，未发生该副作用。
+- 探针隔离与首轮结果：临时脚本已改为SQLite只读查询唯一`interview_turn_understanding`真实路由及所需配置/连接/密封secret，加载到InMemoryStore，拒绝缺失路由或mock；所有调用审计/熔断仅在内存。合成SQLite验证源库字节摘要不变。首轮8条虚构语句7通过/1语义预期不匹配（15.977秒），未生成发布通过证明、未停止服务；失败为“否认退出并继续回答”，首轮未保留具体返回kind，不能反推该次值。一次单例诊断返回`interview_dialogue/confidence=0.95/1989ms`，中央合同允许此类面试交流，运行时回复后返回listening，不进入退出确认。将该探针允许值校正为`continue|interview_dialogue`、增加正常意图confidence>=0.75及固定kind/confidence记录后重新验收；不修改生产Prompt、预算、重试或源码。首次详情保留`/private/tmp/interviewer-088-model-smoke-details.json`。
+- 最终真实模型虚构验收：8/8通过、14.586秒，正常意图置信度0.95–1.0，“嗯”保持uncertain且置信度0.3；结果为`/private/tmp/interviewer-088-model-smoke-final-details.json`，源码绑定证明为`interviewer-088-model-smoke-attestation.json`。保持现有4秒接话与8秒退出分类预算、原路由/fallback，未重放真实候选材料。含首轮及单例诊断共17个虚构请求，失败历史保留；面试核心摘要不变，真实调用/熔断状态无探针写入。
+- 切换恢复保障：独立审查发现临时发布脚本在停止旧服务后若退出，会丢失唯一内存启动配置；已在实际停止前修正为TTY持有配置，异常只接受`status/resume`。续接仅允许已测SHA及本runner已知进程，空闲和数据校验继续有效，不重复启动已有新服务、不重复TERM、不强杀，重试日志另建0600文件。10项隔离检查通过，脚本`/private/tmp/interviewer-088-release.py`、检查`interviewer-088-recovery-isolation-check.py`；未向磁盘序列化环境或凭据。旧服务没有发布准入锁，因此在重复空闲检查及短暂切换期间仍需保持无人新入场。
+- 实际加载：执行`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python /private/tmp/interviewer-088-release.py --execute --expected-sha256 4bf99b0f8240174607abb1b1e7230effca2f385fea800b5dfdf5f25d9c745d3e`（TTY），重复空闲/源码/身份/数据检查后正常TERM旧API20700与worker20701及等待其子进程退出，无强杀、无恢复分支。新API86662和worker/Beat86663于2026-11-09T04:12:49Z（UTC）启动；管理员端点及worker inspect均返回230文件、同一已测摘要，角色/PID正确。health/ready为200且ready=true，worker active/reserved/scheduled及媒体活动为0，74份面试核心摘要与前值一致，脚本exit0。运行日志`/private/tmp/interviewer-088-{api,worker}.log`均含新身份且无ERROR/Traceback；独立检查8000健康、5174页面/健康代理/版本端点全部200，前端代理显示新API86662及同摘要。
+- 实际文件：新增`app/core/runtime_release.py`、`app/operations/runtime_release.py`、`tests/test_runtime_release_088.py`、`tests/test_runtime_release_api_088.py`；修改`app/main.py`、`app/api/routers/system.py`、`app/workers/celery_app.py`。文档修改为接口、架构、已知问题、开发进度、路线图、本日志及086/087说明。无前端、业务Prompt/Schema、供应商路由、数据库结构或评分规则修改；086/087既有代码保留在修复前基线并通过本次实际加载生效。
+- 交付与边界：487份Python文件集合及内容与全量验收冻结值一致，258个修改文档的本地链接有效，`git diff --check`通过。保留基线`4639d2b`与独立修复分支，修复另行提交，不push、不重写历史、不回滚业务数据。核心摘要排除的仅是根级version/updated_at/heartbeats/last_activity_at/agent_events/agent_runtime/lifecycle_events，不声称所有数据库字节不变；探针和发布均未重放、重试、恢复或提交用户场次。第一批已完成；真人长场次、真实麦克风/网络故障验证、模型不可用时延期分析推进、完整进程交流检查点与生产部署验收仍待后续，不能据本次通过承诺任意故障都不中断。
 
 ## 2026-11-03 · PROVISIONAL-TRANSCRIPT-PREPARATION-087
 
-- 状态：`in_progress（仓库全量已验证；运行加载待授权）`。
+- 状态：`verified（仓库全量与本机加载；真人待验）`。后续088于2026-11-09T04:12:49Z完成空闲加载和源码身份核验；以下保留087实施当时的审批限制与验证历史。
 - 目标与依据：用户要求解决临时转写增加一个字后又撤回却取消完整分析的问题。现场`iv_284b5421f1304100`第6交流09:15:54Z的非final一字假设触发transcript取消，7.952秒分析丢失；09:15:55Z该假设撤回，正式重算仅剩8.596秒而超时，恢复被两次调用额度拒绝。修复临时假设与权威证据变化的生命周期区分；沿用已读11份设计文档与模块边界，保留081–086增量及Git基线。
 - 实施边界：临时输入立即撤销旧等待者及推进/确认权限，但纯分析可在原截止时间内保留；只有重新取得完整且匹配的权威final、来源/语境/owner/capture复核后才能复用。真实内容改变、失权、关闭及模式改变仍不得使用旧结果。不得以文本相同代替完整证据身份，不退款、不增加模型次数/超时，不修改ASR、Prompt、评分或供应商配置。
 - 验证与运行：先用纯合成的临时增加→撤回和真实新增对照复现，再覆盖未决假设期间禁止提交、来源失效、预算与有界清理，进行相关和完整回归。真实库只读、不重放或提交现场材料；服务环境读取许可仍未收到，本轮不绕过审批读取环境或重启。独立worker评分超时不纳入此窄修复。实际文件、失败、结果及未完成事项随后补记。
@@ -28,7 +41,7 @@
 
 ## 2026-11-02 · CONVERSATION-CONTROL-AUTONOMY-086
 
-- 状态：`in_progress（仓库全量已验证；真实模型验证与运行加载待授权）`。
+- 状态：`verified（仓库全量、真实模型虚构样例与本机加载；真人待验）`。后续088完成8例真实模型虚构验收并于2026-11-09T04:12:49Z空闲加载；以下保留086实施当时的审批限制与验证历史。
 - 授权与目标：用户要求交流更自主、不要因非预期发言僵硬失败；以当前纯退出请求被完整技术答案合同阻断为入口，将来源有效的交流控制与技术内容分析解耦，沿用已有等待、解释、重读等接话能力。已按序复核设计文档并沿用codebase-design技能；保留Git基线`6e6daed`与081–085增量，ASR、评分、原始转写及真实供应商配置不改。
 - 现场：`iv_0c8e968bd904440e`的当前退出原话与STT最终文本SHA完全一致。预分析2.757秒后因新临时转写取消且占用一次调用；正式分析5.782秒正常返回却选用不自洽的`answer_unresolved`组合，被`unresolved_answer_contract_invalid`拒绝，剩余7.681秒时两次实际调用已耗尽。worker同期正常。无原始响应，不断言具体哪一伴随字段有误，也不把Prompt表述风险当作已证实因果。
 - 实施与验证边界：复用轻量接话识别当前控制请求，完整Schema、原文来源及当前final/owner/capture验证后只允许发起独立退出确认，不授予退出或提交许可；取消/改口/引用/否定/假设及混合技术内容必须保留原门禁。补合同、真实入口/临时SQLite、失败和调用次数回归，先复现再实施；正常回答不增加串行模型调用。真实DB只读，不重放候选材料、不自动重试或提交现场场次。实际修改、测试、失败和加载结果随后补记。
