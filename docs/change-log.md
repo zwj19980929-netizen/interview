@@ -4,7 +4,7 @@
 
 ## 2026-11-10 · PLANNING-JSON-RECOVERY-094
 
-- 状态：`in_progress`。
+- 状态：`verified（仓库全量与本机加载；真人连续面试待验）`。
 - 授权与基线：用户在已定位首题重试原因后要求修改；沿用已有修复、Git回退点、测试及空闲加载授权。首次修改前工作区干净，当前代码已提交为907d551；已按入口顺序复核11份文档。本项覆盖可观察的JSON解析失败、有界规划恢复、回归和配套文档，不修改历史回答/评分或自动操作用户当前面试。
 - 现场证据：iv_e24b4ff9b59e4806的首题规划于11:15:18Z报provider_schema_invalid，耗时2505ms，finish_reason=stop、输出86/600 tokens，schema_reason/path为空；对应adapter空内容/无法解析JSON对象分支，非超时或输出上限截断。未保存响应正文，不能断言具体字符。后一次手动重试于11:15:54Z成功并开始播报。单次max_provider_attempts=1/retries=0覆盖路由重试配置，原规划回退明确排除格式错误。
 - 修改与验收边界：adapter只添加不含正文的明确解析失败分类，网关白名单持久化诊断；Supervisor仅对可重试的明确解析失败，在原15秒/最多3次模型调用内最多自动重试一次，仍失败则独立使用已批准合法目录提案。无效模型输出不能进入领域对象，Schema/领域校验、鉴权/计费、取消、owner/controller、上下文、预算和去重仍严格执行。先补事故红例与失败反例，再完整验证；保存实际文件/命令/失败/加载与剩余事项。
@@ -18,6 +18,10 @@
 
 
 - 最终全量与实际封存：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q`为4841 passed/8 skipped/271.51秒，603份源码/测试集合和hash验证前后一致，已生成runtime-release-tests.v4证明/private/tmp/interviewer-094-test-attestation.json；完整日志/private/tmp/interviewer-094-backend-full.log。仅3份明确生产文件变化，Prompt/响应Schema无差异，未做真实模型外呼。精确录像经再次空闲、owner释放及真实终态检查，现有processing/retry返回202/work_count=0，worker封存completed，16295493字节、SHA256 ed0a8fa23d3f5e5cfb3da6eceb18557445e730dc54f03e261f0e45096e2e963f。80份完整面试文档hash 7ffab1e1dc57b119baafa11b48e30ad535f9cc51a79820f397d1f8d641c14d2e、其他78 capture和515 Outbox原始行、owner均保持；仅新增对应封存任务和原审计。未停止真实录像、未结束面试、未排答案评分/报告。复核还加强临时恢复脚本的0答案/无报告任务前置条件，避免宽接口副作用，独立审查通过。修复提交与即时双重空闲加载进行中。
+
+
+- 实际加载与收尾：修复提交9b1d563，回退基线907d551保留，未push。即时双重空闲、测试证明、源码和媒体配置门禁通过后正常TERM原API31919/worker31920；2026-11-10T11:33:09Z（本地03:33）启动API36249、worker/Beat36250，均235文件、SHA 27a71f8163c6608d10bce377e6657f902ae668a1b0c4a62ba4f1e84642c28ec0。healthz/readyz、唯一worker与媒体ready通过，配置摘要dcbaf54ac496b9217094dae97dfcd6b2ffec665d23f934bfaae2895c5ecefb0f保持；80场核心SHA ef4edc2c9587fb0ea5ba7362744d0abf2c997c90a97d50f9d8988a1c720849a4保持，runner退出0，无强杀或恢复分支。只读前端核验脚本首轮因复用环境读取函数仍限定旧PID而GateError拒绝，无服务/数据副作用；将验证目标精确限定为已启动36249/36250后通过。5174代理返回新API及新摘要，Page.jsx/presentation.js实际HTTP source map内容等于冻结源码，8000静态首页/入口bundle匹配原093构建。前端无变更、未重启，未误将开发服务当静态预览。
+- 实际文件与剩余事项：生产仅app/providers/openai_compatible/provider.py、app/model_gateway/gateway.py、app/services/interviewer_supervisor/service.py；新增tests/test_planning_json_diagnostics_094.py和test_planning_json_recovery_094.py，共71项新回归；同步架构/接口/领域/检索评分/供应商/存储/已知问题/进度/路线图及本日志。无Prompt/响应Schema/模型路由/题数/收音/评分改动，无DDL或历史补写。解析恢复只覆盖明确可重试分类；无合法题目、失权、中央或领域校验错误仍保留真实失败。真人试音至首题、连续交流及供应商长期可靠性待验；093跟踪的断线录制自动入队缺口未在本项修改，本场恢复不等同自动路径已修复，不标closed。
 
 ## 2026-11-10 · FIRST-QUESTION-CONTEXT-093
 
