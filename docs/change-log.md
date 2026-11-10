@@ -4,7 +4,7 @@
 
 ## 2026-11-09 · RECEPTION-FAILURE-RETRY-091
 
-- 状态：`in_progress`。
+- 状态：`verified（仓库全量、本机加载与同场录像恢复；真人长场次及批量STT配置待验）`。
 - 授权与基线：用户要求继续处理新截图中的回答重试故障，沿用已授权的修复、先保存Git基线及验证后空闲加载。工作区干净，基线`4702859`，090及更早提交保留；本项覆盖代码、测试、文档及本机加载。已按原顺序复核相关设计文档，保留086独立退出确认与078/087证据和预算边界。
 - 现场证据：`iv_541249dca9b747c9`于06:26:48Z启动conversation_reception.v10，4.004秒后provider_timeout；代码把异常缓存成other并推进已读转写。06:27:40Z的evidence.retry_processing确已applied，但没有再次调用轻量接话，只重做完整答案分析；后者先超时，06:28:18Z返回后因unresolved_answer_contract_invalid（$.intent）被拒绝。未保存原模型响应，不能断言具体伴随字段错误。会话已于07:14:04Z因appointment_window_expired结束，0答案/0评分；不恢复终态、补交回答或伪造退出确认。
 - 修复边界：区分有效other与识别失败，失败不得消耗已处理发言游标；同一当前服务端来源只做有限自动恢复，显式重试能重做仍未处理的识别。保留成功结果缓存、已送达历史、当前来源/owner/capture及退出二次确认，不用关键词替代语义、不增加完整分析额度、不放宽响应合同。正常技术回答与供应商持续故障均须有界。
@@ -16,6 +16,10 @@
 - 取消边界收尾：新增3例先2失败/1通过，修后8文件156通过；计费启动即保留待完成来源，取消不退款、失权不可续、改口不复活旧退出。独立复审无阻断。公司问答首轮异常确认由人工INT打断MemoryPersistence提交的clear/update造成，独立整文件12通过，未修改业务或旧断言。重新冻结599文件，235份后端摘要f999885d21eab059624b7aeab35a88874ae4170f1aeb52c706916a10d0c3387e；最终全量日志interviewer-091-backend-full-final.log。
 - 发布只读预检：原API10055/worker10056身份及090摘要匹配，媒体配置摘要dcbaf54ac496b9217094dae97dfcd6b2ffec665d23f934bfaae2895c5ecefb0f保持且ready；LiveKit活动egress/面试房间/参与者均0，owner/命令/后台任务/活动capture均0。76场核心摘要fed250c643cc21f5d036f61a4edbb7e749090f6feb982cf2dbc13a1c18fe58e4；尚未停止或替换服务。269个变更文档本地链接检查通过。
 - 最终完整回归：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q`为4707 passed /8 skipped /266.56秒，退出0；599份源码/测试集合及hash均与冻结值一致。前端与63构建文件逐一确认等同090已验收版本，复用其552项前端通过证据，不称本轮重跑。091-test-attestation.json记录本轮后端结果及独立的旧前端证明hash。新增恢复脚本19项隔离测试通过；首次fixture缺时间字段导致12 setup errors，仅测试夹具修正，无真实库副作用。准备保存实现提交后空闲加载。
+- Git与实际加载：实现提交3cb5643，基线4702859保留，未push。2026-11-10T08:08:50Z正常TERM原API10055/worker10056并启动API20027、worker/Beat20028；两者235份后端摘要均为f999885d21eab059624b7aeab35a88874ae4170f1aeb52c706916a10d0c3387e，与全量冻结证明一致，原媒体配置摘要保持，runner退出0。76场核心摘要保持，health/ready及5174页面和代理均200，代理已确认新PID/源码；前端未重启或改构建。
+- 录像恢复前失败留痕：两次只读baseline在fresh_provider_and_object_proof被GateError拒绝，write_attempted=false，未修改目标capture。分段复核表明Egress COMPLETE、绑定、大小、独立SHA和保护全部通过；失败是核验自身的GET /admin/media-runtime新增正常api.request审计，使过严的全审计相等断言失效，非录像损坏。只读诊断也正常产生访问审计，未删除这些记录。正在将三个精确只读诊断端点的GET/200审计纳入白名单，旧审计和所有业务记录仍须逐项保持；不豁免未知或写入类审计。
+- 同场录像实际恢复：恢复工具补充严格只读GET审计扩展后32项隔离测试通过，包含旧审计删除/改写及非白名单负例；首次foreign fixture被tenant guard拒绝，修正测试的创建组织后通过。真实baseline和execute均退出0：指定capture恢复completed，76319467字节，独立SHA与原封存SHA均eb88b8d2124b6144c955e23f57a5929740a5fc3ec20bf87db84a9c234bf0083a；全部其他文档（含完整面试）、Outbox、模型调用和文件字节/hash/mtime保持。原审计保留，仅新增1条封存审计及5条明确只读核验审计。结果保存interviewer-091-recording-recovery-result.json；5174实际review API返回recording.available=true、status/processing_status=completed、failure_reason=null、can_retry=false。
+- 实际文件与剩余事项：生产仅spoken_supplement.py、media_capture.py；新增test_reception_retry_091.py（16项）与test_media_terminal_race_091.py（12项），同步架构/API/091设计/已知问题/进度/路线图/本日志。无新公共字段、Prompt/Schema、模型配置、数据库迁移或前端变更。恢复工具只在/private/tmp、无凭据持久化；既有finalizer仍按原设计保存标准provider元数据。本次没有复活已预约到期的会话或重放回答；断线批量转写真实路由缺口与真人长期供应商表现仍待后续，不标closed。
 
 ## 2026-11-09 · ASSESSMENT-SCOPE-AND-MEDIA-RECOVERY-090
 
