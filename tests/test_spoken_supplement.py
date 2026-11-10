@@ -292,6 +292,10 @@ def test_classification_failures_are_bounded_by_words_not_acoustic_revisions(rec
             await asyncio.sleep(.06)
         assert len(endpoint.capture.replies) == 2
         assert not commits and endpoint.capture.is_open
+        assert spoken == ["check", "reception_recovery_clarification"]
+        # The new bounded invitation owns playback until its trusted drain;
+        # later candidate input still uses the same delivered supplement.
+        await endpoint.confirmation.complete_playback(endpoint, reason="agent_finished")
         endpoint.capture.classify_impl = None
         endpoint.capture.intent = "continue"
         if recovery == "new_words":

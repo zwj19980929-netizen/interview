@@ -74,12 +74,14 @@ def _semantic_provider(monkeypatch, *, technical=False, probe=False, explicit_fi
             data = {"intent": "continue" if "继续" in reply else "confirm", "confidence": .98,
                     "evidence_quote": list(understanding_references(reply, [])["evidence"].values())[-1]}
             calls.append(("exit_confirmation", reply, data["intent"]))
-        elif request.metadata.get("prompt_version") in {"supplement_reply.v5", "supplement_reply.v6"}:
+        elif request.metadata.get("prompt_version") in {"supplement_reply.v5", "supplement_reply.v6", "supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10"}:
             reply = json.loads(request.messages[-1].content)["reply"]
             intent = "continue" if "再想想" in reply else "finish"
             data = {"intent": intent, "confidence": .98, "evidence_id": "E1"}
-            if request.metadata.get("prompt_version") == "supplement_reply.v6":
+            if request.metadata.get("prompt_version") in {"supplement_reply.v6", "supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10"}:
                 data["reply_text"] = ""
+            if request.metadata.get("prompt_version") in {"supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10"}:
+                data["answer_effect"] = "unchanged"
             calls.append(("supplement", reply, intent))
         else:
             transcript = request.metadata["transcript"]

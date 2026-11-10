@@ -48,7 +48,7 @@ async def test_invitation_retains_answer_and_respects_real_followup_decision(sel
 
 @pytest.mark.anyio
 async def test_supplement_classifier_uses_bounded_server_context_but_only_fresh_evidence():
-    gateway = Gateway({"intent": "finish", "confidence": .95, "evidence_id": "E1", "reply_text": ""})
+    gateway = Gateway({"intent": "finish", "confidence": .95, "evidence_id": "E1", "reply_text": "", "answer_effect": "unchanged"})
     result = await _service(gateway).classify_supplement_reply("我已经说完了。", "org_default",
         prior_confirmation=True, preceding_text="已讲完。" * 400, question="确认完成吗？" * 200)
     request = gateway.requests[0]
@@ -56,13 +56,13 @@ async def test_supplement_classifier_uses_bounded_server_context_but_only_fresh_
     assert context["prior_confirmation"] is True
     assert len(context["preceding_text"]) <= 1000 and len(context["question"]) <= 600
     assert context["evidence"] == {"E1": "我已经说完了。"}
-    assert request.metadata["prompt_version"] == "supplement_reply.v6"
+    assert request.metadata["prompt_version"] == "supplement_reply.v9"
     assert result["evidence_quote"] == "我已经说完了。"
 
 
 @pytest.mark.anyio
 async def test_previous_confirmation_cannot_be_cited_as_new_finish_authority():
-    gateway = Gateway({"intent": "finish", "confidence": .95, "evidence_id": "E2", "reply_text": ""})
+    gateway = Gateway({"intent": "finish", "confidence": .95, "evidence_id": "E2", "reply_text": "", "answer_effect": "unchanged"})
     with pytest.raises(StructuredResponseValidationError):
         await _service(gateway).classify_supplement_reply("对。", "org_default",
             prior_confirmation=True, preceding_text="已经讲完了。")
@@ -72,7 +72,7 @@ def test_supplement_context_disambiguates_confirmation_without_renewing_old_perm
     contract = prompt_contract("supplement_reply", {"reply": "对。", "prior_confirmation": True,
         "preceding_text": "没有要补充的了。", "question": ""})
     text = contract.messages[0].content
-    assert "不是当前结束许可" in text and "当前新回复" in text
+    assert "不直接授予本次提交许可" in text and "当前新回复" in text
     assert "确认对象" in text and "无法确定" in text
     no_context = prompt_contract("supplement_reply", {"reply": "对。"})
     data = json.loads(no_context.messages[-1].content)

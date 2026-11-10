@@ -110,6 +110,8 @@ class SpokenSupplementConfirmation:
         self._missing_reply_since = None
         self._confirmed_final = None
         self._confirmation_origin = None
+        self._confirmation_proof = None
+        self._supplement_correction = None
         self._reply_question = ""
         self._clarification_revision = None
         self._semantic_wait_identity = None
@@ -132,6 +134,7 @@ class SpokenSupplementConfirmation:
         self._processing_clarification_attempted = False
         self._processing_clarification_delivery = None
         self._processing_clarification_notice = None
+        self._processing_clarification_return_phase = None
         self._recovery_review = None
         self._idle_check_allowed = True
         self._idle_check_sent = False
@@ -174,6 +177,10 @@ class SpokenSupplementConfirmation:
             "_handled_final", "_handled_trace_revision", "_reception_seen_text", "_reception_seen_final",
             "_failure_spoken_identity", "_idle_check_allowed", "_idle_check_sent", "_off_topic_redirected")}
         checkpoint["failed"] = False
+        if self._processing_clarification_return_phase == "awaiting_reply":
+            # A recovery invitation does not replace the delivered supplement
+            # question or its evidence. Zero-PCM rollback must retain them.
+            checkpoint["recovery_reply"] = True
         self._unplayed_speech_checkpoint = checkpoint
         if self._selecting_supplement_prompt:
             self._pending_prompt_checkpoint = checkpoint
@@ -185,12 +192,18 @@ class SpokenSupplementConfirmation:
             return False
         checkpoint["failed"] = True
         for name, value in checkpoint.items():
-            if name != "failed":
+            if name not in {"failed", "recovery_reply"}:
                 setattr(self, name, value)
+        if checkpoint.get("recovery_reply"):
+            self.phase = self._after_speech = "awaiting_reply"
+            self.confirmed = self.reply_seen = False
+            self._processing_clarification_delivery = None
+            return True
         self.phase = "listening"
         self._after_speech = "listening"
         self.confirmed = self.reply_seen = False
         self._confirmed_final = self._confirmation_origin = None
+        self._confirmation_proof = None
         self.boundary = ""
         self._boundary_final = self._missing_reply_since = None
         self._semantic_wait_identity = self._reception_review = self._clarification_revision = None
@@ -340,6 +353,7 @@ class SpokenSupplementConfirmation:
         self._exit_delivery_revision = None
         self._exit_context = self._exit_context_final = None
         self.confirmed = False
+        self._confirmation_proof = None
         self._confirmed_final = None
         self._confirmation_origin = None
         self.reply_seen = False
@@ -582,6 +596,7 @@ class SpokenSupplementConfirmation:
     def voice(self) -> None:
         self._reception_review = None
         self._recovery_review = None
+        self._supplement_correction = None
         if self._exit_waiting:
             if self.confirmed:
                 self.confirmed = False
@@ -677,7 +692,9 @@ class SpokenSupplementConfirmation:
         """Recheck the delivered output when its scheduled notice runs."""
         notice = self._processing_clarification_notice
         if (notice is None or notice[:2] != (endpoint.capture, endpoint.revision)
-                or endpoint.confirmation is not self or self.phase != "listening"
+                or endpoint.confirmation is not self
+                or self.phase not in {"listening", "awaiting_reply"}
+                or self.phase == "awaiting_reply" and not self._supplement_question_delivered
                 or self.confirmed or not endpoint.preparation_blocked):
             return False
         endpoint.assert_current()
@@ -695,7 +712,9 @@ class SpokenSupplementConfirmation:
         self._content_delivery_pending = False
         self.confirmed = False
         self._recovery_review = None
+        self._confirmation_proof = None
         self._processing_clarification_delivery = None
+        self._processing_clarification_return_phase = None
         self.floor_returned(endpoint, reason="handoff_interrupted")
 
     def floor_returned(self, endpoint: Any, *, reason: str = "agent_finished",
@@ -709,12 +728,14 @@ class SpokenSupplementConfirmation:
         if self._exit_waiting and self._after_speech == "awaiting_exit_reply":
             self._exit_question_delivered = reason == "agent_finished" and exit_boundary_verified
             self._exit_delivery_revision = endpoint.revision if self._exit_question_delivered else None
-        if self._after_speech == "awaiting_reply":
+        if (self._after_speech == "awaiting_reply"
+                and self._processing_clarification_return_phase != "awaiting_reply"):
             self._supplement_question_delivered = reason == "agent_finished" and supplement_boundary_verified
             if self._supplement_question_delivered:
                 self._pending_prompt = None
                 self._pending_prompt_checkpoint = None
         self.phase = self._after_speech
+        self._processing_clarification_return_phase = None
         self.reply_seen = False
         self._missing_reply_since = None
         endpoint._last_voice = endpoint.clock()
@@ -753,6 +774,7 @@ class SpokenSupplementConfirmation:
             self._supplement_question_delivered = False
             self._supplement_delivery_pending = True
             self._confirmed_final = self._confirmation_origin = None
+            self._confirmation_proof = None
         try:
             spoken = await endpoint._infer(self.speak(kind, endpoint.assert_current,
                                       **({"reply_text": reply_text} if reply_text else {}),
@@ -835,6 +857,10 @@ class SpokenSupplementConfirmation:
         return True
 
     def retry_pending_prompt(self, endpoint: Any) -> None:
+        if self.phase == "awaiting_reply" and self._supplement_question_delivered:
+            # Retry saved processing, including after a recovery invitation
+            # returned the floor. It asks for no new audio or completion grant.
+            self.reply_seen = True
         failed = self._reception_failure
         if failed is not None:
             key, capture = failed
@@ -896,7 +922,12 @@ class SpokenSupplementConfirmation:
         endpoint.assert_current()
         if final is not None:
             self._blocked_control_identity = endpoint._identity(final)
-            if has_reception:
+            if self.phase == "awaiting_reply" and self._supplement_question_delivered:
+                # Fresh words can resume this exact delivered exchange using
+                # the remaining failure budget. Reception must not reinterpret
+                # its completion reply as an unrelated conversational request.
+                await self._reply(endpoint, final)
+            elif has_reception:
                 await self._receive_request(endpoint, final)
 
     async def step(self, endpoint: Any, quiet: float) -> None:
@@ -1205,6 +1236,7 @@ class SpokenSupplementConfirmation:
         kind = decision["kind"]
         endpoint.trace("reception_selected", kind=kind, revision=endpoint.revision)
         self.confirmed = False
+        self._confirmation_proof = None
         self._confirmed_final = None
         endpoint._explicit_revision = None
         endpoint._discard_confirmed_preparation()
@@ -1272,7 +1304,8 @@ class SpokenSupplementConfirmation:
             endpoint.trace("recovery_speech_unavailable", error_type=type(exc).__name__)
 
     async def _offer_processing_clarification(self, endpoint: Any) -> bool:
-        if (self._processing_clarification_attempted or self.phase != "listening"
+        if (self._processing_clarification_attempted or self.phase not in {"listening", "awaiting_reply"}
+                or self.phase == "awaiting_reply" and not self._supplement_question_delivered
                 or self.confirmed or self._exit_waiting or self._exit_context is not None
                 or self.content_clarification_active
                 or endpoint._explicit_revision == endpoint.revision
@@ -1287,10 +1320,11 @@ class SpokenSupplementConfirmation:
         self._processing_clarification_attempted = True
         self._failure_spoken_identity = True
         self._processing_clarification_delivery = (endpoint.capture, endpoint.revision)
+        self._processing_clarification_return_phase = self.phase
         self._recovery_review = None
         try:
             spoken = await self._say(endpoint, "reception_recovery_clarification",
-                                     afterwards="listening", recovery=True)
+                                     afterwards=self._processing_clarification_return_phase, recovery=True)
             if not spoken:
                 self._processing_clarification_delivery = None
         except BaseException as exc:
@@ -1299,6 +1333,9 @@ class SpokenSupplementConfirmation:
                     or classify_capture_failure(exc, "speech").safety_violation):
                 raise
             endpoint.trace("recovery_clarification_unavailable", error_type=type(exc).__name__)
+        finally:
+            if not self.speaking:
+                self._processing_clarification_return_phase = None
         return True
 
     async def _semantic_turn(self, endpoint: Any, final: Any, *, reception_kind: Any = None,
@@ -1411,6 +1448,7 @@ class SpokenSupplementConfirmation:
         if self.respond_company is None:
             raise ValueError("Company question responder is unavailable")
         self.confirmed = False
+        self._confirmation_proof = None
         self._confirmed_final = None
         endpoint._explicit_revision = None
         endpoint._discard_confirmed_preparation()
@@ -1443,6 +1481,7 @@ class SpokenSupplementConfirmation:
         if target and (target.evidence_quote not in final.text or target.focus_quote not in target.evidence_quote):
             raise ValueError("Clarification target is not grounded in the current final")
         self.confirmed = False
+        self._confirmation_proof = None
         self._confirmed_final = None
         self._remember_boundary(final)
         self._clarification_revision = endpoint.revision
@@ -1549,6 +1588,12 @@ class SpokenSupplementConfirmation:
             return
         budget_key = endpoint._preparation_budget_key
         budget_epoch = endpoint._preparation_budget_epoch
+        capture = endpoint.capture
+        attempt = endpoint._start_supplement_attempt()
+        if attempt is None:
+            self.phase = "awaiting_reply"
+            await endpoint._understanding_failed(record_failure=False)
+            return
         reply_context = {}
         if (self._confirmed_final is not None and self._confirmation_origin is not None
                 and self._boundary_final is not None
@@ -1561,6 +1606,16 @@ class SpokenSupplementConfirmation:
                 # and the full final/revision must pass the commit fence.
                 reply_context = {"prior_confirmation": True, "preceding_text": preceding,
                                  "question": self._reply_question}
+                if self._confirmation_proof is not None:
+                    reply_context["prior_confirmation_proof"] = self._confirmation_proof
+        correction_identity = (endpoint.capture, endpoint.revision, budget_epoch,
+            endpoint._identity(final), endpoint._identity(self._boundary_final),
+            self._reply_question, self._confirmation_proof)
+        if self._supplement_correction == correction_identity:
+            reply_context["correction_reason"] = "invalid_json_object"
+        # A continuation is consumed before I/O and can never become an inner
+        # retry loop. The endpoint retains the original two-call allowance.
+        self._supplement_correction = None
         try:
             decision = await endpoint._infer(
                 endpoint.capture.classify_supplement_reply(reply, final=final,
@@ -1570,20 +1625,36 @@ class SpokenSupplementConfirmation:
         except Exception as exc:
             self.phase = "awaiting_reply"
             if getattr(exc, "code", None) == "TURN_DECISION_STALE":
+                # A model call cancelled by newer audio still used its slot.
+                # It grants no authority; old epochs/captures cannot charge
+                # a new explicit retry or replacement recording.
+                if endpoint.capture is capture and not endpoint._closed:
+                    endpoint._record_preparation_failure(attempt)
                 raise
+            endpoint.assert_current()
             if (endpoint._preparation_budget_key != budget_key
                     or endpoint._preparation_budget_epoch != budget_epoch):
                 return
             endpoint.trace("supplement_classification_failed", error_type=type(exc).__name__,
                            cause_code=getattr(exc, "code", "supplement_classification_invalid"))
-            await endpoint._understanding_failed()
+            if (isinstance(exc, ProviderError) and exc.retryable and exc.code == "provider_schema_invalid"
+                    and exc.details.get("json_failure_kind") == "invalid_json_object"
+                    and exc.details.get("json_decode_reason") == "non_object"):
+                self._supplement_correction = correction_identity
+            endpoint._record_preparation_failure(attempt, problem=exc)
+            await endpoint._understanding_failed(record_failure=False)
             return
         except BaseException:
             self.phase = "awaiting_reply"
+            if endpoint.capture is capture and not endpoint._closed:
+                endpoint._record_preparation_failure(attempt)
             raise
         if endpoint._prepare_failures:
             await endpoint._notify("supplement_awaiting_reply")
+            endpoint.assert_current()
         action = decision["intent"]
+        if action not in {"finish", "confirmation_unchanged"} or decision["confidence"] < .75:
+            self._confirmation_proof = None
         endpoint.trace("supplement_decided", intent=action, confidence=decision["confidence"],
                        revision=endpoint.revision, text=reply)
         _LOG.info("supplement_reply_decided intent=%s confident=%s", action, decision["confidence"] >= 0.75)
@@ -1591,7 +1662,7 @@ class SpokenSupplementConfirmation:
             self.phase = "listening"
             if not await self._semantic_turn(endpoint, final, supplement_reply=True):
                 await self._say(endpoint, "clarify", afterwards="awaiting_reply")
-        elif action == "finish" and decision["confidence"] >= 0.75:
+        elif action in {"finish", "confirmation_unchanged"} and decision["confidence"] >= 0.75:
             await self._accept_finish(endpoint, final, reply_text=reply, decision=decision)
         elif action in {"continue", "supplement"} and decision["confidence"] >= 0.75:
             self.confirmed = False
@@ -1617,7 +1688,8 @@ class SpokenSupplementConfirmation:
                         "audio_problem", "transcript_correction", "wait", "off_topic"} and decision["confidence"] >= 0.75:
             from app.core.prompt.supplement_reply import SUPPLEMENT_REPLY_VERSION
             await self._respond_reception(endpoint, final, reply,
-                {**decision, "kind": action}, reply_prompt_version=SUPPLEMENT_REPLY_VERSION)
+                {**decision, "kind": action},
+                reply_prompt_version=decision.get("reply_prompt_version", SUPPLEMENT_REPLY_VERSION))
         else:
             self.confirmed = False
             self._confirmed_final = None
@@ -1640,6 +1712,18 @@ class SpokenSupplementConfirmation:
             prepared = confirm_prepared(self._prepared_answer, self._prepared_answer_final,
                 self._boundary_final, final, reply_text=reply_text, decision=decision,
                 question_delivered=self._supplement_question_delivered)
+        if (decision is not None and decision["intent"] == "confirmation_unchanged"
+                and (decision.get("completion_proof") is None or prepared is None)):
+            # This is not new completion consent. Only the source-verified
+            # composer can carry the previous fact across a fresh final.
+            self.confirmed = False
+            self._confirmation_proof = None
+            self._confirmed_final = self._confirmed_reused_prepared = None
+            self._remember_boundary(final)
+            await self._say(endpoint, "clarify", afterwards="awaiting_reply")
+            return
+        if decision is not None:
+            self._confirmation_proof = decision.get("completion_proof")
         if self._confirmed_final is None:
             self._confirmation_origin = (self.boundary, self._boundary_final)
         self.confirmed = True

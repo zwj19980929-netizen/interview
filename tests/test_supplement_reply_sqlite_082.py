@@ -61,12 +61,14 @@ class _Gateway:
     async def invoke(self, capability, request):
         self.requests.append(request)
         version = request.metadata["prompt_version"]
-        if version in {"supplement_reply.v5", "supplement_reply.v6"}:
+        if version in {"supplement_reply.v5", "supplement_reply.v6", "supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10"}:
             self.timeline.append("classify_reply")
             data = {"intent": "finish", "confidence": .96,
                     "evidence_id": request.json_schema["properties"]["evidence_id"]["enum"][-1]}
-            if version == "supplement_reply.v6":
+            if version in {"supplement_reply.v6", "supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10"}:
                 data["reply_text"] = ""
+            if version in {"supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10"}:
+                data["answer_effect"] = "updated"
         else:
             confirmed = version == "interview_turn_understanding.v121"
             self.timeline.append("confirmed_prepare" if confirmed else "unconfirmed_prepare")

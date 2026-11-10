@@ -134,6 +134,7 @@ class AnswerEndpoint:
         self._preparation_budget_epoch = 0
         self._preparation_budget_key = ""
         self._preparation_failures_by_evidence: dict[str, int] = {}
+        self._supplement_calls: dict[tuple, int] = {}
         self._preparation_failure_notice_pending = False
         self._last_server_transcript = ""
         self._interaction_text = ""
@@ -287,6 +288,13 @@ class AnswerEndpoint:
         self._invalidate_answer_corrections()
         self._model_budgets.clear()
         self.speech_started()
+        if self.confirmation is not None:
+            # Continuing withdraws the old completion fact, unlike processing
+            # retry. An unchanged final must not restore that old permission.
+            self.confirmation._confirmation_proof = None
+            self.confirmation._confirmed_final = None
+            self.confirmation._confirmation_origin = None
+            self.confirmation._confirmed_reused_prepared = None
         if self.confirmation is not None and not self.confirmation.speaking:
             if (not getattr(self.confirmation, "_exit_waiting", False)
                     and not (retrying and self.confirmation.phase == "awaiting_reply")):
@@ -1312,6 +1320,7 @@ class AnswerEndpoint:
     def _reset_preparation_budget(self) -> None:
         self._preparation_budget_epoch += 1
         self._preparation_failures_by_evidence.clear()
+        self._supplement_calls.clear()
         self._prepare_failures = 0
         self._preparation_terminal = self._terminal_provider_failure
         self._recovery_retryable = not self._terminal_provider_failure
@@ -1320,6 +1329,17 @@ class AnswerEndpoint:
         self._retry_at = 0
         self._blocked_revision = None
         self._blocked_preview = None
+
+    def _start_supplement_attempt(self) -> Optional[_PreparationAttempt]:
+        """Debit a same-capture/words call before I/O; cancellation never refunds it."""
+        key = (id(self.capture), self._preparation_budget_key)
+        used = self._supplement_calls.get(key, 0)
+        if used >= _MAX_PREPARATION_FAILURES:
+            self._record_preparation_failure(problem=SimpleNamespace(
+                source="schema_or_content", reason_code="call_budget_exhausted", retryable=False))
+            return None
+        self._supplement_calls[key] = used + 1
+        return _PreparationAttempt(self._preparation_budget_epoch, self._preparation_budget_key)
 
     def _record_preparation_failure(self, attempt: Optional[_PreparationAttempt] = None, *, problem: Any = None,
                                     interaction_expired: bool = False) -> None:
@@ -1346,7 +1366,8 @@ class AnswerEndpoint:
         allowed = {"call_budget_exhausted", "provider_timeout", "provider_auth_failed", "provider_billing_required",
                    "provider_rate_limited", "provider_circuit_open", "provider_unavailable"}
         self._recovery_reason = (
-            "invalid_result" if getattr(problem, "source", None) == "schema_or_content" else
+            "invalid_result" if (getattr(problem, "source", None) == "schema_or_content"
+                                 or isinstance(problem, ProviderError) and problem.code == "provider_schema_invalid") else
             reason if reason in allowed else
             "timeout" if interaction_expired or isinstance(problem, asyncio.TimeoutError) else "unavailable"
         )

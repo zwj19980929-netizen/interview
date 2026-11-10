@@ -39,7 +39,7 @@ def _dialogue_provider(monkeypatch, *, ending, misread_fast_finish=False):
             value = json.loads(request.messages[-1].content)
             assert value["reply"] == _SUPPLEMENT_REPLY
             evidence_id = next(key for key, text in value["evidence"].items() if text == _SUPPLEMENT_REPLY)
-            data = {"intent": "finish", "confidence": .98, "evidence_id": evidence_id,
+            data = {"intent": "finish", "answer_effect": "unchanged", "confidence": .98, "evidence_id": evidence_id,
                     "reply_text": ""}
             calls.append({"stage": "supplement", "current_speech": value["reply"]})
         elif version.startswith("conversation_reception."):

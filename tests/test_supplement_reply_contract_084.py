@@ -16,7 +16,8 @@ from app.services.conversation_understanding import ConversationUnderstandingSer
 
 def _response(intent="question_clarification", **changes):
     return {"intent": intent, "confidence": .95, "evidence_id": "E1",
-            "reply_text": "这个术语通常指一种任务队列。", **changes}
+            "reply_text": "这个术语通常指一种任务队列。",
+            "answer_effect": "updated" if intent == "supplement" else "unchanged", **changes}
 
 
 def test_contract_has_one_route_and_only_fresh_utterance_evidence():
@@ -27,7 +28,7 @@ def test_contract_has_one_route_and_only_fresh_utterance_evidence():
             "history": [{"role": "interviewer", "text": "已播出的解释。", "delivery_status": "delivered"},
                         {"role": "interviewer", "text": "未播出的私有说明。", "delivery_status": "selected"}],
             "rubric": "private-rubric-sentinel", "standard_answer": "private-answer-sentinel"}})
-    assert contract.version == "supplement_reply.v6"
+    assert contract.version == "supplement_reply.v9"
     context = json.loads(contract.messages[-1].content)
     assert context["evidence"] == {"E1": "这个术语是什么？"}
     assert context["stage"] == "awaiting_reply"
@@ -95,7 +96,7 @@ async def test_one_bounded_call_restores_fresh_evidence_and_validates_before_ret
     assert calls[0].execution_budget.max_provider_retries == 0
     assert calls[0].execution_budget.max_provider_attempts == 1
     assert calls[0].max_output_tokens == 350
-    assert result == {"intent": "question_clarification", "confidence": .95,
+    assert result == {"intent": "question_clarification", "confidence": .95, "answer_effect": "unchanged",
         "evidence_quote": "这个术语是什么？", "reply_text": "这个术语通常指一种任务队列。", "repeat_target": None}
 
 

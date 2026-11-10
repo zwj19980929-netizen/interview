@@ -84,6 +84,12 @@ class PreparedCompletionReceipt:
     question_act_id: str
 
 
+@dataclass(frozen=True)
+class SemanticPreparedCompletionReceipt(PreparedCompletionReceipt):
+    """A whole new reply was checked by the live evidence chain, not a regex."""
+    proof: Any
+
+
 class InterviewService:
     """Transactional orchestration behind the InterviewSession lifecycle seam."""
 
@@ -1735,7 +1741,8 @@ class InterviewService:
         fresh understanding rather than silently inheriting the old decision.
         """
         if (question_delivered is not True or not isinstance(decision, dict)
-                or decision.get("intent") != "finish"
+                or decision.get("intent") not in {"finish", "confirmation_unchanged"}
+                or ("answer_effect" in decision and decision["answer_effect"] != "unchanged")
                 or type(decision.get("confidence")) not in {float, int}
                 or not .75 <= decision["confidence"] <= 1):
             return None
@@ -1746,14 +1753,31 @@ class InterviewService:
             question = self._delivered_supplement_question(session, turn)
             if question is None:
                 return None
-            receipt = PreparedCompletionReceipt(
-                source=prepared, base_final=base_final.model_copy(deep=True),
-                boundary_final=delivered_boundary_final.model_copy(deep=True),
-                reply_text=reply_text, confidence=minimum_reported_confidence(
-                    float(decision["confidence"]), final.confidence,
-                    *(item.confidence for item in final.segments[len(base_final.segments):])),
-                question_act_id=question,
-            )
+            proof = decision.get("completion_proof")
+            if proof is not None:
+                from app.services.supplement_completion_proof import completion_proof_record, proof_boundary
+                record = completion_proof_record(proof, final=final, capture_binding=prepared.capture_binding)
+                if prepared.capture_binding is None:
+                    return None
+                # The live owner is checked outside any repository transaction.
+                prepared.capture_binding._assert_commit_allowed()
+                receipt = SemanticPreparedCompletionReceipt(
+                    source=prepared, base_final=base_final.model_copy(deep=True),
+                    boundary_final=proof_boundary(record), reply_text=record.finish_evidence,
+                    confidence=minimum_reported_confidence(record.confidence, final.confidence,
+                        *(item.confidence for item in final.segments[len(base_final.segments):])),
+                    question_act_id=question, proof=proof)
+            else:
+                if decision.get("intent") != "finish":
+                    return None
+                receipt = PreparedCompletionReceipt(
+                    source=prepared, base_final=base_final.model_copy(deep=True),
+                    boundary_final=delivered_boundary_final.model_copy(deep=True),
+                    reply_text=reply_text, confidence=minimum_reported_confidence(
+                        float(decision["confidence"]), final.confidence,
+                        *(item.confidence for item in final.segments[len(base_final.segments):])),
+                    question_act_id=question,
+                )
             payload = self._streaming_prepared_payload(final)
             understanding = self._compose_supplement_understanding(receipt, final.text.strip())
             composed = replace(prepared, text=final.text.strip(), understanding=understanding,
@@ -1826,7 +1850,8 @@ class InterviewService:
                 or understanding.suggested_action not in {"accept", "followup", "next", "continue_listening"}
                 or understanding.ambiguities or understanding.contradictions
                 or understanding.clarification_target is not None
-                or not pure_completion_reply(receipt.reply_text)):
+                or (not isinstance(receipt, SemanticPreparedCompletionReceipt)
+                    and not pure_completion_reply(receipt.reply_text))):
             raise ValueError("Preparation cannot be composed with a control reply")
         data = understanding.model_dump(mode="json")
         data.update(understanding_id=understanding_id or new_id("understanding"),
@@ -1852,6 +1877,26 @@ class InterviewService:
         boundary_payload = self._streaming_prepared_payload(receipt.boundary_final)
         expected = self._compose_supplement_understanding(receipt, str(payload["final_transcript"]).strip(),
             understanding_id=prepared.understanding.understanding_id, created_at=prepared.understanding.created_at)
+        unchanged = unchanged_answer_prefix(base_payload, payload, receipt.reply_text)
+        if isinstance(receipt, SemanticPreparedCompletionReceipt):
+            from app.services.supplement_completion_proof import completion_proof_record, proof_final
+            from app.services.prepared_answer_completion import unchanged_source_prefix
+            from app.services.supplement_context import supplement_context
+            record = completion_proof_record(receipt.proof, capture_binding=source.capture_binding)
+            delivered = supplement_context(session, turn)
+            question_identity = tuple(delivered.get(key) for key in
+                                      ("question_act_id", "selection_event_id", "performance_id"))
+            whole_reply = str(payload["final_transcript"]).strip()[len(source.text):].strip()
+            unchanged = (source.capture_binding is not None
+                and record.context_fingerprint == self._prepared_context_fingerprint(session, turn)
+                and record.question_identity == question_identity
+                and record.finish_evidence == receipt.reply_text
+                and receipt.confidence == minimum_reported_confidence(record.confidence,
+                    payload.get("stt_confidence"), *(item.get("confidence") for item in
+                    payload.get("transcript_segments", [])[len(receipt.base_final.segments):]))
+                and self._prepared_stt_fingerprint(self._streaming_prepared_payload(proof_final(record)))
+                    == self._prepared_stt_fingerprint(payload)
+                and unchanged_source_prefix(base_payload, payload, whole_reply))
         valid = (source.interview_id == session["id"] and source.turn_id == turn["id"]
                  and prepared.completion_confirmed and prepared.semantic_first
                  and prepared.capture_binding is source.capture_binding
@@ -1860,7 +1905,7 @@ class InterviewService:
                  and source.stt_fingerprint == self._prepared_stt_fingerprint(boundary_payload)
                  and source.supplement_context_fingerprint == self._supplement_context_fingerprint(session, turn)
                  and receipt.question_act_id == self._delivered_supplement_question(session, turn)
-                 and unchanged_answer_prefix(base_payload, payload, receipt.reply_text)
+                 and unchanged
                  and prepared.followup == source.followup
                  and prepared.understanding == expected)
         if not valid:
@@ -2101,6 +2146,7 @@ class InterviewService:
     ) -> None:
         """Side-effect-free preflight before the capture is detached or sealed."""
         self._require_streaming_final(final)
+        self._assert_semantic_completion_owner(prepared)
         session = self.get_interview(prepared.interview_id, organization_id)
         turn = self.lifecycle.require_active_turn(session, prepared.turn_id, allowed_statuses=("asking",))
         self._assert_prepared_decision(prepared, session, turn, {
@@ -2112,6 +2158,22 @@ class InterviewService:
             "transcript_source": "server_streaming",
         })
 
+    @staticmethod
+    def _assert_semantic_completion_owner(prepared: PreparedTurnDecision) -> Any:
+        """Run external ownership guards before entering the effect transaction."""
+        receipt = getattr(prepared, "completion_receipt", None)
+        if not isinstance(receipt, SemanticPreparedCompletionReceipt):
+            return None
+        from app.services.supplement_completion_proof import completion_proof_record
+        try:
+            record = completion_proof_record(receipt.proof, capture_binding=prepared.capture_binding)
+            if prepared.capture_binding is None:
+                raise ValueError("Missing capture")
+        except (ValueError, TypeError):
+            raise ApiError("TURN_DECISION_STALE", "Supplement evidence changed.", status_code=409) from None
+        record.capture_binding._assert_commit_allowed()
+        return record.capture_binding.commit_fence
+
     async def submit_streaming_answer(
         self,
         interview_id: str,
@@ -2122,6 +2184,11 @@ class InterviewService:
         prepared_decision: Optional[PreparedTurnDecision] = None,
     ) -> Dict[str, Any]:
         """Accept only a validated provider final from the server-side stream module."""
+        semantic_fence = self._assert_semantic_completion_owner(prepared_decision)
+        if semantic_fence is not None:
+            if evidence_fence is not None and evidence_fence != semantic_fence:
+                raise ApiError("TURN_DECISION_STALE", "Supplement owner changed.", status_code=409)
+            evidence_fence = semantic_fence
         provider = payload.get("provider") or {}
         if not payload.get("final_transcript") or not provider.get("provider_id"):
             raise ApiError(

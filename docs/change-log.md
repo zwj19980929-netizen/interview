@@ -2,6 +2,30 @@
 
 本文件记录所有会修改仓库内容的工作项。只读检查不单独登记；同一目标下的代码、测试、迁移和文档修改合并为一个工作项。状态使用 `in_progress`、`verified`、`failed` 或 `cancelled`，历史条目只追加或补充结果，不删除。
 
+## 2026-11-10 · SEMANTIC-TAIL-CONTINUITY-096
+
+- 状态：`in_progress`。
+- 授权与基线：用户反馈iv_25676feea56e4a06完整技术回答、明确说完后追加无关闲聊仍出现处理重试，要求按语义处理噪音。沿用本会话修复、Git回退、验证和仅空闲加载授权；首次修改前工作区干净，已提交基线6888d02（实现d1778f4）保留，按入口顺序复核11份文档及064/068/087相关设计。截图只证明混合发言与重试同时出现，尚不能直接认定闲聊是异常唯一原因；先核对实际调用和送达时间线。
+- 实施边界：完整录音和原始转写保留，累计技术证据与后续交流意图分离；无关尾句不应抹掉有效作答，真正补充、改口、纠错、提问、暂停和退出不能作为噪音丢弃。不用关键词截断或客户端文字生成答案，不放宽来源、补充确认、owner/controller及最终提交门禁，不自动重放/补交/跳题/结束真实场次。新增Prompt/Schema须集中版控并增加合同和混合语义反例；供应商失败与语义噪音分别诊断。所有源码、测试、文档和运行操作均在本项记录，活动面试不重启。
+- 实际事故：14:31:36Z原技术理解成功，补充问题14:31:45Z已可信完整送达，14:31:53Z对截图原句“我已经说完了。太搞笑了吧。”分类finish/.95；完整13字及尾句6字与安全日志SHA精确一致，只比对截图给定文本、未枚举猜测。078的pure_completion_reply对该混合回复为false、仅完成句为true，已足以拒绝旧理解复用并触发额外v152调用；是否还有来源metadata不一致缺少证据。14:32:00Z新audio撤销confirmed，额外理解14:32:05Z取消。14:32:17Z/21Z补充分类v6两次请求哈希相同，均返回合法JSON但顶层不是对象（non_object，80字符/31 tokens、finish=stop），不是截断或模型超时；不存正文，无法判定顶层具体类型。095只恢复listening，此处awaiting_reply未获恢复提示。
+- 实施方向：在集中小合同中明确新回复对已准备回答的影响，以服务端签发、完整来源和实际送达绑定的语义证明支持“完成语+非回答附言”及已确认后纯附言，原078封闭短句兼容不放宽。VAD继续先冻结执行许可，真正新权威文本语义验证后再决定是否恢复。补充分类仍最多两次，剩余一次针对实际固定格式原因纠错，失败后提供一次同题澄清而非把失败当结束。
+- 独立音频现象：14:31:45Z可选S2S输入队列溢出已隔离，之后权威STT仍成功final/切流，不能视为直接卡死识别。14:33:29Z权威发送积压；其后3次新流握手成功但同一尾段回放未在原15秒恢复期限完成，14:34:15Z耗尽。缺发送进度/队列水位，尚不能确定网络、供应商吞吐或回放耗时，不宣称与语义噪音同一根因。调查时86段已封存PCM、7171840字节、1题/0正式答案，capture未完整关闭；只读调查没有恢复或补交该场。
+
+
+- 实施进展：新增v7语义影响合同及v8同证据格式纠错、进程内不透明语义证明与独立组合收据，保留078纯控制路径和完整原文。初始核心红测3失败/3通过；adapter纠错红测22失败/4通过，均先证明旧接口缺失。版本升级的9份旧fixture按实际语义增加answer_effect并保留v1–v6分支，合同/SQLite/交流等两组193项通过。运行时已补awaiting_reply恢复、一次提示的完整播放授权及取消/零音频/新输入/通知竞态；旧测试两例因未模拟新增提示实际播完而失败，补可信播放后保持原额度断言。交叉审查追加取消不退实际调用额度、v8接话版本留痕、显式updated/uncertain不得被旧纯控制路径覆盖等反例，最终完整回归待冻结。
+- 加载准备只读核验：当前API44501/worker44502，媒体配置仍dcbaf54ac496b9217094dae97dfcd6b2ffec665d23f934bfaae2895c5ecefb0f。82场、0有效owner/0命令/0未完成work、LiveKit 0房间/参与者/活跃Egress，但1份capture仍recording导致原严格预检停止，未发任何进程信号。精确只读查询media_capture_5182068697374651对应EG_73Hvw4DHWyeE为EGRESS_COMPLETE、room匹配、结束时间存在且无错误；该原始行SHA4e74d3887724dbe645dee234ab7456c9ba915ebcb349f093878618c61fcd465c。临时加载脚本只接受此行原样且再次实时验证该Egress终态，未知/变化行仍阻断；不调用StopEgress或恢复API、不改录制状态，加载前后同时核验全部capture文档SHA。隔离22项通过；前两次隔离失败分别为旧未知capture测试触发新增证明分支、旧PID断言未迁移，已修复前者仅精确候选行才查询证明，并更新后者常量。补独立终态负例和审查后才可执行。
+
+
+- 首轮完整回归：冻结613文件/237后端源码SHA843eb192bc87d72cb2afc5054602e40e6b7fdcd13bc0c205254e0ace01d6e6c7后，9 failed/5048 passed/8 skipped（298.27秒）。5例为064/085旧模拟补充结果缺新增answer_effect，各补1字段且保留原commit/claims/生命周期断言；2文件22通过。059的4例原先期望裸prior_confirmation标志直接传真，按096服务端证明合同改为false，capture/owner失效前后校验断言全部保留，5项通过。未生成发布证明；失败日志和冻结源分别保留为interviewer-096-backend-first-full.log、first-tested-source.json。
+- 首轮真实语义验收：6条虚构输入各1次调用（v7四条/v8两条），全部只读配置后转内存，不写业务DB。混合结束回复finish+unchanged、真实技术补充supplement+updated通过；已确认后的纯附言被标off_topic+unchanged、转写争议被标transcript_correction+unchanged不符合事前预期；退出和等待两条返回non_object（41/50 tokens、finish=stop、350上限），严格拒绝。整体2/6通过，不能改预期追认成功。前两次临时脚本在journal创建与LLM调用前失败：误把worker PID作为API listener核验，修为identity(API_PID, signatures)且仍核对双进程，隔离模拟通过后才真正执行6次。原结果interviewer-096-supplement-model-probe-result.json完整保留。
+- 真实发现后的修正：v7将普通off_topic与已有确认后的附言同时允许、没有明确优先级；answer_effect原定义也未规定尚未给出替换内容的转写投诉。新增v9/v10集中规则明确有有效前次确认且无新请求的附言必须confirmation_unchanged；未解转写争议为uncertain、明确技术纠正为updated，严格拒绝transcript_correction+unchanged。新增红例2失败/2通过，先更新API/领域后实现。早期v7/v8审计保持；另准备最多2次新版本虚构复验，不重复退出/等待请求追求全绿。此轮附言场景的stage固定为真实新尾句链路awaiting_reply、prior_confirmation=true，原轮为confirmed，不冒充单变量对照或真人验收。
+
+
+- 最终候选复验：v9/v10两条虚构真实模型调用各一次均通过：已确认后附言为confirmation_unchanged+unchanged/.95，未解决转写争议为transcript_correction+uncertain/.95；无业务写入，结果保留interviewer-096-supplement-model-probe-v9-v10-result.json，不能据此覆盖首轮2/6结果或宣称供应商格式失败消失。候选613文件/237后端SHA0cc4a926ee6bf2f38d10f97a70a2e4fe946b7424e1e507aebfc806c24ce71f69启动完整回归；独立审查随后在合成内存场景复现“继续补充”只清proof却保留旧confirmed_final/reused_prepared，失败恢复后同final可重新确认。须补红例并撤销旧完成事实，保留原技术准备及独立手动重试语义；此轮不能作为最终发布证明，原回归和探针证据保留。
+- 第二轮回归已中止：核对临时runner50811及其pytest50814身份后只向测试发送INT；未退出，再以TERM正常结束pytest，exit-15、runner exit1。API44501/worker44502未操作。日志与冻结快照保留为interviewer-096-backend-second-interrupted.log、second-tested-source.json，不生成验收证明；窄修后重新冻结完整回归。
+- 显式继续修正：新增对照红例1失败/1通过；continue_speaking清旧confirmed_final、confirmation_origin、confirmed_reused_prepared及proof，保留原技术准备、录音和已送达问题，独立retry_answer_processing仍可复用有效确认。首个定向命令含不存在的测试文件，exit4/未运行，纠正后6文件95通过；新096运行时共26项。最终重新冻结613文件/237后端SHAa121dfadf6b1860f158a3d41b5d052c0c7d4ba94cb6375b4a5dd101364b077cb。真实两条探针基于前一候选SHA，最终仅显式继续撤销逻辑/对照测试变化、v9/v10合同不变；不追加真实调用或将其冒称最终全源码验收。
+- 最终仓库验证：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q`为5066 passed /8 skipped /276.49秒；`npm test -- --reporter=dot`为26文件580项通过；`npm run build -- --outDir /private/tmp/interviewer-096-web-dist`通过，保留既有大bundle提醒。613文件集合/内容与冻结值一致，237后端SHA保持a121dfadf6b1860f158a3d41b5d052c0c7d4ba94cb6375b4a5dd101364b077cb。测试产物原子发布并保留66份历史assets，生成runtime-release-tests.v5证明interviewer-096-test-attestation.json。独立审查无剩余阻断；438处本地文档链接及diff检查通过。代码尚未加载，准备保存Git实现提交后即时空闲核验。
+- 实际修改范围：生产10文件为supplement_reply集中Prompt/校验、gateway版本审计、mock合同、answer_endpoint、conversation_understanding、interview_evidence、interviews、prepared_answer_completion、spoken_supplement及新supplement_completion_proof。新增3份096合同/真实adapter隔离/运行时回归，迁移13份旧测试的版本、effect与服务端证明语义，保留原业务断言；同步架构/API/领域/检索评分/供应商/存储/问题/进度/路线图/本日志10份文档。无新公共API、持久表、DDL或模型路由变更；原始候选录音转写及历史回答不修改。
 
 ## 2026-11-10 · ANSWER-CONTINUITY-AND-STT-REPAIR-095
 

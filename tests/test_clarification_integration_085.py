@@ -52,7 +52,7 @@ class _Gateway:
     async def invoke(self, capability, request):
         self.requests.append(request)
         if request.metadata["prompt_version"].startswith("supplement_reply."):
-            data = {"intent": "finish", "confidence": .96, "reply_text": "",
+            data = {"intent": "finish", "answer_effect": "unchanged", "confidence": .96, "reply_text": "",
                     "evidence_id": request.json_schema["properties"]["evidence_id"]["enum"][-1]}
         else:
             text = request.metadata["transcript"]

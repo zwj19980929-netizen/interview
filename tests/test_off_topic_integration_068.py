@@ -56,13 +56,15 @@ def _provider(monkeypatch, *, technical=False, relevant=False, stop=False, incon
             data = {"intent": "confirm", "confidence": .98,
                     "evidence_quote": list(understanding_references(reply, [])["evidence"].values())[-1]}
             calls.append(("exit", reply))
-        elif version in {"supplement_reply.v5", "supplement_reply.v6"}:
+        elif version in {"supplement_reply.v5", "supplement_reply.v6", "supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10"}:
             reply = json.loads(request.messages[-1].content)["reply"]
             if reply != SUPPLEMENT_REPLY:
                 return await original(provider, capability, request, context)
             data = {"intent": "finish", "confidence": .98, "evidence_id": "E1"}
-            if version == "supplement_reply.v6":
+            if version in {"supplement_reply.v6", "supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10"}:
                 data["reply_text"] = ""
+            if version in {"supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10"}:
+                data["answer_effect"] = "unchanged"
             calls.append(("supplement", reply))
         elif version.startswith(("interview_turn_understanding.", "interview_turn_decision.")):
             transcript = request.metadata["transcript"]

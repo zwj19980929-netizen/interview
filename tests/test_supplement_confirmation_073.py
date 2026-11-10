@@ -35,7 +35,8 @@ class Capture(_Capture):
     async def classify_supplement_reply(self, reply, **kwargs):
         self.replies.append(reply)
         return {"intent": "finish" if reply.endswith(FINISH) else "supplement",
-                "confidence": .98, "evidence_quote": reply}
+                "confidence": .98, "evidence_quote": reply,
+                "answer_effect": "unchanged" if reply.endswith(FINISH) else "updated"}
 
 
 def setup(**kwargs):
@@ -238,7 +239,7 @@ async def test_uncertain_reply_does_not_spend_full_analysis_or_grant_completion(
 
         async def uncertain(words, **kwargs):
             endpoint.capture.replies.append(words)
-            return {"intent": "unclear", "confidence": .9, "evidence_quote": words,
+            return {"intent": "unclear", "confidence": .9, "evidence_quote": words, "answer_effect": "uncertain",
                     "reply_text": "我想先确认一下，你刚才是希望我怎么配合？", "repeat_target": None}
 
         endpoint.capture.classify_supplement_reply = uncertain
@@ -277,9 +278,11 @@ async def test_supplement_exit_request_routes_real_audio_to_separate_exit_confir
             return response
         version = request.metadata.get("prompt_version", "")
         data = deepcopy(response.data)
-        if version in {"supplement_reply.v5", "supplement_reply.v6"}:
+        if version in {"supplement_reply.v5", "supplement_reply.v6", "supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10"}:
             requests.append("supplement")
             data.update(intent="stop_interview", confidence=.95, reply_text="")
+            if version in {"supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10"}:
+                data["answer_effect"] = "unchanged"
         elif version.startswith(("interview_turn_understanding.", "interview_turn_decision.")):
             requests.append("understanding")
             text = request.metadata["transcript"]

@@ -419,7 +419,9 @@ class InterviewEvidenceChain:
 
     async def classify_supplement_reply(self, reply: str, *, prior_confirmation: bool = False,
                                         preceding_text: str = "", question: str = "",
-                                        final: Any = None, boundary_final: Any = None) -> Any:
+                                        final: Any = None, boundary_final: Any = None,
+                                        prior_confirmation_proof: Any = None,
+                                        correction_reason: Optional[str] = None) -> Any:
         stream = self._stt
         if stream is None or self._input_revoked:
             raise ApiError("AGENT_EVIDENCE_NOT_OPEN", "Evidence is not open.", status_code=409)
@@ -447,11 +449,45 @@ class InterviewEvidenceChain:
         context, delivered_question, context_fingerprint = self._supplement_dialogue_context(stream)
         if final is not None and context["stage"] != "awaiting_reply":
             raise ApiError("TURN_DECISION_STALE", "Supplement question has not been delivered.", status_code=409)
-        result = await stream.interviews.conversation.classify_supplement_reply(
-            reply, self.organization_id, prior_confirmation=prior_confirmation,
-            preceding_text=preceding_text, question=delivered_question or question,
-            conversation_context=context,
-        )
+        from app.services.supplement_completion_proof import completion_proof_record, issue_completion_proof
+        from app.services.supplement_context import supplement_context
+        session = stream.interviews.get_interview(self.interview_id, self.organization_id)
+        turn = next(item for item in session["turns"] if item["id"] == stream.turn_id)
+        delivered = supplement_context(session, turn)
+        question_identity = tuple(delivered.get(key) for key in
+                                  ("question_act_id", "selection_event_id", "performance_id"))
+        verified_prior = False
+        if prior_confirmation_proof is not None and boundary_final is not None:
+            try:
+                prior = completion_proof_record(prior_confirmation_proof, final=boundary_final,
+                                                capture_binding=stream)
+                verified_prior = (prior.context_fingerprint == context_fingerprint
+                                  and prior.question_identity == question_identity)
+            except ValueError:
+                pass
+        failure_identity = (stream, generation, recognizer, frozen_evidence, context_fingerprint,
+                            prior_confirmation_proof if verified_prior else None)
+        correction = ("invalid_json_object" if correction_reason == "invalid_json_object"
+                      and getattr(self, "_supplement_reply_failure", None) == failure_identity else None)
+        self._supplement_reply_failure = None
+        try:
+            result = await stream.interviews.conversation.classify_supplement_reply(
+                reply, self.organization_id, prior_confirmation=verified_prior,
+                preceding_text=preceding_text, question=delivered_question or question,
+                conversation_context=context, correction_reason=correction,
+            )
+        except Exception as exc:
+            from app.model_gateway.errors import ProviderError
+            if (isinstance(exc, ProviderError) and exc.code == "provider_schema_invalid" and exc.retryable
+                    and exc.details.get("json_failure_kind") == "invalid_json_object"
+                    and exc.details.get("json_decode_reason") == "non_object"
+                    and stream is self._stt and not self._input_revoked
+                    and stream.turn_id == turn_id and stream._capture_generation == generation
+                    and stream.stream is recognizer and evidence_identity() == frozen_evidence):
+                stream._assert_commit_allowed()
+                if self._supplement_dialogue_context(stream)[2] == context_fingerprint:
+                    self._supplement_reply_failure = failure_identity
+            raise
         if (stream is not self._stt or self._input_revoked or stream.turn_id != turn_id
                 or stream._capture_generation != generation or stream.stream is not recognizer
                 or evidence_identity() != frozen_evidence):
@@ -459,6 +495,35 @@ class InterviewEvidenceChain:
         stream._assert_commit_allowed()
         if self._supplement_dialogue_context(stream)[2] != context_fingerprint:
             raise ApiError("TURN_DECISION_STALE", "Conversation changed.", status_code=409)
+        from app.core.prompt.supplement_reply import SUPPLEMENT_REPLY_VERSION, SUPPLEMENT_REPLY_CORRECTION_VERSION
+        result = {**result, "reply_prompt_version": (SUPPLEMENT_REPLY_CORRECTION_VERSION
+                  if correction is not None else SUPPLEMENT_REPLY_VERSION)}
+        if final is not None and boundary_final is not None and all(question_identity):
+            import weakref
+            chain_reference, stream_reference = weakref.ref(self), weakref.ref(stream)
+            try:
+                recognizer_reference = weakref.ref(recognizer)
+            except TypeError:
+                # Tiny synthetic recognizers may lack weakref support. Real
+                # continuous recognizers use the weak reference above.
+                recognizer_reference = lambda: recognizer
+            def proof_current():
+                # Durable ownership is checked by the normal chain/preflight
+                # and commit transaction. This local check also works while
+                # the same stream is detached for its final atomic commit.
+                chain, live = chain_reference(), stream_reference()
+                attached = chain is not None and live is not None and live is chain._stt
+                finishing = chain is not None and chain._finishing and chain._stt is None
+                if (chain is None or live is None or chain._input_revoked or not (attached or finishing)
+                        or live.turn_id != turn_id or live._capture_generation != generation
+                        or live.stream is not recognizer_reference()):
+                    raise ValueError("Supplement capture changed")
+            proof = issue_completion_proof(result, final=final, boundary_final=boundary_final,
+                reply=reply, capture_binding=stream, question_identity=question_identity,
+                context_fingerprint=context_fingerprint, assert_current=proof_current,
+                prior_proof=prior_confirmation_proof if verified_prior else None)
+            if proof is not None:
+                result = {**result, "completion_proof": proof}
         return result
 
     async def classify_exit_reply(self, reply: str) -> Any:

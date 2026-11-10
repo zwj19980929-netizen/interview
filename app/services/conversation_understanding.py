@@ -460,6 +460,7 @@ class ConversationUnderstandingService:
         self, reply: str, organization_id: str, *, prior_confirmation: bool = False,
         preceding_text: str = "", question: str = "",
         conversation_context: Optional[Dict[str, Any]] = None,
+        correction_reason: Optional[str] = None,
     ) -> Dict[str, Any]:
         if not isinstance(reply, str) or not reply.strip() or len(reply) > 100000:
             raise ValueError("A bounded nonempty server reply is required")
@@ -467,6 +468,7 @@ class ConversationUnderstandingService:
             "reply": reply, "prior_confirmation": prior_confirmation,
             "preceding_text": preceding_text, "question": question,
             "conversation_context": conversation_context,
+            "correction_reason": correction_reason,
         })
         response = await self.gateway.invoke(cap.LLM_CHAT_JSON, ChatJSONRequest(
             organization_id=organization_id, purpose="interview_turn_understanding",
@@ -476,7 +478,8 @@ class ConversationUnderstandingService:
             metadata={"prompt_version": contract.version},
         ))
         from app.core.prompt.supplement_reply import validate_supplement_reply
-        return validate_supplement_reply(response.data, contract.response_schema, reply=reply)
+        return validate_supplement_reply(response.data, contract.response_schema, reply=reply,
+                                        prior_confirmation=prior_confirmation)
 
     async def classify_exit_reply(self, reply: str, organization_id: str) -> Dict[str, Any]:
         """Classify fresh authoritative speech after a delivered exit question.

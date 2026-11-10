@@ -69,7 +69,9 @@ async def test_confirmation_context_is_fenced_before_and_after_inference(tmp_pat
         assert len(calls) == 1
         reply, organization, context = calls[0]
         assert (reply, organization) == ("对。", "org_default")
-        assert context["prior_confirmation"] is True
+        # A caller's historical-context flag has no issued completion proof.
+        # Keep all source/owner fences without promoting that flag to fact.
+        assert context["prior_confirmation"] is False
         assert context["preceding_text"] == "我已经说完了。"
         assert context["conversation_context"]["stage"] == "awaiting_reply"
         assert context["conversation_context"]["reply_target"] == "supplement_question"

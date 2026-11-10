@@ -17,6 +17,10 @@ def pure_completion_reply(text):
 
 
 def unchanged_answer_prefix(base, current, reply):
+    return pure_completion_reply(reply) and unchanged_source_prefix(base, current, reply)
+
+
+def unchanged_source_prefix(base, current, reply):
     """Keep original source segments, timing and confidence on a new final.
 
     Continuous capture rotates provider requests. A new request ID is expected,
@@ -25,7 +29,7 @@ def unchanged_answer_prefix(base, current, reply):
     """
     before, after = str(base["final_transcript"]).strip(), str(current["final_transcript"]).strip()
     if (not before or not after.startswith(before) or after[len(before):].strip() != reply
-            or not pure_completion_reply(reply) or base.get("language") != current.get("language")
+            or not isinstance(reply, str) or not reply.strip() or base.get("language") != current.get("language")
             or base.get("transcript_source") != "server_streaming"
             or current.get("transcript_source") != "server_streaming"):
         return False

@@ -55,7 +55,9 @@ class _Gateway:
                 raise self.small_error
             data = {"intent": self.intent, "confidence": self.confidence,
                     "evidence_id": request.json_schema["properties"]["evidence_id"]["enum"][-1],
-                    "reply_text": self.reply_text}
+                    "reply_text": self.reply_text,
+                    "answer_effect": ("updated" if self.intent == "supplement" else "uncertain"
+                                      if self.intent in {"transcript_correction", "unclear"} else "unchanged")}
         elif version.startswith("conversation_reception."):
             data = {"kind": "other", "confidence": .96,
                     "evidence_id": request.json_schema["properties"]["evidence_id"]["enum"][-1],
@@ -211,7 +213,7 @@ async def test_new_noncompletion_reply_uses_one_small_decision_and_no_full_analy
                                       else "你是想确认题目里这个词的含义吗？") if generated else ""
         await _reply(harness, reply)
         assert harness.gateway.kinds == ["small"]
-        assert harness.gateway.requests[0].metadata["prompt_version"] == "supplement_reply.v6"
+        assert harness.gateway.requests[0].metadata["prompt_version"] == "supplement_reply.v9"
         assert harness.spoken == ["check", speech]
         assert not harness.committed and not harness.confirmation.confirmed
         assert harness.capture.is_open and len(harness.capture.prepares) == 1

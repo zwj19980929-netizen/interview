@@ -71,12 +71,14 @@ class MockProvider:
                         "evidence_id": next(iter(json.loads(request.messages[-1].content)["evidence"]))}
                 if request.metadata.get("prompt_version") in {"conversation_reception.v2", "conversation_reception.v3", "conversation_reception.v4", "conversation_reception.v5", "conversation_reception.v6", "conversation_reception.v7", "conversation_reception.v8", "conversation_reception.v9", "conversation_reception.v10"}:
                     data["reply_text"] = ""
-            elif request.purpose == "interview_turn_understanding" and request.metadata.get("prompt_version") == "supplement_reply.v6":
+            elif request.purpose == "interview_turn_understanding" and request.metadata.get("prompt_version") in {"supplement_reply.v6", "supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10"}:
                 from app.core.prompt.conversation_reception import RECEPTION_SPEECH
                 # Offline development cannot classify intent or grant consent.
                 data = {"intent": "unclear", "confidence": 0.0,
                         "evidence_id": next(iter(json.loads(request.messages[-1].content)["evidence"])),
                         "reply_text": RECEPTION_SPEECH["unclear"], "repeat_target": None}
+                if request.metadata.get("prompt_version") in {"supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10"}:
+                    data["answer_effect"] = "uncertain"
             elif request.purpose == "interview_turn_understanding" and request.metadata.get("prompt_version") in {"supplement_reply.v1", "supplement_reply.v2", "supplement_reply.v3", "supplement_reply.v4", "supplement_reply.v5"}:
                 reply = json.loads(request.messages[-1].content)["reply"]
                 # Offline mock never fabricates permission to finish.
