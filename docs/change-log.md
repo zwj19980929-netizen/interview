@@ -25,6 +25,8 @@
 - 指定录像恢复：既有processing/retry API仅重放work_c5bd61cf32cf407b封存，answer/report work_count=0。capture与work均completed，1051629048字节，真实存储保护local_private_development；独立流式SHA与封存SHA均81da8dd6fcc5033738b6b9504d0032d320283d3b0a850ced599daa59109798ce，签名Range返回206且1024字节与原文件相同。75场完整面试文档、全部评分/报告Outbox、其他capture及原文件大小/mtime均与修前baseline完全相同；目标16份回答、18个评分历史版本、1份报告保留。旧overall_score仍为空且14主题+2追问、45分51秒时间结束事实正确投影，没有事后重配权重。安全结果保存在/private/tmp/interviewer-090-recording-recovery-result.json，不保存签名回放URL。
 - 实际文件与边界：新增media_runtime、local_runtime、session_assessment_scope、interview_completion和5份090测试；修改自适应合同/准入/生命周期、计划/预约/追问/监督器目录、媒体/复核/报告服务、system/Celery诊断，前端计划/报告/入场提示与测试、三份旧后端fixture、local-media脚本及README/CONTEXT和对应设计文档。无Prompt/provider协议、DDL或历史合同迁移；旧v1继续兼容，新的考察范围需重新准备计划才生效。时间预算是事前估计，真人长场次及外部供应商长期稳定性仍需验收；不标closed。
 
+- Git收尾：实现、测试、构建及文档已提交cb850bb，基线9f41d4c保留，未push。最后文档排版脚本首次按空段落查找失败（StopIteration、无写入），改为按完整行匹配后成功；只调整090验收段位置及补充089死信已在090恢复的说明，不删除历史记录。
+
 ## 2026-11-08 · INTERVIEW-FLOW-CONTINUITY-089
 
 - 状态：`verified（仓库全量与本机加载；真人长场次待验）`。
