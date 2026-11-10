@@ -2,6 +2,21 @@
 
 本文件记录所有会修改仓库内容的工作项。只读检查不单独登记；同一目标下的代码、测试、迁移和文档修改合并为一个工作项。状态使用 `in_progress`、`verified`、`failed` 或 `cancelled`，历史条目只追加或补充结果，不删除。
 
+## 2026-11-10 · SPEECH-HANDOFF-AND-FAREWELL-092
+
+- 状态：`in_progress`。
+- 授权与基线：用户报告主动退出时结束语被截断，以及补充提示后立即回答丢失首字；沿用本会话已授权的排查修复、Git回退点与验证后空闲加载。首次修改前工作区干净，基线`1c80cc7`已提交，091及更早提交保持。已按顺序复核入口文档，本项覆盖代码、测试、文档和经核验的本机加载。
+- 现场证据：`iv_c2e73a9cde80427e`的结束音频为10240ms；08:32:05Z进入closing，08:32:15Z因farewell_timeout关闭。现有watchdog把音频时长加余量强制截为最多10000ms，早于音频本身结束。补充确认在实际播放停止后仍保持speaking并等待STT快照/重开；LiveKit ingress此时仅保留200ms供打断使用、普通完成会清空，存在立即回复丢前缀窗口。具体现场首字是否采集/识别丢失仍需证据核对，不将代码缺陷等同于音频逐字证明。
+- 修复边界与验证：以实际播放完成回执为正常结束依据，音频时长和有限启动/排空余量决定失联兜底，保留失权/断线/旧回执保护。补充交接仅缓存真实播放结束后的当前capture音频，冻结提示前转写后顺序补送，禁止将面试官回声或旧来源当确认。先复现长结束语及慢STT切流丢帧，再验证正常补充、独立退出确认、打断、取消、失权和缓冲上限。保留历史业务数据和原始音频；完成后补实际文件/命令/结果及未完成事项。
+- 阶段证据：告别首次夹具直接调用内部展示触发终态回收竞态，9项setup失败；改用真实正式收尾入口后有效红测试7失败/2通过，初修9通过。独立审查追加失权/控制连接变化先2失败、异常极晚口型先1失败，改为可信素材跨度加固定余量且到期重验原权限后12项通过。收音首批复现1失败/7通过（回执后音频没有进入采集），初修与旧确认/游标组合35通过；仍在补慢事件投影、VAD并发、取消和溢出反例，不将阶段通过当最终验收。
+- 发布准备：/private/tmp的092 runner适配现API20027/worker20028和运行摘要f999885d21eab059624b7aeab35a88874ae4170f1aeb52c706916a10d0c3387e，独立保留090前端证明来源，19组隔离检查通过。只读preflight成功、services_changed=false，77场核心摘要1debb66b16d690782a83fe58df0cead39d28873cdddd505e55c2ff6bfc2fbd5e；媒体配置一致，活动房间/参与者/egress/owner/命令/后台任务/采集均0。尚未执行重启，正式加载仍须新完整测试证明和即时空闲核验。
+- 独立审查补边界：可信播放ACK之后、停止/floor事件投影之前即同步开启交接；回执前已经被LiveKit接收但在队列中迟到的帧不得混入回复，因此纳入adapter只读接收sequence水位。取消若仍为同一有效capture，先撤销送达/确认许可，再有界顺序保存PCM；失权不能借用新capture，无法保存必须关闭输入并提示恢复。告别最终8文件169通过；交接仍在补真实channel慢投影与迟到队列测试，未运行最终全量。
+- 交接审查复现：原取消分支确会静默丢弃FIFO且保留delivered，已改为保留同来源PCM并撤销权限；只在handoff期间过滤旧帧仍会让快切流后的迟到回声通过，已改为同ingress/capture水位持续到序号越界。两个独立红例均复验通过。中间真实通道组合73通过/1失败/5个未await警告，原因是取消清理改为异步后AgentChannel调用未加await；已补这一接线，失败日志保留，不算最终验收。
+- 最终定向与冻结：新告别13项、新交接22项，后者含真实LiveKit adapter队列→AgentChannel→ContinuousSTT录音/转写的正常、慢投影和取消路径。告别相关8文件169通过/27.83秒；交接相关9文件125通过/18.45秒、无警告；独立复审5文件76通过/9.72秒、无阻断。`git diff --check`及273个本地文档链接通过。已冻结601份源码/测试文件，235份后端摘要a722a679284c4454278994ea231793798b2f3e7488b217cfcedef3518a83fd81；完整回归正在执行，证据保存/private/tmp/interviewer-092-backend-full.log与tested-source.json，服务尚未切换。
+- 首次全量失败：5 failed /4737 passed /8 skipped /267.33秒，未生成通过证明、未发布。5例均来自流式输出共用测试替身：fixture把ManagedLiveKitEvidenceSession类型替换成SimpleNamespace，却没有新增begin/cancel接口，可信drain后AttributeError使测试发言权没有回候选人。独立核实生产唯一attach路径始终构造真实Managed类，不存在缺hook旧实现。仅补两处输出专用fixture的no-op begin和async cancel，不放宽生产接口或旧断言，另覆盖实际Managed无确认端点的正常drain。首次日志与601文件快照复制保留为/private/tmp/interviewer-092-first-backend-full.log及first-tested-source.json；随后重新冻结并跑完整回归。
+- 替身修正复验：首次定向命令拼错测试文件名，exit4/no tests ran，无数据副作用；正确四文件组合97 passed /4.76秒，独立重复97 passed /4.72秒、无警告。生产摘要保持a722a679284c4454278994ea231793798b2f3e7488b217cfcedef3518a83fd81，仅test_streaming_expression_lifecycle.py初始化和farewell092新增真实对象回归不同。重新冻结601文件，重跑完整回归；新告别测试现14项、交接22项。
+- 最终完整验证：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q`为4743 passed /8 skipped /268.75秒、exit0。601文件集合/内容全部保持冻结值，235份后端仍为a722a679284c4454278994ea231793798b2f3e7488b217cfcedef3518a83fd81；生成/private/tmp/interviewer-092-test-attestation.json（v2）。前端源码与63构建文件逐hash保持090版本，复用552项前端证明，不称本轮重跑。无Prompt/供应商协议/模型配置修改，未发送候选材料作外部探针；下一步保存修复提交并即时空闲加载。
+
 ## 2026-11-09 · RECEPTION-FAILURE-RETRY-091
 
 - 状态：`verified（仓库全量、本机加载与同场录像恢复；真人长场次及批量STT配置待验）`。

@@ -16,11 +16,23 @@ from test_approved_speech_output import _Publisher, _RawTTS
 from test_expression_stale_fence import _harness, _mutate
 
 
+def _install_no_confirmation_handoff(managed):
+    # These output-only fixtures have no AnswerEndpoint/confirmation. Match
+    # the real Managed session's no-op result for that absence explicitly.
+    managed.begin_confirmation_handoff = lambda: None
+
+    async def cancel_confirmation_handoff(handoff):
+        assert handoff is None
+
+    managed.cancel_confirmation_handoff = cancel_confirmation_handoff
+
+
 def _streaming_harness(monkeypatch, *, gate_before_first=False, gate_eof=False):
     runtime, channel, coordinator, grant = _harness()
     monkeypatch.setattr(interview_agent, "ManagedLiveKitEvidenceSession", SimpleNamespace)
     managed = channel._evidence_session
     managed.assert_controller = lambda _channel: None
+    _install_no_confirmation_handoff(managed)
 
     async def detach(_channel):
         managed._stopped = True
@@ -128,6 +140,7 @@ async def _replacement_channel(h):
         connection_id=opened.connection_id, local_instance_id=h.grant.local_instance_id,
     )
     managed = SimpleNamespace(ownership=grant, _stopped=False)
+    _install_no_confirmation_handoff(managed)
 
     def assert_controller(_channel):
         with h.runtime.persistence.transaction(replacement.organization_id) as transaction:

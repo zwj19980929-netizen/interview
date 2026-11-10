@@ -218,6 +218,11 @@ class LiveKitCandidateAudioIngress:
     def last_track_failure(self) -> Optional[LiveKitAudioIngressFailure]:
         return self._last_track_failure
 
+    @property
+    def accepted_audio_sequence(self) -> int:
+        """Server receive watermark, including frames still queued for the sink."""
+        return self._sequence
+
     async def drain(self, *, timeout_seconds: Optional[float] = None) -> int:
         """Wait until every frame accepted before this call crossed the sink.
 

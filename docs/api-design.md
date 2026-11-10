@@ -1,5 +1,9 @@
 # 接口设计
 
+## 092：播放完成和交接缓冲
+
+沿用`avatar.performance.stopped`及既有收音/恢复事件，无新REST、客户端音频文本权限或持久字段。当前有效播放回执之后的服务端PCM在STT快照和重开期间有界保留，不能因此推断答案完成或退出确认。告别正常由真实完成回执结束，丢失回执的兜底不再把长素材截为10秒；不能根据重复播放状态无限延期。详见[092设计](speech-handoff-and-farewell-092.md)。
+
 ## 091：处理重试包含失败的交流识别
 
 既有retry_answer_processing/evidence.retry_processing可以恢复当前未成功的轻量接话，沿用当前turn/capture/owner门禁；不重开已结束会话、不撤销已送达确认，也不授予退出或答案提交许可。公共字段与错误合同保持，详见[091](reception-failure-retry-091.md)。

@@ -595,21 +595,27 @@ class SpokenSupplementConfirmation:
         if self.phase in {"awaiting_reply", "classifying"}:
             self.reply_seen = True
 
-    async def complete_playback(self, endpoint: Any, *, reason: str) -> None:
+    async def complete_playback(self, endpoint: Any, *, reason: str,
+                                delivery_guard: Any = None) -> None:
         """Fence the reply boundary at delivered audio, not before synthesis.
 
-        Keep the microphone echo gate closed while taking this final cut.
-        Speech arriving before/during the question belongs to its prefix and
-        cannot later become a new confirmation through a button or VAD noise.
+        Keep the echo gate closed while taking this final cut. The ingress
+        separately buffers PCM received after the verified playback drain;
+        it enters the resumed stream only after this old-prefix boundary is
+        frozen. Earlier playback audio cannot become a new confirmation.
         """
         verified = False
         supplement_verified = False
         try:
+            if delivery_guard is not None:
+                delivery_guard()
             if self.speaking and self._supplement_delivery_pending:
                 self._supplement_question_delivered = False
                 if reason == "agent_finished":
                     endpoint._proposal_revision = endpoint.revision
                     final = await endpoint.listening_snapshot()
+                    if delivery_guard is not None:
+                        delivery_guard()
                     endpoint.assert_current()
                     if (getattr(final, "type", None) == "transcript.final"
                             and getattr(final, "is_final", False)):
@@ -620,6 +626,8 @@ class SpokenSupplementConfirmation:
                 if reason == "agent_finished":
                     endpoint._proposal_revision = endpoint.revision
                     final = await endpoint.listening_snapshot()
+                    if delivery_guard is not None:
+                        delivery_guard()
                     endpoint.assert_current()
                     if (getattr(final, "type", None) == "transcript.final" and getattr(final, "is_final", False)
                             and self._content_question_focus in final.text):
@@ -629,6 +637,8 @@ class SpokenSupplementConfirmation:
                     and reason == "agent_finished"):
                 endpoint._proposal_revision = endpoint.revision
                 final = await endpoint.listening_snapshot()
+                if delivery_guard is not None:
+                    delivery_guard()
                 endpoint.assert_current()
                 if final is not None:
                     self._exit_request_final = final.model_copy(deep=True)
@@ -643,6 +653,18 @@ class SpokenSupplementConfirmation:
                                 supplement_boundary_verified=supplement_verified)
             if supplement_verified and endpoint._recovery_stage == "supplement_prompt":
                 await endpoint._understanding_succeeded()
+
+    def abandon_delivery(self, endpoint: Any) -> None:
+        """A cancelled handoff may retain raw PCM, never its confirmation grant."""
+        self._supplement_question_delivered = False
+        self._exit_question_delivered = False
+        self._exit_delivery_revision = None
+        self._content_question_delivered = False
+        self._supplement_delivery_pending = False
+        self._content_delivery_pending = False
+        self.confirmed = False
+        self._recovery_review = None
+        self.floor_returned(endpoint, reason="handoff_interrupted")
 
     def floor_returned(self, endpoint: Any, *, reason: str = "agent_finished",
                        exit_boundary_verified: bool = False,

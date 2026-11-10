@@ -17,6 +17,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 import weakref
 from dataclasses import dataclass
+from collections import deque
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from app.services.speech_output_interruption import revoke_active_performance
 
@@ -24,6 +25,7 @@ from app.adapters.livekit_audio_ingress import (
     LiveKitAudioIngressBinding,
     LiveKitCandidateAudioIngress,
     LiveKitIngressAudioFrame,
+    LiveKitAudioIngressBackpressureError,
 )
 from app.adapters.livekit_media import LiveKitMediaPlane
 from app.core.errors import ApiError
@@ -85,6 +87,7 @@ _TERMINAL_INTERVIEW_STATUSES = frozenset(
 _PARTIAL_PROJECTION_CAPACITY = 16
 _TERMINAL_PRESENTATION_GRACE_SECONDS = 5.0
 _PRESENTATION_CANCEL_GRACE_SECONDS = 0.1
+_REPLY_HANDOFF_MAX_BYTES = 60 * 32000
 
 
 @dataclass(frozen=True)
@@ -92,6 +95,67 @@ class _PendingProjection:
     kind: str
     raw: Dict[str, Any]
     turn_id: Optional[str]
+
+
+class _ReplyAudioHandoff:
+    """Post-delivery PCM only; the speaking-time echo preroll stays separate."""
+
+    def __init__(self, session: Any) -> None:
+        self.endpoint = session._answer_endpoint
+        self.confirmation = self.endpoint.confirmation
+        self.chain = session.chain
+        self.capture_id = session._capture_id
+        self.turn_id = session.chain.turn_id
+        self.owner = self.owner_identity(session)
+        self.grant = getattr(session, "ownership", None)
+        self.ingress = getattr(session, "_ingress", None)
+        self.audio_watermark = getattr(self.ingress, "accepted_audio_sequence", None)
+        self.frames: Any = deque()
+        self.received_bytes = 0
+        self.processing = False
+        self.client_speech_started = False
+        self.failed = False
+
+    @staticmethod
+    def owner_identity(session: Any) -> Any:
+        owner = getattr(session, "ownership", None)
+        return (owner.commit_fence(), owner.control_generation, owner.control_connection_id) if owner is not None else None
+
+    def is_current(self, session: Any) -> bool:
+        return bool(not self.failed and not session._stopped
+                    and getattr(session, "_reply_audio_handoff", None) is self
+                    and getattr(session, "_ingress", None) is self.ingress
+                    and session.chain is self.chain
+                    and session._answer_endpoint is self.endpoint
+                    and self.endpoint.confirmation is self.confirmation
+                    and session._capture_id == self.capture_id
+                    and self.chain.turn_id == self.turn_id and self.chain.is_open
+                    and not self.endpoint._closed
+                    and self.owner_identity(session) == self.owner)
+
+    def assert_current(self, session: Any) -> None:
+        if not self.is_current(session):
+            raise ApiError("TURN_DECISION_STALE", "Reply handoff changed.", status_code=409)
+        if self.grant is not None:
+            with session.persistence.transaction(session.organization_id, read_only=True) as transaction:
+                assert_current_evidence_fence(transaction, self.grant.commit_fence())
+                assert_current_evidence_control(transaction, self.grant)
+                interview = transaction.interview_sessions.get(session.interview_id)
+                if (not interview or interview.get("status") != "in_progress"
+                        or interview.get("candidate_input_completed_at")
+                        or interview.get("current_turn_id") != self.turn_id):
+                    raise ApiError("TURN_DECISION_STALE", "Reply handoff ended.", status_code=409)
+
+    def append(self, frame: LiveKitIngressAudioFrame) -> None:
+        if self.audio_watermark is not None and frame.sequence <= self.audio_watermark:
+            return  # Old sink backlog is playback-time echo, not a new reply.
+        if self.received_bytes + len(frame.pcm_s16le) > _REPLY_HANDOFF_MAX_BYTES:
+            # Never replace the beginning of a reply with its newest tail.
+            # The existing ingress failure path pauses a bounded-buffer gap.
+            self.failed = True
+            raise LiveKitAudioIngressBackpressureError("Reply audio handoff exceeded its bounded intake.")
+        self.frames.append(frame)
+        self.received_bytes += len(frame.pcm_s16le)
 
 
 class ManagedLiveKitEvidenceSession:
@@ -161,6 +225,8 @@ class ManagedLiveKitEvidenceSession:
         self._transcript_wait_notice_key: Optional[tuple] = None
         self._prepared_finish: Any = None
         self._presentation_task: Optional[asyncio.Task] = None
+        self._reply_audio_handoff: Optional[_ReplyAudioHandoff] = None
+        self._reply_audio_watermark: Any = None
 
     @property
     def turn_id(self) -> Optional[str]:
@@ -890,6 +956,78 @@ class ManagedLiveKitEvidenceSession:
         self._answer_endpoint = endpoint
         endpoint.start()
 
+    def begin_confirmation_handoff(self) -> Optional[_ReplyAudioHandoff]:
+        """Called synchronously only after a matching normal playback drain.
+
+        This receipt starts retaining *new* microphone frames while the old
+        transcript prefix is finalized. It does not itself confirm a reply.
+        """
+        current = getattr(self, "_reply_audio_handoff", None)
+        if current is not None and current.is_current(self):
+            return current
+        self._reply_audio_handoff = None
+        endpoint = self._answer_endpoint
+        if (self._stopped or endpoint is None or endpoint._closed
+                or not endpoint.confirmation or not endpoint.confirmation.speaking
+                or not getattr(self, "_capture_id", None)
+                or self.chain is not endpoint.capture or not self.chain.is_open):
+            return None
+        handoff = _ReplyAudioHandoff(self)
+        self._reply_audio_handoff = handoff
+        if handoff.audio_watermark is not None:
+            self._reply_audio_watermark = (handoff.chain, handoff.capture_id,
+                                          handoff.ingress, handoff.audio_watermark)
+        return handoff
+
+    def _clear_confirmation_handoff(self, handoff: Optional[_ReplyAudioHandoff]) -> None:
+        if handoff is not None and getattr(self, "_reply_audio_handoff", None) is handoff:
+            self._reply_audio_handoff = None
+            handoff.frames.clear()
+
+    async def cancel_confirmation_handoff(self, handoff: Optional[_ReplyAudioHandoff]) -> None:
+        """Abandoned delivery must not turn a retained reply into a tail only.
+
+        On the same live capture, retain its PCM but revoke the interrupted
+        question's confirmation authority. A different/closed owner cannot
+        inherit the buffer. Any inability to preserve it fails input closed.
+        """
+        if handoff is None or getattr(self, "_reply_audio_handoff", None) is not handoff:
+            return
+        try:
+            if (self._answer_endpoint is handoff.endpoint
+                    and handoff.endpoint.confirmation is handoff.confirmation):
+                handoff.confirmation.abandon_delivery(handoff.endpoint)
+            if handoff.is_current(self):
+                try:
+                    handoff.assert_current(self)
+                except ApiError as exc:
+                    if exc.code in {"TURN_DECISION_STALE", "EVIDENCE_CONTROL_STALE", "EVIDENCE_OWNER_FENCED"}:
+                        return
+                    raise
+                async def preserve() -> None:
+                    while handoff.frames:
+                        handoff.assert_current(self)
+                        await self._receive_candidate_audio(handoff.frames.popleft())
+                    if handoff.client_speech_started:
+                        handoff.endpoint.speech_started()
+
+                try:
+                    await asyncio.wait_for(preserve(), timeout=5.0)
+                except ApiError as exc:
+                    if exc.code in {"TURN_DECISION_STALE", "EVIDENCE_CONTROL_STALE", "EVIDENCE_OWNER_FENCED"}:
+                        return
+                    self.chain.revoke_audio_input()
+                    await self._fatal_ingress_problem("LIVEKIT_EVIDENCE_AUDIO_STREAM_FAILED", exc)
+                    raise
+                except BaseException:
+                    self.chain.revoke_audio_input()
+                    await self._fatal_ingress_problem("LIVEKIT_EVIDENCE_AUDIO_STREAM_FAILED",
+                        ApiError("LIVEKIT_EVIDENCE_AUDIO_STREAM_FAILED",
+                                 "Reply audio handoff could not preserve all received speech.", status_code=503))
+                    raise
+        finally:
+            ManagedLiveKitEvidenceSession._clear_confirmation_handoff(self, handoff)
+
     async def confirmation_floor_returned(self, reason: str) -> None:
         endpoint = self._answer_endpoint
         if endpoint is not None:
@@ -897,6 +1035,22 @@ class ManagedLiveKitEvidenceSession:
         confirmation = endpoint.confirmation if endpoint else None
         if confirmation is None or not confirmation.speaking:
             return
+        handoff = (ManagedLiveKitEvidenceSession.begin_confirmation_handoff(self)
+                   if reason == "agent_finished" else None)
+        if handoff is not None:
+            if handoff.processing:
+                return  # A duplicate delivery cannot take another prefix cut.
+            handoff.processing = True
+        try:
+            await ManagedLiveKitEvidenceSession._complete_confirmation_floor_returned(
+                self, reason, endpoint, confirmation, handoff)
+        finally:
+            await ManagedLiveKitEvidenceSession.cancel_confirmation_handoff(self, handoff)
+
+    async def _complete_confirmation_floor_returned(
+        self, reason: str, endpoint: Any, confirmation: Any,
+        handoff: Optional[_ReplyAudioHandoff],
+    ) -> None:
         company_performance = getattr(self, "_company_reply_performance", None)
         if company_performance is not None:
             from app.services.company_questions import update_company_delivery
@@ -911,9 +1065,13 @@ class ManagedLiveKitEvidenceSession:
                 confirmation._after_speech == "pause_requested" and reason != "agent_finished"):
             confirmation._after_speech = "listening"
             confirmation._semantic_wait_identity = None
-        await confirmation.complete_playback(endpoint, reason=reason)
-        if endpoint is not self._answer_endpoint or self._stopped:
+        await confirmation.complete_playback(endpoint, reason=reason,
+            delivery_guard=(lambda: handoff.assert_current(self)) if handoff is not None else None)
+        if (endpoint is not self._answer_endpoint or self._stopped
+                or (handoff is not None and not handoff.is_current(self))):
             return
+        if handoff is not None:
+            handoff.assert_current(self)
         if confirmation._content_question_delivered and confirmation._content_request_final is not None:
             from app.services.content_clarification import text_hash
             with self.persistence.transaction(self.organization_id) as transaction:
@@ -938,6 +1096,18 @@ class ManagedLiveKitEvidenceSession:
                 endpoint.observe_audio(pcm)
                 await self.chain.send_audio(pcm)
             endpoint.speech_started()
+        if handoff is not None:
+            while handoff.frames:
+                if not handoff.is_current(self):
+                    return
+                await self._receive_candidate_audio(handoff.frames.popleft())
+            if not handoff.is_current(self):
+                return
+            handoff.assert_current(self)
+            if handoff.client_speech_started:
+                endpoint.speech_started()
+            # No await between emptying the FIFO and reopening direct intake.
+            ManagedLiveKitEvidenceSession._clear_confirmation_handoff(self, handoff)
         await endpoint._notify(endpoint._listening_notice())
 
     def _persist_answer_preparation(self, capture_id: Optional[str], turn_id: Optional[str], *, preparing: bool,
@@ -2054,13 +2224,21 @@ class ManagedLiveKitEvidenceSession:
             await self.cancel_endpoint()
             self._capture_speech_started = True
             if self._answer_endpoint is not None:
-                self._answer_endpoint.speech_started()
+                handoff = getattr(self, "_reply_audio_handoff", None)
+                if handoff is not None and handoff.is_current(self):
+                    # The matching playback is already drained. Apply this
+                    # advisory VAD after the old prefix cut, like its PCM.
+                    handoff.client_speech_started = True
+                else:
+                    self._answer_endpoint.speech_started()
         effective_turn_id = signal.turn_id or session.get("current_turn_id")
         if runtime_state.get("calibration_status") == "opening":
             source.runtime._set_calibration(
                 self.interview_id, "listening", self.organization_id
             )
-        if runtime_state.get("floor") == FloorOwner.AGENT.value:
+        handoff = getattr(self, "_reply_audio_handoff", None)
+        if (runtime_state.get("floor") == FloorOwner.AGENT.value
+                and (handoff is None or not handoff.is_current(self))):
             await revoke_active_performance(source, runtime_state.get("active_performance_id"), reason="barge_in",
                 turn_id=effective_turn_id,
                 causation_id=signal.causation_id,
@@ -2069,9 +2247,11 @@ class ManagedLiveKitEvidenceSession:
             if self._presentation_task is not None and not self._presentation_task.done():
                 self._presentation_task.cancel()
                 await asyncio.gather(self._presentation_task, return_exceptions=True)
-        await source._set_floor(
-            FloorOwner.CANDIDATE, "barge_in", signal.causation_id
-        )
+        handoff = getattr(self, "_reply_audio_handoff", None)
+        if handoff is None or not handoff.is_current(self):
+            await source._set_floor(
+                FloorOwner.CANDIDATE, "barge_in", signal.causation_id
+            )
         await source._emit(
             "speech.started",
             {
@@ -2626,8 +2806,25 @@ class ManagedLiveKitEvidenceSession:
             raise RuntimeError(
                 "Authoritative transcript projection failed closed"
             ) from self._partial_projection_failure
+        watermark = getattr(self, "_reply_audio_watermark", None)
+        if watermark is not None:
+            if (watermark[:3] == (self.chain, self._capture_id, getattr(self, "_ingress", None))
+                    and frame.sequence <= watermark[3]):
+                return
+            # The adapter sink is ordered. The first later frame drains this
+            # fence, even if the STT handoff finished before the old queue did.
+            self._reply_audio_watermark = None
         endpoint = self._answer_endpoint
-        capture_id = self._capture_id
+        handoff = getattr(self, "_reply_audio_handoff", None)
+        if handoff is not None:
+            if handoff.is_current(self):
+                try:
+                    handoff.append(frame)
+                except LiveKitAudioIngressBackpressureError:
+                    self.chain.revoke_audio_input()
+                    raise
+                return
+            ManagedLiveKitEvidenceSession._clear_confirmation_handoff(self, handoff)
         if endpoint and endpoint.confirmation and endpoint.confirmation.speaking:
             # Do not recognise the interviewer's own confirmation prompt as a
             # candidate reply. Retain only 200 ms to restore a confirmed barge-in.
@@ -2635,6 +2832,11 @@ class ManagedLiveKitEvidenceSession:
             preroll.append(frame.pcm_s16le)
             self._supplement_preroll = preroll[-10:]
             return
+        await self._receive_candidate_audio(frame)
+
+    async def _receive_candidate_audio(self, frame: LiveKitIngressAudioFrame) -> None:
+        endpoint = self._answer_endpoint
+        capture_id = self._capture_id
         if self.chain.kind == "formal" and self._answer_endpoint is not None:
             self._answer_endpoint.observe_audio(frame.pcm_s16le)
         try:

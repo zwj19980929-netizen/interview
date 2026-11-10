@@ -11,7 +11,7 @@ import logging
 import os
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
-from typing import Any, AsyncIterator, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 from app.core.auth import Principal
 from app.core.errors import ApiError
@@ -71,6 +71,9 @@ _CLOSE = object()
 _LOG = logging.getLogger(__name__)
 _COMPLETION_RECORDING_TIMEOUT = 2.0
 _COMPLETION_PREPARATION_TIMEOUT = 4.0
+# Match the browser's 8 s startup watchdog, allow one 8 s buffering recovery,
+# and leave 2 s for the real ended receipt. Playback reports never renew this.
+_COMPLETION_PLAYBACK_GRACE_MS = 18_000
 _AGENT_QUEUE_CAPACITY = 2048
 _DURABLE_EVIDENCE_SIGNALS = {
     "evidence.stream.open",
@@ -926,48 +929,63 @@ class AgentChannel:
                 # performance has started.  A stale stop must have no effect on
                 # the current floor, calibration, or completion state.
                 return
-            if runtime_state.get("question_audio_recovery"):
-                # Clients keep VAD/capture gated until this authoritative clear
-                # arrives; release candidate floor only after the snapshot.
-                await self._emit_snapshot(signal.causation_id)
-            await self._emit(
-                "avatar.performance.stopped",
-                {"performance_id": signal.payload.get("performance_id"), "reason": "completed"},
-                turn_id=signal.turn_id,
-                causation_id=signal.causation_id,
-                replayability=Replayability.TRANSIENT,
+            # Arm at the trusted playback boundary, before event projection
+            # can yield. A fast reply must survive those awaits as well as the
+            # later STT handoff; only this current confirmation can own it.
+            handoff_session = (
+                self._evidence_session
+                if isinstance(self._evidence_session, ManagedLiveKitEvidenceSession)
+                and not closing_performance_id
+                and runtime_state.get("calibration_status") not in {"opening", "awaiting_confirmation"}
+                else None
             )
-            if closing_performance_id and stopped_performance_id == closing_performance_id:
-                await self._finalize_completion(
+            handoff = handoff_session.begin_confirmation_handoff() if handoff_session is not None else None
+            try:
+                if runtime_state.get("question_audio_recovery"):
+                    # Clients keep VAD/capture gated until this authoritative clear
+                    # arrives; release candidate floor only after the snapshot.
+                    await self._emit_snapshot(signal.causation_id)
+                await self._emit(
+                    "avatar.performance.stopped",
+                    {"performance_id": signal.payload.get("performance_id"), "reason": "completed"},
+                    turn_id=signal.turn_id,
                     causation_id=signal.causation_id,
-                    reason="farewell_completed",
+                    replayability=Replayability.TRANSIENT,
                 )
-                return
-            session = self.runtime.interviews.get_interview(
-                self.interview_id, self.organization_id
-            )
-            calibration = (session.get("agent_runtime") or {}).get(
-                "calibration_status"
-            )
-            if calibration == "opening":
-                self.runtime._set_calibration(
-                    self.interview_id,
-                    "listening",
-                    self.organization_id,
+                if closing_performance_id and stopped_performance_id == closing_performance_id:
+                    await self._finalize_completion(
+                        causation_id=signal.causation_id,
+                        reason="farewell_completed",
+                    )
+                    return
+                session = self.runtime.interviews.get_interview(
+                    self.interview_id, self.organization_id
                 )
-                await self._set_floor(
-                    FloorOwner.CANDIDATE, "warmup_listening", signal.causation_id
+                calibration = (session.get("agent_runtime") or {}).get(
+                    "calibration_status"
                 )
-            elif calibration == "awaiting_confirmation":
-                await self._set_floor(
-                    FloorOwner.CANDIDATE,
-                    "warmup_awaiting_confirmation",
-                    signal.causation_id,
-                )
-            else:
-                await self._set_floor(
-                    FloorOwner.CANDIDATE, "agent_finished", signal.causation_id
-                )
+                if calibration == "opening":
+                    self.runtime._set_calibration(
+                        self.interview_id,
+                        "listening",
+                        self.organization_id,
+                    )
+                    await self._set_floor(
+                        FloorOwner.CANDIDATE, "warmup_listening", signal.causation_id
+                    )
+                elif calibration == "awaiting_confirmation":
+                    await self._set_floor(
+                        FloorOwner.CANDIDATE,
+                        "warmup_awaiting_confirmation",
+                        signal.causation_id,
+                    )
+                else:
+                    await self._set_floor(
+                        FloorOwner.CANDIDATE, "agent_finished", signal.causation_id
+                    )
+            finally:
+                if handoff_session is not None:
+                    await handoff_session.cancel_confirmation_handoff(handoff)
             return
         if kind == "takeover.acquire":
             await self._acquire_takeover(signal)
@@ -1517,19 +1535,23 @@ class AgentChannel:
             performance.performance_id,
             self.organization_id,
         )
-        timeout_ms = min(
-            10_000,
-            max(
-                cue.at_ms + cue.duration_ms
-                for cue in performance.visemes
-            )
-            + 2_000,
+        # The composer spans the actual materialized audio with its own
+        # zero-origin gestures (validated at <=60 s). Provider mouth cues can
+        # end too early or have arbitrary offsets, so they cannot set this
+        # deadline. A fixed 10 s cap used to cut off even our ordinary 10.24 s
+        # farewell. Keep ended as
+        # the normal completion signal and reserve this one-shot deadline for
+        # a missing receipt or failed playback, including loading/buffering.
+        duration_ms = max(
+            cue.duration_ms for cue in performance.gestures if cue.at_ms == 0
         )
+        timeout_ms = duration_ms + _COMPLETION_PLAYBACK_GRACE_MS
         self._completion_task = asyncio.create_task(
             self._completion_after_timeout(
                 performance.performance_id,
                 timeout_ms,
                 causation_id,
+                is_current=closing_is_current,
             )
         )
         return
@@ -1539,11 +1561,13 @@ class AgentChannel:
         performance_id: str,
         timeout_ms: int,
         causation_id: Optional[str],
+        *,
+        is_current: Optional[Callable[[], bool]] = None,
     ) -> None:
         try:
             await asyncio.sleep(timeout_ms / 1000)
             async with self._lock:
-                if self._closed:
+                if self._closed or self._terminating or (is_current is not None and not is_current()):
                     return
                 session = self.runtime.interviews.get_interview(
                     self.interview_id, self.organization_id
@@ -1560,6 +1584,8 @@ class AgentChannel:
                     causation_id=causation_id,
                     replayability=Replayability.TRANSIENT,
                 )
+                if is_current is not None and not is_current():
+                    return
                 await self._finalize_completion(
                     causation_id=causation_id,
                     reason="farewell_timeout",
