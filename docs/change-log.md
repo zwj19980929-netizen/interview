@@ -4,7 +4,7 @@
 
 ## 2026-11-10 · FIRST-QUESTION-CONTEXT-093
 
-- 状态：`in_progress`。
+- 状态：`verified（仓库全量与本机加载；真人试音至首题复验待完成）`。
 - 授权与基线：沿用本会话排查修复、Git回退及验证后空闲加载授权。首次修改前工作区干净，当前代码已提交为6043968；已按顺序复核入口文档。本项覆盖首题措辞、关联边界核查、测试与文档，不改写真实场次、答案或评分。
 - 现场证据：iv_a25c790e72b0461a在10:15:17Z完成试音并规划，10:15:21Z选中的首题文本已经包含“谢谢你的说明”；正式STT首次非空partial直到10:15:30Z才出现，10:15:32Z撤回为空。仅1个正式turn，答案、评分、权威utterance均0。纯内存零回答/零音频复现同样前缀，规划memory不含试音转写；此次前缀不能归因为噪声提交了一题。
 - 修复与验证计划：最终问题表达根据当前题之前的已提交回答决定是否允许承接，无前置回答时直接播报题干，保留后续正常承接、最近拒答、追问和真实音频恢复语义。独立核查试音至首题收音门与首轮规划文案；新增实际播报文本回归和暖场到真实规划入口集成测试。所有测试/加载结果与失败保留于本项；未验真人或生产前不标closed。
@@ -13,6 +13,8 @@
 - 加载前阻碍：只读门禁确认0媒体房间/参与者/活动Egress、无有效owner和未结任务，但本场media_capture_c37ef931775847d1仍标recording，故拒绝重启（services_changed=false）。精确ListEgress证实EG_JhzaskGK8PUq已于10:16:00.961588Z为EGRESS_COMPLETE，无error，绑定匹配，文件17300798字节、44.701529秒；owner于10:16:31.591Z释放，宽限已过。断线关闭STT/ingress但未入队录制封存。拟调用既有processing/retry仅对账此已结束录像：worker重查真实终态、绑定、文件hash/保护，不调用StopEgress、不结束面试；本场无答案且未提交，不生成评分或报告。完成后记录真实结果，保持重启门禁。
 - 竞态复验与实际对账：新增HTTP/WS交错红例9 failed/66 passed；修后首题/未知/当前题/未来题/已答题相关228项通过，独立7场景复查无阻断。前端只在完整一致空历史且completed_answers=0时说第一题，当前asking/pending或资料不完整用中性提示。真实processing/retry返回202，原worker校验后capture已completed，17300798字节、SHA256 3f239bc2c8145296808baca0be772f585c0b0bd6367cb930e6ad2f380e32216c；79份完整InterviewSession文档逐内容摘要保持一致。面试未结束、无答案/评分/报告新增，原音频未修改。第二次冻结601文件开始最终全量，后端235文件摘要70fa9be092e137a812b67364451450f3a9f04f5677915e03e05c4572a906b044，尚未加载。
 - 最终全量与静态发布：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q`为4770 passed/8 skipped/270.52秒；`cd app/web && npm test -- --reporter=dot`为568 passed/26文件；`npm run build -- --outDir /private/tmp/interviewer-093-web-dist`成功，保留原有大chunk非阻断提示。601文件在验证前后集合/hash一致，Prompt/Provider相对6043968无差异，生成runtime-release-tests.v3证明，日志/private/tmp/interviewer-093-{backend-full,frontend-full,web-build}.log。`--publish`追加2个新bundle、原子替换index，保留62个旧资产，最终65构建文件全部冻结；发布门禁19项与资产发布11项隔离检查通过。只读preflight现全部空闲，79场核心SHA6979589e86435e9ecc0ffb1d4c6c0cf8c4fa5d185f9c05ef2c9c4bc3081f3307；API/worker尚为092，保存修复提交后再执行即时双重门禁加载。
+- 实际加载：修复提交bb0db61，回退基线6043968保持、未push。即时双重空闲与全部证明检查通过，正常TERM旧API26537/worker26538，2026-11-10T10:34:20Z加载API31919和worker/Beat31920（本地02:34）；两者235文件启动SHA均为70fa9be092e137a812b67364451450f3a9f04f5677915e03e05c4572a906b044，与已测源码一致。媒体配置摘要dcbaf54ac496b9217094dae97dfcd6b2ffec665d23f934bfaae2895c5ecefb0f保持、ready无issues；79场核心摘要保持，runner退出0。首次将5174首页按dist字节比对失败，查明其为Vite开发服务而非静态预览；未重启或误替换该服务。随后Page.jsx/presentation.js真实HTTP返回的source map内容逐hash等于冻结源码，5174代理返回新API31919与新SHA；8000静态首页/入口bundle与已测dist一致，healthz/readyz通过。
+- 实际文件与剩余事项：生产为interview_agent.py的表达守卫、前端Page.jsx/presentation.js及追加构建资产；测试为question_delivery_057、warmup_output_transition_061、前端Page/presentation/agent-experience；同步架构、已知问题、进度、路线图及本日志，252个本地文档链接和diffcheck通过。没有公共接口、数据库结构、Prompt/Schema、模型路由或收音逻辑修改，也未外发真实候选材料作探针。真人试音至首题及实际噪声听感待验；此次证据只证明该场致谢先于声音识别及零正式答案，不泛化为所有噪声永不被识别。断线后的录制自动入队缺口另行跟踪，本次通过既有流程完成指定录像真实对账，不宣称已修改自动封存实现；不标closed。
 
 ## 2026-11-10 · SPEECH-HANDOFF-AND-FAREWELL-092
 
