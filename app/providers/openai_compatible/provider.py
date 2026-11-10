@@ -191,7 +191,7 @@ class OpenAICompatibleProvider:
                 "provider_schema_invalid",
                 "Provider returned empty JSON content.",
                 retryable=True,
-                details=diagnostics,
+                details={**diagnostics, "json_failure_kind": "empty_content"},
             )
         try:
             data = parse_json_object_content(content)
@@ -201,7 +201,7 @@ class OpenAICompatibleProvider:
                 "Provider response was not valid JSON (finish_reason=%s, content_length=%s)."
                 % (finish_reason or "unknown", len(content)),
                 retryable=True,
-                details=diagnostics,
+                details={**diagnostics, "json_failure_kind": "invalid_json_object"},
             ) from exc
 
         usage = Usage(

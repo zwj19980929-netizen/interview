@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from app.core.errors import ApiError
 from app.core.interaction_budget import remaining_interaction_seconds
@@ -24,6 +24,16 @@ from .tools import InterviewerTools, COMPANY_CONTEXT_REFERENCE, company_context
 _TRANSIENT_PLANNING_ERRORS = frozenset({
     "provider_timeout", "provider_server_error", "provider_rate_limited", "provider_circuit_open",
 })
+_PLANNING_JSON_RETRY_MIN_SECONDS = 1.0
+
+
+def _retryable_planning_json_failure(error: ProviderError) -> bool:
+    # A failed wire parse has no proposal to validate or repair. Parsed schema
+    # and domain violations must still fail closed, even if retryable upstream.
+    kind = error.details.get("json_failure_kind")
+    return (error.retryable and error.code == "provider_schema_invalid"
+            and isinstance(kind, str) and kind in {"empty_content", "invalid_json_object"}
+            and not {"schema_reason", "schema_path"}.intersection(error.details))
 
 
 @dataclass(frozen=True)
@@ -151,35 +161,55 @@ class InterviewerSupervisor:
                    "remaining_seconds": self._remaining_seconds(session)}
         observations = []
         calls = 0
+        json_retry_used = False
         tools_used = []
         observed_requests = set()
 
-        async def invoke(contract):
-            nonlocal calls
-            size = planning_request_size(contract)
-            remaining = deadline - time.monotonic()
-            if calls >= 3 or remaining <= 0:
-                raise ApiError("INTERVIEW_DECISION_BUDGET_EXHAUSTED", "Interview planning reached its bounded budget.", status_code=503)
-            calls += 1
-            try:
-                response = await asyncio.wait_for(self.gateway.invoke(cap.LLM_CHAT_JSON, ChatJSONRequest(
-                    organization_id=session["organization_id"], purpose="interview_turn_understanding",
-                    messages=contract.messages, json_schema=contract.response_schema, max_output_tokens=600, temperature=0.0,
-                    execution_budget=InvocationExecutionBudget(timeout_s=remaining, max_provider_retries=0, max_provider_attempts=1),
-                    metadata={"prompt_version": contract.version, "planning_input_size": size},
-                )), timeout=remaining)
-            except asyncio.TimeoutError:
-                # Only a timed-out model await is recoverable here. Tool limits,
-                # invalid responses and cancelled ownership remain failures.
-                raise ProviderError("provider_timeout", "The bounded planning call timed out.", retryable=True) from None
-            data = response.data
-            validate_structured_response(data, contract.response_schema)
-            return data
+        async def invoke(contract_factory: Callable, *, reserve_calls: int = 0):
+            nonlocal calls, json_retry_used
+            while True:
+                contract = contract_factory()
+                size = planning_request_size(contract)
+                remaining = deadline - time.monotonic()
+                if calls >= 3 or remaining <= 0:
+                    raise ApiError("INTERVIEW_DECISION_BUDGET_EXHAUSTED", "Interview planning reached its bounded budget.", status_code=503)
+                calls += 1
+                try:
+                    response = await asyncio.wait_for(self.gateway.invoke(cap.LLM_CHAT_JSON, ChatJSONRequest(
+                        organization_id=session["organization_id"], purpose="interview_turn_understanding",
+                        messages=contract.messages, json_schema=contract.response_schema, max_output_tokens=600, temperature=0.0,
+                        execution_budget=InvocationExecutionBudget(timeout_s=remaining, max_provider_retries=0, max_provider_attempts=1),
+                        metadata={"prompt_version": contract.version, "planning_input_size": size},
+                    )), timeout=remaining)
+                except asyncio.TimeoutError:
+                    # Only a timed-out model await is recoverable here. Tool
+                    # limits and cancelled ownership remain failures.
+                    raise ProviderError("provider_timeout", "The bounded planning call timed out.", retryable=True) from None
+                except ProviderError as error:
+                    if (_retryable_planning_json_failure(error) and not json_retry_used
+                            and calls + reserve_calls < 3
+                            and deadline - time.monotonic() >= _PLANNING_JSON_RETRY_MIN_SECONDS):
+                        json_retry_used = True
+                        continue
+                    raise
+                data = response.data
+                validate_structured_response(data, contract.response_schema)
+                return data
+
+        usable = []
+
+        def planning_contract():
+            nonlocal usable
+            # A parse retry consumes an actual call. Recompute both the wire
+            # contract and local tool authorization before that next attempt.
+            usable = ([name for name in tools.allowed
+                       if not (name == "specialists.consult" and (calls > 0 or name in tools_used))]
+                      if calls < 2 else [])
+            return supervisor_contract(context, observations, tools=usable)
 
         try:
             while calls < 3:
-                usable = [name for name in tools.allowed if not (name == "specialists.consult" and (calls > 0 or name in tools_used))]
-                data = await invoke(supervisor_contract(context, observations, tools=usable if calls < 2 else []))
+                data = await invoke(planning_contract)
                 action = data["action"]
                 if action == "use_tool":
                     if data["question_id"] is not None or data["inquiry_unit_id"] is not None or not data["tool_name"] or data["reason_code"] != "inspect_context":
@@ -194,7 +224,9 @@ class InterviewerSupervisor:
                     if name == "specialists.consult":
                         if data["argument"] is not None:
                             raise ValueError("specialist takes the frozen context only")
-                        result = await invoke(evidence_expert_contract(context))
+                        # An expert suggestion still needs a final supervisor
+                        # decision. Do not spend that last slot retrying it.
+                        result = await invoke(lambda: evidence_expert_contract(context), reserve_calls=1)
                         if any(question_id not in tools.candidates for question_id in result["question_ids"]):
                             raise ValueError("specialist question outside frozen scope")
                     else:
@@ -217,7 +249,8 @@ class InterviewerSupervisor:
         except asyncio.CancelledError:
             raise
         except ProviderError as error:
-            if error.retryable and error.code in _TRANSIENT_PLANNING_ERRORS:
+            if ((error.retryable and error.code in _TRANSIENT_PLANNING_ERRORS)
+                    or _retryable_planning_json_failure(error)):
                 # The wait may have consumed the last interview seconds. Re-read
                 # budget facts before selecting anything; the service still
                 # commits through its normal owner/context/lifecycle fences.

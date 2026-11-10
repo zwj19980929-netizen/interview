@@ -1437,6 +1437,12 @@ class ModelGateway:
                 "unique_items", "minimum", "maximum", "min_length", "max_length",
             } else None,
             "schema_path": diagnostics.get("schema_path") if re.fullmatch(r"\$[A-Za-z0-9_.\[\]]{0,160}", str(diagnostics.get("schema_path", ""))) else None,
+            "json_failure_kind": diagnostics.get("json_failure_kind")
+                if isinstance(diagnostics.get("json_failure_kind"), str)
+                and diagnostics.get("json_failure_kind") in {"empty_content", "invalid_json_object"} else None,
+            "content_length": diagnostics.get("content_length")
+                if type(diagnostics.get("content_length")) is int
+                and 0 <= diagnostics.get("content_length") <= 10_000_000 else None,
             "rejection_category": diagnostics.get("rejection_category") if diagnostics.get("rejection_category") in {
                 "request_rejected", "structured_schema_rejected", "output_limit_rejected",
             } else None,

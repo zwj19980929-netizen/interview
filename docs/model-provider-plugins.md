@@ -1,5 +1,11 @@
 # 模型供应商插件化设计
 
+## 094：可观察的 JSON 解析错误
+
+OpenAI-compatible及继承适配器在原空内容和JSON解析失败分支，分别附加`json_failure_kind=empty_content/invalid_json_object`，保持`provider_schema_invalid`及原解析政策。网关只持久化这两个枚举和0–10000000的严格整数`content_length`，拒绝布尔值、容器、私密字符串和越界长度；不记录响应正文。合法JSON的中央Schema拒绝仍是原规则/路径诊断，无解析分类；截断、鉴权及HTTP错误语义保持。
+
+Supervisor仅对上述可重试分类增加共享一次后台重试，使用原治理合同、当前工具清单、原15秒期限及最多3次实际模型调用，每次Provider仍为单attempt/零内部重试。至少保留1秒及必要最终决策额度，否则独立使用批准目录回退。取消、Schema/领域拒绝、认证/计费错误不走此恢复。没有Prompt、Schema、模型路由或厂商请求协议修改；此次离线HTTP集成不等同真实模型稳定性验收。
+
 ## 090：媒体封存恢复诊断
 
 没有新增模型Prompt或厂商协议。封存配置缺失/鉴权错误、身份或保护校验失败停止自动重试；暂时供应商故障与Egress未结束仍受Outbox有限退避约束。API/worker使用独立media-runtime配置摘要核验同媒体模式与存储路由，摘要不比较凭据值，不替代真实ListEgress/对象验证。开发入口统一设置本地开关，production拒绝使用。
@@ -7,7 +13,7 @@
 
 ## 089：下一题规划的临时故障处理
 
-Provider仍只报告原始协议及结构化错误；Supervisor仅对`retryable=true`的`provider_timeout / provider_server_error / provider_rate_limited / provider_circuit_open`，以及当前有界模型await的本地超时，使用已批准候选目录继续选题。原15秒/最多3次模型调用及中央格式校验不变，不增加供应商重试或切换模型；认证、计费、Schema失败和取消不会被转换为正常答案。选题回退不适用于回答理解、STT或评分失败。保留原模型调用失败审计，并将固定策略/原因写入规划收据，不记录敏感响应。
+089基线中Provider只报告原始协议及结构化错误；Supervisor仅对`retryable=true`的`provider_timeout / provider_server_error / provider_rate_limited / provider_circuit_open`，以及当前有界模型await的本地超时，使用已批准候选目录继续选题。原15秒/最多3次模型调用及中央格式校验不变，不增加供应商重试或切换模型；认证、计费、中央Schema失败和取消不会被转换为正常答案；094另增加明确解析故障的独立恢复，不采用无效模型结果。选题回退不适用于回答理解、STT或评分失败。保留原模型调用失败审计，并将固定策略/原因写入规划收据，不记录敏感响应。
 
 ## 087：临时转写与分析取消来源
 

@@ -1,5 +1,9 @@
 # 领域模型
 
+## 094：解析故障诊断与独立提案
+
+既有ModelInvocation审计JSON追加可空`json_failure_kind`（仅`empty_content`或`invalid_json_object`）和`content_length`（整数0–10000000）；无响应正文、候选原文或凭据。中央Schema错误仍使用原`schema_reason/schema_path`，不能冒充解析故障。成功重试记录真实模型调用次数；批准目录回退沿原`approved_catalog_fallback.v1`和`fallback_reason=provider_schema_invalid`收据，不增加会话状态或将失败输出写入领域对象。无DDL或历史回填。
+
 ## 090：预算内的冻结考察范围
 
 新题库计划使用 `interview_assessment.v2`，新增 `assessment_scope`（`session_assessment_scope.v1` / `budgeted_core_competencies.v1`）：`selected_units`、`source_question_counts`、`included_competency_ids`、`excluded_competency_ids`、`available_competency_ids`、`estimated_required_seconds`。范围和能力权重在面试前冻结并参与 hash；完整批准题池、原题单元及来源绑定保留。只有入选单元可用于本场主题，追问继续附属于原根题而不独立计权；旧 v1 不迁移。

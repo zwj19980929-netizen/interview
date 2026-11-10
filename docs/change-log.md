@@ -2,6 +2,23 @@
 
 本文件记录所有会修改仓库内容的工作项。只读检查不单独登记；同一目标下的代码、测试、迁移和文档修改合并为一个工作项。状态使用 `in_progress`、`verified`、`failed` 或 `cancelled`，历史条目只追加或补充结果，不删除。
 
+## 2026-11-10 · PLANNING-JSON-RECOVERY-094
+
+- 状态：`in_progress`。
+- 授权与基线：用户在已定位首题重试原因后要求修改；沿用已有修复、Git回退点、测试及空闲加载授权。首次修改前工作区干净，当前代码已提交为907d551；已按入口顺序复核11份文档。本项覆盖可观察的JSON解析失败、有界规划恢复、回归和配套文档，不修改历史回答/评分或自动操作用户当前面试。
+- 现场证据：iv_e24b4ff9b59e4806的首题规划于11:15:18Z报provider_schema_invalid，耗时2505ms，finish_reason=stop、输出86/600 tokens，schema_reason/path为空；对应adapter空内容/无法解析JSON对象分支，非超时或输出上限截断。未保存响应正文，不能断言具体字符。后一次手动重试于11:15:54Z成功并开始播报。单次max_provider_attempts=1/retries=0覆盖路由重试配置，原规划回退明确排除格式错误。
+- 修改与验收边界：adapter只添加不含正文的明确解析失败分类，网关白名单持久化诊断；Supervisor仅对可重试的明确解析失败，在原15秒/最多3次模型调用内最多自动重试一次，仍失败则独立使用已批准合法目录提案。无效模型输出不能进入领域对象，Schema/领域校验、鉴权/计费、取消、owner/controller、上下文、预算和去重仍严格执行。先补事故红例与失败反例，再完整验证；保存实际文件/命令/失败/加载与剩余事项。
+
+
+- 阶段回归：解析诊断先红22 failed/11 passed；首次修后2个夹具误判（既有解析器允许扫描完整对象后缀），将负例改为真正不完整/尾随文本，未改解析政策，相关5文件90 passed。规划恢复先红12 failed/10 passed，修后6文件100 passed，含32项新增回归：原预算内共享重试、专家调用预留、无合法候选/字段/领域/鉴权拒绝、取消、owner/controller/语境变化及Memory/SQLite并发唯一提交。日志保留于/private/tmp/interviewer-094-{diagnostics-red,diagnostics-green,diagnostics-final,planning-red,planning-focused}.log；一次只读rg使用不存在glob被shell拒绝后纠正，无业务副作用。
+- 加载前只读检查：原API31919/worker31920身份与媒体配置一致，LiveKit活动房间/参与者/Egress全0；因本场media_capture_789287c2f11d4d52仍recording，重启门禁正确拒绝，服务未改变。按精确绑定查询EG_wMjYmstw6hE7已EGRESS_COMPLETE，无错误，42.376239853秒、16295493字节。本场0答案、1题、未结束；仅拟经现有processing/retry请求worker验真封存，验证owner释放/无待处理工作及所有面试文档保持，不调用StopEgress或结束面试，也不以直接改库绕过门禁。
+
+
+- 完整链路与冻结：新增6项真实OpenAI-compatible adapter→ModelGateway→Supervisor的HTTP MockTransport集成（无真实外呼），诊断文件共39项；两次实际请求恢复/独立目录回退、中央合同和领域越界拒绝均通过，相关7文件147 passed。首轮1 failed/69 passed源于夹具误把题目字符串越界归为中央校验，现明确分别断言中央合同拒绝和领域目录拒绝；原日志interviewer-094-json-pipeline.log保留，最终日志interviewer-094-json-pipeline-final.log。独立审查通过，603份源码/测试冻结，235份后端启动文件SHA为27a71f8163c6608d10bce377e6657f902ae668a1b0c4a62ba4f1e84642c28ec0。81份前端源码及65份构建资产逐hash等于093已测证据，复用568项前端回归及构建，不声称本次重新执行前端。发布与证明脚本22项隔离测试通过，无真实网络/信号/环境读取；343处本地文档链接与diff检查通过。完整后端正在执行，未加载。
+
+
+- 最终全量与实际封存：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q`为4841 passed/8 skipped/271.51秒，603份源码/测试集合和hash验证前后一致，已生成runtime-release-tests.v4证明/private/tmp/interviewer-094-test-attestation.json；完整日志/private/tmp/interviewer-094-backend-full.log。仅3份明确生产文件变化，Prompt/响应Schema无差异，未做真实模型外呼。精确录像经再次空闲、owner释放及真实终态检查，现有processing/retry返回202/work_count=0，worker封存completed，16295493字节、SHA256 ed0a8fa23d3f5e5cfb3da6eceb18557445e730dc54f03e261f0e45096e2e963f。80份完整面试文档hash 7ffab1e1dc57b119baafa11b48e30ad535f9cc51a79820f397d1f8d641c14d2e、其他78 capture和515 Outbox原始行、owner均保持；仅新增对应封存任务和原审计。未停止真实录像、未结束面试、未排答案评分/报告。复核还加强临时恢复脚本的0答案/无报告任务前置条件，避免宽接口副作用，独立审查通过。修复提交与即时双重空闲加载进行中。
+
 ## 2026-11-10 · FIRST-QUESTION-CONTEXT-093
 
 - 状态：`verified（仓库全量与本机加载；真人试音至首题复验待完成）`。

@@ -1,5 +1,9 @@
 # 数据库与向量存储设计
 
+## 094：模型调用的安全解析分类
+
+既有`model_invocations.data`新增可空`json_failure_kind`和`content_length`，前者严格限制为`empty_content/invalid_json_object`，后者为0–10000000的严格整数。沿现有组织隔离和JSON文档写入，无新表、索引或DDL。历史缺失诊断保留为空，不能倒推原响应；不保存原始模型正文，也不回填或改写历史面试、答案、评分及音频。
+
 ## 090：兼容的文档字段
 
 新计划的v2冻结合同含assessment_scope；会话可选candidate_input_completion_detail记录真实预算触发，媒体capture可选finalization_error记录安全分类。全部沿现有组织隔离的document存储与版本事务，无表/索引迁移，旧文档不回填。指定录像恢复仅沿Outbox原幂等身份重放封存，不能直接改completed或重写回答/评分/报告。
