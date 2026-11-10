@@ -9,6 +9,7 @@ from app.adapters.livekit_media import LiveKitMediaPlane
 from app.core.readiness import deployment_readiness
 from app.core.interview_agent_metrics import interview_agent_metrics
 from app.core.runtime_release import runtime_release_snapshot
+from app.core.media_runtime import media_runtime_snapshot
 from app.core.auth import (
     current_principal,
     issue_interviewer_websocket_ticket,
@@ -59,6 +60,12 @@ async def readyz() -> Response:
 async def get_runtime_release() -> Response:
     """Return the frozen process source snapshot, never current disk contents."""
     return api_response(runtime_release_snapshot("api"), headers={"Cache-Control": "no-store"})
+
+
+@router.get("/api/v1/admin/media-runtime")
+async def get_media_runtime() -> Response:
+    """Expose frozen configuration identity only, not provider health or secrets."""
+    return api_response(media_runtime_snapshot(), headers={"Cache-Control": "no-store"})
 
 
 @router.get("/api/v1/admin/interview-agent-metrics")

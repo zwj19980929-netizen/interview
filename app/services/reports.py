@@ -307,6 +307,8 @@ class ReportService:
             fields = [
                 "interview_id",
                 "overall_score",
+                "score_scope",
+                "assessment_scope",
                 "score_status",
                 "recognition_notice",
                 "recognition_warning_answer_ids",
@@ -326,6 +328,8 @@ class ReportService:
                 {
                     "interview_id": interview_id,
                     "overall_score": report["overall_score"],
+                    "score_scope": report.get("score_scope"),
+                    "assessment_scope": json.dumps(report["assessment_scope"], ensure_ascii=False) if report.get("assessment_scope") else "",
                     "score_status": report["score_status"],
                     "recognition_notice": report.get("recognition_notice"),
                     "recognition_warning_answer_ids": json.dumps(report.get("recognition_warning_answer_ids", [])),

@@ -111,7 +111,7 @@ it("clears the audio review attestation when switching questions", async () => {
 it("shows failure and uses the selected answer's signed recording", async () => {
   workbench.request.mockResolvedValue({ url: "/api/v1/private-media/synthetic_audio" });
   await show();
-  expect(host.textContent).toContain("失败 2 题");
+  expect(host.textContent).toContain("失败 2 份");
   expect(host.textContent).toContain("评分输出达到模型上限");
   await act(async () => button("第 2 题 · 评分失败").click());
   expect(host.textContent).toContain("回答原文2");
@@ -187,6 +187,39 @@ it("does not call an unverified recording playable and makes retry idempotent in
   expect(workbench.request).toHaveBeenCalledTimes(1);
   await act(async () => resolve({ status: "queued" }));
   expect(reload).toHaveBeenCalledOnce();
+});
+
+it.each([
+  ["configuration", "媒体存储配置待修复", false],
+  ["retry_exhausted", "自动重试次数已用完", true],
+  ["integrity", "录像完整性或访问保护校验未通过", false],
+  ["provider", "录像服务暂不可用", true],
+  ["unexpected_private_error", "请管理员检查后恢复封存", false],
+])("shows a safe %s recording failure instead of an endless finishing state", async (reason, text, canRetry) => {
+  await show({ ...review, processing: { ...review.processing, can_retry: false },
+    recording: { status: "stopping", processing_status: "failed", available: false, hash_verified: false,
+      failure_reason: reason, can_retry: canRetry, failure_code: "NEVER_RENDER_INTERNAL_CODE",
+      raw_error: "NEVER_RENDER_SECRET_PATH" },
+    turns: [{ ...review.turns[0], playback: { audio_available: true, video_available: false } }],
+  });
+  expect(host.textContent).toContain("录像封存失败");
+  expect(host.textContent).toContain(text);
+  expect(host.textContent).not.toContain("录像正在收尾");
+  expect(host.textContent).not.toContain("NEVER_RENDER");
+  expect(host.textContent).not.toContain("unexpected_private_error");
+  expect(!!button("重试未完成处理")).toBe(canRetry);
+  expect(button("播放整场音视频")).toBeUndefined();
+  expect(button("播放本题音频").disabled).toBe(false);
+  expect(workbench.request).not.toHaveBeenCalled();
+});
+
+it("honors an explicit recording retry prohibition while genuine sealing is in progress", async () => {
+  await show({ ...review, processing: { ...review.processing, can_retry: false },
+    recording: { status: "hash_pending", processing_status: "processing", available: false, hash_verified: false, can_retry: false },
+  });
+  expect(host.textContent).toContain("录像正在封存校验");
+  expect(host.textContent).not.toContain("录像封存失败");
+  expect(button("重试未完成处理")).toBeUndefined();
 });
 
 it("loads submitted interviews without opening a dead live monitor and refreshes the finished report", async () => {
@@ -284,6 +317,38 @@ it("shows withdrawal awaiting human review while the report is still processing"
   expect(host.querySelector(".score-value")).toBeNull();
 });
 
+it.each([
+  [{ trigger: "time_limit", limit_minutes: 45 }, "达到 45 分钟时长上限"],
+  [{ trigger: "primary_question_limit", primary_question_limit: 10 }, "达到 10 道主问题上限"],
+  [{ trigger: "candidate_pool_exhausted" }, "本场可用问题已问完"],
+])("distinguishes the recorded completion limit %j", async (completion, label) => {
+  await show({ ...warningReview(), candidate_input_completion_reason: "budget_exhausted", completion });
+  expect(host.textContent).toContain(`结束原因：${label}`);
+  expect(host.textContent).not.toContain("考察时间或题数预算已用完");
+});
+
+it("keeps an unknown historical budget trigger ambiguous instead of inferring a new ten-question limit", async () => {
+  await show({ ...warningReview(), candidate_input_completion_reason: "budget_exhausted",
+    completion: { trigger: "unrecognized_private_cause", primary_question_limit: 10 } });
+  expect(host.textContent).toContain("考察时间或题数预算已用完");
+  expect(host.textContent).not.toContain("达到 10 道主问题上限");
+  expect(host.textContent).not.toContain("unrecognized_private_cause");
+});
+
+it("keeps actual main and followup counts distinct from scored answer counts", async () => {
+  await show({ ...warningReview(), candidate_input_completion_reason: "budget_exhausted",
+    completion: { trigger: "time_limit", limit_minutes: 45, elapsed_seconds: 2751 },
+    question_counts: { primary: 14, followup: 2 },
+    processing: { report_status: "ready", total: 16, completed: 16, pending: 0, failed: 0 },
+    turns: [...review.turns, { turn_id: "never_presented", order: 17, status: "pending", playback: {} }],
+  });
+  expect(host.textContent).toContain("已提问 14 道主问题 · 2 道追问");
+  expect(host.textContent).toContain("本场用时 45 分 51 秒");
+  expect(host.textContent).toContain("已评分 16 / 16 份回答");
+  expect(host.textContent).not.toContain("已评分 16 / 16 题");
+  expect(host.textContent).not.toContain("17 道主问题");
+});
+
 it("keeps genuine zero competency scores visible and identifies followup evidence", async () => {
   const value = warningReview();
   value.execution_schema_version = 3;
@@ -297,6 +362,60 @@ it("keeps genuine zero competency scores visible and identifies followup evidenc
   expect(host.querySelector('section[aria-label="能力维度评分"] table').textContent).toContain("0 分");
   expect(host.textContent).toContain("此追问作为主问题的补充证据");
   expect(host.textContent).not.toContain("考察覆盖不足");
+});
+
+const frozenScope = () => ({ schema_version: "session_assessment_scope.v1", policy: "budgeted_core_competencies.v1",
+  selected_units: Array.from({ length: 9 }, (_, index) => ({ question_id: `q_${index}`, inquiry_unit_id: `unit_${index}` })),
+  source_question_counts: { position_bank: 6, resume_experience: 3 },
+  included_competency_ids: ["服务可靠性", "项目复盘"], excluded_competency_ids: ["底层编译原理"],
+  available_competency_ids: ["服务可靠性", "项目复盘", "底层编译原理"], estimated_required_seconds: 1800,
+});
+
+it("labels the new score against its frozen session scope and distinguishes the unused bank scope", async () => {
+  const value = warningReview();
+  value.report = { ...value.report, score_scope: "session_assessment", assessment_scope: frozenScope() };
+  await show(value);
+  expect(host.textContent).toContain("本场考察综合分");
+  const scope = host.querySelector('[aria-label="本场事前约定的考察范围"]');
+  expect(scope.textContent).toContain("岗位题 6 道 · 简历题 3 道");
+  expect(scope.textContent).toContain("服务可靠性、项目复盘");
+  expect(scope.textContent).toContain("未纳入本场考察的能力（1 项）");
+  expect(scope.textContent).toContain("底层编译原理");
+  expect(scope.textContent).toContain("题库其他范围不计入本场综合分");
+  expect(host.querySelector(".score-value").textContent).toContain("76");
+  expect(workbench.request).not.toHaveBeenCalled();
+});
+
+it.each([
+  [{ position_bank: 8 }, "岗位题 8 道 · 简历题 0 道"],
+  [{ resume_experience: 8 }, "岗位题 0 道 · 简历题 8 道"],
+])("displays an absent source as zero in the frozen scope", async (sources, text) => {
+  const value = warningReview();
+  value.report = { ...value.report, score_scope: "session_assessment",
+    assessment_scope: { ...frozenScope(), source_question_counts: sources } };
+  await show(value);
+  expect(host.querySelector('[aria-label="本场事前约定的考察范围"]').textContent).toContain(text);
+});
+
+it("does not convert historical partial coverage into a score or relabel its original contract", async () => {
+  const value = warningReview();
+  value.report = { ...value.report, overall_score: null, coverage_status: "insufficient_evidence",
+    assessment_coverage: { covered_competencies: 24, total_competencies: 41 } };
+  await show(value);
+  expect(host.textContent).toContain("考察覆盖不足，暂不形成总分");
+  expect(host.textContent).not.toContain("本场考察综合分");
+  expect(host.querySelector('[aria-label="本场事前约定的考察范围"]')).toBeNull();
+  expect(host.querySelector(".score-value")).toBeNull();
+  expect(host.textContent).not.toContain("58.5");
+});
+
+it("keeps a new session score unavailable until the frozen scope has sufficient evidence", async () => {
+  const value = warningReview();
+  value.report = { ...value.report, overall_score: null, coverage_status: "insufficient_evidence",
+    score_scope: "session_assessment", assessment_scope: frozenScope() };
+  await show(value);
+  expect(host.textContent).toContain("本场约定范围证据不足，暂不形成综合分");
+  expect(host.querySelector(".score-value")).toBeNull();
 });
 
 it("explains deadline skips and keeps real processing distinct from insufficient coverage", async () => {

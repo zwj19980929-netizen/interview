@@ -1,5 +1,19 @@
 # 接口设计
 
+## 090：事前考察范围、结束事实与媒体诊断
+
+CSV 报告导出追加 `score_scope` 与 JSON 编码的 `assessment_scope` 列，与 JSON 报告保持同一事前范围；旧报告留空，不把本场抽样分误标成整份题库总分。新增时间不足错误 `ASSESSMENT_APPOINTMENT_WINDOW_TOO_SHORT` / `ASSESSMENT_START_TIME_INSUFFICIENT`（422）仅暴露 `required_seconds/available_seconds`，候选就绪投影明确提示改期。
+
+新v2范围的预约创建、改期须验证窗口不小于预计必需耗时加告别预留；开场前剩余窗口不足亦明确拒绝并提示调整时间，不能默默缩减已冻结范围或等到中途才收口。旧v1预约兼容保持。
+
+新题库准备计划的 `assessment_contract` 使用 `interview_assessment.v2`：`assessment_scope`（`session_assessment_scope.v1`）在开始前冻结本场选中的单元、两来源名额、核心能力、未纳入能力与预计耗时；完整批准题池仍保留。报告追加 `score_scope=session_assessment` 和同一 `assessment_scope`，综合分只解释本场范围；旧 v1 不修改合同或分数。
+
+企业 `GET /api/v1/interviews/{id}/review` 追加 `completion`（可空）：`trigger=time_limit|primary_question_limit|candidate_pool_exhausted`、可选 `limit_minutes/elapsed_seconds/primary_question_limit`；新场次记录实际触发条件，旧场次仅在结束时间与冻结预算足以证明时投影，否则保留笼统原因。`question_counts={primary,followup}` 只统计实际呈现的主题和追问，评分进度仍为回答份数。
+
+`recording` 保留既有状态及严格可播放条件，新增 `processing_status=processing|failed|completed|unavailable`、`failure_reason=configuration|retry_exhausted|integrity|provider|unknown`（或空）、安全 `failure_code` 及 `can_retry`。失败/死信不能继续显示正常收尾；配置错误须先恢复配置再重试，记录成功仍必须通过真实对象哈希与存储保护校验。
+
+新增管理员只读 `GET /api/v1/admin/media-runtime`（admin RBAC、Cache-Control: no-store），worker 只读 inspect `media_runtime` 返回同一结构：`schema=media-runtime.v1`、`mode`、`configuration_sha256`、`recording_ready`、`issues`。在引导时冻结已解析媒体配置；不返回凭据、URL或绝对路径。摘要涵盖媒体模式、端点与存储路由及凭据存在性（不比较凭据值），用于核验 API/worker 配置一致性，不等于外部媒体服务健康证明，不替代原 readiness。既有 `runtime-release.v1` 源码身份协议不变。
+
 ## 089：总主题预算与结束播放
 
 岗位题库和简历题库共用全场主题预算，常规新计划目标8–10道、总上限10道，追问单独计数；短预约或材料不足可更少。候选池数量不是必问题数，不再因为完整能力覆盖需要更多单元而抬高主题上限。冻结历史合同不原地改写，执行层仍在题间以统一上限校验下一题，保留回答与未考察能力的证据不足事实。

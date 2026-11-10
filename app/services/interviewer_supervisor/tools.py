@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 from app.core.errors import ApiError
 from app.core.prompt.interviewer_supervisor import TOOLS
 from app.domain.adaptive_interview import closed_source_question_ids
+from app.domain.session_assessment_scope import scope_pairs
 from .context import assessment_contract
 from .context import conversation_memory, committed_turn_evidence
 
@@ -44,6 +45,7 @@ class InterviewerTools:
         roots = [turn for turn in session.get("turns", []) if not turn.get("is_followup")]
         asked = {(turn.get("question_id"), turn.get("inquiry_unit_id")) for turn in roots}
         declined = closed_source_question_ids(session)
+        planned = scope_pairs(self.contract)
         self.candidates = {}
         for source in self.contract.get("candidate_questions", []):
             identity = source.get("question_id")
@@ -54,7 +56,12 @@ class InterviewerTools:
             minutes = max(1, int(candidate.get("expected_minutes") or 1))
             candidate["_expected_seconds"] = (max(1, (minutes + len(units) - 1) // len(units)) if units else minutes) * 60
             if units:
-                candidate["inquiry_units"] = [unit for unit in units if (identity, unit["id"]) not in asked]
+                candidate["inquiry_units"] = [unit for unit in units if (identity, unit["id"]) not in asked
+                    and (planned is None or (identity, unit["id"]) in planned)]
+                if planned is not None:
+                    for unit in candidate["inquiry_units"]:
+                        unit["competency_ids"] = [name for name in unit["competency_ids"]
+                            if name in self.contract["assessment_scope"]["included_competency_ids"]]
                 if not candidate["inquiry_units"]:
                     continue
                 candidate["competency_ids"] = sorted({name for unit in candidate["inquiry_units"]

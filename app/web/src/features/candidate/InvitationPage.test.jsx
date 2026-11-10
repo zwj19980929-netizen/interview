@@ -280,6 +280,18 @@ describe("invitation admission diagnosis", () => {
     expect(host.querySelector('[role="alert"]').textContent).not.toContain("网络");
     expect(enterButton().disabled).toBe(false);
   });
+  it("explains insufficient interview time without starting a session or blaming the connection", async () => {
+    workbench.request.mockResolvedValue({ can_start: false, entry_blocker: { code: "ASSESSMENT_START_TIME_INSUFFICIENT" } });
+    await prepare();
+    await act(async () => enterButton().click());
+    const notice = host.querySelector('[role="alert"]').textContent;
+    expect(notice).toContain("剩余预约时间不足");
+    expect(notice).toContain("联系面试安排人改期");
+    expect(notice).not.toMatch(/稍后|等待|服务尚未准备|网络/);
+    expect(networkRow().classList.contains("is-ready")).toBe(true);
+    expect(workbench.request).toHaveBeenCalledTimes(1);
+    expect(workbench.request.mock.calls[0][0]).toContain("/readiness");
+  });
   it.each(["NETWORK_UNAVAILABLE", "REQUEST_TIMEOUT"])("invalidates the old green check after %s and recovers through a fresh probe", async (code) => {
     workbench.request.mockRejectedValue(Object.assign(new Error("private provider diagnostics"), { code }));
     await prepare();

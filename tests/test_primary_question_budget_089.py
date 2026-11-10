@@ -52,6 +52,12 @@ def bank_contract():
 
 def historical_contract():
     contract = bank_contract()
+    # Historical fixture is explicitly v1; new preparation freezes a bounded
+    # v2 session scope and must not be rewritten to simulate old storage.
+    contract.pop("assessment_scope", None)
+    contract.update(schema_version="interview_assessment.v1", scoring_policy="fixed_competencies.v1")
+    contract["competencies"] = [{"id": "c%d" % index, "weight": 1 / 41,
+        "required": True, "min_evidence_roots": 1} for index in range(41)]
     contract["budget"].update(min_root_questions=28, max_root_questions=28)
     contract["coverage_policy"] = "answered_roots.v1"
     body = {key: value for key, value in contract.items() if key != "contract_hash"}
@@ -75,11 +81,11 @@ def choose(session, candidate, unit):
 
 def test_bank_preparation_never_inflates_ten_total_topics_to_cover_41_labels():
     contract = bank_contract()
-    assert len(contract["competencies"]) == 41
+    assert len(contract["assessment_scope"]["available_competency_ids"]) == 41
     assert sum(len(row["inquiry_units"]) for row in contract["candidate_questions"]) == 56
-    assert contract["budget"]["min_root_questions"] == 8
+    assert contract["budget"]["min_root_questions"] == 10
     assert contract["budget"]["max_root_questions"] == 10
-    assert contract["coverage_policy"] == "sampled_answered_roots.v1"
+    assert contract["coverage_policy"] == "session_scope_answered_roots.v1"
     assert all(item["required"] for item in contract["competencies"])
     assert sum(item["weight"] for item in contract["competencies"]) == pytest.approx(1)
 

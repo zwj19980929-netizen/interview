@@ -1,5 +1,13 @@
 # 领域模型
 
+## 090：预算内的冻结考察范围
+
+新题库计划使用 `interview_assessment.v2`，新增 `assessment_scope`（`session_assessment_scope.v1` / `budgeted_core_competencies.v1`）：`selected_units`、`source_question_counts`、`included_competency_ids`、`excluded_competency_ids`、`available_competency_ids`、`estimated_required_seconds`。范围和能力权重在面试前冻结并参与 hash；完整批准题池、原题单元及来源绑定保留。只有入选单元可用于本场主题，追问继续附属于原根题而不独立计权；旧 v1 不迁移。
+
+新增会话 JSON 事实 `candidate_input_completion_detail`，在预算结束事务记录时间/主题数/题池耗尽的准确触发条件。企业读取可从旧结束时刻和冻结预算作有证据的只读投影，不回填历史。
+
+媒体 capture 增加可选 `finalization_error={code,category,retryable,occurred_at}`，只含安全枚举/原因码；配置缺失与完整性失败不能伪装成供应商仍在处理，成功封存清除错误。Outbox 仍负责尝试次数和死信事实，恢复沿既有幂等接口，不改写已提交答案/评分。无新增表或 DDL。
+
 ## 089：主题预算与告别投影
 
 主题为非followup的正式根轮次，岗位和简历来源共用总量；追问是零独立权重子轮次，不占8–10道主题预算。候选原题及其拆分单元属于可选范围，不能自动转成必须全部询问的数量。执行总上限不改写历史冻结合同或既有答案；预算到达后在当前回答完成的边界收口，未考察的能力保持insufficient_evidence，不制造零分或覆盖充分事实。

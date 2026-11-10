@@ -1,5 +1,10 @@
 # 模型供应商插件化设计
 
+## 090：媒体封存恢复诊断
+
+没有新增模型Prompt或厂商协议。封存配置缺失/鉴权错误、身份或保护校验失败停止自动重试；暂时供应商故障与Egress未结束仍受Outbox有限退避约束。API/worker使用独立media-runtime配置摘要核验同媒体模式与存储路由，摘要不比较凭据值，不替代真实ListEgress/对象验证。开发入口统一设置本地开关，production拒绝使用。
+
+
 ## 089：下一题规划的临时故障处理
 
 Provider仍只报告原始协议及结构化错误；Supervisor仅对`retryable=true`的`provider_timeout / provider_server_error / provider_rate_limited / provider_circuit_open`，以及当前有界模型await的本地超时，使用已批准候选目录继续选题。原15秒/最多3次模型调用及中央格式校验不变，不增加供应商重试或切换模型；认证、计费、Schema失败和取消不会被转换为正常答案。选题回退不适用于回答理解、STT或评分失败。保留原模型调用失败审计，并将固定策略/原因写入规划收据，不记录敏感响应。

@@ -2,6 +2,29 @@
 
 本文件记录所有会修改仓库内容的工作项。只读检查不单独登记；同一目标下的代码、测试、迁移和文档修改合并为一个工作项。状态使用 `in_progress`、`verified`、`failed` 或 `cancelled`，历史条目只追加或补充结果，不删除。
 
+## 2026-11-09 · ASSESSMENT-SCOPE-AND-MEDIA-RECOVERY-090
+
+- 状态：`verified（仓库全量、本机加载与指定录像恢复；真人/生产待验）`。
+- 用户授权：修复上一轮已查清的考察范围/题数/总分不一致、API与worker媒体配置漂移、录像失败误显示处理中及笼统结束原因；允许完成验证后恢复指定旧场次录像封存。修复前工作区干净，Git基线`9f41d4c`，保留`ef5d277`和`4639d2b`；代码、测试、配置、构建、文档、运行加载与指定封存恢复均归本项。
+- 只读事实：`iv_a304dabcf1a243c7`实际45分51秒，触发时间上限；14主题+2追问均已评分，但旧41必需能力仅覆盖24，旧最低28主题未满足，完整总分为空。当前089新合同虽限制8–10主题，仍把41能力全设required，内存复现最低完整覆盖仍28，因此必须在面试前冻结可行的本场范围，不能事后删掉缺失维度凑总分。
+- 录像事实：API99185启用本地媒体且ready，worker99186缺该开关、默认OSS且4项配置缺失，`LIVEKIT_RECORDING_NOT_READY`在ListEgress前抛出；指定capture的1,051,629,048字节本地mp4存在，原egress已结束，封存重试失败。UI只看stopping，未投影实际失败。此前089仅保存该异常，未恢复封存。
+- 实施边界：新计划预先冻结8–10主题可完成的考察范围和权重、验证时间/题数可行性；既有终态合同/回答/评分/报告保持，不用改写历史或零分填补未考察。结束原因细分并保留旧兼容；配置缺失明确归类，API/worker同配置检查；实际恢复仅作用于指定录像封存工作，不触发重新评分或补交回答。遵守既有组织、来源、存储保护、真实哈希与幂等门禁。
+- 验收计划：合成大题池的范围可行性、完整10主题可出范围明确总分、缺关键证据/提前退出不伪造完整分、追问不独立计权与旧合同不变；媒体配置差异、可恢复/不可恢复失败、真实临时文件哈希及安全回放；前后端合同与全量回归。空闲加载后核对源码及配置身份，再恢复指定录像并比对答案/评分/报告摘要。首个日志补丁因定位文本错误未写入，随后在正确标题前登记；后续失败与结果持续保留。
+
+- 阶段进展：v2本场范围合同与严格校验、选题双围栏、完成原因事实、录像错误分类和配置身份、前端范围/失败展示均已实现。相关回归通过；独立审查发现提前预约截止仍显示完整时长、自动退避误显示失败、永久死信误称重试耗尽三处，已修并补负例。新增测试中一次foreign-capture断言误放入另一fixture导致1失败，移回正确测试后18项通过。README首个补丁因完整段落不匹配失败无写入，随后精确替换成功。未对真实业务或服务执行写入；全量及加载另补。
+
+- 扩展边界与审查：新范围在预约创建/改期、readiness和最终START事务核验可完成时间；追问为剩余主问题留时，min3简历配额适配3、不可行策略提前拒绝；候选时间不足明确改期而非等待。真实prepare入口默认阈值由1改2并补端到端合成证据，最终相关21文件304项通过。前端新范围/故障/入场提示共552项通过，构建成功（原大bundle提示保持）；报告JSON/CSV都携带范围，28项相关回归通过。新增模板文档补丁另两次因整段匹配失败均无写入。
+- 发布准备：090 runner复用089全部空闲/身份/正常TERM/TTY恢复围栏，仅显式development统一LOCAL_MEDIA开关，再比较API/worker安全配置摘要；17项隔离检查通过，0真实环境读取/网络/信号。随后只读真实预检通过：worker/media/owner/非终态work皆0，75场核心摘要仍为3c84f7f19b9f5c2bfb364338d953a33f2721ea8b75344425577f51973b4f347b；两份修正媒体配置摘要dcbaf54ac496b9217094dae97dfcd6b2ffec665d23f934bfaae2895c5ecefb0f一致且ready，尚未重启。原环境只保存在内存未输出。
+- 冻结：597份源码/测试文件已冻结到/private/tmp/interviewer-090-tested-source.json。第一轮全量在补边界期间执行，仅用于发现兼容失败，不作为最终冻结证明；最终全量与加载随后记录。指定恢复baseline已保存75场完整文档、评分Outbox及其他capture摘要，原文件1051629048字节/mtime保持；当前16份回答、18个评分历史版本、1份报告，封存work8次失败dead_letter。实际恢复尚未执行。
+
+- 首轮完整回归：4670 passed /1 failed /8 skipped /276.42秒（interviewer-090-backend-first-full.log）。唯一失败为旧企业E2E题库fixture固定循环两题，而两题估时7+8分钟占满15分钟、无告别预留，新范围合法仅冻结1题；正在改为足量合成材料，保留真实准入/STT/评分/HTTP报告且加强双能力最低证据与本场总分断言，不放宽生产时间门禁。尚未发布。
+
+- 最终完整回归：修正旧E2E后33项通过并重冻597文件；`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q`得到4679 passed /8 skipped /267.13秒，日志interviewer-090-backend-full-final.log。前端最终26文件552项通过与临时构建成功；源码集合/hash不变，401本地文档链接和diff检查通过。静态前端按先不可变bundle、后原子index发布并保留旧bundle；090-test-attestation绑定已测源码/测试及构建集合，实际API/worker加载进行中。恢复脚本追加预POST报告重放拒绝、组织/唯一capture/幂等键绑定，10项隔离检查通过；现场基线复核仍完全一致，未发恢复请求。
+
+- 实际加载：2026-11-10T03:23:27Z（本地11月9日19:23）正常TERM旧API99185/worker99186后启动API10055、worker/Beat10056，无强杀、无恢复分支，runner退出0。235份后端源码SHA=144b9b7e2b4fb0abbca832dd68e7c893851d0ef6b89222593cf1cd67e1d223c6，与597文件测试证明一致；63构建文件受证明校验。API/worker媒体摘要均dcbaf54ac496b9217094dae97dfcd6b2ffec665d23f934bfaae2895c5ecefb0f，local/ready/noissues。健康、就绪、媒体空闲及75场核心摘要全部通过。Vite进程未重启，5174新源码及代理已读取新后端，8000静态index与bundle HEAD核验通过。
+- 指定录像恢复：既有processing/retry API仅重放work_c5bd61cf32cf407b封存，answer/report work_count=0。capture与work均completed，1051629048字节，真实存储保护local_private_development；独立流式SHA与封存SHA均81da8dd6fcc5033738b6b9504d0032d320283d3b0a850ced599daa59109798ce，签名Range返回206且1024字节与原文件相同。75场完整面试文档、全部评分/报告Outbox、其他capture及原文件大小/mtime均与修前baseline完全相同；目标16份回答、18个评分历史版本、1份报告保留。旧overall_score仍为空且14主题+2追问、45分51秒时间结束事实正确投影，没有事后重配权重。安全结果保存在/private/tmp/interviewer-090-recording-recovery-result.json，不保存签名回放URL。
+- 实际文件与边界：新增media_runtime、local_runtime、session_assessment_scope、interview_completion和5份090测试；修改自适应合同/准入/生命周期、计划/预约/追问/监督器目录、媒体/复核/报告服务、system/Celery诊断，前端计划/报告/入场提示与测试、三份旧后端fixture、local-media脚本及README/CONTEXT和对应设计文档。无Prompt/provider协议、DDL或历史合同迁移；旧v1继续兼容，新的考察范围需重新准备计划才生效。时间预算是事前估计，真人长场次及外部供应商长期稳定性仍需验收；不标closed。
+
 ## 2026-11-08 · INTERVIEW-FLOW-CONTINUITY-089
 
 - 状态：`verified（仓库全量与本机加载；真人长场次待验）`。

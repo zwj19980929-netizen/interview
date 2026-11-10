@@ -19,6 +19,7 @@ from app.core.ids import new_id
 from app.domain.primary_question_budget import (
     MAX_PRIMARY_QUESTIONS, NORMAL_MIN_PRIMARY_QUESTIONS, primary_question_budget,
 )
+from app.domain.session_assessment_scope import freeze_session_scope, scope_pairs, validate_session_scope
 
 
 Document = Dict[str, Any]
@@ -170,6 +171,12 @@ def freeze_assessment_contract(
                      "min_evidence_roots": min(settings.min_evidence_units_per_competency,
                         competency_unit_counts[name]) if has_units else 1}
                     for name, weight in sorted(weights.items())]
+    scope = None
+    if has_units and assessment_basis is not None:
+        competencies, scope = freeze_session_scope(candidates, weights, maximum,
+            duration_minutes * 60 - settings.closing_reserve_seconds,
+            settings.min_evidence_units_per_competency)
+        minimum = maximum = len(scope["selected_units"])
     if has_units and assessment_basis is None:
         needed = _minimum_evidence_units(competencies, candidates)
         if needed > maximum:
@@ -179,7 +186,7 @@ def freeze_assessment_contract(
                                          "min_evidence_units_per_competency": settings.min_evidence_units_per_competency})
         minimum = max(minimum, needed)
     contract = {
-        "schema_version": "interview_assessment.v1", "role_requirement_id": role["id"],
+        "schema_version": "interview_assessment.v2" if scope else "interview_assessment.v1", "role_requirement_id": role["id"],
         "role_requirement_version": role["version"], "competencies": competencies,
         "candidate_questions": deepcopy(candidates),
         "budget": {"min_root_questions": minimum, "max_root_questions": maximum,
@@ -194,14 +201,21 @@ def freeze_assessment_contract(
     }
     if assessment_basis is not None:
         contract["assessment_basis"] = deepcopy(assessment_basis)
+    if scope:
+        contract.update(assessment_scope=scope, coverage_policy="session_scope_answered_roots.v1",
+                        scoring_policy="fixed_session_competencies.v1")
     contract["contract_hash"] = _hash(contract)
     validate_assessment_contract(contract)
     return contract
 
 
 def validate_assessment_contract(contract: Document) -> None:
-    if contract.get("schema_version") != "interview_assessment.v1":
+    if contract.get("schema_version") not in {"interview_assessment.v1", "interview_assessment.v2"}:
         _invalid("Unsupported assessment contract version.")
+    if contract.get("schema_version") == "interview_assessment.v2":
+        validate_session_scope(contract)
+    elif "assessment_scope" in contract:
+        _invalid("Legacy contracts cannot carry a new session scope.")
     body = {key: value for key, value in contract.items() if key != "contract_hash"}
     if contract.get("contract_hash") != _hash(body):
         _invalid("Frozen assessment contract content has changed.")
@@ -218,13 +232,14 @@ def validate_assessment_contract(contract: Document) -> None:
     if abs(sum(float(item["weight"]) for item in competencies) - 1) > 0.00001:
         _invalid("Frozen competency weights must total one.")
     candidates = contract.get("candidate_questions") or []
+    available_ids = contract.get("assessment_scope", {}).get("available_competency_ids", ids)
     question_ids = [item.get("question_id") for item in candidates]
     if not candidates or len(set(question_ids)) != len(question_ids):
         _invalid("Approved candidate question identities must be unique.")
     available = set()
     for candidate in candidates:
         mapped = candidate.get("competency_ids") or []
-        if not mapped or not set(mapped).issubset(ids):
+        if not mapped or not set(mapped).issubset(available_ids):
             _invalid("Every approved question must map to frozen competencies.")
         question = candidate.get("frozen_question") or {}
         if (question.get("id") != candidate.get("question_id") or not question.get("version")
@@ -320,9 +335,11 @@ def budget_summary(session: Document, now: str) -> Document:
     roots = root_turns(session)
     selected = {(turn.get("question_id"), turn.get("inquiry_unit_id")) for turn in roots}
     closed = closed_source_question_ids(session)
+    planned = scope_pairs(contract)
     remaining_units = sum(1 for candidate in contract["candidate_questions"] if candidate["question_id"] not in closed
                           for unit in candidate.get("inquiry_units") or [{"id": None}]
-                          if (candidate["question_id"], unit["id"]) not in selected)
+                          if (candidate["question_id"], unit["id"]) not in selected
+                          and (planned is None or (candidate["question_id"], unit["id"]) in planned))
     return {"remaining_seconds": max(0, int(available)),
             "remaining_root_questions": max(0, execution_budget["max_root_questions"] - len(roots)),
             "execution_question_budget": execution_budget,
@@ -398,6 +415,9 @@ def append_adaptive_question(session: Document, question_id: str, decision_id: s
     candidate = next((item for item in contract["candidate_questions"] if item["question_id"] == question_id), None)
     if candidate is None:
         _invalid("The question does not belong to the frozen approved pool.", "ADAPTIVE_QUESTION_NOT_APPROVED")
+    planned = scope_pairs(contract)
+    if planned is not None and (question_id, inquiry_unit_id) not in planned:
+        _invalid("This inquiry unit is outside the frozen session assessment scope.", "ADAPTIVE_INQUIRY_UNIT_NOT_APPROVED")
     question = candidate["frozen_question"]
     previous = [turn for turn in root_turns(session) if turn.get("question_id") == question_id]
     if question_id in closed_source_question_ids(session):
@@ -418,6 +438,9 @@ def append_adaptive_question(session: Document, question_id: str, decision_id: s
     presented = [unit["id"]] if unit else ["complete_question"]
     spoken = unit["question_text"] if unit else question["question_text"]
     mapped_competencies = deepcopy(unit["competency_ids"] if unit else candidate["competency_ids"])
+    if planned is not None:
+        mapped_competencies = [name for name in mapped_competencies
+                              if name in contract["assessment_scope"]["included_competency_ids"]]
     minutes = candidate["expected_minutes"]
     if unit:
         minutes = max(1, (minutes + len(candidate["inquiry_units"]) - 1) // len(candidate["inquiry_units"]))
@@ -503,10 +526,13 @@ def adaptive_score_summary(session: Document, evaluations: List[Document]) -> Do
             "assessed_rubric_point_ids": sorted(assessed), "not_assessed_rubric_point_ids": sorted(full - assessed),
             "assessed_point_count": len(assessed), "approved_point_count": len(full),
             "scope_status": "complete" if assessed == full else "partial" if assessed else "not_assessed"})
-    return {"overall_score": int(round(weighted)) if complete and dimensions and coverage["sufficient"] else None,
+    result = {"overall_score": int(round(weighted)) if complete and dimensions and coverage["sufficient"] else None,
             "dimension_scores": dimensions, "coverage_status": "sufficient" if complete and coverage["sufficient"] else "insufficient_evidence",
             "assessment_coverage": coverage, "scoring_policy": contract["scoring_policy"],
             "assessment_contract_hash": contract["contract_hash"], "source_question_scopes": source_scopes}
+    if contract.get("assessment_scope"):
+        result.update(score_scope="session_assessment", assessment_scope=deepcopy(contract["assessment_scope"]))
+    return result
 
 
 def interrupted_fixed_plan_summary(session: Document, evaluations: List[Document]) -> Document:

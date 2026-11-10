@@ -99,6 +99,8 @@ function PlanDetail({ planId, onUpdated, onBack, onCreate }) {
   };
   useEffect(() => { read(); return () => { generation.current += 1; busyRef.current = false; }; }, [planId]);
   const contract = plan?.assessment_contract;
+  const assessmentScope = contract?.assessment_scope?.schema_version === "session_assessment_scope.v1"
+    ? contract.assessment_scope : null;
   const questions = contract?.candidate_questions || [];
   const budget = contract?.budget || {};
   const skill = plan?.skill_snapshot || plan?.enterprise_skill_snapshot;
@@ -144,11 +146,11 @@ function PlanDetail({ planId, onUpdated, onBack, onCreate }) {
       {plan.status === "approved" && <div className="plans-callout is-ready" role="status"><div><strong>计划已启用，可以安排面试</strong><p>到面试会话页创建预约，选择这位候选人和本计划。</p></div><a className="button button-secondary" href="#interviews">去安排面试 <span aria-hidden="true">→</span></a></div>}
       <div className="plans-detail-layout">
         <section className="plans-section" aria-label="计划考察内容">
-          <header><h2>{modern ? "候选问题池" : "原定考察安排"}</h2><p>{modern ? "下列内容供面试官选择，不会全部提问。岗位题和简历题合计最多 10 道主问题，追问单独计算；未考察的能力会在报告中注明证据不足。" : "这份计划保留原有题序和评分安排，实际提问受合计最多 10 道主问题的限制；追问单独计算。"}</p></header>
+          <header><h2>{modern ? "候选问题池" : "原定考察安排"}</h2><p>{assessmentScope ? "面试官只在事前选定的问题中提问，岗位题和简历题合计最多 10 道主问题，追问单独计算。其他内容保留供审阅，不纳入本场评分范围。" : modern ? "下列内容供面试官选择，不会全部提问。岗位题和简历题合计最多 10 道主问题，追问单独计算；未考察的能力会在报告中注明证据不足。" : "这份计划保留原有题序和评分安排，实际提问受合计最多 10 道主问题的限制；追问单独计算。"}</p></header>
           {modern ? questions.map((question, index) => <section className="plans-question-group" key={question.question_id}>
             <div className="plans-question-head"><span className="plans-question-number">{String(index + 1).padStart(2, "0")}</span><div><h3>{question.frozen_question?.title || `考察方向 ${index + 1}`}</h3><p>{question.source_type === "resume_experience" ? "来自简历经历" : "来自岗位题库"} · {question.inquiry_units?.length || 0} 个可选问题</p></div></div>
             <ol className="plans-question-list">{(question.inquiry_units || []).map((unit) => <li className="plans-question-item" key={unit.id}>
-              <p>{unit.question_text}</p><div className="plans-question-meta">{unit.competency_ids?.map((item) => <span key={item}>{item}</span>)}</div>
+              <p>{unit.question_text}</p><div className="plans-question-meta">{assessmentScope && <span>{assessmentScope.selected_units?.some((selected) => selected.question_id === question.question_id && selected.inquiry_unit_id === unit.id) ? "本场计划提问" : "本场范围外"}</span>}{unit.competency_ids?.map((item) => <span key={item}>{item}</span>)}</div>
               <details className="plans-disclosure"><summary>评分依据</summary><div><h4>考察点</h4><p>{(unit.assessed_rubric_point_ids || []).map((id) => {
                 const point = question.frozen_question?.key_points?.find((item) => (typeof item === "string" ? item : item.id) === id);
                 return typeof point === "string" ? point : point?.text || id;
@@ -161,6 +163,12 @@ function PlanDetail({ planId, onUpdated, onBack, onCreate }) {
           {!!plan.assembly_summary?.warnings?.length && <details className="plans-disclosure"><summary>计划准备说明（{plan.assembly_summary.warnings.length}）</summary><ul>{plan.assembly_summary.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul></details>}
         </section>
         <aside>
+          {assessmentScope && <section className="plans-section" aria-label="本场冻结的考察范围">
+            <header><h2>本场冻结的考察范围</h2><p>本场考察综合分只汇总以下事前约定的能力，权重与证据要求不随面试结果改变。</p></header>
+            <p>纳入本场：{assessmentScope.included_competency_ids?.join("、")}</p>
+            <p>岗位题 {assessmentScope.source_question_counts?.position_bank ?? 0} 道 · 简历题 {assessmentScope.source_question_counts?.resume_experience ?? 0} 道，追问另计。</p>
+            {!!assessmentScope.excluded_competency_ids?.length && <details className="plans-disclosure"><summary>未纳入本场的能力（{assessmentScope.excluded_competency_ids.length} 项）</summary><p>{assessmentScope.excluded_competency_ids.join("、")}</p><p>这些能力不作为本场的扣分项，也不影响本场约定范围的综合分。</p></details>}
+          </section>}
           {modern && <section className="plans-section"><header><h2>考察重点</h2><p>能力权重在面试前确定。</p></header><div className="plans-competencies">{(contract?.competencies || []).map((item) => <div className="plans-competency" key={item.id}><strong>{item.id}</strong><span>{Number.isFinite(item.weight) ? `${Math.round(item.weight * 10000) / 100}%` : "未设置"}</span><small>至少 {item.min_evidence_roots} 处回答证据{item.required ? " · 必需" : ""}</small></div>)}</div><details className="plans-disclosure"><summary>话题与追问设置</summary><p>每个话题最多追问 {budget.max_followups_per_root ?? 0} 次，总追问上限 {budget.max_total_followups ?? 0} 次。</p><p>预留 {budget.closing_reserve_seconds ?? 0} 秒结束交流。</p></details></section>}
           <section className="plans-section"><header><h2>本场面试定制</h2><p>使用生成本计划时保存的内容，后续修改不会影响本场面试。</p></header><details className="plans-disclosure"><summary>Skill（可选）<small>{skill ? `已选择 · 第 ${skill.revision} 版` : "未使用"}</small></summary>{skill ? <><p>使用生成计划时保存的 Skill 第 {skill.revision} 版。</p><a href="#skills">管理面试定制 →</a></> : <p>{selectedSkillId ? "所选 Skill 版本尚未保存到本场计划，请重新生成。" : "使用基础面试官，根据本场题库和回答展开交流。"}</p>}</details><details className="plans-disclosure"><summary>企业资料（可选）<small>{plan.company_context ? "已提供" : "未提供"}</small></summary><p className="plans-prose">{plan.company_context || "未提供企业资料，面试官仅依据本场考察材料交流，不编造企业信息。"}</p></details></section>
           <section className="plans-section"><details className="plans-disclosure plans-technical"><summary>版本记录</summary><p>计划版本 {plan.version} · {planDate(plan.updated_at || plan.created_at, true)}</p><p>{plan.preparation_mode === "question_bank" ? "考察内容来自所选题库，已自动完成准备检查。" : `岗位要求版本 ${contract?.role_requirement_version ?? "未记录"}`}</p><p>计划编号 <code>{plan.id}</code></p>{skill && <><p>Skill 第 {skill.revision} 版 <code>{skill.skill_id}</code></p><p>内容标识 <code>{skill.content_hash}</code></p></>}<button className="button button-secondary" disabled={busy} onClick={read}>重新加载</button></details></section>

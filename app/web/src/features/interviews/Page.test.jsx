@@ -146,6 +146,15 @@ describe("saved appointment invitation diagnostics", () => {
     return host.querySelector('[aria-label="邀请签发失败原因"]');
   };
 
+  it("explains an insufficient frozen assessment window as a scheduling issue", async () => {
+    const failure = await failInvite({ code: "APPOINTMENT_NOT_READY", details: { checks: [
+      { name: "assessment_time_budget", ready: false, invite_ready: false, required_seconds: 1830, available_seconds: 300 },
+    ] } });
+    expect(failure.textContent).toContain("本场考察所需时间");
+    expect(failure.textContent).toContain("请延长预约或重新准备更短的计划");
+    expect(failure.textContent).not.toMatch(/其他服务检查|检查配置|assessment_time_budget|稍后|等待/);
+  });
+
   it.each(["development", "production"])("lists only actual invitation blockers in %s without exposing diagnostic payloads", async (environment) => {
     const failure = await failInvite({ code: "APPOINTMENT_NOT_READY", details: {
       runtime_environment: environment,

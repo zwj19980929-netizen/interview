@@ -21,13 +21,14 @@ cd ../..
 ./scripts/local-media.sh up
 ```
 
-后端只需增加一个配置参数：
+API 和 worker 都通过统一开发入口启动（分别在两个终端运行，并加载各自既有模型与 broker 配置）：
 
 ```bash
-INTERVIEWER_LOCAL_MEDIA=true .venv/bin/python main.py
+.venv/bin/python -m app.operations.local_runtime api
+.venv/bin/python -m app.operations.local_runtime worker
 ```
 
-如果使用 PyCharm，把 `INTERVIEWER_LOCAL_MEDIA=true` 填到后端 Run Configuration 的“环境变量”即可。`.env.example` 只是中文配置说明，应用不会从它读取运行配置，也不需要新建 `.env.local`。本地 Participant Egress 录像写入 `data/private-files/interview-captures/`；它会记录为 `local_private_development`，不会伪装成已启用静态加密。查看或停止媒体服务：
+如果使用 PyCharm，API 与 worker 的 Run Configuration 都须设置 `INTERVIEWER_LOCAL_MEDIA=true`，不能只设置 API。统一入口仅允许 development，拒绝生产环境。发布时对照管理员 `/api/v1/admin/media-runtime` 与 worker inspect `media_runtime`：配置摘要须相同且 recording_ready 均为 true；摘要不比较凭据值，仍须实际服务验收。`.env.example` 只是中文配置说明，应用不会从它读取运行配置，也不需要新建 `.env.local`。本地 Participant Egress 录像写入 `data/private-files/interview-captures/`；它会记录为 `local_private_development`，不会伪装成已启用静态加密。查看或停止媒体服务：
 
 ```bash
 ./scripts/local-media.sh status
@@ -149,7 +150,7 @@ INTERVIEWER_POSTGRES_DSN=postgresql://runtime_app:password@127.0.0.1/interviewer
 ```bash
 redis-server
 INTERVIEWER_CELERY_BROKER_URL=redis://127.0.0.1:6379/2 \
-.venv/bin/celery -A app.workers.celery_app:celery_app worker --beat --loglevel=INFO
+.venv/bin/python -m app.operations.local_runtime worker
 ```
 
 安装项目脚本后也可以运行 `interviewer-celery`。Celery Beat 每两秒补发 due/租约过期工作项；Web 请求不直接执行 TTS。`app.workers.outbox` 保留为不依赖 broker 的故障恢复/测试入口，但生产部署使用 Celery。

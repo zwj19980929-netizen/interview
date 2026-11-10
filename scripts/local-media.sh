@@ -29,7 +29,9 @@ case "${ACTION}" in
     export INTERVIEWER_LOCAL_LIVEKIT_NODE_IP="${INTERVIEWER_LOCAL_LIVEKIT_NODE_IP:-$(detect_node_ip)}"
     docker compose -f "${COMPOSE_FILE}" up -d
     echo "本地 LiveKit/Egress 已启动，RTC 地址：${INTERVIEWER_LOCAL_LIVEKIT_NODE_IP}"
-    echo "启动后端时只需增加：INTERVIEWER_LOCAL_MEDIA=true"
+    echo "使用统一开发配置分别启动 API 和 worker："
+    echo ".venv/bin/python -m app.operations.local_runtime api"
+    echo ".venv/bin/python -m app.operations.local_runtime worker"
     ;;
   down)
     docker compose -f "${COMPOSE_FILE}" down

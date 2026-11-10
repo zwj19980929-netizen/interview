@@ -18,6 +18,7 @@ from app.domain.appointment_admission import (
     parse_utc,
 )
 from app.domain.appointment_speech import summarize_speech_preparation
+from app.domain.session_assessment_scope import require_scope_window
 from app.domain.speech_profile import (
     freeze_interview_speech_profile,
     speech_asset_matches_profile,
@@ -71,6 +72,7 @@ class AppointmentService:
             self._required(plan, "INTERVIEW_PLAN_NOT_FOUND", "Interview plan does not exist.")
             if plan["status"] != "approved":
                 raise ApiError("INTERVIEW_PLAN_NOT_APPROVED", "Appointment requires an approved plan.", status_code=409)
+            require_scope_window(plan.get("assessment_contract"), payload["scheduled_start_at"], payload["scheduled_end_at"])
             candidate = transaction.candidate_profiles.get(payload["candidate_profile_id"])
             self._required(candidate, "CANDIDATE_PROFILE_NOT_FOUND", "Candidate profile does not exist.")
             position = transaction.job_positions.get(payload["job_position_id"])
@@ -188,9 +190,10 @@ class AppointmentService:
             end = payload.get("scheduled_end_at") or appointment["scheduled_end_at"]
             if self._parse_time(start) >= self._parse_time(end):
                 raise ApiError("APPOINTMENT_TIME_INVALID", "Appointment end must be after its start.")
+            plan = transaction.interview_plans.get(appointment["plan_id"])
+            require_scope_window((plan or {}).get("assessment_contract"), start, end)
             appointment["scheduled_start_at"] = start
             appointment["scheduled_end_at"] = end
-            plan = transaction.interview_plans.get(appointment["plan_id"])
             speech_profile = self._plan_speech_profile(transaction, plan)
             if payload.get("settings") is not None:
                 settings = self._normalized_settings(
@@ -260,6 +263,9 @@ class AppointmentService:
                 return self._readiness(transaction, plan, appointment=appointment, now=self._now())
 
         readiness = snapshot()
+        if any(check.get("name") == "assessment_time_budget" and not check.get("ready")
+               for check in readiness.get("checks", [])):
+            return readiness
         route_ids = sorted({
             check["route_readiness"]["route_id"]
             for check in readiness.get("checks", [])
@@ -542,8 +548,13 @@ class AppointmentService:
                     "CONSENT_REQUIRED", "AUDIO_RECORDING_CONSENT_REQUIRED", "VIDEO_RECORDING_CONSENT_REQUIRED",
                     "APPOINTMENT_TOO_EARLY", "APPOINTMENT_WINDOW_CLOSED", "APPOINTMENT_DEVICE_NOT_READY",
                     "APPOINTMENT_NOT_READY", "INTERVIEW_PLAN_NOT_APPROVED",
+                    "ASSESSMENT_START_TIME_INSUFFICIENT",
                 }
                 entry_blocker = {"code": error.code if error.code in public_codes else "APPOINTMENT_NOT_READY"}
+                if error.code == "ASSESSMENT_START_TIME_INSUFFICIENT":
+                    entry_blocker["details"] = {key: error.details[key]
+                        for key in ("required_seconds", "available_seconds")
+                        if type(error.details.get(key)) is int and error.details[key] >= 0}
         result = deepcopy(readiness)
         result["device_readiness"] = device
         result["can_start"] = can_start

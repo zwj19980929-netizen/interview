@@ -10,6 +10,7 @@ from app.core.time import utc_now
 from app.domain.scoring_quality import is_unresolved_evaluation, evaluation_answers, project_evaluation, project_report
 from app.domain.speech_quality import transcript_is_verified
 from app.domain.interview_lifecycle import LifecycleCommand, LifecycleCommandType
+from app.domain.interview_completion import completion_projection, presented_question_counts
 from app.file_storage.signing import FileAccessSigner
 from app.file_storage.provider import private_file_storage
 from app.file_storage.interface import PrivateFileStorage
@@ -48,7 +49,7 @@ class EnterpriseReviewService:
                             if item.get("interview_id") == interview_id), None)
             works = [item for item in transaction.outbox.list()
                      if item.get("payload", {}).get("interview_id") == interview_id]
-        recording = self._recording_projection(capture)
+        recording = self._recording_projection(capture, works)
         turns = []
         for turn in sorted(interview.get("turns", []), key=lambda item: item["order"]):
             answer = answers.get(turn["id"])
@@ -100,6 +101,8 @@ class EnterpriseReviewService:
             "status": interview["status"],
             "execution_schema_version": interview.get("execution_schema_version") or interview.get("plan_snapshot", {}).get("execution_schema_version", 2),
             "candidate_input_completion_reason": interview.get("candidate_input_completion_reason"),
+            "completion": completion_projection(interview),
+            "question_counts": presented_question_counts(interview),
             "planning": {
                 "last_decision": {key: deepcopy(value) for key, value in
                     (interview.get("agent_runtime", {}).get("last_planning") or {}).items()
@@ -146,14 +149,44 @@ class EnterpriseReviewService:
                 "report_status": status, "can_retry": bool(failed or interview.get("status") == "report_failed")}
 
     @staticmethod
-    def _recording_projection(capture):
+    def _recording_projection(capture, works=()):
         if not capture:
-            return {"status": "unavailable", "available": False, "consented_scopes": []}
-        return {"status": capture["status"], "available": bool(capture.get("status") == "completed"
-                and capture.get("content_hash") and capture.get("byte_count") and capture.get("storage_protection")),
+            return {"status": "unavailable", "available": False, "consented_scopes": [],
+                    "processing_status": "unavailable", "failure_reason": None, "can_retry": False}
+        available = bool(capture.get("status") == "completed" and capture.get("content_hash")
+                         and capture.get("byte_count") and capture.get("storage_protection"))
+        work = next((item for item in works if item.get("kind") == "interview.media.finalize"
+                     and item.get("payload", {}).get("capture_id") == capture["id"]), None)
+        error = capture.get("finalization_error") or {}
+        active = bool(work and (work.get("status") in {"pending", "running"}
+                      or work.get("status") == "failed" and work.get("error_retryable") is not False))
+        dead_letter = bool(work and work.get("status") == "dead_letter")
+        exhausted = bool(dead_letter and work.get("error_retryable") is not False
+                         and int(work.get("attempt_count", 0)) >= int(work.get("max_attempts", 8)))
+        failure = bool(capture["status"] == "failed" or (not active and (error or dead_letter
+                       or work and work.get("status") == "failed")))
+        code = error.get("code") or capture.get("failure_code") or (work or {}).get("last_error_code")
+        codes = {"recording_configuration_invalid", "recording_binding_invalid", "recording_protection_unverified",
+                 "recording_provider_unauthorized", "recording_provider_unavailable", "recording_finalization_failed",
+                 "recording_finalization_pending", "recording_capture_failed", "egress_provider_failed"}
+        code = code if code in codes else ("recording_finalization_failed" if failure else None)
+        category = error.get("category")
+        reason = category if category in {"configuration", "integrity", "provider", "unknown"} else None
+        if reason not in {"configuration", "integrity"} and exhausted:
+            reason = "retry_exhausted"
+        if failure and not reason:
+            reason = "provider" if code == "egress_provider_failed" else "unknown"
+        if capture["status"] == "completed" and not available:
+            reason = "integrity"
+        state = "completed" if available else "failed" if failure or capture["status"] == "completed" else (
+            "unavailable" if capture["status"] in {"cancelled", "retention_purged"} else "processing")
+        return {"status": capture["status"], "available": available,
                 "consented_scopes": capture.get("consented_scopes", []),
                 "hash_verified": bool(capture.get("status") == "completed" and capture.get("content_hash")),
-                "storage_protection": capture.get("storage_protection"), "failure_code": capture.get("failure_code")}
+                "storage_protection": capture.get("storage_protection"), "failure_code": code,
+                "processing_status": state, "failure_reason": reason if state == "failed" else None,
+                "can_retry": bool(state == "failed" and capture["status"] in {"recording", "stopping", "hash_pending"}
+                                  and reason not in {"configuration", "integrity"})}
 
     @staticmethod
     def _turn_playback(turn, answer, capture):

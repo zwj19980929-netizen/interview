@@ -29,22 +29,27 @@ async def test_bank_preparation_ignores_old_flask_requirement_and_is_immediately
     assert plan['role_requirement_id'] is None
     assert store.role_requirements == before_roles
     assert list(store.interview_plans) == [plan['id']]
-    assert {row['id'] for row in plan['assessment_contract']['competencies']} == {'python', 'redis'}
+    scope = plan['assessment_contract']['assessment_scope']
+    assert set(scope['available_competency_ids']) == {'python', 'redis'}
+    assert len(scope['included_competency_ids']) == 1
+    assert len(scope['excluded_competency_ids']) == 1
     assert plan['assembly_summary']['warnings'] == []
     assert 'enterprise_skill_snapshot' not in plan and 'company_context' not in plan
     validate_assessment_contract(plan['assessment_contract'])
-    assert plan['assessment_contract']['budget']['max_root_questions'] == 4
+    # The four units estimate 46 minutes before closing. One complete two-unit
+    # core fits; the other skill stays outside this session's score scope.
+    assert plan['assessment_contract']['budget']['max_root_questions'] == 2
+    assert plan['assessment_contract']['competencies'][0]['min_evidence_roots'] == 2
 
 
 @pytest.mark.anyio
-async def test_no_role_or_resume_review_is_required_and_short_interview_uses_available_points():
+async def test_no_role_or_resume_review_is_required_but_time_cannot_weaken_evidence():
     store, _, assembly, args, _ = await prepared_scope()
     store.role_requirements.clear()
-    plan = await assembly.prepare(**args, duration_minutes=5)
-    assert plan['estimated_minutes'] == 5
-    assert plan['resume_review_id'] is None
-    assert plan['assessment_contract']['budget']['min_root_questions'] == 1
-    assert plan['assessment_contract']['budget']['max_root_questions'] == 1
+    with pytest.raises(ApiError) as error:
+        await assembly.prepare(**args, duration_minutes=5)
+    assert error.value.code == 'ASSESSMENT_COVERAGE_BUDGET_INVALID'
+    assert not store.interview_plans
     assert store.role_requirements == {}
 
 

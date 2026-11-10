@@ -11,6 +11,8 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
+import httpx
+
 from app.adapters.livekit_media import LiveKitMediaPlane
 from app.core.errors import ApiError
 from app.core.ids import new_id
@@ -27,6 +29,44 @@ from app.services.livekit_room_binding import (
 
 
 _SAFE_KEY_PART = re.compile(r"[^A-Za-z0-9_.-]+")
+
+
+class _FinalizationProblem(Exception):
+    def __init__(self, code: str, category: str, retryable: bool, message: str):
+        self.code, self.category, self.retryable, self.message = code, category, retryable, message
+
+
+def _finalization_problem(error: Exception) -> _FinalizationProblem:
+    """One bounded classification; never persist or return provider error bodies."""
+    if isinstance(error, _FinalizationProblem):
+        return error
+    if isinstance(error, ApiError):
+        if error.code in {"LIVEKIT_RECORDING_NOT_READY", "LIVEKIT_MEDIA_NOT_READY"}:
+            return _FinalizationProblem("recording_configuration_invalid", "configuration", False,
+                                        "录像封存失败：媒体存储配置待修复。")
+        if error.code == "LIVEKIT_EGRESS_CAPTURE_BINDING_INVALID":
+            return _FinalizationProblem("recording_binding_invalid", "integrity", False,
+                                        "录像身份校验失败，需要管理员核查。")
+        if error.code == "MEDIA_CAPTURE_ENCRYPTION_UNVERIFIED":
+            return _FinalizationProblem("recording_protection_unverified", "integrity", False,
+                                        "录像存储保护校验失败，需要管理员核查。")
+    if isinstance(error, httpx.HTTPStatusError):
+        if error.response.status_code in {401, 403}:
+            return _FinalizationProblem("recording_provider_unauthorized", "configuration", False,
+                                        "录像服务鉴权失败，请管理员修复配置。")
+        if error.response.status_code == 429 or error.response.status_code >= 500:
+            return _FinalizationProblem("recording_provider_unavailable", "provider", True,
+                                        "录像服务暂时不可用，将有限重试。")
+    if isinstance(error, (httpx.TransportError, asyncio.TimeoutError)):
+        return _FinalizationProblem("recording_provider_unavailable", "provider", True,
+                                    "录像服务暂时不可用，将有限重试。")
+    return _FinalizationProblem("recording_finalization_failed", "unknown", False,
+                                "录像封存失败，需要管理员核查后恢复。")
+
+
+def _finalization_pending() -> _FinalizationProblem:
+    return _FinalizationProblem("recording_finalization_pending", "pending", True,
+                                "录像尚未完成封存或校验，将有限重试。")
 
 
 class InterviewMediaCaptureService:
@@ -89,6 +129,10 @@ class InterviewMediaCaptureService:
                 return None
             work = self._enqueue_finalization(transaction, capture)
             if work["status"] in {"failed", "dead_letter"}:
+                if work.get("last_error_code") == "recording_configuration_invalid":
+                    require_ready = getattr(self.media_plane, "require_ready", None)
+                    if require_ready is not None:
+                        require_ready(recording=True)
                 work = transaction.outbox.replay(work["id"], reason="recording_finalization_retry", actor_id=actor_id)
             return work
 
@@ -97,28 +141,46 @@ class InterviewMediaCaptureService:
             work = transaction.outbox.start(work_item_id, lease_seconds=300)
             capture = transaction.interview_media_captures.get(work["payload"]["capture_id"])
         try:
-            if not capture or capture.get("status") in {"completed", "cancelled", "failed", "retention_purged"}:
+            if capture and capture.get("status") == "failed":
+                raise _FinalizationProblem("recording_capture_failed", "provider", False,
+                                           "录像采集已失败，需要管理员核查。")
+            if not capture or capture.get("status") in {"completed", "cancelled", "retention_purged"}:
                 result = capture or {"status": "missing"}
             else:
                 response = await self.media_plane.list_egress(egress_id=capture["egress_id"], room_name=capture["room_name"])
                 info = next((item for item in self._egress_items(response)
                              if self._provider_egress_id(item) == capture["egress_id"]), None)
                 if info is None:
-                    raise RuntimeError("Recording provider has no final result")
+                    raise _finalization_pending()
                 if not self._provider_capture_matches(capture, info):
                     raise self._provider_binding_error()
                 result = await self.finalize_provider_result(capture["id"], info, actor_id="media_worker",
                                                               organization_id=organization_id)
+                if result.get("status") == "failed":
+                    raise _FinalizationProblem("recording_capture_failed", "provider", False,
+                                               "录像采集已失败，需要管理员核查。")
                 if result.get("status") != "completed":
-                    raise RuntimeError("Recording has not finished finalization")
+                    raise _finalization_pending()
             with self.persistence.transaction(organization_id) as transaction:
                 transaction.outbox.complete(work_item_id, lease_token=work["lease_token"])
             return result
-        except Exception:
+        except Exception as exc:
+            problem = _finalization_problem(exc)
             with self.persistence.transaction(organization_id) as transaction:
-                transaction.outbox.fail(work_item_id, "录像尚未完成封存或校验，请稍后重试。",
-                                       lease_token=work["lease_token"], error_code="recording_finalization_pending", retryable=True)
-            raise
+                # Lease ownership is checked before any capture diagnostics are written.
+                transaction.outbox.fail(work_item_id, problem.message,
+                                       lease_token=work["lease_token"], error_code=problem.code,
+                                       retryable=problem.retryable)
+                current = transaction.interview_media_captures.get(work["payload"]["capture_id"])
+                if current and current.get("status") not in {"completed", "cancelled", "retention_purged"}:
+                    current["finalization_error"] = {
+                        "code": problem.code, "category": problem.category,
+                        "retryable": problem.retryable, "occurred_at": utc_now(),
+                    }
+                    current["updated_at"] = utc_now()
+                    transaction.interview_media_captures.update(current, expected_version=current["version"])
+            raise ApiError(problem.code, problem.message, status_code=503,
+                           details={"category": problem.category, "retryable": problem.retryable}) from None
 
     async def start_for_connection(
         self,
@@ -709,6 +771,7 @@ class InterviewMediaCaptureService:
                     "storage_protection_verified_at": (
                         utc_now() if storage_protection else None
                     ),
+                    "finalization_error": None,
                     "provider_result": self._provider_projection(provider_result),
                     "stopped_at": current.get("stopped_at") or utc_now(),
                     "updated_at": utc_now(),

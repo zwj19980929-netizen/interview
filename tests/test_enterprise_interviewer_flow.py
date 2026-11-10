@@ -49,7 +49,11 @@ async def test_enterprise_plan_real_admission_autonomous_selection_scoring_and_h
     store = InMemoryStore()
     catalog, position, kb, role, candidate = create_scope(store, "自主后端", ["python", "database"], 15)
     for skill, point in (("python", "线程边界"), ("database", "事务隔离")):
-        await add_question(catalog, kb["id"], title=point, skill=skill, difficulty="mid", key_points=[point])
+        # The bank preparation freezes two evidence units per core skill.
+        # Three short approved units per source let both skills fit the
+        # 15-minute appointment, including its closing reserve.
+        points = [point, point + "的故障处理", point + "的边界验证"] if context_mode == "bank" else [point]
+        await add_question(catalog, kb["id"], title=point, skill=skill, difficulty="mid", key_points=points)
     skills = InterviewSkillService(store)
     uses_skill = context_mode in {"skill", "both", "legacy_skill"}
     company = COMPANY_CONTEXT if context_mode in {"company", "both"} else None
@@ -86,6 +90,13 @@ async def test_enterprise_plan_real_admission_autonomous_selection_scoring_and_h
         assert frozen_skill is None
     assert plan.get("company_context") == company
     assert plan["status"] == ("approved" if context_mode == "bank" else "draft")
+    expected_topics = plan["assessment_contract"]["budget"]["max_root_questions"]
+    if context_mode == "bank":
+        assert expected_topics == 4
+        assert {item["id"] for item in plan["assessment_contract"]["competencies"]} == {"python", "database"}
+        assert all(item["min_evidence_roots"] == 2 for item in plan["assessment_contract"]["competencies"])
+    else:
+        assert expected_topics == 2
     if selected_skill:
         revised_package = package(style="concise") if context_mode == "legacy_skill" else {
             **PERSONAL_SKILL, "instructions": "# 新的习惯\n\n先谈一个项目，再谈工程取舍。"}
@@ -127,7 +138,7 @@ async def test_enterprise_plan_real_admission_autonomous_selection_scoring_and_h
     assert session["plan_snapshot"].get("company_context") == company
     assert appointments.start(token)["interview_id"] == interview_id
 
-    for index in range(2):
+    for index in range(expected_topics):
         session = await service.advance_adaptive_interview(interview_id)
         turn = next(t for t in session["turns"] if t["id"] == session["current_turn_id"])
         assert len(session["turns"]) == index + 1
@@ -145,7 +156,7 @@ async def test_enterprise_plan_real_admission_autonomous_selection_scoring_and_h
         assert current["dialogue_state"] == "awaiting_next_decision"
     session = await service.advance_adaptive_interview(interview_id)
     if context_mode == "bank":
-        assert len(declined_probes) == 2 and len(set(declined_probes)) == 2
+        assert len(declined_probes) == expected_topics and len(set(declined_probes)) == expected_topics
     assert session["candidate_input_completed_at"]
     assert session["candidate_input_completion_reason"] in {"evidence_sufficient", "budget_exhausted"}
     with persistence_for(store).transaction("org_default") as tx:
@@ -160,12 +171,17 @@ async def test_enterprise_plan_real_admission_autonomous_selection_scoring_and_h
     assert value["human_decision_required"] is True
     assert value["execution_schema_version"] == 3
     assert len(value["dimension_scores"]) == 2
+    if context_mode == "bank":
+        assert value["score_scope"] == "session_assessment"
+        assert value["assessment_scope"] == plan["assessment_contract"]["assessment_scope"]
+        assert value["overall_score"] is not None
+        assert value["coverage_status"] == "sufficient"
     exported = api.get(f"/api/v1/interviews/{interview_id}/report/export?format=json")
     assert exported.status_code == 200
     assert exported.json()["overall_score"] == value["overall_score"]
     review = api.get(f"/api/v1/interviews/{interview_id}/review")
     assert review.status_code == 200
-    assert len(review.json()["turns"]) == 2
+    assert len(review.json()["turns"]) == expected_topics
     public = service.get_candidate_interview(interview_id, service._candidate_session_token(service.get_interview(interview_id)))
     assert "assessment_contract" not in public and "plan_snapshot" not in public
     assert "enterprise_skill_snapshot" not in public

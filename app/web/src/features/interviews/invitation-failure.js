@@ -1,5 +1,6 @@
 const CHECK_LABELS = {
   candidate_pools: "面试题目候选池",
+  assessment_time_budget: "本场考察所需时间",
   question_speech: "题目语音资源",
   experience_question_speech: "经历题语音资源",
   answer_evaluation: "回答评分服务",
@@ -100,7 +101,8 @@ function readinessFailures(details, now) {
     return ready !== true;
   }).slice(0, 32).map((check) => ({
     label: known(CHECK_LABELS, check.name) || "其他服务检查",
-    message: check.route_readiness ? routeFailure(check.route_readiness, now)
+    message: check.name === "assessment_time_budget" ? "预约可用时间不足，请延长预约或重新准备更短的计划。"
+      : check.route_readiness ? routeFailure(check.route_readiness, now)
       : "该项尚未通过，请管理员检查配置或资源准备情况。",
   }));
 }
@@ -128,6 +130,8 @@ export function invitationFailure(error, now = Date.now()) {
     INTERVIEW_APPOINTMENT_NOT_FOUND: ["预约暂不可用", "请刷新预约列表，并确认当前账号有权访问该预约。"],
     INTERVIEW_PLAN_NOT_FOUND: ["面试计划暂不可用", "请检查预约关联的面试计划。"],
     INTERVIEW_PLAN_NOT_APPROVED: ["面试计划未获批准", "请先检查并批准预约关联的面试计划，再签发邀请。"],
+    ASSESSMENT_APPOINTMENT_WINDOW_TOO_SHORT: ["预约时长不足", "本次预约时长不足以完成已确定的考察范围，请延长预约或重新准备更短的计划。"],
+    ASSESSMENT_START_TIME_INSUFFICIENT: ["剩余预约时间不足", "剩余时间不足以完成本场已确定的考察范围，请重新安排预约时间。"],
     REQUEST_VALIDATION_FAILED: ["邀请请求信息无效", "请检查预约信息后重试。"],
     PERSISTENCE_CONFLICT: ["预约信息已变化", "请刷新预约列表，确认最新状态后重试。"],
   }, failure.code);

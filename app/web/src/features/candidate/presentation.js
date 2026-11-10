@@ -127,6 +127,10 @@ export function candidateEntryFailure(error) {
       return { title: "尚未到入场时间", detail: "请在预约开始后进入面试。" };
     case "APPOINTMENT_WINDOW_CLOSED":
       return { title: "本次预约时间已结束", detail: "请联系面试安排人重新预约。" };
+    case "ASSESSMENT_START_TIME_INSUFFICIENT":
+      return { title: "剩余预约时间不足", detail: "剩余时间不足以完成本场已确定的考察范围，请联系面试安排人改期。" };
+    case "ASSESSMENT_APPOINTMENT_WINDOW_TOO_SHORT":
+      return { title: "预约时长不足", detail: "本次预约时长不足以完成已确定的考察范围，请联系面试安排人改期。" };
     case "APPOINTMENT_DEVICE_NOT_READY":
       return { title: "设备检查尚未通过", detail: "请重新检查设备，并确认麦克风、摄像头、浏览器和测试音均可用后再试。", recheckDevices: true };
     case "APPOINTMENT_NOT_READY":

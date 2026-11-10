@@ -6,6 +6,22 @@ import { flattenQuestions, questionTree } from "./question-tree.js";
 const recordingLabels = { completed: "录像已保存", hash_pending: "录像正在封存校验", stopping: "录像正在收尾", recording: "正在录制", failed: "录像处理失败", unavailable: "暂无全场录像", cancelled: "未开始录制", retention_purged: "录像已按留存策略清除" };
 const fitLabels = { strong_match: "高度匹配", match: "匹配", partial_match: "部分匹配", insufficient_evidence: "证据不足", manual_review: "建议人工复核" };
 const completionLabels = { evidence_sufficient: "已取得约定范围的考察证据", budget_exhausted: "考察时间或题数预算已用完", candidate_requested: "候选人主动提前退出", appointment_window_expired: "预约时间已结束", media_failure: "音视频故障导致结束" };
+const recordingFailureLabels = {
+  configuration: "媒体存储配置待修复，请管理员修复后恢复封存。",
+  retry_exhausted: "自动重试次数已用完，请检查原因后重试封存。",
+  integrity: "录像完整性或访问保护校验未通过，请管理员检查存储文件。",
+  provider: "录像服务暂不可用，请检查服务后重试封存。",
+};
+function completionLabel(reason, completion) {
+  if (reason === "budget_exhausted") {
+    if (completion?.trigger === "time_limit") return Number.isFinite(completion.limit_minutes) && completion.limit_minutes > 0
+      ? `达到 ${completion.limit_minutes} 分钟时长上限` : "达到本场时长上限";
+    if (completion?.trigger === "primary_question_limit") return Number.isInteger(completion.primary_question_limit) && completion.primary_question_limit > 0
+      ? `达到 ${completion.primary_question_limit} 道主问题上限` : "达到本场主问题数量上限";
+    if (completion?.trigger === "candidate_pool_exhausted") return "本场可用问题已问完";
+  }
+  return completionLabels[reason] || "本场考察已结束";
+}
 const decisionLabels = { ...completionLabels, coverage_gap: "补充能力证据", relevant_experience: "了解相关经历", topic_change: "转换考察方向", coverage_complete: "已取得约定范围的考察证据" };
 const toolLabels = { "questions.search": "检索批准题池", "questions.read": "读取批准问题", "resume.read_evidence": "读取简历证据", "interview.read_context": "读取考察上下文", "company.read_reference": "读取企业资料", "specialists.consult": "咨询专业证据专家" };
 const evaluationFailures = {
@@ -57,12 +73,23 @@ export default function InterviewReview({ interviewId, review, error, reload, ca
   if (!review) return <section className="report-panel" aria-label="面试复核"><p role="status">{error || "正在加载评分与回放…"}</p></section>;
   const processing = review.processing || {};
   const recording = review.recording || {};
+  const recordingFailed = recording.processing_status === "failed" || recording.status === "failed";
+  const recordingLabel = recordingFailed ? "录像封存失败" : recordingLabels[recording.status] || "暂无全场录像";
+  const recordingCanRetry = typeof recording.can_retry === "boolean" ? recording.can_retry
+    : !recordingFailed && ["hash_pending", "stopping"].includes(recording.status);
+  const recordingFailure = Object.hasOwn(recordingFailureLabels, recording.failure_reason)
+    ? recordingFailureLabels[recording.failure_reason] : "请管理员检查后恢复封存。";
+  const questionCounts = review.question_counts;
+  const elapsedSeconds = Number.isFinite(review.completion?.elapsed_seconds) && review.completion.elapsed_seconds >= 0
+    ? Math.floor(review.completion.elapsed_seconds) : null;
   const turns = review.turns || [];
   const questionGroups = questionTree(turns);
   const selected = selectedId === "__none__" ? null : turns.find((turn) => turn.turn_id === selectedId) || turns[0];
   const selectedRoot = questionGroups.find(node => node.id !== selected?.turn_id
     && flattenQuestions(node.children).some(child => child.id === selected?.turn_id));
   const report = review.report;
+  const sessionAssessment = report?.score_scope === "session_assessment"
+    && report?.assessment_scope?.schema_version === "session_assessment_scope.v1";
   const transcriptReviewRequired = report?.overall_score == null
     && (report?.manual_review_required === true || report?.pending_verification_answer_ids?.length > 0);
   const selectedTranscriptReviewRequired = selected?.evaluation?.score == null
@@ -128,7 +155,7 @@ export default function InterviewReview({ interviewId, review, error, reload, ca
           <button className="button button-secondary" disabled={!selected.playback?.video_available} onClick={() => play("video", selected)}>播放本题视频</button>
         </div>
         {!selected.playback?.audio_available && <p className="form-hint">本题没有可回听的独立回答录音。</p>}
-        {!selected.playback?.video_available && <p className="form-hint">{recording.available ? "本题缺少可定位的视频时间段，可使用上方的整场音视频回放。" : `${recordingLabels[recording.status] || "暂无全场录像"}，暂不能播放本题视频。`}</p>}
+        {!selected.playback?.video_available && <p className="form-hint">{recording.available ? "本题缺少可定位的视频时间段，可使用上方的整场音视频回放。" : `${recordingLabel}，暂不能播放本题视频。`}</p>}
         {selected.playback?.video_available && <p className="form-hint">{selected.playback.timing_source === "server_capture_window" ? "视频按服务端回答采集时间定位。" : "历史视频按服务端题目时间窗口定位，包含读题和回答。"}音频为本题独立回答录音。</p>}
         <h4>回答转写</h4><p className="review-transcript">{selected.answer?.final_transcript || "本题没有已提交回答。"}</p>
         {selected.answer?.evaluation_status === "failed" && <p role="alert">{evaluationFailure(selected.answer.evaluation_failure_code)}</p>}
@@ -152,20 +179,25 @@ export default function InterviewReview({ interviewId, review, error, reload, ca
       <h2>面试报告与回放</h2>
       <p role="status"><strong>{status}</strong></p>
       {processing.submitted_at && <p>{completionReason ? "候选人作答已结束" : "回答已收齐"} · {formatDate(processing.submitted_at)}</p>}
-      {completionReason && <p>结束原因：{completionLabels[completionReason] || "本场考察已结束"}</p>}
+      {completionReason && <p>结束原因：{completionLabel(completionReason, review.completion)}</p>}
+      {elapsedSeconds !== null && <p>本场用时 {Math.floor(elapsedSeconds / 60)} 分 {elapsedSeconds % 60} 秒</p>}
       {completionReason === "candidate_requested" && <p role="status">提前退出待人工复核，最终决定由企业人员完成。</p>}
-      <p>已评分 {processing.completed || 0} / {processing.total || 0} 题 · 待处理 {processing.pending || 0} 题 · 失败 {processing.failed || 0} 题</p>
+      {Number.isInteger(questionCounts?.primary) && Number.isInteger(questionCounts?.followup)
+        && <p>已提问 {questionCounts.primary} 道主问题 · {questionCounts.followup} 道追问</p>}
+      <p>已评分 {processing.completed || 0} / {processing.total || 0} 份回答 · 待处理 {processing.pending || 0} 份 · 失败 {processing.failed || 0} 份</p>
       {processing.failed > 0 && <p role="alert">评分失败不会丢失回答和录音。修复模型问题后可重试，评分完成后会自动生成报告。</p>}
       {error && <p role="alert">状态刷新失败：{error}</p>}
-      <p>{recordingLabels[recording.status] || "暂无全场录像"} · {recording.hash_verified ? "完整性校验通过" : "尚未通过完整性校验"}</p>
+      <p role={recordingFailed ? "alert" : undefined}>{recordingLabel}{recordingFailed ? `：${recordingFailure}` : ""} · {recording.hash_verified ? "完整性校验通过" : "尚未通过完整性校验"}</p>
       <div className="page-actions">
         <button className="button button-secondary" onClick={reload}>刷新结果</button>
         {recording.available && <button className="button button-secondary" onClick={() => play("video")}>播放整场音视频</button>}
-        {canManage && (processing.can_retry || ["hash_pending", "stopping"].includes(recording.status)) && <button className="button button-primary" disabled={busy} onClick={retry}>{busy ? "正在排队…" : "重试未完成处理"}</button>}
+        {canManage && (processing.can_retry || recordingCanRetry) && <button className="button button-primary" disabled={busy} onClick={retry}>{busy ? "正在排队…" : "重试未完成处理"}</button>}
       </div>
       {report && <div className="review-report-summary">
-        {report.overall_score == null ? <p role="status"><strong>{report.score_status === "processing" ? "正在重新评分" : transcriptReviewRequired ? "回答转写待人工核验" : report.coverage_status === "insufficient_evidence" ? "考察覆盖不足，暂不形成总分" : "正在等待有效评分"}</strong></p> : <strong className="score-value">{report.overall_score}<small> / 100</small></strong>}
+        {sessionAssessment && <h3>本场考察综合分</h3>}
+        {report.overall_score == null ? <p role="status"><strong>{report.score_status === "processing" ? "正在重新评分" : transcriptReviewRequired ? "回答转写待人工核验" : report.coverage_status === "insufficient_evidence" ? sessionAssessment ? "本场约定范围证据不足，暂不形成综合分" : "考察覆盖不足，暂不形成总分" : "正在等待有效评分"}</strong></p> : <strong className="score-value">{report.overall_score}<small> / 100</small></strong>}
         {report.coverage_status === "insufficient_evidence" && <p>已考察题目的有效分数仍可查看。未考察的范围不计零分，也不分摊到其他能力。</p>}
+        {sessionAssessment && <AssessmentScope scope={report.assessment_scope} />}
         {report.recognition_notice && <p className="form-hint">{report.recognition_notice}</p>}
         {report.scope_notice && <p className="form-hint">{report.scope_notice}</p>}
         <h3>{fitLabels[report.job_fit_level] || "待人工复核"}</h3>
@@ -207,6 +239,22 @@ export default function InterviewReview({ interviewId, review, error, reload, ca
         </li>)}</ol>
       </details>
     </section>}
+  </section>;
+}
+
+function AssessmentScope({ scope }) {
+  const included = scope.included_competency_ids || [];
+  const excluded = scope.excluded_competency_ids || [];
+  const sources = scope.source_question_counts || {};
+  const positionCount = sources.position_bank ?? 0;
+  const resumeCount = sources.resume_experience ?? 0;
+  return <section aria-label="本场事前约定的考察范围">
+    <h4>本场事前约定的考察范围</h4>
+    <p>只汇总面试开始前约定的 {included.length} 项能力；题库其他范围不计入本场综合分。</p>
+    <p>纳入本场：{included.join("、")}</p>
+    {Number.isInteger(positionCount) && Number.isInteger(resumeCount)
+      && <p>计划题源：岗位题 {positionCount} 道 · 简历题 {resumeCount} 道，追问另计。</p>}
+    {!!excluded.length && <details><summary>未纳入本场考察的能力（{excluded.length} 项）</summary><p>{excluded.join("、")}</p></details>}
   </section>;
 }
 

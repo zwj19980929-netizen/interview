@@ -10,7 +10,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from app.domain.speech_quality import limit_semantic_confidence, control_evidence_confidence, transcript_confidence_segments
-from app.domain.adaptive_interview import is_adaptive, assessment_contract
+from app.domain.adaptive_interview import is_adaptive, assessment_contract, budget_summary
+from app.domain.session_assessment_scope import scope_allows_followup
 from app.core.ids import new_id
 from app.core.answer_processing_budget import (
     consume_answer_model_call, new_correction_attempt, remember_answer_correction,
@@ -1293,6 +1294,10 @@ class ConversationUnderstandingService:
         interview: Dict[str, Any], minimum_seconds: int, *, now: Optional[datetime]
     ) -> bool:
         current = now or datetime.now(timezone.utc)
+        contract = interview.get("plan_snapshot", {}).get("assessment_contract") or {}
+        if contract.get("schema_version") == "interview_assessment.v2":
+            return scope_allows_followup(interview,
+                budget_summary(interview, current.isoformat())["remaining_seconds"], minimum_seconds)
         scheduled_end = interview.get("scheduled_end_at") or interview.get("settings", {}).get("scheduled_end_at")
         if scheduled_end:
             try:

@@ -149,6 +149,8 @@ it.each([
   ["VIDEO_RECORDING_CONSENT_REQUIRED", "请确认本次面试授权"],
   ["APPOINTMENT_TOO_EARLY", "尚未到入场时间"],
   ["APPOINTMENT_WINDOW_CLOSED", "本次预约时间已结束"],
+  ["ASSESSMENT_START_TIME_INSUFFICIENT", "剩余预约时间不足"],
+  ["ASSESSMENT_APPOINTMENT_WINDOW_TOO_SHORT", "预约时长不足"],
   ["APPOINTMENT_DEVICE_NOT_READY", "设备检查尚未通过"],
   ["APPOINTMENT_NOT_READY", "面试服务尚未准备好"],
   ["INVITATION_EXPIRED", "邀请链接已过期"],
@@ -160,4 +162,10 @@ it.each([
   expect(result.title).toBe(title);
   expect(JSON.stringify(result)).not.toMatch(/secret|provider/);
   expect(Boolean(result.invalidateNetwork)).toBe(["NETWORK_UNAVAILABLE", "REQUEST_TIMEOUT"].includes(code));
+});
+
+it.each(["ASSESSMENT_START_TIME_INSUFFICIENT", "ASSESSMENT_APPOINTMENT_WINDOW_TOO_SHORT"])("directs %s to rescheduling instead of waiting", (code) => {
+  const result = candidateEntryFailure({ code });
+  expect(result.detail).toContain("联系面试安排人改期");
+  expect(result.detail).not.toMatch(/稍后|重试|等待/);
 });

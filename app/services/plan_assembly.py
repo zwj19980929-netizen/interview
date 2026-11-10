@@ -112,7 +112,7 @@ class InterviewPlanAssembly:
             knowledge_base_ids=tuple(knowledge_base_ids), duration_minutes=duration_minutes,
             question_count=min(MAX_PRIMARY_QUESTIONS, max(1, duration_minutes // 3)), approve=True,
             execution_schema_version=3, preparation_mode="question_bank",
-            adaptive_policy={"min_root_questions": 1, "min_evidence_units_per_competency": 1},
+            adaptive_policy={"min_root_questions": 1, "min_evidence_units_per_competency": 2},
         ), organization_id, on_progress=on_progress)
 
     async def assemble(
@@ -321,6 +321,9 @@ class InterviewPlanAssembly:
                 contract = plan["assessment_contract"]
                 plan["assembly_summary"]["inquiry_unit_count"] = sum(len(item["inquiry_units"]) for item in contract["candidate_questions"])
                 plan["assembly_summary"]["minimum_required_root_questions"] = contract["budget"]["min_root_questions"]
+                if contract.get("assessment_scope"):
+                    summary["primary_question_limit"] = contract["budget"]["max_root_questions"]
+                    summary["not_in_session_scope_dimensions"] = deepcopy(contract["assessment_scope"]["excluded_competency_ids"])
                 if bank_preparation:
                     summary["coverage_dimensions"] = [item["id"] for item in contract["competencies"]]
                     summary["uncovered_dimensions"] = []

@@ -69,6 +69,36 @@ it("shows one combined execution limit for a larger frozen pool without editing 
   expect(wb.request.mock.calls.some(([, options]) => options?.method)).toBe(false);
 });
 
+it("makes the frozen session scope and selected questions visible before plan approval", async () => {
+  const scoped = plan();
+  scoped.assessment_contract.schema_version = "interview_assessment.v2";
+  scoped.assessment_contract.assessment_scope = {
+    schema_version: "session_assessment_scope.v1", policy: "budgeted_core_competencies.v1",
+    included_competency_ids: ["可靠性"], excluded_competency_ids: ["图形渲染"],
+    available_competency_ids: ["可靠性", "图形渲染"],
+    source_question_counts: { position_bank: 1, resume_experience: 0 },
+    selected_units: [{ question_id: "q_1", inquiry_unit_id: "unit_1" }], estimated_required_seconds: 240,
+  };
+  scoped.assessment_contract.candidate_questions[0].inquiry_units.push({ id: "unit_2", question_text: "本场范围外的问题？",
+    competency_ids: ["图形渲染"], assessed_rubric_point_ids: ["point_2"], standard_answer_quote: "原题中的其他内容。" });
+  const original = JSON.stringify(scoped);
+  wb.request = vi.fn(async () => scoped);
+  await detail();
+  const content = host.querySelector('[aria-label="计划考察内容"]');
+  expect(content.textContent).toContain("只在事前选定的问题中提问");
+  const items = content.querySelectorAll(".plans-question-item");
+  expect(items[0].textContent).toContain("本场计划提问");
+  expect(items[1].textContent).toContain("本场范围外");
+  const scope = host.querySelector('[aria-label="本场冻结的考察范围"]');
+  expect(scope.textContent).toContain("岗位题 1 道 · 简历题 0 道");
+  expect(scope.textContent).toContain("本场考察综合分");
+  expect(scope.textContent).toContain("未纳入本场的能力（1 项）");
+  expect(scope.textContent).toContain("图形渲染");
+  expect(scope.textContent).toContain("可靠性");
+  expect(JSON.stringify(scoped)).toBe(original);
+  expect(wb.request.mock.calls.some(([, options]) => options?.method)).toBe(false);
+});
+
 it("distinguishes candidates sharing a role and opens a draft through its own route", async () => {
   wb.data.candidates.push({ id: "candidate_2", name: "候选人乙" });
   wb.data.plans.push({ ...plan(), id: "plan_2", candidate_profile_id: "candidate_2", status: "approved" });

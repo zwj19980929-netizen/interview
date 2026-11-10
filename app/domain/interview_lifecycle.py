@@ -8,6 +8,8 @@ from app.core.ids import new_id
 from app.core.time import utc_now
 from app.domain.candidate_runtime import CANDIDATE_RUNTIME_PROBLEM_REASONS, runtime_pause_epoch
 from app.domain.evaluation_evidence import evidence_fingerprint
+from app.domain.interview_completion import budget_completion_detail
+from app.domain.session_assessment_scope import require_scope_window, scope_allows_followup
 from app.domain.primary_question_budget import (
     apply_primary_question_budget, primary_question_budget, started_primary_question_count,
 )
@@ -170,6 +172,9 @@ class InterviewSessionLifecycle:
             return
         if session["status"] not in {"scheduled", "waiting"}:
             self._invalid("Only a scheduled or waiting InterviewSession can be started.")
+        if session.get("scheduled_end_at"):
+            require_scope_window(session.get("plan_snapshot", {}).get("assessment_contract"),
+                                 now, session["scheduled_end_at"], starting=True)
         session["status"] = "in_progress"
         session["started_at"] = session.get("started_at") or now
         session["interruption"] = None
@@ -444,6 +449,7 @@ class InterviewSessionLifecycle:
             budget = budget_summary(session, now)
             if not budget["exhausted"] or (session.get("current_turn_id") and budget["remaining_seconds"] > 0):
                 self._invalid("The frozen assessment budget does not authorize ending this active question.")
+            session["candidate_input_completion_detail"] = budget_completion_detail(session, now, allow_pool=True)
         if reason == "appointment_window_expired":
             from datetime import datetime
             deadline = session.get("scheduled_end_at")
@@ -496,7 +502,9 @@ class InterviewSessionLifecycle:
             budget = assessment_contract(session)["budget"]
             follows = [turn for turn in session.get("turns", []) if turn.get("is_followup")]
             same_root = [turn for turn in follows if turn.get("root_turn_id") == root_turn_id]
-            if (session.get("candidate_input_completed_at") or budget_summary(session, now)["remaining_seconds"] <= 0
+            remaining_seconds = budget_summary(session, now)["remaining_seconds"]
+            if (session.get("candidate_input_completed_at") or remaining_seconds <= 0
+                    or not scope_allows_followup(session, remaining_seconds)
                     or len(follows) >= budget["max_total_followups"]
                     or len(same_root) >= budget["max_followups_per_root"]):
                 self._invalid("The frozen follow-up budget has been exhausted.")

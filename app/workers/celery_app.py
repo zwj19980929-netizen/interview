@@ -1,4 +1,5 @@
 from app.core.runtime_release import runtime_release_snapshot
+from app.core.media_runtime import media_runtime_snapshot
 
 import json
 import logging
@@ -24,6 +25,12 @@ def log_runtime_release(sender=None, **kwargs):
 def runtime_release(state, **kwargs):
     """Read the worker's frozen bootstrap identity without scheduling work."""
     return runtime_release_snapshot("worker")
+
+
+@inspect_command()
+def media_runtime(state, **kwargs):
+    """Read frozen media configuration facts without probing or scheduling work."""
+    return media_runtime_snapshot()
 
 
 BROKER_URL = os.getenv("INTERVIEWER_CELERY_BROKER_URL", "redis://127.0.0.1:6379/2")
