@@ -4,7 +4,7 @@
 
 ## 2026-11-10 · SEMANTIC-TAIL-CONTINUITY-096
 
-- 状态：`in_progress`。
+- 状态：`verified（仓库全量、本机加载；真实语义探针有限通过，真人连续面试与独立STT积压待验）`。
 - 授权与基线：用户反馈iv_25676feea56e4a06完整技术回答、明确说完后追加无关闲聊仍出现处理重试，要求按语义处理噪音。沿用本会话修复、Git回退、验证和仅空闲加载授权；首次修改前工作区干净，已提交基线6888d02（实现d1778f4）保留，按入口顺序复核11份文档及064/068/087相关设计。截图只证明混合发言与重试同时出现，尚不能直接认定闲聊是异常唯一原因；先核对实际调用和送达时间线。
 - 实施边界：完整录音和原始转写保留，累计技术证据与后续交流意图分离；无关尾句不应抹掉有效作答，真正补充、改口、纠错、提问、暂停和退出不能作为噪音丢弃。不用关键词截断或客户端文字生成答案，不放宽来源、补充确认、owner/controller及最终提交门禁，不自动重放/补交/跳题/结束真实场次。新增Prompt/Schema须集中版控并增加合同和混合语义反例；供应商失败与语义噪音分别诊断。所有源码、测试、文档和运行操作均在本项记录，活动面试不重启。
 - 实际事故：14:31:36Z原技术理解成功，补充问题14:31:45Z已可信完整送达，14:31:53Z对截图原句“我已经说完了。太搞笑了吧。”分类finish/.95；完整13字及尾句6字与安全日志SHA精确一致，只比对截图给定文本、未枚举猜测。078的pure_completion_reply对该混合回复为false、仅完成句为true，已足以拒绝旧理解复用并触发额外v152调用；是否还有来源metadata不一致缺少证据。14:32:00Z新audio撤销confirmed，额外理解14:32:05Z取消。14:32:17Z/21Z补充分类v6两次请求哈希相同，均返回合法JSON但顶层不是对象（non_object，80字符/31 tokens、finish=stop），不是截断或模型超时；不存正文，无法判定顶层具体类型。095只恢复listening，此处awaiting_reply未获恢复提示。
@@ -26,6 +26,8 @@
 - 显式继续修正：新增对照红例1失败/1通过；continue_speaking清旧confirmed_final、confirmation_origin、confirmed_reused_prepared及proof，保留原技术准备、录音和已送达问题，独立retry_answer_processing仍可复用有效确认。首个定向命令含不存在的测试文件，exit4/未运行，纠正后6文件95通过；新096运行时共26项。最终重新冻结613文件/237后端SHAa121dfadf6b1860f158a3d41b5d052c0c7d4ba94cb6375b4a5dd101364b077cb。真实两条探针基于前一候选SHA，最终仅显式继续撤销逻辑/对照测试变化、v9/v10合同不变；不追加真实调用或将其冒称最终全源码验收。
 - 最终仓库验证：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q`为5066 passed /8 skipped /276.49秒；`npm test -- --reporter=dot`为26文件580项通过；`npm run build -- --outDir /private/tmp/interviewer-096-web-dist`通过，保留既有大bundle提醒。613文件集合/内容与冻结值一致，237后端SHA保持a121dfadf6b1860f158a3d41b5d052c0c7d4ba94cb6375b4a5dd101364b077cb。测试产物原子发布并保留66份历史assets，生成runtime-release-tests.v5证明interviewer-096-test-attestation.json。独立审查无剩余阻断；438处本地文档链接及diff检查通过。代码尚未加载，准备保存Git实现提交后即时空闲核验。
 - 实际修改范围：生产10文件为supplement_reply集中Prompt/校验、gateway版本审计、mock合同、answer_endpoint、conversation_understanding、interview_evidence、interviews、prepared_answer_completion、spoken_supplement及新supplement_completion_proof。新增3份096合同/真实adapter隔离/运行时回归，迁移13份旧测试的版本、effect与服务端证明语义，保留原业务断言；同步架构/API/领域/检索评分/供应商/存储/问题/进度/路线图/本日志10份文档。无新公共API、持久表、DDL或模型路由变更；原始候选录音转写及历史回答不修改。
+- Git及实际加载：修复提交7f32fc5，旧6888d02保留、未push。最终即时预检两轮均为0有效owner/命令/任务/活动capture，LiveKit房间/参与者/活跃Egress及worker活动/保留/定时任务均0；此前精确终态capture豁免此次未使用，最终查询时该capture已不再处于活动状态；本次没有调用任何恢复或停止录制API，不据此反推其具体推进来源。以最终预检82场核心SHA5e4ede619fb2981db590373db46d85d1cb4cffdb151d5a208158f7c49001aa5d及全部capture文档SHAbfd13e87c2a9b5869554b64e003425ac93464294a86d3d45d57b8e60089cfbf1为加载前后对照，均保持。正常TERM旧API44501/worker44502，2026-11-10T15:29:26Z启动API52071、随后worker/Beat52072；均237文件SHAa121dfadf6b1860f158a3d41b5d052c0c7d4ba94cb6375b4a5dd101364b077cb，匹配最终证明。媒体配置dcbaf54ac496b9217094dae97dfcd6b2ffec665d23f934bfaae2895c5ecefb0f保持且ready，runner exit0。
+- 独立运行核验：`interviewer-096-runtime-verify.py 52071 52072`通过，API healthz/readyz、5174 health及代理新版本、8000静态入口和bundle、四份Vite实际模块源码与冻结证明一致；前端代码未改、Vite未重启。未重放/补交/跳题/结束真实面试，未改历史回答、评分或原音频。剩余：真人即时补充/无关附言的连续体验待验，外部模型仍可能格式失败（本项有界纠错/同题提示不等于保证成功），同场独立STT背压与长尾回放超时需另行定位；保留078兼容路径，本项不标closed。
 
 ## 2026-11-10 · ANSWER-CONTINUITY-AND-STT-REPAIR-095
 
