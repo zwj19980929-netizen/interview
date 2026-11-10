@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from app.domain.speech_quality import minimum_reported_confidence
+from app.core.prompt.validation import StructuredResponseValidationError
+from app.model_gateway.errors import ProviderError
 from app.services.conversation_understanding import ConversationUnderstandingService
 from app.services.capture_recovery import classify_capture_failure
 from typing import Any
@@ -112,6 +114,10 @@ class SpokenSupplementConfirmation:
         self._clarification_revision = None
         self._semantic_wait_identity = None
         self._reception_cache = None
+        # Failed classification is unknown, not a successful `other` receipt.
+        # Text/context budgets survive audio revisions and provider metadata.
+        self._reception_attempts = {}
+        self._reception_failure = None
         self._reception_seen_text = ""
         self._reception_seen_final = None
         self._reception_review = None
@@ -774,6 +780,19 @@ class SpokenSupplementConfirmation:
         return True
 
     def retry_pending_prompt(self, endpoint: Any) -> None:
+        failed = self._reception_failure
+        if failed is not None:
+            key, capture = failed
+            attempt = self._reception_attempts.get(key) or {}
+            phase = "awaiting_reply" if self.phase in {"awaiting_reply", "classifying"} else "listening"
+            current_text = endpoint._covered_server_transcript or endpoint._last_server_transcript
+            if (capture is endpoint.capture and attempt.get("retryable")
+                    and key == (current_text.strip(), phase, self._reception_seen_text)):
+                # Only this unresolved source is renewed. Keep successful
+                # decisions and delivered-history cursors intact.
+                self._reception_attempts.pop(key, None)
+                self._reception_failure = None
+                self._recovery_review = None
         if self._exit_waiting:
             self._exit_reply_attempt_key = None
             self._exit_reply_blocked_revision = None
@@ -1063,18 +1082,42 @@ class SpokenSupplementConfirmation:
         if self._reception_cache and self._reception_cache[0] == cache_key:
             decision = self._reception_cache[1]
         else:
-            try:
-                decision = await endpoint._infer(classify(new_text, phase=phase, preceding_text=previous),
-                                                  timeout=5.5, use_interaction_budget=not prepare_only and not endpoint.preparation_blocked)
+            attempt = self._reception_attempts.setdefault(cache_key, {"count": 0, "retryable": True})
+            decision = None
+            while attempt["count"] < 2 and attempt["retryable"]:
                 endpoint.assert_current()
-            except Exception as exc:
-                if getattr(exc, "code", None) == "TURN_DECISION_STALE":
-                    raise
-                # Failure does not fabricate a request or finish permission.
-                # Full understanding still has its own bounded recovery path.
-                endpoint.trace("reception_unavailable", error_type=type(exc).__name__)
-                decision = {"kind": "other", "confidence": 0.0}
+                attempt["count"] += 1
+                # An input-driven cancellation still spent this attempt. Keep
+                # its unresolved source so an explicit retry can renew it if
+                # the same speech survives the next authoritative snapshot.
+                self._reception_failure = (cache_key, endpoint.capture)
+                try:
+                    decision = await endpoint._infer(classify(new_text, phase=phase, preceding_text=previous),
+                        timeout=5.5, use_interaction_budget=not prepare_only and not endpoint.preparation_blocked)
+                    endpoint.assert_current()
+                    break
+                except Exception as exc:
+                    if classify_capture_failure(exc, "understanding").safety_violation:
+                        attempt["retryable"] = False
+                        raise
+                    if getattr(exc, "code", None) == "TURN_DECISION_STALE":
+                        raise
+                    attempt["retryable"] = (isinstance(exc, (TimeoutError, asyncio.TimeoutError,
+                                                            StructuredResponseValidationError))
+                                            or isinstance(exc, ProviderError) and exc.retryable)
+                    endpoint.trace("reception_unavailable", error_type=type(exc).__name__)
+                    # A preview cannot speak and spends at most one call per
+                    # inspection. The authoritative cut may use the remaining
+                    # attempt before falling back to complete answer analysis.
+                    if prepare_only:
+                        break
+            if decision is None:
+                # Exhaustion never consumes the speech or fabricates `other`.
+                # Normal answer analysis remains available on the same input.
+                return False
             self._reception_cache = (cache_key, decision)
+            if self._reception_failure and self._reception_failure[0] == cache_key:
+                self._reception_failure = None
         confidence = minimum_reported_confidence(final.confidence, decision["confidence"])
         if decision["kind"] == "other" or confidence is None or confidence < .75:
             if not prepare_only:

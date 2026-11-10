@@ -1,5 +1,9 @@
 # 接口设计
 
+## 091：处理重试包含失败的交流识别
+
+既有retry_answer_processing/evidence.retry_processing可以恢复当前未成功的轻量接话，沿用当前turn/capture/owner门禁；不重开已结束会话、不撤销已送达确认，也不授予退出或答案提交许可。公共字段与错误合同保持，详见[091](reception-failure-retry-091.md)。
+
 ## 090：事前考察范围、结束事实与媒体诊断
 
 CSV 报告导出追加 `score_scope` 与 JSON 编码的 `assessment_scope` 列，与 JSON 报告保持同一事前范围；旧报告留空，不把本场抽样分误标成整份题库总分。新增时间不足错误 `ASSESSMENT_APPOINTMENT_WINDOW_TOO_SHORT` / `ASSESSMENT_START_TIME_INSUFFICIENT`（422）仅暴露 `required_seconds/available_seconds`，候选就绪投影明确提示改期。

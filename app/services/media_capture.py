@@ -635,7 +635,7 @@ class InterviewMediaCaptureService:
         capture = self.get_for_interview(interview_id, organization_id)
         if capture is None:
             return None
-        if capture.get("status") in {"completed", "cancelled", "failed"}:
+        if capture.get("status") in {"completed", "cancelled", "failed", "retention_purged"}:
             return capture
         if capture.get("status") == "pending":
             return self._cancel_pending(
@@ -662,6 +662,8 @@ class InterviewMediaCaptureService:
             current = transaction.interview_media_captures.get(capture["id"])
             if current is None:
                 return None
+            if current.get("status") in {"completed", "cancelled", "failed", "retention_purged"}:
+                return deepcopy(current)
             if current.get("status") == "recording":
                 current["status"] = "stopping"
                 current["updated_at"] = utc_now()
@@ -672,14 +674,17 @@ class InterviewMediaCaptureService:
         try:
             response = await self.media_plane.stop_egress(egress_id)
         except Exception as exc:
-            self._mark_failed(
+            current = self._mark_failed(
                 capture["id"],
                 interview_id,
                 "egress_stop_failed",
                 exc,
                 actor_id=actor_id,
                 organization_id=organization_id,
+                preserve_terminal=True,
             )
+            if current and current.get("status") in {"completed", "cancelled", "retention_purged"}:
+                return current
             raise ApiError(
                 "MEDIA_CAPTURE_STOP_FAILED",
                 "Private recording could not be finalized.",
@@ -777,6 +782,8 @@ class InterviewMediaCaptureService:
                     "updated_at": utc_now(),
                 }
             )
+            if status == "completed":
+                current.update(failure_code=None, failure_type=None)
             current = transaction.interview_media_captures.update(
                 current, expected_version=current["version"]
             )
@@ -1145,10 +1152,17 @@ class InterviewMediaCaptureService:
         *,
         actor_id: str,
         organization_id: str,
-    ) -> None:
+        preserve_terminal: bool = False,
+    ) -> Optional[Dict[str, Any]]:
         with self.persistence.transaction(organization_id) as transaction:
             capture = transaction.interview_media_captures.get(capture_id)
             if capture is not None:
+                # Only StopEgress transport failure opts into this guard. A
+                # worker may seal the file while StopEgress is still awaiting
+                # its response; that late response cannot undo sealed facts.
+                # Other integrity/protection failure paths remain unchanged.
+                if preserve_terminal and capture.get("status") in {"completed", "cancelled", "retention_purged"}:
+                    return deepcopy(capture)
                 capture.update(
                     {
                         "status": "failed",
@@ -1174,6 +1188,7 @@ class InterviewMediaCaptureService:
                 reason="required_media_capture_failed",
                 organization_id=organization_id,
             )
+        return deepcopy(capture) if capture is not None else None
 
     def _cancel_pending(
         self, capture: Dict[str, Any], *, actor_id: str, organization_id: str
