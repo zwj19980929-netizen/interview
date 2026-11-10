@@ -81,7 +81,7 @@ async def test_expired_attempt_counts_once_and_recovery_has_one_independent_budg
         await asyncio.sleep(.02)
         assert endpoint.preparation_blocked and endpoint._prepare_failures == 1
         assert not capture.prepares and not commits
-        assert calls[0][0] == "reception_unavailable" and 0 < calls[0][1] <= 12
+        assert calls[0][0] == "reception_recovery_clarification" and 0 < calls[0][1] <= 12
         assert "understanding_retry_exhausted" in notices
         snapshots = len(capture.snapshots)
         for _ in range(3):
@@ -144,11 +144,11 @@ async def test_blocked_recovery_playback_still_expires_without_retrying_understa
     endpoint.start()
     try:
         await _until(lambda: endpoint.confirmation.speaking and endpoint.preparation_blocked)
-        assert spoken == ["reception_unavailable"]
+        assert spoken == ["reception_recovery_clarification"]
         snapshots = len(capture.snapshots)
         clock.value += 60
         await _until(lambda: endpoint.confirmation.phase == "listening")
-        assert spoken == ["reception_unavailable", "playback_timeout"]
+        assert spoken == ["reception_recovery_clarification", "playback_timeout"]
         assert endpoint.preparation_blocked and endpoint._prepare_failures == 1
         endpoint.speech_started(source="audio")
         clock.value += 60

@@ -47,6 +47,11 @@ _FAILURE_REASONS = frozenset({
     "semantic_completion_evidence_invalid", "technical_content_claims_missing", "unresolved_answer_contract_invalid",
     "unresolved_clarification_required", "unresolved_clarification_source_invalid",
 })
+_COMPANY_CONTRACT_DETAILS = frozenset({
+    "missing_question", "completion_basis_present", "followup_allowed", "action_mismatch",
+    "low_confidence", "unresolved_ambiguity", "intent_content_mismatch", "quote_mismatch",
+    "invalid_span", "unexpected_question", "unexpected_action", "unexpected_intent",
+})
 _OUTCOMES = frozenset({"success", "fallback_success", "failed", "timeout", "cancelled", "started"})
 _IDENTIFIERS = frozenset({"interview_id", "turn_id", "capture_id", "diagnostic_scope_id", "parent_scope_id",
                          "invocation_id", "organization_id", "route_id", "provider_connection_id",
@@ -93,6 +98,8 @@ def safe_model_diagnostic_fields(fields: dict) -> dict:
                                           "understanding_materialize", "understanding_canonical", "understanding_references",
                                           "understanding_domain", "followup", "followup_references", "followup_gate", "followup_act",
                                           "followup_repair", "reception_content"} else "unknown"
+        elif key == "contract_detail" and isinstance(value, str) and value in _COMPANY_CONTRACT_DETAILS:
+            safe[key] = value
         elif key == "schema_path" and isinstance(value, str) and re.fullmatch(r"\$[A-Za-z0-9_.\[\]]{0,160}", value):
             safe[key] = re.sub(r"\[\d+\]", "[]", value)
         elif key == "prompt_version" and isinstance(value, str) and re.fullmatch(r"[a-z_]{1,64}\.v[0-9]{1,6}", value):

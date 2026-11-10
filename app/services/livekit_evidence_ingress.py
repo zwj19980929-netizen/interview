@@ -644,6 +644,15 @@ class ManagedLiveKitEvidenceSession:
                 self._persist_answer_preparation(capture_id, turn_id, preparing=True,
                     status=("blocked" if blocked else "retrying" if reason in {"understanding_unavailable", "understanding_retrying"} else "retry_required"),
                     recovery_details=recovery_details)
+            elif reason == "understanding_clarification":
+                # Playback verification precedes _notify's scheduled callback.
+                # A new utterance, retry or controller can win that scheduling
+                # gap; the old output must not overwrite its current state.
+                if (endpoint is not self._answer_endpoint or endpoint.confirmation is None
+                        or not endpoint.confirmation.processing_clarification_notice_current(endpoint)):
+                    return
+                self._persist_answer_preparation(capture_id, turn_id, preparing=True,
+                    status="clarifying", recovery_details=recovery_details)
             elif reason == "understanding_recovered":
                 self._persist_answer_preparation(capture_id, turn_id, preparing=False)
             elif reason in {"answer_listening", "supplement_awaiting_reply", "exit_awaiting_reply",
@@ -712,6 +721,8 @@ class ManagedLiveKitEvidenceSession:
             await source._emit("floor.changed", {
                 "owner": "candidate", "reason": reason, "capture_id": capture_id,
             }, turn_id=turn_id, causation_id=None, replayability=Replayability.TRANSIENT)
+            if reason == "understanding_clarification":
+                await source._emit_snapshot(None)
 
         async def commit(decision: Any, guard: Any) -> None:
             guard()
@@ -827,7 +838,10 @@ class ManagedLiveKitEvidenceSession:
                 return {"act_id": selected["payload"]["act_id"]}
             from app.core.prompt.contracts import clarification_speech, CLARIFICATION_SPEECH_VERSION
             if kind.startswith("reception_"):
-                from app.core.prompt.conversation_reception import RECEPTION_SPEECH, RECEPTION_SPEECH_VERSION, RECEPTION_VERSION, reception_repeat
+                from app.core.prompt.conversation_reception import (
+                    RECEPTION_SPEECH, RECEPTION_SPEECH_VERSION, RECEPTION_VERSION,
+                    RECEPTION_RECOVERY_SPEECH_VERSION, reception_repeat,
+                )
                 request_kind = kind.removeprefix("reception_")
                 if request_kind == "repeat":
                     session = self.supervisor.interviews.get_interview(self.interview_id, self.organization_id)
@@ -841,7 +855,9 @@ class ManagedLiveKitEvidenceSession:
                     act_type="conversation_acknowledgement", text=text,
                     turn_id=turn_id, causation_id=None, evidence_refs=[], gesture="listen",
                     approval_guard=guard,
-                    prompt_version=(reply_prompt_version or RECEPTION_VERSION) if reply_text else RECEPTION_SPEECH_VERSION,
+                    prompt_version=((reply_prompt_version or RECEPTION_VERSION) if reply_text else
+                                    RECEPTION_RECOVERY_SPEECH_VERSION if request_kind == "recovery_clarification"
+                                    else RECEPTION_SPEECH_VERSION),
                     dialogue_question=request_kind == "question_clarification",
                     on_playback_selected=lambda: self._answer_endpoint.confirmation.playback_selected(self._answer_endpoint),
                 )
@@ -1126,7 +1142,9 @@ class ManagedLiveKitEvidenceSession:
                 previous = state.get("answer_preparation") or {}
                 same = previous.get("capture_id") == capture_id and previous.get("turn_id") == turn_id
                 recovering = same and previous.get("status") in {"retrying", "retry_required", "blocked"}
-                if recovering and ((preparing and status == "preparing") or preserve_recovery):
+                clarifying = same and previous.get("status") == "clarifying"
+                if (recovering and preparing and status == "preparing"
+                        or (recovering or clarifying) and preserve_recovery):
                     return
                 if preparing:
                     if (self._stopped or self._capture_id != capture_id or not self.chain.is_open
@@ -2348,10 +2366,10 @@ class ManagedLiveKitEvidenceSession:
             raise ApiError("ANSWER_PROCESSING_RECOVERY_STALE", "Answer recovery no longer matches the current capture.", status_code=409)
         if recovery.get("status") == "blocked":
             raise ApiError("ANSWER_PROCESSING_RECOVERY_BLOCKED", "This answer processing failure requires service recovery.", status_code=409)
-        if recovery.get("status") not in {"retrying", "retry_required"}:
+        if recovery.get("status") not in {"retrying", "retry_required", "clarifying"}:
             raise ApiError("ANSWER_PROCESSING_RECOVERY_UNAVAILABLE", "No failed answer processing is available to retry.", status_code=409)
         self._output_transition_guard(current, control_generation=control_generation)()
-        if recovery["status"] == "retry_required" and not self._answer_endpoint.retry_answer_processing():
+        if recovery["status"] in {"retry_required", "clarifying"} and not self._answer_endpoint.retry_answer_processing():
             await source._emit_snapshot(signal.causation_id)
             raise ApiError("ANSWER_PROCESSING_RECOVERY_UNAVAILABLE", "Retained answer processing is no longer retryable.", status_code=409)
         await source._emit_snapshot(signal.causation_id)

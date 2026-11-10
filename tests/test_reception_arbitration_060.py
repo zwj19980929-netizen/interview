@@ -283,7 +283,13 @@ async def test_full_review_deadline_cancels_work_and_never_creates_a_polling_inf
         assert endpoint.preparation_blocked and endpoint._prepare_failures == 2
         assert endpoint.confirmation._reception_review is None
         assert not endpoint.preparation._tasks and endpoint._inference_task is None
-        assert spoken == ["reception_wait"] and not commits and capture.is_open
+        assert spoken == ["reception_wait", "reception_recovery_clarification"]
+        assert not commits and capture.is_open
+        await endpoint.confirmation.complete_playback(endpoint, reason="agent_finished")
+        clock.value += 600
+        await asyncio.sleep(.2)
+        assert len(capture.prepares) == capture.cancelled == 2
+        assert spoken == ["reception_wait", "reception_recovery_clarification"]
     finally:
         await endpoint.close()
 

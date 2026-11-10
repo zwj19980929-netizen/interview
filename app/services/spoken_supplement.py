@@ -127,6 +127,11 @@ class SpokenSupplementConfirmation:
         self._handled_final = None
         self._handled_trace_revision = None
         self._failure_spoken_identity = None
+        # One neutral invitation per capture, even after explicit retries.
+        # This is output-only recovery, never a fresh model-call allowance.
+        self._processing_clarification_attempted = False
+        self._processing_clarification_delivery = None
+        self._processing_clarification_notice = None
         self._recovery_review = None
         self._idle_check_allowed = True
         self._idle_check_sent = False
@@ -196,6 +201,7 @@ class SpokenSupplementConfirmation:
         self._content_question_act_id = self._content_question_focus = self._content_request_final = None
         self._content_question_delivered = self._content_delivery_pending = False
         self._supplement_question_delivered = self._supplement_delivery_pending = False
+        self._processing_clarification_delivery = None
         return True
 
     def _speech_result_current(self) -> bool:
@@ -606,9 +612,15 @@ class SpokenSupplementConfirmation:
         """
         verified = False
         supplement_verified = False
+        processing_clarification_verified = None
         try:
             if delivery_guard is not None:
                 delivery_guard()
+            pending = self._processing_clarification_delivery
+            if (self.speaking and pending is not None and reason == "agent_finished"
+                    and pending == (endpoint.capture, endpoint.revision)):
+                endpoint.assert_current()
+                processing_clarification_verified = (endpoint.capture, endpoint.revision, delivery_guard)
             if self.speaking and self._supplement_delivery_pending:
                 self._supplement_question_delivered = False
                 if reason == "agent_finished":
@@ -647,12 +659,31 @@ class SpokenSupplementConfirmation:
         except Exception as exc:
             endpoint.trace("exit_delivery_boundary_unavailable", error_type=type(exc).__name__)
         finally:
+            self._processing_clarification_delivery = None
             self._content_delivery_pending = False
             self._supplement_delivery_pending = False
             self.floor_returned(endpoint, reason=reason, exit_boundary_verified=verified,
                                 supplement_boundary_verified=supplement_verified)
             if supplement_verified and endpoint._recovery_stage == "supplement_prompt":
                 await endpoint._understanding_succeeded()
+            if processing_clarification_verified:
+                self._processing_clarification_notice = processing_clarification_verified
+                try:
+                    await endpoint._notify("understanding_clarification")
+                finally:
+                    self._processing_clarification_notice = None
+
+    def processing_clarification_notice_current(self, endpoint: Any) -> bool:
+        """Recheck the delivered output when its scheduled notice runs."""
+        notice = self._processing_clarification_notice
+        if (notice is None or notice[:2] != (endpoint.capture, endpoint.revision)
+                or endpoint.confirmation is not self or self.phase != "listening"
+                or self.confirmed or not endpoint.preparation_blocked):
+            return False
+        endpoint.assert_current()
+        if notice[2] is not None:
+            notice[2]()
+        return True
 
     def abandon_delivery(self, endpoint: Any) -> None:
         """A cancelled handoff may retain raw PCM, never its confirmation grant."""
@@ -664,6 +695,7 @@ class SpokenSupplementConfirmation:
         self._content_delivery_pending = False
         self.confirmed = False
         self._recovery_review = None
+        self._processing_clarification_delivery = None
         self.floor_returned(endpoint, reason="handoff_interrupted")
 
     def floor_returned(self, endpoint: Any, *, reason: str = "agent_finished",
@@ -671,6 +703,7 @@ class SpokenSupplementConfirmation:
                        supplement_boundary_verified: bool = False) -> None:
         if self.phase != "speaking":
             return
+        self._processing_clarification_delivery = None
         if reason != "agent_finished":
             self._recovery_review = None
         if self._exit_waiting and self._after_speech == "awaiting_exit_reply":
@@ -831,6 +864,8 @@ class SpokenSupplementConfirmation:
         """Inspect each new input once while technical preparation is blocked."""
         if self._exit_waiting:
             await self._exit_step(endpoint, quiet)
+            return
+        if quiet >= self.silence_seconds and await self._offer_processing_clarification(endpoint):
             return
         has_reception = self.semantic_first and callable(getattr(endpoint.capture, "classify_reception", None))
         if quiet < (max(1.0, endpoint.min_silence_seconds) if has_reception else self.silence_seconds):
@@ -1209,6 +1244,11 @@ class SpokenSupplementConfirmation:
 
     async def _recover_interaction(self, endpoint: Any, final: Any) -> None:
         endpoint.assert_current()
+        if endpoint.preparation_blocked and await self._offer_processing_clarification(endpoint):
+            # Failed model output does not justify choosing an answer or a new
+            # question. Offer one neutral opportunity to clarify, then retain
+            # the same evidence and optional explicit processing retry.
+            return
         start = getattr(endpoint, "start_recovery_preparation", None)
         started = callable(start) and start(final)
         if self._failure_spoken_identity is not None:
@@ -1230,6 +1270,36 @@ class SpokenSupplementConfirmation:
             if getattr(exc, "code", None) == "TURN_DECISION_STALE":
                 raise
             endpoint.trace("recovery_speech_unavailable", error_type=type(exc).__name__)
+
+    async def _offer_processing_clarification(self, endpoint: Any) -> bool:
+        if (self._processing_clarification_attempted or self.phase != "listening"
+                or self.confirmed or self._exit_waiting or self._exit_context is not None
+                or self.content_clarification_active
+                or endpoint._explicit_revision == endpoint.revision
+                or endpoint._closed or not endpoint.capture.is_open
+                or not endpoint.preparation_blocked or not endpoint._recovery_retryable
+                or endpoint._recovery_stage != "answer_understanding"):
+            return False
+        endpoint._proposal_revision = endpoint.revision
+        endpoint.assert_current()
+        # Spend before any await, including failed/partial speech. Never put
+        # this flag in the unplayed-speech rollback checkpoint.
+        self._processing_clarification_attempted = True
+        self._failure_spoken_identity = True
+        self._processing_clarification_delivery = (endpoint.capture, endpoint.revision)
+        self._recovery_review = None
+        try:
+            spoken = await self._say(endpoint, "reception_recovery_clarification",
+                                     afterwards="listening", recovery=True)
+            if not spoken:
+                self._processing_clarification_delivery = None
+        except BaseException as exc:
+            self._processing_clarification_delivery = None
+            if (not isinstance(exc, Exception) or getattr(exc, "code", None) == "TURN_DECISION_STALE"
+                    or classify_capture_failure(exc, "speech").safety_violation):
+                raise
+            endpoint.trace("recovery_clarification_unavailable", error_type=type(exc).__name__)
+        return True
 
     async def _semantic_turn(self, endpoint: Any, final: Any, *, reception_kind: Any = None,
                              supplement_reply: bool = False) -> bool:

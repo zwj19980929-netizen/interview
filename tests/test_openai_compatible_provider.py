@@ -124,6 +124,7 @@ async def test_openai_compatible_chat_json_classifies_length_truncation_with_saf
     assert error.details == {
         "finish_reason": "length",
         "requested_max_output_tokens": 4400,
+        "requested_response_format": "prompt",
         "content_length": len(partial_content),
         "input_tokens": 940,
         "output_tokens": 4400,

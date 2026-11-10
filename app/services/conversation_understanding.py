@@ -104,6 +104,7 @@ def _log_validation_rejection(
     record_model_diagnostic("understanding_rejected", **{
         **safe_model_call_context(), "interview_id": safe_id(interview_id), "turn_id": safe_id(turn_id),
         "validation_stage": stage, "failure_reason": reason, "schema_path": path,
+        "contract_detail": getattr(exc, "contract_detail", None),
         "attempt": attempt, "provider_request_id": safe_id(provider_request_id),
     })
     _LOGGER.warning(

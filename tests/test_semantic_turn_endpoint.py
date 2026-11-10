@@ -135,7 +135,8 @@ def test_semantic_failures_use_one_shared_budget_and_noise_does_not_reset_it():
                 await asyncio.sleep(.06)
             assert len(endpoint.capture.prepares) == 2
             assert "understanding_retry_exhausted" in notices
-            assert not commits and spoken == ["reception_unavailable"] and endpoint.capture.is_open
+            assert not commits and spoken == ["reception_unavailable", "reception_recovery_clarification"]
+            assert endpoint.capture.is_open
         finally:
             release_failure_notice.set()
             await endpoint.close()

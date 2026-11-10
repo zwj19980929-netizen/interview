@@ -2,6 +2,37 @@
 
 本文件记录所有会修改仓库内容的工作项。只读检查不单独登记；同一目标下的代码、测试、迁移和文档修改合并为一个工作项。状态使用 `in_progress`、`verified`、`failed` 或 `cancelled`，历史条目只追加或补充结果，不删除。
 
+
+## 2026-11-10 · ANSWER-CONTINUITY-AND-STT-REPAIR-095
+
+- 状态：`in_progress`。
+- 授权与基线：用户在最新回答处理失败诊断后要求修复，沿用Git回退、验证与空闲加载授权。首次修改前工作区干净，基线04e87fd已提交；按入口顺序复核11份文档。本项覆盖回答理解失败后的有界澄清、公司反问/题干术语合同纠错与安全诊断、真实批量STT修复能力核查及必要配置，不自动补交真实回答、跳题、评分或结束面试。
+- 现场证据：iv_50f6ecd910ab4c28在11:50:50Z的v151结果通过JSON/中央Schema，但company_question_contract_invalid领域校验失败；随后自动纠错和后续调用于11:50:55Z/11:51:21Z各报invalid_json_object，分别200/2000和216/2000 tokens、finish_reason=stop，非超时/截断。094只覆盖选题，本次回答链已用完恢复预算。全场19次关联LLM调用含6次解析失败，不能凭未留存正文确定具体语法或断言Salary/Celery误识别是唯一原因。11:52断线后原始音频完成恢复，批量STT走mock-stt被provider_real_stt_required拒绝；该批量审计缺会话关联，时间与恢复链强关联，历史2份答案保留、当前题未生成正式答案。
+- 修改和验收边界：先复现再改动。恢复交流只能保留原题/原录音、有限询问，不将无效结果转为答案/完成许可，不放宽校验或无限刷新调用预算；仅当前来源/owner/controller允许发言，取消和旧结果不得晚播。所有业务Prompt/Schema继续集中版控并有合同测试。STT先核验已有连接/模型支持及合成音频，不向外发送真实候选材料作探针；生产代码、测试、配置、文档与真实操作结果均在本项留痕，验证前不加载，活动面试期间不重启。
+
+
+- 阶段实施：公司反问合同保留全部拒绝规则，新增12个固定子原因、仅相关纠错分支的8个Prompt版本及独立恢复语音v1；167项相关回归通过。回答理解耗尽后同capture一次恢复澄清，可信完整播完才发布clarifying；保留新输入、原手动重试、退出/暂停/内容澄清边界，原调用额度不放宽。交叉审查发现新准备未覆盖clarifying与普通发言权归还过早清提示两处竞态，均补红例修正；真实ingress新输入45项、前端4文件260项通过。进一步补通知异步调度间的来源复验，完整首次回归仅作为发现兼容问题，不提前生成已验收结论。
+- 批量转写：新增集中版控探针batch_stt_known_speech.v1，固定WAV 86366字节、16kHz单声道、2.6975625秒、SHA256 326d0aad88aab144a81701c3f30b10a49795bee4e655e96ab583f105a31f3a5a。首次系统合成命令返回0但实际0帧，校验拒绝；权限升级后生成有效音频并验证。模型/路由探针仅primary、零重试、内容匹配且拒绝真实配置的mock来源。真实流式STT开发准入不再绕过真实batch修复能力，纯mock开发兼容保持。相关160项与邻接72项通过；未外发真实候选音频。本机真实配置待验证后加载，再经正常管理API新增/测试。
+- 安全诊断回归：JSON诊断增加固定解析枚举、strip后字符偏移与实际请求格式，不改变接受策略、不记录正文。红例12失败中4项为测试替身列表包装错误，已纠正；首绿70通过/1失败为旧截断测试精确字典缺新增安全字段，更新期望后71通过。公司红22失败/8通过，首次绿6失败源于新版本尚未加入领域白名单，补齐后167通过。前端过程测试夹具receipt场次错误和新增重试去重/播放归还反例均保留日志；全部日志/private/tmp/interviewer-095-*，失败不删除。
+
+
+
+- 完整首轮与竞态补验：首次609文件冻结后完整后端4937 passed/1 failed/8 skipped/270.64秒。唯一失败是旧reception_arbitration_060仍断言只有等待提示；按新合同加入一次恢复提示，并保留两次实际调用/取消断言，追加播放确认后再等600秒不得新增调用或提示。首次追加夹具遗漏complete_playback的reason参数，1失败/36通过，修正后37通过；过程日志保留。另有真实ingress延迟通知期间新音频revision/控制generation变化两项红例，已加临时播放证明token并在异步回调真正投递前复验，47项通过和独立审查通过；通用notify API不变。首轮日志/快照归档为interviewer-095-backend-first-full.log及first-tested-source.json，最终按新SHA9871191c1e65fc2998ea452215db9f484eaebcc1d3c8bc8dd9a0d007d2f51aab重新冻结回归。
+- 真实合成语义探针：使用已配置模型、只读数据库后转内存，3条虚构输入各最多1次真实调用，总3次。技术术语和歧义请求通过；普通公司提问仍company_question_contract_invalid（wire成功253tokens），因此整体2/3未通过，不能宣称全部纠错验收成功。无真实候选输入、无业务数据库写入、没有重试碰运气；结果interviewer-095-company-model-probe-result.json，进一步定位安全子原因后再决定修复。
+- 只读加载预检：当前API36249/worker36250、LiveKit和后台任务空闲，81场面试核心摘要e99359d8842c1bdf915a3793c28e89caa2bfa34f435bb15735808a270000d3d2。仅media_capture_aaf8ff033d95486f仍recording而精确EG_FWeheZDwp93C已EGRESS_COMPLETE，无错误，316.836816562秒、4709291字节。原文件SHA7d7387f05bf4852dc026cdf134cdefdce5aba4e2e90849b64127ecf6ba62c9a2；本场2个答案已评分、3个旧评分work全completed、无结束/报告，现有processing/retry无可排答案/报告工作。拟仅验真封存，81份完整面试原始行、其他79capture/521outbox和owner摘要冻结；只读preflight通过，尚未发送恢复请求。
+
+
+
+- 进一步真实诊断与合同修正：只增加1次虚构公司提问调用，仍得到ask_company且company_question缺失/空，安全子原因为missing_question；其他控制字段、置信度和歧义规则一致。发现纠错wire Schema将此字段列为可选，缺字段通过中央格式校验后才被领域拒绝，通用示例还会省略可选字段。不凭get(None)区分历史响应究竟省略还是显式null。修正仅纠错Schema要求显式返回该可空字段，并说明它提取候选原问题而非企业回答，未知公司资料不能丢弃原问题；不强制公司分类、不生成来源或放宽领域规则。新理解130–133/决策161–164，保留早期126–129/157–160版本读取；正常请求不变。第二轮后端4940 passed/8 skipped/272.37秒，但为落实真实探针发现的合同修正再次修改源码，不能作为最终发布证明；完整证据保留，最后重冻复验。
+- 指定录像实际封存：精准恢复脚本19项隔离负例与允许路径通过，正常审计API返回202、answer/report work_count=0；原worker将4709291字节文件验真为completed，SHA与修前7d7387f05bf4852dc026cdf134cdefdce5aba4e2e90849b64127ecf6ba62c9a2一致。81份完整面试原始行摘要43fa14e9a05b2cc6337f5980bb806c4dd502cab223b5e1b5802d5080daba6c17、其他79capture/521outbox和owner均保持；未生成答案/报告、未结束面试、未调用StopEgress。093记录的断线自动封存缺口仍未修改。
+
+
+- 最终合同与真实模型结果：新字段必填红例成立，相关9文件197项通过（json_schema/json_object/prompt传输、旧/早期/新版本、null与来源边界）；首绿8失败/186通过是历史mock结果误配新Schema，按历史Schema复验并只对新mock版本增加显式null，未放宽校验。最后v161真实虚构3场景为2/3通过：公司提问现有真实原文对象且通过；歧义请求显式null并正确澄清；技术术语一次返回可解析但顶层非对象的JSON（json_decode_reason=non_object、requested_response_format=json_schema、finish_reason=stop、191/2000tokens），被原严格门禁拒绝。累计7次真实LLM调用，无真实候选内容和业务DB写入；不以重复调用追求全绿，不宣称供应商格式问题消失。该失败由已验收的一次同题恢复澄清承接；真实供应商长期可靠性和真人复验保持待验。最终冻结609文件、236后端源码，SHA353ba4628f7bba76360dcded9342963d529b63bce99040e5c497d4e2f0c87544；完整最终回归进行中。
+
+
+- 最终全量与静态发布：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q`为4944 passed/8 skipped/271.70秒；`cd app/web && npm test -- --reporter=dot`为580 passed/26文件；`npm run build -- --outDir /private/tmp/interviewer-095-web-dist`成功。609份源码/测试（含固定WAV）在完整回归/构建前后集合与hash完全一致，20份生产路径通过精确范围门禁；生成v5发布证明，静态构建按追加不可变资产后原子切换index，原64旧资产保留。原非阻断大chunk提示保持。347处文档链接与diff检查通过；发布/恢复脚本22项、配置脚本23项和精准封存19项隔离检查通过，未向真实环境发出模拟信号。完整日志为/private/tmp/interviewer-095-{backend-full,frontend-full,web-build}.log，发布证明interviewer-095-test-attestation.json。保存修复提交后按即时双重空闲门禁加载，再通过正常API验证真实batch。
+
+
 ## 2026-11-10 · PLANNING-JSON-RECOVERY-094
 
 - 状态：`verified（仓库全量与本机加载；真人连续面试待验）`。

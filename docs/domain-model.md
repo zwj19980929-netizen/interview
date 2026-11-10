@@ -1,5 +1,9 @@
 # 领域模型
 
+## 095：有界恢复交流与合同诊断
+
+当前采集的answer_preparation可选状态clarifying只表达一次恢复提示已经完整送达、可继续说明，不表示Answer/Understanding生成或结束许可。失败预算保持，提示资格在I/O前消费，不随噪声、同文、显式重试或断续播放反复授予。原音频与来源保留；新权威发言经正常权限/语境门禁分析。模型诊断新增白名单contract_detail细分company_question_contract_invalid，保留原aggregate原因与路径，不保存响应正文或改变旧记录；不新增表或DDL。
+
 ## 094：解析故障诊断与独立提案
 
 既有ModelInvocation审计JSON追加可空`json_failure_kind`（仅`empty_content`或`invalid_json_object`）和`content_length`（整数0–10000000）；无响应正文、候选原文或凭据。中央Schema错误仍使用原`schema_reason/schema_path`，不能冒充解析故障。成功重试记录真实模型调用次数；批准目录回退沿原`approved_catalog_fallback.v1`和`fallback_reason=provider_schema_invalid`收据，不增加会话状态或将失败输出写入领域对象。无DDL或历史回填。

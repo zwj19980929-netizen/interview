@@ -51,6 +51,16 @@ def parse_json_object_content(content: str) -> Dict[str, Any]:
     raise json.JSONDecodeError("No complete JSON object found", text, 0)
 
 
+def _json_failure_diagnostics(content: str) -> Dict[str, Any]:
+    """Strict decoder facts only; this does not broaden accepted wrappers."""
+    try:
+        value = json.loads(content.strip())
+    except json.JSONDecodeError as error:
+        return {"json_decode_reason": "extra_data" if error.msg == "Extra data" else "syntax_error",
+                "json_error_offset": error.pos}
+    return {"json_decode_reason": "non_object" if not isinstance(value, dict) else "syntax_error"}
+
+
 class OpenAICompatibleProvider:
     provider_id = "openai_compatible"
     structured_output_mode = "json_schema"
@@ -177,6 +187,7 @@ class OpenAICompatibleProvider:
             requested_max_output_tokens=request.max_output_tokens,
             content_length=len(content) if isinstance(content, str) else 0,
         )
+        diagnostics["requested_response_format"] = (payload.get("response_format") or {}).get("type", "prompt")
         if finish_reason == "length":
             raise ProviderError(
                 "provider_output_truncated",
@@ -201,7 +212,8 @@ class OpenAICompatibleProvider:
                 "Provider response was not valid JSON (finish_reason=%s, content_length=%s)."
                 % (finish_reason or "unknown", len(content)),
                 retryable=True,
-                details={**diagnostics, "json_failure_kind": "invalid_json_object"},
+                details={**diagnostics, "json_failure_kind": "invalid_json_object",
+                         **_json_failure_diagnostics(content)},
             ) from exc
 
         usage = Usage(

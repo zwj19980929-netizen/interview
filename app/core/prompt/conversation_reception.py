@@ -7,6 +7,7 @@ from app.model_gateway.schemas import ChatMessage
 
 RECEPTION_VERSION = "conversation_reception.v10"
 RECEPTION_SPEECH_VERSION = "conversation_reception_speech.v4"
+RECEPTION_RECOVERY_SPEECH_VERSION = "conversation_recovery_speech.v1"
 RECEPTION_SPEECH = {
     "idle_check": "我还在听。需要一点时间，或希望我再解释一下题目，都可以告诉我。",
     "wait": "好的，不着急，你慢慢想，我在听。",
@@ -19,6 +20,7 @@ RECEPTION_SPEECH = {
     "pause": "好的，我们先暂停。准备好了以后再继续。",
     "unclear": "我想先确认一下，你刚才是希望我怎么配合？",
     "unavailable": "刚才的回答暂时没处理成功，录音和转写已保留，不用重复整段回答。请留意页面的处理提示。",
+    "recovery_clarification": "刚才这句话暂时没理解清楚。你可以换个说法，简短说明你想回答或询问的内容，我们继续当前这道题。",
 }
 
 

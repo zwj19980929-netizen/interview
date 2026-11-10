@@ -9,8 +9,10 @@ const UNDERSTANDING_RETRY_CODES = new Set([
 
 export function understandingRecoveryState(problem) {
   if (problem?.recoverable !== true) return null;
-  if ((UNDERSTANDING_RETRY_CODES.has(problem.code) || UNDERSTANDING_RECOVERY_CODES.has(problem.code))
+  const clarifying = problem.code === "UNDERSTANDING_CLARIFICATION_REQUIRED";
+  if ((clarifying || UNDERSTANDING_RETRY_CODES.has(problem.code) || UNDERSTANDING_RECOVERY_CODES.has(problem.code))
     && problem.action === "contact_support") return "blocked";
+  if (clarifying) return "clarifying";
   if (UNDERSTANDING_RETRY_CODES.has(problem.code)) return "retry_required";
   return UNDERSTANDING_RECOVERY_CODES.has(problem.code) ? "retrying" : null;
 }
@@ -110,6 +112,10 @@ export function candidateNotice(problem, pauseConfirmed = false, phase = null, p
     const stage = problem.stage === "supplement_prompt" ? "正在恢复补充确认提示" : "正在恢复回答处理";
     return { title: stage, detail: "录音和已识别内容已保留，系统正在自动恢复此步骤。无需重说整题；想补充仍可直接开口。"
       + (phase === "awaiting_exit_confirmation" ? "本次面试尚未结束。" : "") };
+  }
+  if (understandingRecoveryState(problem) === "clarifying") {
+    return { title: "可以继续说明", detail: "刚才这句话暂未理解清楚，可以换个说法继续；也可重试处理已收到的语音，无需重说整题。",
+      retry: true, action: "retry_answer_processing", retryLabel: "重试处理" };
   }
   if (understandingRecoveryState(problem) === "retry_required") {
     return { title: "回答处理需要重试", detail: "录音和已识别内容已保留。点击“重试处理”继续处理已有回答，无需重说整题。"

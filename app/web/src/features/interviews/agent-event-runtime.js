@@ -430,9 +430,10 @@ function validateAnswerPreparation(value, snapshot) {
   return isPlainObject(value) && ["status", "turn_id", "capture_id"].every(key => Object.hasOwn(value, key))
     && hasOnlyKeys(value, ["status", "turn_id", "capture_id", "stage", "reason_code", "attempt", "max_attempts", "retryable"])
     && validatePreparationRecoveryDetails(value)
-    && ["preparing", "retrying", "retry_required", "blocked"].includes(value.status) && scopeId(value.turn_id) && scopeId(value.capture_id)
+    && ["preparing", "retrying", "retry_required", "blocked", "clarifying"].includes(value.status) && scopeId(value.turn_id) && scopeId(value.capture_id)
     && value.turn_id === snapshot.current_turn_id
-    && snapshot.status === "in_progress" && (value.status !== "preparing" || snapshot.floor === "candidate")
+    && snapshot.status === "in_progress" && (!["preparing", "clarifying"].includes(value.status) || snapshot.floor === "candidate")
+    && (value.status !== "clarifying" || value.retryable !== false)
     && snapshot.calibration_status === "completed" && !snapshot.capture_recovery;
 }
 

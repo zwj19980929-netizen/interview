@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { candidateEntryMessage, candidateEntryFailure, candidateNotice, candidateStoppedPresentation, candidatePlanningPresentation } from "./presentation.js";
+import { candidateEntryMessage, candidateEntryFailure, candidateNotice, candidateStoppedPresentation, candidatePlanningPresentation, understandingRecoveryState } from "./presentation.js";
 
 describe("candidate stopped presentation uses confirmed session facts", () => {
   it("does not equate a local paused phase with an acknowledged server pause", () => {
@@ -22,6 +22,17 @@ describe("candidate stopped presentation uses confirmed session facts", () => {
 });
 
 describe("candidate copy separates actions from diagnostics", () => {
+  it("presents delivered recovery clarification as continuing the current question with an optional retry", () => {
+    const problem = { code: "UNDERSTANDING_CLARIFICATION_REQUIRED", recoverable: true,
+      action: "retry_answer_processing", message: "PRIVATE_PROVIDER_RESPONSE" };
+    expect(understandingRecoveryState(problem)).toBe("clarifying");
+    expect(candidateNotice(problem)).toEqual({ title: "可以继续说明",
+      detail: "刚才这句话暂未理解清楚，可以换个说法继续；也可重试处理已收到的语音，无需重说整题。",
+      retry: true, retryLabel: "重试处理", action: "retry_answer_processing" });
+    expect(JSON.stringify(candidateNotice(problem))).not.toMatch(/PRIVATE|处理失败|已暂停|下一题/);
+    expect(understandingRecoveryState({ ...problem, recoverable: false })).toBeNull();
+    expect(candidateNotice({ ...problem, action: "contact_support", retryable: false }).retry).not.toBe(true);
+  });
   it.each([
     { id: "first", status: "asking" },
     { id: "first", status: "pending" },

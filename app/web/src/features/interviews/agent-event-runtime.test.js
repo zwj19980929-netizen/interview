@@ -227,6 +227,24 @@ describe("ordered AgentEvent runtime", () => {
     }
   });
 
+  it("accepts clarification only on the candidate floor with current scope and safe recovery metadata", () => {
+    const snapshot = { ...candidateSnapshot(), floor: "candidate", current_turn_id: "turn_1" };
+    const preparation = { status: "clarifying", turn_id: "turn_1", capture_id: "capture_1",
+      stage: "answer_understanding", reason_code: "invalid_result", attempt: 2, max_attempts: 2, retryable: true };
+    expect(validateAgentEvent(event(1, "session.snapshot", { ...snapshot, answer_preparation: preparation })).ok).toBe(true);
+    for (const change of [{ status: "paused" }, { status: "completed" }, { floor: "agent" }, { floor: "none" },
+      { current_turn_id: "turn_old" }, { calibration_status: "listening" },
+      { capture_recovery: { status: "recovering", turn_id: "turn_1", capture_id: "capture_1", attempt: 1, max_attempts: 3 } }]) {
+      expect(validateAgentEvent(event(1, "session.snapshot", { ...snapshot, ...change, answer_preparation: preparation })).ok).toBe(false);
+    }
+    for (const change of [{ turn_id: "turn_old" }, { capture_id: "" }, { capture_id: "wrong scope" },
+      { provider_result: "PRIVATE_RESPONSE" }, { transcript: "PRIVATE_WORDS" }, { retryable: false }]) {
+      expect(validateAgentEvent(event(1, "session.snapshot", {
+        ...snapshot, answer_preparation: { ...preparation, ...change },
+      })).ok).toBe(false);
+    }
+  });
+
   it("requires capture and turn scope with the correct floor/action for recovery events", () => {
     const recoveryEvents = [
       ["floor.changed", { owner: "candidate", reason: "answer_recovering", capture_id: "capture_1" }],

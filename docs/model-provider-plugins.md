@@ -1,5 +1,15 @@
 # 模型供应商插件化设计
 
+## 095：业务纠错、安全解析诊断与真实批量转写
+
+仅 `semantic_first + optional_context + company_question_contract_invalid` 的纠错分支采用新集中指令：理解版本120/121/124/125分别映射130/131/132/133，组合决策151/152/155/156分别映射161/162/163/164；本轮早期合成验收使用的126–129/157–160继续兼容读取。纠错Schema要求显式返回company_question（合法原文引用对象或null），普通请求Schema、来源引用、置信度及调用额度保持；模糊音近词不得强制解释为公司问题或技术术语，也不得通过删除真实歧义来过校验。`contract_detail`仅记录12个固定规则枚举，无字段原值。固定恢复语音独立使用 `conversation_recovery_speech.v1`，原固定通知v4不变。
+
+解析失败追加 `json_decode_reason=non_object/extra_data/syntax_error`、严格整数 `json_error_offset`（相对strip后文本）和实际请求格式 `requested_response_format=json_schema/json_object/prompt`。这只诊断原拒绝分支，不改变JSON接受策略；请求格式不代表供应商遵守格式，错误位置也不暴露响应正文。
+
+`batch_stt_known_speech.v1` 以仓库内16kHz单声道PCM WAV合成语音及固定文本匹配验证批量模型。资源有界读取并校验SHA256，缺失、符号链接或内容变化拒绝。探针仅测primary、零重试、无fallback，避免mock或次级模型替主模型获得健康证明；实际业务路由的重试策略保持。结果只含探针模式/版本、字节数与匹配布尔值。真实streaming启用时，入场必须具备健康真实batch修复路由，纯mock开发兼容路径仍在。
+
+已有DashScope适配器支持 `qwen3-asr-flash`，使用私有音频Data URL。官方批量能力存在5分钟/10MB边界（编码体积需考虑），095不实现长音频分块，也不将短合成探针通过等同真实长答案验收。实际本机配置和外呼结果以[操作日志](change-log.md)为准。
+
 ## 094：可观察的 JSON 解析错误
 
 OpenAI-compatible及继承适配器在原空内容和JSON解析失败分支，分别附加`json_failure_kind=empty_content/invalid_json_object`，保持`provider_schema_invalid`及原解析政策。网关只持久化这两个枚举和0–10000000的严格整数`content_length`，拒绝布尔值、容器、私密字符串和越界长度；不记录响应正文。合法JSON的中央Schema拒绝仍是原规则/路径诊断，无解析分类；截断、鉴权及HTTP错误语义保持。

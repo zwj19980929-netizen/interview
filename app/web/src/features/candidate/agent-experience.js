@@ -23,6 +23,7 @@ const AVATAR_METRIC_WINDOW_MS = 1_000;
 const MICROPHONE_LEVEL_INTERVAL_MS = 100;
 const ANSWER_PREPARATION_WARNING_CODES = new Set([
   "UNDERSTANDING_UNAVAILABLE", "UNDERSTANDING_RESULT_REJECTED", "UNDERSTANDING_RETRY_EXHAUSTED",
+  "UNDERSTANDING_CLARIFICATION_REQUIRED",
   "SUPPLEMENT_REPLY_UNAVAILABLE", "SUPPLEMENT_REPLY_RETRY_EXHAUSTED",
   "TRANSCRIPT_UNAVAILABLE", "TRANSCRIPT_RETRY_REQUIRED", "ENDPOINT_UNCERTAIN",
 ]);
@@ -418,7 +419,7 @@ class CandidateExperienceRun {
     }
     if (type === "retry_answer_processing") {
       if (!this.evidenceReady || this.answerSubmissionPending || this.isSafetyStopped()
-        || understandingRecoveryState(this.state.problem) !== "retry_required"
+        || !["retry_required", "clarifying"].includes(understandingRecoveryState(this.state.problem))
         || this.understandingRetryCausationId
         || this.endpointProblemScope?.turnId !== this.evidenceTurnId
         || this.endpointProblemScope?.captureId !== this.evidenceCaptureId
@@ -989,6 +990,10 @@ class CandidateExperienceRun {
           }
           return;
         }
+        // The playback handoff also emits answer_listening. It acknowledges
+        // the open input stream, not new words or successful understanding.
+        if (payload.reason !== "answer_listening"
+          && understandingRecoveryState(this.state.problem) === "clarifying") this.clearUnderstandingRecovery();
         this.answerPreparation = payload.reason === "answer_preparing"
           ? { status: "preparing", turn_id: event.turn_id, capture_id: payload.capture_id } : null;
         if (payload.reason === "answer_listening") {
@@ -1013,6 +1018,9 @@ class CandidateExperienceRun {
         });
         return;
       }
+      // Only the following scoped snapshot certifies a completely delivered
+      // recovery prompt; this floor event alone grants no recovery action.
+      if (payload.reason === "understanding_clarification") return;
       if (payload.owner === "agent" || payload.owner === "candidate") this.answerSubmissionPending = false;
       if (payload.owner !== "candidate" || payload.reason === "barge_in") this.answerPreparation = null;
       if (payload.owner === "agent") this.answerFinishRequested = false;
@@ -1252,6 +1260,8 @@ class CandidateExperienceRun {
       return;
     }
     if (event.type === "problem") {
+      // This code is a local presentation of authoritative snapshot state.
+      if (payload.code === "UNDERSTANDING_CLARIFICATION_REQUIRED") return;
       // A queued VAD error must never replace the actionable safety pause.
       if (this.state.problem?.recoverable === false && payload.recoverable) return;
       const rejectedWarmupOpen = payload.recoverable === true && payload.code === "WARMUP_RETRY_REQUIRED"
@@ -1634,16 +1644,21 @@ class CandidateExperienceRun {
     const transcriptTurnChanged = nextTranscriptTurnId !== this.currentTranscriptTurnId();
     if (transcriptTurnChanged || sessionStatus !== "in_progress") this.clearUnderstandingRecovery();
     const understandingRecovery = this.answerPreparation;
-    if (!this.isSafetyStopped() && ["retrying", "retry_required", "blocked"].includes(understandingRecovery?.status)
+    if (understandingRecoveryState(this.state.problem) === "clarifying"
+      && nextTranscriptTurnId === this.endpointProblemScope?.turnId
+      && (!understandingRecovery || (understandingRecovery.capture_id === this.endpointProblemScope.captureId
+        && understandingRecovery.status === "preparing"))) this.clearUnderstandingRecovery();
+    if (!this.isSafetyStopped() && ["retrying", "retry_required", "blocked", "clarifying"].includes(understandingRecovery?.status)
       && (transcriptTurnChanged || !this.evidenceCaptureId || understandingRecovery.capture_id === this.evidenceCaptureId)) {
       this.endpointProblemScope = { turnId: understandingRecovery.turn_id, captureId: understandingRecovery.capture_id };
-      const retryPending = understandingRecovery.status === "retry_required" && Boolean(this.understandingRetryCausationId);
+      const retryPending = ["retry_required", "clarifying"].includes(understandingRecovery.status) && Boolean(this.understandingRetryCausationId);
       if (!retryPending) this.understandingRetryCausationId = null;
       this.patch({ understandingRetryPending: retryPending, problem: {
         code: understandingRecovery.status === "blocked" ? "UNDERSTANDING_RESULT_REJECTED"
+          : understandingRecovery.status === "clarifying" ? "UNDERSTANDING_CLARIFICATION_REQUIRED"
           : understandingRecovery.status === "retry_required" ? "UNDERSTANDING_RETRY_EXHAUSTED" : "UNDERSTANDING_UNAVAILABLE",
         recoverable: true, action: understandingRecovery.status === "blocked" ? "contact_support"
-          : understandingRecovery.status === "retry_required" ? "retry_answer_processing" : "continue_listening",
+          : ["retry_required", "clarifying"].includes(understandingRecovery.status) ? "retry_answer_processing" : "continue_listening",
         capture_id: understandingRecovery.capture_id,
         ...Object.fromEntries(["stage", "reason_code", "attempt", "max_attempts", "retryable"]
           .filter(key => Object.hasOwn(understandingRecovery, key)).map(key => [key, understandingRecovery[key]])),
@@ -1912,6 +1927,8 @@ class CandidateExperienceRun {
       this.patch({ microphone: { ...this.state.microphone, localDetected: true } });
       return;
     }
+    if (this.evidenceReady && this.state.floor === "candidate"
+      && understandingRecoveryState(this.state.problem) === "clarifying") this.clearUnderstandingRecovery();
     const cancelsPreparation = this.answerFinishRequested || this.state.phase === "answer_preparing";
     this.answerFinishRequested = false;
     // A click can happen while VAD is already active. Still send one fresh,

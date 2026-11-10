@@ -1,5 +1,9 @@
 # 数据库与向量存储设计
 
+## 095：澄清恢复与诊断兼容
+
+既有 `agent_runtime.answer_preparation` JSON 增加 `clarifying` 状态，只保存当前turn/capture及安全恢复事实；仍由快照权限过滤，不迁移或补写历史Answer、Understanding和评分。新准备覆盖旧澄清，普通发言权归还保持当前恢复提示。模型调用日志可选增加请求格式、JSON解析枚举/位置，公司合同子原因仅在安全诊断白名单记录，不落响应正文。新增Prompt版本加入历史读取白名单；没有DDL、表、索引或向量检索变更。模型配置/路由如需新增，须通过正常管理API、合成语音测试和健康指纹流程，不能直接修改数据库绕过审计。
+
 ## 094：模型调用的安全解析分类
 
 既有`model_invocations.data`新增可空`json_failure_kind`和`content_length`，前者严格限制为`empty_content/invalid_json_object`，后者为0–10000000的严格整数。沿现有组织隔离和JSON文档写入，无新表、索引或DDL。历史缺失诊断保留为空，不能倒推原响应；不保存原始模型正文，也不回填或改写历史面试、答案、评分及音频。

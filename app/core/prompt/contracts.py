@@ -12,7 +12,10 @@ from app.core.prompt.semantic_turn import (
     content_clarification_instruction,
     SERVER_CONTROL_DERIVATION_INSTRUCTION,
 )
-from app.core.prompt.company_questions import COMPANY_QUESTION_INSTRUCTION
+from app.core.prompt.company_questions import (
+    COMPANY_QUESTION_INSTRUCTION, COMPANY_QUESTION_CORRECTION_INSTRUCTION,
+    company_question_correction_schema,
+)
 
 
 @dataclass(frozen=True)
@@ -452,16 +455,24 @@ def _interview_turn_understanding(context: Dict[str, Any]) -> PromptContract:
     optional_context = _has_optional_interviewer_context(context)
     resolved_input = _has_resolved_conversation_input(context)
     exit_context = semantic_first and bool((context.get("interviewer_context") or {}).get("exit_confirmation"))
+    company_correction = (semantic_first and optional_context
+                          and context.get("correction_reason") == "company_question_contract_invalid")
     from app.core.prompt.candidate_exit import EXIT_CONFIRMATION_INSTRUCTION
     if semantic_first:
         schema = with_semantic_turn_schema(schema, evidence_ids=references["evidence"], company_questions=optional_context)
         schema["properties"]["intent"]["enum"].append("answer_unresolved")
+    if company_correction:
+        schema = company_question_correction_schema(schema)
     if references.get("clarification_sources"):
         schema["properties"] = {"clarification_target": schema["properties"]["clarification_target"],
                                 **{key: value for key, value in schema["properties"].items() if key != "clarification_target"}}
         schema["required"] = ["clarification_target", *[key for key in schema["required"] if key != "clarification_target"]]
     return PromptContract(
-        version=("interview_turn_understanding.v125" if exit_context and optional_context and context.get("completion_confirmed") else
+        version=("interview_turn_understanding.v133" if company_correction and exit_context and context.get("completion_confirmed") else
+                 "interview_turn_understanding.v132" if company_correction and exit_context else
+                 "interview_turn_understanding.v131" if company_correction and context.get("completion_confirmed") else
+                 "interview_turn_understanding.v130" if company_correction else
+                 "interview_turn_understanding.v125" if exit_context and optional_context and context.get("completion_confirmed") else
                  "interview_turn_understanding.v124" if exit_context and optional_context else
                  "interview_turn_understanding.v123" if exit_context and context.get("completion_confirmed") else
                  "interview_turn_understanding.v122" if exit_context else
@@ -579,6 +590,7 @@ def _interview_turn_understanding(context: Dict[str, Any]) -> PromptContract:
                 "遵守编号、完整分区及 claim 证据声明规则，不引用或修补上一轮输出。"
                 % context["correction_reason"]
                 + semantic_content_correction_instruction(context["correction_reason"])
+                + (COMPANY_QUESTION_CORRECTION_INSTRUCTION if company_correction else "")
                 + (SEMANTIC_CONTROL_CORRECTION_INSTRUCTION
                    if context["correction_reason"] == "semantic_control_contract_invalid" else "")
                 + ((CURRENT_SPEECH_CORRECTION_INSTRUCTION if semantic_first else LEGACY_CURRENT_SPEECH_INSTRUCTION)
@@ -614,7 +626,15 @@ def _interview_turn_decision(context: Dict[str, Any]) -> PromptContract:
                             "difficulty", "sensitive_attribute_inference", "leaks_answer"]
     followup["properties"] = {name: properties[name] for name in followup["required"]}
     return PromptContract(
-        version=("interview_turn_decision.v156" if understanding.version == "interview_turn_understanding.v125" else
+        version=("interview_turn_decision.v164" if understanding.version == "interview_turn_understanding.v133" else
+                 "interview_turn_decision.v163" if understanding.version == "interview_turn_understanding.v132" else
+                 "interview_turn_decision.v162" if understanding.version == "interview_turn_understanding.v131" else
+                 "interview_turn_decision.v161" if understanding.version == "interview_turn_understanding.v130" else
+                 "interview_turn_decision.v160" if understanding.version == "interview_turn_understanding.v129" else
+                 "interview_turn_decision.v159" if understanding.version == "interview_turn_understanding.v128" else
+                 "interview_turn_decision.v158" if understanding.version == "interview_turn_understanding.v127" else
+                 "interview_turn_decision.v157" if understanding.version == "interview_turn_understanding.v126" else
+                 "interview_turn_decision.v156" if understanding.version == "interview_turn_understanding.v125" else
                  "interview_turn_decision.v155" if understanding.version == "interview_turn_understanding.v124" else
                  "interview_turn_decision.v154" if understanding.version == "interview_turn_understanding.v123" else
                  "interview_turn_decision.v153" if understanding.version == "interview_turn_understanding.v122" else

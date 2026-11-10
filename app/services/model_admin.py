@@ -2,14 +2,15 @@ from copy import deepcopy
 import asyncio
 import hashlib
 import os
-from io import BytesIO
 from time import monotonic
-import wave
 from typing import Any, Dict, List, Optional
 
 from app.core.errors import ApiError
 from app.core.ids import new_id
 from app.core.prompt.contracts import prompt_contract
+from app.core.prompt.model_probes import (
+    BATCH_STT_PROBE_TEXT, BATCH_STT_PROBE_VERSION, batch_stt_probe_audio, batch_stt_probe_matches,
+)
 from app.core.prompt.realtime_dialogue import session_instruction
 from app.core.time import utc_now
 from app.model_gateway import capabilities as cap
@@ -490,6 +491,8 @@ class ModelAdminService:
             request = self._probe_request(capability, organization_id, "model_configuration_test")
             if capability in {cap.STT_STREAMING, cap.SPEECH_DIALOGUE_REALTIME}:
                 result = await self._probe_stream_handshake(capability, request, route)
+            elif capability == cap.STT_BATCH:
+                result = await self._probe_batch_speech(request, route)
             else:
                 response = await self.gateway.invoke(capability, request, route=route)
                 result = response.model_dump()
@@ -563,11 +566,31 @@ class ModelAdminService:
             result = await self._probe_tts_stream(request, route)
         elif route["capability"] in {cap.STT_STREAMING, cap.SPEECH_DIALOGUE_REALTIME}:
             result = await self._probe_stream_handshake(route["capability"], request, route)
+        elif route["capability"] == cap.STT_BATCH:
+            result = await self._probe_batch_speech(request, route)
         else:
             response = await self.gateway.invoke(route["capability"], request, route=route)
             result = response.model_dump()
             await self._close_avatar_probe(response, route, organization_id)
         return result
+
+    async def _probe_batch_speech(self, request: BatchSTTRequest, route: Dict[str, Any]) -> Dict[str, Any]:
+        # Certify this primary with one paid request, not a hidden retry or a
+        # successful fallback. Candidate recovery retains its runtime policy.
+        probe_route = deepcopy(route)
+        probe_route["policy"] = {**(route.get("policy") or {}), "retry_count": 0}
+        probe_route["fallbacks"] = []
+        response = await self.gateway.invoke(cap.STT_BATCH, request, route=probe_route)
+        if response.provider.provider_id == "mock":
+            with self.persistence.transaction(request.organization_id) as transaction:
+                targets = [route.get("primary") or {}, *(route.get("fallbacks") or [])]
+                models = [transaction.model_configurations.get(target.get("model_configuration_id")) for target in targets]
+            if not models or any(not model or model.get("provider_id") != "mock" for model in models):
+                raise ProviderError("provider_probe_failed", "Real speech probe cannot use mock transcription.", retryable=False)
+        if not batch_stt_probe_matches(response.text):
+            raise ProviderError("provider_probe_failed", "Speech recognition did not match the synthetic probe.", retryable=True)
+        return {"probe_mode": "known_speech", "probe_version": BATCH_STT_PROBE_VERSION,
+                "audio_bytes": len(request.audio_bytes), "transcript_matched": True}
 
     async def _probe_tts_stream(self, request: TTSSynthesizeRequest, route: Dict[str, Any]) -> Dict[str, Any]:
         """Check the configured voice through the runtime protocol, without caching audio.
@@ -868,8 +891,9 @@ class ModelAdminService:
                 purpose=purpose,
                 audio_uri="probe-audio://connection-test.wav",
                 content_type="audio/wav",
-                metadata={"development_transcript": "连接测试"},
-                audio_bytes=_probe_wav(),
+                metadata={"development_transcript": BATCH_STT_PROBE_TEXT,
+                          "probe_version": BATCH_STT_PROBE_VERSION},
+                audio_bytes=batch_stt_probe_audio(),
             )
         if capability == cap.STT_STREAMING:
             return StreamingSTTRequest(
@@ -927,14 +951,3 @@ class ModelAdminService:
         fallback_on = policy.get("fallback_on")
         if fallback_on is not None and (not isinstance(fallback_on, list) or not all(isinstance(item, str) for item in fallback_on)):
             raise ApiError("MODEL_ROUTE_INVALID", "fallback_on must be a list of error codes.", status_code=400)
-
-
-def _probe_wav() -> bytes:
-    """Small valid silent WAV used only for provider contract/authorization probes."""
-    target = BytesIO()
-    with wave.open(target, "wb") as output:
-        output.setnchannels(1)
-        output.setsampwidth(2)
-        output.setframerate(16000)
-        output.writeframes(b"\x00\x00" * 1600)
-    return target.getvalue()

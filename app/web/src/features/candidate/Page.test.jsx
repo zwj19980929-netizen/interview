@@ -180,6 +180,22 @@ describe("candidate capture recovery presentation", () => {
     } finally { await act(async () => root.unmount()); host.remove(); }
   });
 
+  it("keeps the microphone available for a delivered clarification without making a completion claim", async () => {
+    const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+    const experience = { phase: "listening", evidence: { ready: true },
+      problem: { code: "UNDERSTANDING_CLARIFICATION_REQUIRED", recoverable: true, action: "retry_answer_processing" },
+      microphone: { localDetected: false, level: 0.4 } };
+    try {
+      await act(async () => root.render(<CandidateSignalList experience={experience} />));
+      expect(host.textContent).toContain("麦克风已开启，可随时说话");
+      expect(host.textContent).not.toMatch(/暂未就绪|已结束|已提交|已暂停/);
+      await act(async () => root.render(<CandidateSignalList experience={{ ...experience,
+        microphone: { ...experience.microphone, localDetected: true } }} />));
+      expect(host.textContent).toContain("正在收到你的声音");
+      expect(host.querySelectorAll(".is-active")).toHaveLength(1);
+    } finally { await act(async () => root.unmount()); host.remove(); }
+  });
+
   it("prevents duplicate retries while sending and until the runtime clears pending", async () => {
     const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
     let resolve;

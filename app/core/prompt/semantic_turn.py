@@ -334,6 +334,14 @@ class SemanticContractError(ValueError):
         super().__init__(reason_code)
 
 
+class CompanyQuestionContractError(SemanticContractError):
+    """Keep the recovery category stable while identifying a rejected rule."""
+
+    def __init__(self, contract_detail):
+        super().__init__("company_question_contract_invalid", "$.company_question")
+        self.contract_detail = contract_detail
+
+
 class SemanticControlContractError(SemanticContractError):
     """A fixed, non-sensitive cross-field error for logging and one correction."""
 
@@ -762,12 +770,26 @@ def validate_semantic_turn(data, transcript):
     intent, content, basis = data["turn_intent"], data["answer_content"], data["completion_basis"]
     company = data.get("company_question")
     if intent == "ask_company":
-        if (not company or basis or data["followup_allowed"] or data["suggested_action"] != "respond_company"
-                or data["confidence"] < .75 or data["ambiguities"]
-                or data["intent"] != ("company_question" if content == "none" else "answer")
-                or transcript[company["start"]:company["end"]] != company["quote"]
-                or company["end"] <= company["start"]):
-            raise SemanticContractError("company_question_contract_invalid", "$.company_question")
+        # Preserve every rejection and its ordering. Never retain field values
+        # in this diagnostic: the unchanged category owns recovery policy.
+        if not company:
+            raise CompanyQuestionContractError("missing_question")
+        if basis:
+            raise CompanyQuestionContractError("completion_basis_present")
+        if data["followup_allowed"]:
+            raise CompanyQuestionContractError("followup_allowed")
+        if data["suggested_action"] != "respond_company":
+            raise CompanyQuestionContractError("action_mismatch")
+        if data["confidence"] < .75:
+            raise CompanyQuestionContractError("low_confidence")
+        if data["ambiguities"]:
+            raise CompanyQuestionContractError("unresolved_ambiguity")
+        if data["intent"] != ("company_question" if content == "none" else "answer"):
+            raise CompanyQuestionContractError("intent_content_mismatch")
+        if transcript[company["start"]:company["end"]] != company["quote"]:
+            raise CompanyQuestionContractError("quote_mismatch")
+        if company["end"] <= company["start"]:
+            raise CompanyQuestionContractError("invalid_span")
         # E references are sentences and can contain BOTH technical evidence
         # and a question. Require a verbatim technical claim when they share
         # one reference so its preservation is mechanically provable.
@@ -781,8 +803,12 @@ def validate_semantic_turn(data, transcript):
                 remaining = normalized(evidence.replace(quote, "", 1))
                 if not technical or technical not in remaining or technical in normalized(quote):
                     raise SemanticContractError("company_question_covers_technical_evidence", "$.company_question")
-    elif company is not None or data["suggested_action"] == "respond_company" or data["intent"] == "company_question":
-        raise SemanticContractError("company_question_contract_invalid", "$.company_question")
+    elif company is not None:
+        raise CompanyQuestionContractError("unexpected_question")
+    elif data["suggested_action"] == "respond_company":
+        raise CompanyQuestionContractError("unexpected_action")
+    elif data["intent"] == "company_question":
+        raise CompanyQuestionContractError("unexpected_intent")
     unresolved = data["intent"] == "answer_unresolved"
     if data["intent"] == "off_topic" and (
         intent not in {"answering", "thinking", "finish_answer", "finish_topic", "decline_topic", "stop_interview"}

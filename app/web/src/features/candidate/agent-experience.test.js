@@ -2389,6 +2389,138 @@ describe("understanding failure recovery", () => {
     answer_preparation: status ? { status, turn_id: "turn_1", capture_id: captureId } : null,
   });
 
+  it("restores a delivered clarification without replacing the question and permits optional scoped retry", async () => {
+    const { run, emit, socket } = await openFormalEndpointHarness();
+    try {
+      const question = run.getSnapshot().currentQuestion;
+      emit("session.snapshot", durable("clarifying"));
+      expect(run.getSnapshot()).toMatchObject({ phase: "listening", evidence: { ready: true },
+        problem: { code: "UNDERSTANDING_CLARIFICATION_REQUIRED", action: "retry_answer_processing" } });
+      expect(run.getSnapshot().currentQuestion).toEqual(question);
+      expect(candidateNotice(run.getSnapshot().problem).title).toBe("可以继续说明");
+      expect(await run.act({ type: "retry_answer_processing", payload: { capture_id: "capture_old" } })).toBe(false);
+      expect(await run.act({ type: "retry_answer_processing", turnId: "turn_old" })).toBe(false);
+      await run.act({ type: "retry_answer_processing" });
+      expect(latestSentSignal(socket, "retry_answer_processing").payload).toEqual({ capture_id: "capture_endpoint" });
+      expect(await run.act({ type: "retry_answer_processing" })).toBe(false);
+      emit("session.snapshot", durable("clarifying"));
+      expect(run.getSnapshot().understandingRetryPending).toBe(true);
+      emit("session.snapshot", durable("retry_required"));
+      expect(run.getSnapshot().understandingRetryPending).toBe(true);
+      expect(await run.act({ type: "retry_answer_processing" })).toBe(false);
+      expect(socket.sent.filter(signal => signal.type === "finish_answer")).toHaveLength(0);
+      emit("floor.changed", { owner: "candidate", reason: "understanding_retrying", capture_id: "capture_endpoint" });
+      expect(run.getSnapshot()).toMatchObject({ understandingRetryPending: false, problem: { code: "UNDERSTANDING_UNAVAILABLE" } });
+    } finally { await run.close(); }
+  });
+
+  it("keeps VAD input live after clarification and dismisses only that prompt on fresh speech", async () => {
+    const { run, emit, socket, capture } = await openFormalEndpointHarness();
+    try {
+      emit("session.snapshot", durable("clarifying"));
+      await capture.onSpeechStarted();
+      capture.onSpeechStopped();
+      expect(latestSentSignal(socket, "speech.started").payload.capture_id).toBe("capture_endpoint");
+      expect(latestSentSignal(socket, "speech.stopped").payload.capture_id).toBe("capture_endpoint");
+      expect(run.getSnapshot()).toMatchObject({ phase: "listening", evidence: { ready: true }, problem: null });
+      expect(socket.sent.filter(signal => signal.type === "retry_answer_processing" || signal.type === "finish_answer")).toHaveLength(0);
+    } finally { await run.close(); }
+  });
+
+  it("retains delivered clarification through the playback handoff listening event", async () => {
+    const { run, emit, socket } = await openFormalEndpointHarness();
+    try {
+      emit("problem", failure("UNDERSTANDING_RETRY_EXHAUSTED"));
+      emit("floor.changed", { owner: "candidate", reason: "understanding_clarification", capture_id: "capture_endpoint" });
+      emit("session.snapshot", durable("clarifying"));
+      emit("floor.changed", { owner: "candidate", reason: "answer_listening", capture_id: "capture_endpoint" });
+      expect(run.getSnapshot()).toMatchObject({ phase: "listening", evidence: { ready: true },
+        problem: { code: "UNDERSTANDING_CLARIFICATION_REQUIRED", action: "retry_answer_processing" } });
+      expect(candidateNotice(run.getSnapshot().problem).title).toBe("可以继续说明");
+      await run.act({ type: "retry_answer_processing" });
+      expect(latestSentSignal(socket, "retry_answer_processing").payload).toEqual({ capture_id: "capture_endpoint" });
+      expect(socket.sent.filter(signal => signal.type === "finish_answer")).toHaveLength(0);
+      emit("floor.changed", { owner: "candidate", reason: "understanding_recovered", capture_id: "capture_endpoint" });
+      expect(run.getSnapshot().problem).toBeNull();
+    } finally { await run.close(); }
+  });
+
+  it.each(["preparing", null])("clears the clarification on a later %s snapshot and ignores an older delivered notice", async status => {
+    const { run, emit, socket } = await openFormalEndpointHarness();
+    try {
+      emit("session.snapshot", durable("clarifying")); // Sequence 3.
+      emit("session.snapshot", durable(status));
+      expect(run.getSnapshot().problem).toBeNull();
+      socket.emit("message", { data: JSON.stringify({ ...candidateEvent(3, "session.snapshot", durable("clarifying")),
+        event_id: "late_clarification_snapshot_095" }) });
+      expect(run.getSnapshot().problem).toBeNull();
+    } finally { await run.close(); }
+  });
+
+  it("does not accept an old capture, floor event alone, or partial playback as a delivered clarification", async () => {
+    const { run, emit } = await openFormalEndpointHarness();
+    try {
+      emit("problem", failure("UNDERSTANDING_RETRY_EXHAUSTED"));
+      emit("floor.changed", { owner: "candidate", reason: "understanding_clarification", capture_id: "capture_endpoint" });
+      expect(run.getSnapshot().problem.code).toBe("UNDERSTANDING_RETRY_EXHAUSTED");
+      emit("session.snapshot", durable("clarifying", "capture_old"));
+      expect(run.getSnapshot().problem.code).toBe("UNDERSTANDING_RETRY_EXHAUSTED");
+      emit("session.snapshot", { ...durable("retry_required"), floor: "agent" });
+      expect(run.getSnapshot().problem.code).toBe("UNDERSTANDING_RETRY_EXHAUSTED");
+      emit("session.snapshot", durable("clarifying"));
+      expect(run.getSnapshot().problem.code).toBe("UNDERSTANDING_CLARIFICATION_REQUIRED");
+      emit("floor.changed", { owner: "candidate", reason: "answer_preparing", capture_id: "capture_old" });
+      expect(run.getSnapshot().problem.code).toBe("UNDERSTANDING_CLARIFICATION_REQUIRED");
+      emit("floor.changed", { owner: "candidate", reason: "answer_preparing", capture_id: "capture_endpoint" });
+      expect(run.getSnapshot().problem).toBeNull();
+    } finally { await run.close(); }
+  });
+
+  it("revokes clarification display and manual recovery when the interview pauses", async () => {
+    const { run, emit, capture, socket } = await openFormalEndpointHarness();
+    try {
+      emit("session.snapshot", durable("clarifying"));
+      emit("session.snapshot", { ...durable(null), status: "paused", floor: "none" });
+      const signalCount = socket.sent.length;
+      expect(run.getSnapshot().problem?.code).not.toBe("UNDERSTANDING_CLARIFICATION_REQUIRED");
+      expect(await run.act({ type: "retry_answer_processing" })).toBe(false);
+      await capture.onSpeechStarted();
+      capture.onSpeechStopped();
+      expect(socket.sent).toHaveLength(signalCount);
+    } finally { await run.close(); }
+  });
+
+  it("does not downgrade a permanent service block to a falsely retryable clarification", async () => {
+    const { run, emit } = await openFormalEndpointHarness();
+    try {
+      const details = { stage: "answer_understanding", reason_code: "provider_billing_required",
+        attempt: 1, max_attempts: 2, retryable: false };
+      const blocked = durable("blocked");
+      emit("session.snapshot", { ...blocked, answer_preparation: { ...blocked.answer_preparation, ...details } });
+      expect(run.getSnapshot().problem.action).toBe("contact_support");
+      emit("session.snapshot", { ...blocked, answer_preparation: { ...blocked.answer_preparation, ...details, status: "clarifying" } });
+      expect(run.getSnapshot().problem.action).toBe("contact_support");
+      expect(await run.act({ type: "retry_answer_processing" })).toBe(false);
+    } finally { await run.close(); }
+  });
+
+  it("ends clarification input during the closing presentation without sending another candidate signal", async () => {
+    const { run, emit, capture, socket } = await openFormalEndpointHarness();
+    try {
+      emit("session.snapshot", durable("clarifying"));
+      const receipt = { interview_id: "iv_test", status: "submitted_for_human_review",
+        submitted_at: "2026-09-23T00:00:00Z", recording_retention_notice: "已停止采集。", human_review_required: true };
+      emit("session.snapshot", { ...candidateSnapshot(), current_turn_id: null, current_question: null,
+        floor: "agent", completion: receipt, completion_presentation: "closing" });
+      expect(run.getSnapshot()).toMatchObject({ phase: "closing", evidence: { ready: false }, problem: null });
+      const signals = socket.sent.length;
+      expect(await run.act({ type: "retry_answer_processing" })).toBe(false);
+      await capture.onSpeechStarted();
+      capture.onSpeechStopped();
+      expect(socket.sent).toHaveLength(signals);
+    } finally { await run.close(); }
+  });
+
   it("preserves failure through ordinary activity and snapshots while accepting only scoped successful recovery", async () => {
     const { run, emit, capture, socket } = await openFormalEndpointHarness();
     try {

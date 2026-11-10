@@ -1,5 +1,11 @@
 # 接口设计
 
+## 095：回答失败后的同题澄清
+
+既有answer_preparation投影增加status=clarifying，仍绑定当前turn_id/capture_id及原安全恢复字段；仅中性恢复提示已可信完整播完、当前owner/controller和输入仍有效时发布。客户端可继续说明或重试已保留语音；该状态不提交答案、不换题、不授权完成。取消、播放失败和过期通知不得进入clarifying。原retry_required/blocked及显式重试合同保持，恢复提示每个capture最多一次。批量STT管理探针改为版本化合成语音与内容匹配，结果只暴露有限健康诊断，不返回探针音频或转写正文。
+
+普通 `answer_listening` 只确认收音，不清除 `clarifying`；同采集的新 `answer_preparing`、理解恢复或撤销当前采集替换该提示。`floor.changed` 本身不授予 `clarifying`，客户端仅接受当前作用域且有序的权威快照。批量模型/路由测试只认证当前primary，一次真实调用，不通过fallback取得健康证明；业务重试策略不变。
+
 ## 094：首题及题间规划自动恢复
 
 公共REST/WebSocket事件、候选权限及手动重试接口保持。明确的供应商空内容/JSON对象解析失败在原规划期限内最多自动重试一次；仍失败时从本场已批准目录提出合法题目。若权限、预算或目录校验不能通过，保留原失败投影和手动恢复入口。新增内部模型调用审计分类不投影到候选页面，也不授予客户端文本提交权限。见[供应商设计](model-provider-plugins.md)。

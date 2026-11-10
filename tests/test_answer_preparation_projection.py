@@ -173,12 +173,13 @@ def test_preparation_state_write_failure_does_not_prevent_audio_shutdown(tmp_pat
     asyncio.run(scenario())
 
 
-def test_snapshot_only_projects_safe_current_active_preparation(tmp_path, monkeypatch):
+@pytest.mark.parametrize("status", ["preparing", "clarifying"])
+def test_snapshot_only_projects_safe_current_active_preparation(tmp_path, monkeypatch, status):
     async def scenario():
         async with _automatic_session(tmp_path, monkeypatch, [""], spoken_confirmation=True) as (_, runtime, channel, managed):
             await managed._answer_endpoint._notify("answer_preparing")
             current = _current(runtime)
-            expected = current["agent_runtime"]["answer_preparation"]
+            expected = {**current["agent_runtime"]["answer_preparation"], "status": status}
             current["agent_runtime"]["answer_preparation"] = {**expected, "private_debug": "not_public", "ready": True}
             assert runtime._snapshot(current, channel.principal)["answer_preparation"] == expected
             mutations = [

@@ -69,7 +69,10 @@ async def advance_to_failure(endpoint, clock, count):
     # The one-time recovery allowance is spent before speech I/O. Capture
     # whether this attempt owes playback before advancing the worker, rather
     # than mistaking its later spent flag for an already selected output.
-    expects_recovery_speech = count == 1 and endpoint.confirmation._failure_spoken_identity is None
+    expects_recovery_speech = (
+        count == 1 and endpoint.confirmation._failure_spoken_identity is None
+        or count >= 2 and not endpoint.confirmation._processing_clarification_attempted
+    )
     clock.value += 10
     # Recovery now runs during the notice: a fast second failure can finish
     # before this observer sees the first count. Final assertions still bound
@@ -100,7 +103,7 @@ async def test_retryable_episode_stops_at_two_and_fresh_finished_words_get_only_
             await advance_to_failure(endpoint, clock, count)
         assert len(endpoint.capture.prepares) == 2
         assert "understanding_retry_exhausted" in notices
-        assert spoken == ["reception_unavailable"]
+        assert spoken == ["reception_unavailable", "reception_recovery_clarification"]
 
         endpoint.capture.current_final = endpoint.capture.current_final.model_copy(update={
             "sequence": 25, "stream_id": "new-provider-stream", "confidence": .8,
@@ -116,7 +119,7 @@ async def test_retryable_episode_stops_at_two_and_fresh_finished_words_get_only_
         await let_endpoint_poll(clock)
         assert len(endpoint.capture.prepares) == 3
         assert endpoint.preparation_blocked and endpoint._prepare_failures == 3
-        assert spoken == ["reception_unavailable"]
+        assert spoken == ["reception_unavailable", "reception_recovery_clarification"]
         assert not commits and not endpoint.confirmation.confirmed and endpoint.capture.is_open
     finally:
         await endpoint.close()
@@ -141,7 +144,7 @@ async def test_nonretryable_schema_problem_blocks_same_words_but_accepts_one_new
         await advance_to_failure(endpoint, clock, 2)
         await let_endpoint_poll(clock)
         assert len(endpoint.capture.prepares) == 2
-        assert spoken == ["reception_unavailable"] and not commits
+        assert spoken == ["reception_recovery_clarification"] and not commits
     finally:
         await endpoint.close()
 
@@ -160,7 +163,7 @@ async def test_explicit_continue_renews_budget_without_completion_or_another_apo
             await advance_to_failure(endpoint, clock, count)
         await let_endpoint_poll(clock)
         assert len(endpoint.capture.prepares) == 4
-        assert not commits and spoken == ["reception_unavailable"]
+        assert not commits and spoken == ["reception_unavailable", "reception_recovery_clarification"]
     finally:
         await endpoint.close()
 
@@ -188,7 +191,7 @@ async def test_successful_understanding_clears_failure_episode_and_allows_next_e
         endpoint.capture.current_final = _final(text)
         endpoint.observe_transcript(text)
         await advance_to_failure(endpoint, clock, 1)
-        assert spoken == ["reception_unavailable", "reception_wait", "reception_unavailable"]
+        assert spoken == ["reception_recovery_clarification", "reception_wait", "reception_unavailable"]
         await let_endpoint_poll(clock)
         assert len(endpoint.capture.prepares) == 3 and not commits
     finally:

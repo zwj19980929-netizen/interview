@@ -3463,7 +3463,7 @@ class InterviewAgentRuntime:
                 and runtime_state.get("calibration_status") == "completed"
                 and not runtime_state.get("capture_recovery")
                 and (runtime_state.get("takeover") or {}).get("status") != "active"
-                and preparation.get("status") in {"preparing", "retrying", "retry_required", "blocked"}
+                and preparation.get("status") in {"preparing", "retrying", "retry_required", "blocked", "clarifying"}
                 and preparation.get("turn_id") == current["id"]
                 and isinstance(preparation.get("capture_id"), str) and preparation["capture_id"]
                 and not any(answer.get("turn_id") == current["id"] for answer in session.get("answers", []))):

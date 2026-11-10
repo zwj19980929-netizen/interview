@@ -167,12 +167,17 @@ class AppointmentAdmission:
         batch_production_ready = self._route_ready(
             transaction, cap.STT_BATCH, "candidate_answer_repair", now
         )
+        real_audio_configured = self._non_mock_route_configured(
+            transaction, cap.STT_STREAMING, "candidate_answer_transcription"
+        ) or self._non_mock_route_configured(transaction, cap.STT_BATCH, "candidate_answer_repair")
+        batch_development_fixture = local_mode and not real_audio_configured
         checks.append(
             {
                 "name": "stt_batch",
-                "ready": local_mode or batch_production_ready,
+                "ready": batch_development_fixture or batch_production_ready,
                 "production_ready": batch_production_ready,
-                "mode": "mock_development" if local_mode else "real_provider_required",
+                "mode": "configured_route" if batch_production_ready else
+                        "mock_development" if batch_development_fixture else "real_provider_required",
             }
         )
         streaming_production_ready = self._route_ready(
@@ -461,6 +466,22 @@ class AppointmentAdmission:
         now: datetime,
     ) -> bool:
         return bool(purpose_readiness(transaction, capability, purpose, now)["ready"])
+
+    @staticmethod
+    def _non_mock_route_configured(transaction: Any, capability: str, purpose: str) -> bool:
+        """Only wholly explicit mock routes may use development transcript fixtures."""
+        routes = [route for route in transaction.model_routes.list()
+                  if route.get("capability") == capability and route.get("enabled", True)]
+        route = next((item for item in routes if item.get("purpose") == purpose), None)
+        if route is None:
+            route = next((item for item in routes if item.get("purpose") == "default"), None)
+        if route is None:
+            return False
+        for target in [route.get("primary") or {}, *(route.get("fallbacks") or [])]:
+            model = transaction.model_configurations.get(target.get("model_configuration_id"))
+            if not model or model.get("provider_id") != "mock":
+                return True
+        return False
 
     @staticmethod
     def _route_configured(transaction: Any, capability: str, purpose: str) -> bool:
