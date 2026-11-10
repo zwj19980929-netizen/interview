@@ -4,7 +4,7 @@
 
 ## 2026-11-10 · SPEECH-HANDOFF-AND-FAREWELL-092
 
-- 状态：`in_progress`。
+- 状态：`verified（仓库全量与本机加载；真人即时回复和长场次待验）`。
 - 授权与基线：用户报告主动退出时结束语被截断，以及补充提示后立即回答丢失首字；沿用本会话已授权的排查修复、Git回退点与验证后空闲加载。首次修改前工作区干净，基线`1c80cc7`已提交，091及更早提交保持。已按顺序复核入口文档，本项覆盖代码、测试、文档和经核验的本机加载。
 - 现场证据：`iv_c2e73a9cde80427e`的结束音频为10240ms；08:32:05Z进入closing，08:32:15Z因farewell_timeout关闭。现有watchdog把音频时长加余量强制截为最多10000ms，早于音频本身结束。补充确认在实际播放停止后仍保持speaking并等待STT快照/重开；LiveKit ingress此时仅保留200ms供打断使用、普通完成会清空，存在立即回复丢前缀窗口。具体现场首字是否采集/识别丢失仍需证据核对，不将代码缺陷等同于音频逐字证明。
 - 修复边界与验证：以实际播放完成回执为正常结束依据，音频时长和有限启动/排空余量决定失联兜底，保留失权/断线/旧回执保护。补充交接仅缓存真实播放结束后的当前capture音频，冻结提示前转写后顺序补送，禁止将面试官回声或旧来源当确认。先复现长结束语及慢STT切流丢帧，再验证正常补充、独立退出确认、打断、取消、失权和缓冲上限。保留历史业务数据和原始音频；完成后补实际文件/命令/结果及未完成事项。
@@ -16,6 +16,9 @@
 - 首次全量失败：5 failed /4737 passed /8 skipped /267.33秒，未生成通过证明、未发布。5例均来自流式输出共用测试替身：fixture把ManagedLiveKitEvidenceSession类型替换成SimpleNamespace，却没有新增begin/cancel接口，可信drain后AttributeError使测试发言权没有回候选人。独立核实生产唯一attach路径始终构造真实Managed类，不存在缺hook旧实现。仅补两处输出专用fixture的no-op begin和async cancel，不放宽生产接口或旧断言，另覆盖实际Managed无确认端点的正常drain。首次日志与601文件快照复制保留为/private/tmp/interviewer-092-first-backend-full.log及first-tested-source.json；随后重新冻结并跑完整回归。
 - 替身修正复验：首次定向命令拼错测试文件名，exit4/no tests ran，无数据副作用；正确四文件组合97 passed /4.76秒，独立重复97 passed /4.72秒、无警告。生产摘要保持a722a679284c4454278994ea231793798b2f3e7488b217cfcedef3518a83fd81，仅test_streaming_expression_lifecycle.py初始化和farewell092新增真实对象回归不同。重新冻结601文件，重跑完整回归；新告别测试现14项、交接22项。
 - 最终完整验证：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q`为4743 passed /8 skipped /268.75秒、exit0。601文件集合/内容全部保持冻结值，235份后端仍为a722a679284c4454278994ea231793798b2f3e7488b217cfcedef3518a83fd81；生成/private/tmp/interviewer-092-test-attestation.json（v2）。前端源码与63构建文件逐hash保持090版本，复用552项前端证明，不称本轮重跑。无Prompt/供应商协议/模型配置修改，未发送候选材料作外部探针；下一步保存修复提交并即时空闲加载。
+- Git与首次加载保护：修复提交078eade，原1c80cc7保持，未push。首次execute初检通过（77场核心摘要保持、所有活动计数0），再次worker_idle检查被GateError拒绝；services_changed=false、new_pids为空，没有停服务或改业务数据。未记录到具体子检查失败，不能断言是哪项任务。随后独立只读ping/active/reserved/scheduled/stats逐项核对：单一worker20028、pong、三个任务计数均0；按原规则重新执行全部门禁，不增加任务豁免或删除失败记录。
+- 实际加载：第二次全部门禁通过，正常TERM原API20027/worker20028，2026-11-10T09:17:11Z启动API26537、worker/Beat26538（本地11月10日01:17）。两者235份后端SHA均为a722a679284c4454278994ea231793798b2f3e7488b217cfcedef3518a83fd81，与完整证明一致；媒体配置摘要dcbaf54ac496b9217094dae97dfcd6b2ffec665d23f934bfaae2895c5ecefb0f保持、local ready且无issues。runner退出0，77场核心摘要1debb66b16d690782a83fe58df0cead39d28873cdddd505e55c2ff6bfc2fbd5e保持。healthz/readyz、5174页面及代理均200；代理实际返回API26537与新摘要。前端未改构建或重启。
+- 实际文件与剩余事项：生产改interview_agent.py、livekit_evidence_ingress.py、spoken_supplement.py及LiveKit adapter只读sequence属性；新增farewell092十四例、reply_handoff092二十二例，并更新流式输出替身；同步架构/API/092设计/已知问题/进度/路线图/本日志。无新公共字段、持久表/DDL、Prompt/Schema或模型路由；未重放真实回答、改历史评分或改写原音频。服务端收到可信ACK之前的网络窗口保持原回声/真实打断边界，模型识别准确率和真人首音节逐字归因不由本次合成测试证明；真人立即回复及长会话继续待验，不标closed。
 
 ## 2026-11-09 · RECEPTION-FAILURE-RETRY-091
 
