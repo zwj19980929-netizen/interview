@@ -5,7 +5,7 @@
 
 ## 2026-11-10 · ANSWER-CONTINUITY-AND-STT-REPAIR-095
 
-- 状态：`in_progress`。
+- 状态：`verified（仓库全量、本机加载与真实批量STT合成探针；真人连续面试及供应商长期可靠性待验）`。
 - 授权与基线：用户在最新回答处理失败诊断后要求修复，沿用Git回退、验证与空闲加载授权。首次修改前工作区干净，基线04e87fd已提交；按入口顺序复核11份文档。本项覆盖回答理解失败后的有界澄清、公司反问/题干术语合同纠错与安全诊断、真实批量STT修复能力核查及必要配置，不自动补交真实回答、跳题、评分或结束面试。
 - 现场证据：iv_50f6ecd910ab4c28在11:50:50Z的v151结果通过JSON/中央Schema，但company_question_contract_invalid领域校验失败；随后自动纠错和后续调用于11:50:55Z/11:51:21Z各报invalid_json_object，分别200/2000和216/2000 tokens、finish_reason=stop，非超时/截断。094只覆盖选题，本次回答链已用完恢复预算。全场19次关联LLM调用含6次解析失败，不能凭未留存正文确定具体语法或断言Salary/Celery误识别是唯一原因。11:52断线后原始音频完成恢复，批量STT走mock-stt被provider_real_stt_required拒绝；该批量审计缺会话关联，时间与恢复链强关联，历史2份答案保留、当前题未生成正式答案。
 - 修改和验收边界：先复现再改动。恢复交流只能保留原题/原录音、有限询问，不将无效结果转为答案/完成许可，不放宽校验或无限刷新调用预算；仅当前来源/owner/controller允许发言，取消和旧结果不得晚播。所有业务Prompt/Schema继续集中版控并有合同测试。STT先核验已有连接/模型支持及合成音频，不向外发送真实候选材料作探针；生产代码、测试、配置、文档与真实操作结果均在本项留痕，验证前不加载，活动面试期间不重启。
@@ -31,6 +31,16 @@
 
 
 - 最终全量与静态发布：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q`为4944 passed/8 skipped/271.70秒；`cd app/web && npm test -- --reporter=dot`为580 passed/26文件；`npm run build -- --outDir /private/tmp/interviewer-095-web-dist`成功。609份源码/测试（含固定WAV）在完整回归/构建前后集合与hash完全一致，20份生产路径通过精确范围门禁；生成v5发布证明，静态构建按追加不可变资产后原子切换index，原64旧资产保留。原非阻断大chunk提示保持。347处文档链接与diff检查通过；发布/恢复脚本22项、配置脚本23项和精准封存19项隔离检查通过，未向真实环境发出模拟信号。完整日志为/private/tmp/interviewer-095-{backend-full,frontend-full,web-build}.log，发布证明interviewer-095-test-attestation.json。保存修复提交后按即时双重空闲门禁加载，再通过正常API验证真实batch。
+
+
+- 实际加载：修复提交d1778f4，基线04e87fd保留、未push。即时双重空闲和v5证明通过后正常TERM旧API36249/worker36250；2026-11-10T13:40:31Z启动API44501、worker/Beat44502，均236文件、SHA353ba4628f7bba76360dcded9342963d529b63bce99040e5c497d4e2f0c87544。健康/就绪、唯一worker和媒体配置dcbaf54ac496b9217094dae97dfcd6b2ffec665d23f934bfaae2895c5ecefb0f保持ready；重启前后81场核心SHA均cf402e3432b8c518787d19fe464aaadcc6deecec60c6db7f68afa90aed704534，runner退出0，无强杀或恢复分支。真实batch管理API配置/合成语音验收随后执行。
+- 历史状态时间边界：上述重启前的核心SHA不同于早期只读预检e993...。只读核对发现截图旧场预约截止12:45:00Z，原有system:interview-deadline于12:58:07Z记录interview.appointment_window_expired，关闭未回答题并在12:58:34Z形成报告；该变更发生在12:25指定录像封存完成之后、13:40服务重启之前。2份已提交答案和3份评分版本保留。不能声称整轮任务期间全部面试数据始终不变；精准封存期间完整原始行保持、重启期间核心摘要保持分别有证据，本次未执行结束/跳题/报告请求。
+
+- 配置阶段停顿与只读复核：正常API已创建model_cfg_9108bc47faf24656，并于13:42:35Z完成一次真实stt.batch合成语音测试，739ms、success、HTTP 200，模型ready/version=2。配置脚本随后以Stop停在model_probe_started：模型测试会同步更新所属连接的健康字段，而脚本只允许新模型的健康变化，误判父连接哈希漂移。路由尚未创建，未重复调用模型；原journal保留，核实连接业务配置未改变后才允许继续剩余步骤。最后HTTP验收脚本首轮未细分端点、第二轮定位为5174/readyz的404：既有Vite没有代理该路径，改为核验8000真实readyz，不修改产品代理配置；先前失败不等同后端未就绪。
+- 实际前端与运行复核：`interviewer-095-runtime-verify.py 44501 44502`最终退出0。API及worker源码和媒体配置匹配冻结证明，8000健康/就绪、5174健康代理及API版本通过，8000静态首页和入口bundle匹配构建。四个实际HTTP模块与冻结源码一致；agent-experience.js的source map包含Vite变换后的8个本地导入地址及livekit依赖地址，前两轮直接hash断言失败，逐项确认差异仅这些导入路径后严格还原再核验完整hash通过。没有放宽业务源码比较，也没有改产品代码或重启Vite。
+- 批量配置安全恢复与完成：原配置脚本23项隔离替身未模拟既有父连接健康更新，故漏掉上述正常副作用。新增一次性journal恢复工具23项隔离检查，使用真实ModelAdmin与MockTransport覆盖该副作用，并确认route测试不更新父模型/连接。实际唯一成功调用、HTTP 200审计及ready状态一致；将当前模型/连接仅还原旧health/version/time字段后，全JSON哈希精确命中原baseline，其他配置和库存集合保持。只读预检及独立审查通过后，逐字0600备份原journal（SHA6146e8ef525fc01798f8b8478677e1cfa07e2cc4f3f1f4a9b316d693066492e4），仅修正本地阶段为model_verified，未重跑已成功模型测试。原冻结脚本继续执行并退出0：创建route_5b0fd47d4a404328（stt.batch/candidate_answer_repair、primary=model_cfg_9108bc47faf24656、DashScope qwen3-asr-flash），合成语音路由测试成功，ready=true/status=healthy。总计2次真实batch调用（模型1次、路由1次），均固定探针匹配，不使用候选音频。81场核心SHA仍cf402e3432b8c518787d19fe464aaadcc6deecec60c6db7f68afa90aed704534，已有配置业务字段保持；本轮正常管理API只新增一个模型和一条专用路由，模型探针正常更新原连接健康，不直接写业务数据库。
+- 实际文件与交付边界：实现提交d1778f4涉及47文件，生产变更为core/model_diagnostics、core/prompt/{company_questions,contracts,conversation_reception,model_probes,semantic_turn}及固定WAV、domain/{appointment_admission,interview_agent}、model_gateway/gateway、providers/{mock,openai_compatible}/provider、services/{conversation_understanding,interview_agent,livekit_evidence_ingress,model_admin,spoken_supplement}，前端candidate/{presentation,agent-experience}与interviews/agent-event-runtime及构建入口/两bundle。新增4份095后端测试，更新6份旧后端测试和4份前端测试，同步架构/API/领域/检索评分/供应商/存储/已知问题/进度/路线图/本日志。无DDL、历史答案补交、评分重跑或旧合同改写；题源合计8–10主题、追问另计及结束流程保持。API/worker已重启并核验，Vite热更新未重启，基线04e87fd与实现提交保留、未push。外部模型仍有一次顶层非对象的真实失败，严格拒绝后由已验证的同题恢复分支承接，不能承诺外部服务不再失败；真人连续语音、长音频分块与093断线录像自动封存缺口继续待验/跟踪，不标closed。最后仅补文档，无需重复完整代码回归。
+- 收尾核验：7份收尾文档中的276处本地链接有效，`git diff --check`通过；后端源码SHA仍与最终全量证明完全一致。配置journal为complete，model/route probe计数分别1/1，保留原journal备份和不重放证明。仅提交这7份文档的实际验收记录，不包含凭据、原始模型响应或临时运行工具。
 
 
 ## 2026-11-10 · PLANNING-JSON-RECOVERY-094

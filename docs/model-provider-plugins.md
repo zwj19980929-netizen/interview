@@ -405,7 +405,7 @@ app/
 
 ## 实时语音的空转写与真实补偿边界
 
-`provider_final_transcript_missing` 不代表一个可提交的空答案：实时 Evidence 保留录音并返回 `STT_TRANSCRIPT_UNAVAILABLE`，继续当前题，不把空值交给理解或评分。其他流式故障仍可使用 `stt.batch/candidate_answer_repair` 补偿；网关在调用 mock adapter 前检查必须是开发环境且提供显式非空字符串 `development_transcript`，否则以 `provider_real_stt_required` 拒绝（包含 mock fallback）。Mock adapter 同时拒绝 None、非字符串与空白 fixture，禁止 `str(None)` 伪造转写。此约束适用于真实本地面试，而非仅生产环境；开发测试 fixture 通道保留，生产禁止 fixture。当前本机只有真实流式 STT，尚无真实批量识别路由，不能宣称已具备真实断流批量补偿。
+`provider_final_transcript_missing` 不代表一个可提交的空答案：实时 Evidence 保留录音并返回 `STT_TRANSCRIPT_UNAVAILABLE`，继续当前题，不把空值交给理解或评分。其他流式故障仍可使用 `stt.batch/candidate_answer_repair` 补偿；网关在调用 mock adapter 前检查必须是开发环境且提供显式非空字符串 `development_transcript`，否则以 `provider_real_stt_required` 拒绝（包含 mock fallback）。Mock adapter 同时拒绝 None、非字符串与空白 fixture，禁止 `str(None)` 伪造转写。此约束适用于真实本地面试，而非仅生产环境；开发测试 fixture 通道保留，生产禁止 fixture。091排查时本机仅有真实流式STT；095已通过正常管理API新增真实`qwen3-asr-flash`模型及`stt.batch/candidate_answer_repair`专用路由，模型和路由各一次固定合成语音测试通过。该验证证明短音频配置可用，真人断流和长音频仍需复验，详见[操作日志095](change-log.md)。
 
 ## 插件 Manifest
 
