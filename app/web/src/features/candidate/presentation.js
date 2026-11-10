@@ -50,7 +50,31 @@ export function candidateStoppedPresentation({ experience, interview, problem })
   };
 }
 
-export function candidateNotice(problem, pauseConfirmed = false, phase = null) {
+// Hidden future plan entries, warm-up captions and local microphone activity
+// are not answers. HTTP may expose the newly selected first question before
+// the WebSocket leaves planning; current, skipped and incomplete rows cannot
+// establish a previous topic.
+export function candidatePlanningPresentation({ session, history } = {}) {
+  const visible = (history?.turns || []).filter(turn =>
+    typeof turn.question_spoken_text === "string" && turn.question_spoken_text.trim());
+  const previousTopic = visible.some(turn => typeof turn.id === "string" && turn.id
+    && turn.id !== history?.current_turn_id && ["transcribing", "evaluating", "completed"].includes(turn.status));
+  const submitted = Number(session?.completed_answers) > 0 || (history?.answers || []).length > 0;
+  const firstQuestion = session?.completed_answers === 0 && !visible.length && !submitted
+    && Array.isArray(history?.turns) && Array.isArray(history?.answers) && !history.current_turn_id;
+  const subject = firstQuestion ? "第一题" : submitted || previousTopic ? "下一话题" : "面试问题";
+  return {
+    title: `正在准备${subject}`,
+    heading: `面试官正在准备${subject}`,
+    detail: firstQuestion ? "试音已完成，请稍等面试官开始提问。"
+      : submitted ? "这段回答已保留，请稍等面试官继续。" : "请稍等面试官继续提问。",
+    retryTitle: `${subject}暂时没准备好`,
+    retryDetail: firstQuestion ? "试音已完成，可以重试开始提问。"
+      : submitted ? "你的回答已保留，可以重试继续面试。" : "可以重试继续面试。",
+  };
+}
+
+export function candidateNotice(problem, pauseConfirmed = false, phase = null, planningContext) {
   if (!problem) return null;
   if (problem.recoverable === false) {
     if (problem.pausePending) return { title: "正在暂停面试", detail: "请先停止作答，稍等片刻。", urgent: true };
@@ -66,7 +90,8 @@ export function candidateNotice(problem, pauseConfirmed = false, phase = null) {
       : { title: "连接中断，请先停止作答", detail: `${audioReason}请联系面试安排人确认后再继续。`, urgent: true };
   }
   if (problem.action === "retry_planning") {
-    return { title: "下一话题暂时没准备好", detail: "你的回答已保留，可以重试继续面试。", retry: true, action: "planning.retry" };
+    const presentation = candidatePlanningPresentation(planningContext);
+    return { title: presentation.retryTitle, detail: presentation.retryDetail, retry: true, action: "planning.retry" };
   }
   if (problem.code === "QUESTION_AUDIO_RETRY_REQUIRED") {
     return { title: "追问语音需要重试", detail: "上一题回答已保留。点击“重试播放”收听这道追问，播完后再作答。",

@@ -3565,10 +3565,12 @@ describe("adaptive topic planning", () => {
     } finally { await run.close(); }
   });
 
-  it("keeps a topic gap open without opening an old capture or claiming interview completion", async () => {
+  it.each([0, 2])("keeps the planning gap after %s completed topics closed to noise and old capture", async completedAnswers => {
     const { run, socket, capture } = await openPlaybackHarness();
     socket.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", candidateSnapshot())) });
-    socket.emit("message", { data: JSON.stringify(candidateEvent(2, "session.snapshot", waiting())) });
+    socket.emit("message", { data: JSON.stringify(candidateEvent(2, "session.snapshot", {
+      ...waiting(), completed_answers: completedAnswers,
+    })) });
     await capture.onSpeechStarted();
     capture.onSpeechStopped();
     expect(run.getSnapshot()).toMatchObject({ phase: "planning", currentQuestion: null, completion: null,

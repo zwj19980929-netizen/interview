@@ -2,6 +2,18 @@
 
 本文件记录所有会修改仓库内容的工作项。只读检查不单独登记；同一目标下的代码、测试、迁移和文档修改合并为一个工作项。状态使用 `in_progress`、`verified`、`failed` 或 `cancelled`，历史条目只追加或补充结果，不删除。
 
+## 2026-11-10 · FIRST-QUESTION-CONTEXT-093
+
+- 状态：`in_progress`。
+- 授权与基线：沿用本会话排查修复、Git回退及验证后空闲加载授权。首次修改前工作区干净，当前代码已提交为6043968；已按顺序复核入口文档。本项覆盖首题措辞、关联边界核查、测试与文档，不改写真实场次、答案或评分。
+- 现场证据：iv_a25c790e72b0461a在10:15:17Z完成试音并规划，10:15:21Z选中的首题文本已经包含“谢谢你的说明”；正式STT首次非空partial直到10:15:30Z才出现，10:15:32Z撤回为空。仅1个正式turn，答案、评分、权威utterance均0。纯内存零回答/零音频复现同样前缀，规划memory不含试音转写；此次前缀不能归因为噪声提交了一题。
+- 修复与验证计划：最终问题表达根据当前题之前的已提交回答决定是否允许承接，无前置回答时直接播报题干，保留后续正常承接、最近拒答、追问和真实音频恢复语义。独立核查试音至首题收音门与首轮规划文案；新增实际播报文本回归和暖场到真实规划入口集成测试。所有测试/加载结果与失败保留于本项；未验真人或生产前不标closed。
+- 阶段复现与修复：前端把首次planning也描述为“这段回答已保留”，但该状态会清理capture/readiness并拒绝普通VAD，Evidence关闭时不送入STT；未发现等待首题的声音形成正式答案的证据。后端先增加红例得到21 failed/34 passed，日志/private/tmp/interviewer-093-backend-red.log；最小语境守卫后相关六文件128 passed/4.60秒。新增27例覆盖全部转场键、试音/未提交/未来/当前答案不能冒充前置回答、正常后续致谢和追问/重读，并强化真实warmup→planner的实际conversation_act文本断言。未改Prompt/Schema或原始数据。
+- 前端阶段验证与审查：先红3 failed/62 passed，修后定向217通过、预验证全量557通过及临时构建成功；首次修后测试夹具缺connection导致1失败，已修正并保留日志。独立审查发现HTTP先返回已选中的当前首题、WebSocket仍旧planning时，当前题会被误当作上一话题；为补这一同任务边界，正常SIGINT停止首次完整pytest，1326 passed/2 skipped/103.93秒、退出2，不是完整通过，runner未生成发布证明。原日志与601文件快照保留为interviewer-093-interrupted-backend-full.log与interrupted-tested-source.json，补丁完成后重新冻结验证。
+- 加载前阻碍：只读门禁确认0媒体房间/参与者/活动Egress、无有效owner和未结任务，但本场media_capture_c37ef931775847d1仍标recording，故拒绝重启（services_changed=false）。精确ListEgress证实EG_JhzaskGK8PUq已于10:16:00.961588Z为EGRESS_COMPLETE，无error，绑定匹配，文件17300798字节、44.701529秒；owner于10:16:31.591Z释放，宽限已过。断线关闭STT/ingress但未入队录制封存。拟调用既有processing/retry仅对账此已结束录像：worker重查真实终态、绑定、文件hash/保护，不调用StopEgress、不结束面试；本场无答案且未提交，不生成评分或报告。完成后记录真实结果，保持重启门禁。
+- 竞态复验与实际对账：新增HTTP/WS交错红例9 failed/66 passed；修后首题/未知/当前题/未来题/已答题相关228项通过，独立7场景复查无阻断。前端只在完整一致空历史且completed_answers=0时说第一题，当前asking/pending或资料不完整用中性提示。真实processing/retry返回202，原worker校验后capture已completed，17300798字节、SHA256 3f239bc2c8145296808baca0be772f585c0b0bd6367cb930e6ad2f380e32216c；79份完整InterviewSession文档逐内容摘要保持一致。面试未结束、无答案/评分/报告新增，原音频未修改。第二次冻结601文件开始最终全量，后端235文件摘要70fa9be092e137a812b67364451450f3a9f04f5677915e03e05c4572a906b044，尚未加载。
+- 最终全量与静态发布：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m pytest -p no:cacheprovider -q`为4770 passed/8 skipped/270.52秒；`cd app/web && npm test -- --reporter=dot`为568 passed/26文件；`npm run build -- --outDir /private/tmp/interviewer-093-web-dist`成功，保留原有大chunk非阻断提示。601文件在验证前后集合/hash一致，Prompt/Provider相对6043968无差异，生成runtime-release-tests.v3证明，日志/private/tmp/interviewer-093-{backend-full,frontend-full,web-build}.log。`--publish`追加2个新bundle、原子替换index，保留62个旧资产，最终65构建文件全部冻结；发布门禁19项与资产发布11项隔离检查通过。只读preflight现全部空闲，79场核心SHA6979589e86435e9ecc0ffb1d4c6c0cf8c4fa5d185f9c05ef2c9c4bc3081f3307；API/worker尚为092，保存修复提交后再执行即时双重门禁加载。
+
 ## 2026-11-10 · SPEECH-HANDOFF-AND-FAREWELL-092
 
 - 状态：`verified（仓库全量与本机加载；真人即时回复和长场次待验）`。

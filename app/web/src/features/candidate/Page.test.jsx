@@ -131,7 +131,8 @@ describe("candidate capture recovery presentation", () => {
         ["paused", "listening", "面试已暂停"],
         ["completed", "completed", "面试已结束"],
       ]) {
-        await act(async () => root.render(<CandidateSignalList experience={{ ...experience, phase, calibration: { status } }} />));
+        await act(async () => root.render(<CandidateSignalList experience={{ ...experience, phase, calibration: { status } }}
+          planningContext={{ session: { completed_answers: 1 } }} />));
         expect(host.textContent).toContain(detail);
         expect(host.textContent).not.toContain("暂未收音");
         expect(host.querySelectorAll(".is-active")).toHaveLength(0);
@@ -296,6 +297,52 @@ describe("candidate warm-up recovery", () => {
 });
 
 describe("adaptive interview progress", () => {
+  it("keeps planning neutral when HTTP has selected the first question ahead of the WebSocket snapshot", async () => {
+    const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+    const planningContext = { session: { completed_answers: 0, current_turn_id: null }, history: {
+      current_turn_id: "first", turns: [{ id: "first", status: "asking", question_spoken_text: "合成第一题？" }], answers: [],
+    } };
+    try {
+      await act(async () => root.render(<>
+        <ConversationState phase="planning" endpoint={{ active: false }} formal planningContext={planningContext} />
+        <CandidateSignalList experience={{ phase: "planning", microphone: { localDetected: false, level: 0 } }}
+          planningContext={planningContext} />
+      </>));
+      expect(host.textContent).toContain("正在准备面试问题");
+      expect(host.textContent).not.toMatch(/下一话题|第一题|回答已保留/);
+    } finally { await act(async () => root.unmount()); host.remove(); }
+  });
+
+  it("describes first-question preparation without inventing a retained answer", async () => {
+    const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+    const planningContext = { session: { completed_answers: 0 }, history: { turns: [], answers: [] } };
+    try {
+      await act(async () => root.render(<>
+        <ConversationState phase="planning" endpoint={{ active: false }} formal planningContext={planningContext} />
+        <CandidateSignalList experience={{ phase: "planning", session: planningContext.session,
+          calibration: { status: "completed" }, microphone: { localDetected: true, level: 0.8 } }}
+          planningContext={planningContext} />
+      </>));
+      expect(host.textContent).toContain("正在准备第一题");
+      expect(host.textContent).toContain("试音已完成，请稍等面试官开始提问");
+      expect(host.textContent).not.toMatch(/下一话题|回答已保留|正在收到你的声音/);
+      expect(host.querySelectorAll(".is-active")).toHaveLength(0);
+    } finally { await act(async () => root.unmount()); host.remove(); }
+  });
+
+  it("keeps a previously presented unanswered topic separate from a retained answer", async () => {
+    const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+    const planningContext = { session: { completed_answers: 0 }, history: {
+      turns: [{ id: "presented", is_followup: false, status: "completed", question_spoken_text: "合成已呈现问题？" }], answers: [],
+    } };
+    try {
+      await act(async () => root.render(<ConversationState phase="planning" endpoint={{ active: false }} formal
+        planningContext={planningContext} />));
+      expect(host.textContent).toContain("正在准备下一话题");
+      expect(host.textContent).not.toMatch(/第一题|回答已保留/);
+    } finally { await act(async () => root.unmount()); host.remove(); }
+  });
+
   it("shows completed topics without inventing a total and keeps legacy progress", async () => {
     const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
     try {
@@ -305,7 +352,8 @@ describe("adaptive interview progress", () => {
       expect(host.querySelector("[aria-label]").getAttribute("aria-label")).toBe("已完成 3 个话题");
       await act(async () => root.render(<CandidateProgress answered={3} totalQuestions={6} />));
       expect(host.textContent).toBe("3/6");
-      await act(async () => root.render(<ConversationState phase="planning" endpoint={{ active: false }} formal />));
+      await act(async () => root.render(<ConversationState phase="planning" endpoint={{ active: false }} formal
+        planningContext={{ session: { completed_answers: 3 } }} />));
       expect(host.textContent).toContain("正在准备下一话题");
       expect(host.textContent).toContain("这段回答已保留");
       expect(host.textContent).not.toContain("已完成");

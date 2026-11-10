@@ -8,7 +8,7 @@ import {
   useState,
 } from "react";
 
-import { candidateNotice, candidateConnectionNotice, candidateStoppedPresentation, candidateEntryMessage, candidateEntryFailure, understandingRecoveryState } from "./presentation.js";
+import { candidateNotice, candidateConnectionNotice, candidateStoppedPresentation, candidateEntryMessage, candidateEntryFailure, understandingRecoveryState, candidatePlanningPresentation } from "./presentation.js";
 import { CandidateQuestionContext, CandidateQuestionHistory, useCandidateQuestionHistory } from "./QuestionHistory.jsx";
 
 import { useWorkbench } from "../../core/WorkbenchProvider.jsx";
@@ -571,9 +571,11 @@ function CandidateRoom({ interview, token }) {
   const planning = experience.phase === "planning";
   const totalQuestions = adaptive ? null : Number(session.total_primary_questions ?? interview?.turns?.filter((item) => !item.is_followup).length ?? 0);
   const answered = Number(session.completed_answers ?? interview?.answers?.length ?? 0);
+  const planningContext = { session, history: questionHistory.history };
+  const planningPresentation = candidatePlanningPresentation(planningContext);
   const connectionNotice = stoppedPresentation ? null : candidateConnectionNotice(experience);
   const controlsReady = !closing && !stoppedPresentation && experience.connection.control === "connected" && !connectionNotice;
-  const notice = stoppedPresentation?.notice || connectionNotice || candidateNotice(problem, false, experience.phase);
+  const notice = stoppedPresentation?.notice || connectionNotice || candidateNotice(problem, false, experience.phase, planningContext);
   const visibleExperience = stoppedPresentation ? {
     ...experience, phase: "paused", floor: "none",
     avatar: { ...experience.avatar, status: "idle", viseme: "sil", visemeWeight: 0, gesture: "idle" },
@@ -636,7 +638,8 @@ function CandidateRoom({ interview, token }) {
             </div>}
             <span className="camera-label">我的画面</span>
           </div>
-          <CandidateSignalList experience={visibleExperience} blocked={Boolean(stoppedPresentation)} stoppedDetail={stoppedPresentation?.microphoneDetail} />
+          <CandidateSignalList experience={visibleExperience} blocked={Boolean(stoppedPresentation)} stoppedDetail={stoppedPresentation?.microphoneDetail}
+            planningContext={planningContext} />
           <p className="privacy-note">
             录音录像仅用于本场面试记录与复核。真人面试官加入时会明确提示。
           </p>
@@ -658,11 +661,11 @@ function CandidateRoom({ interview, token }) {
           <div className="candidate-question-head">
             <div>
               <p className="eyebrow">{closing ? "本场交流已完成" : planning ? "稍作停顿" : currentQuestion?.is_followup ? "基于你刚才回答的追问" : adaptive ? `交流话题 ${currentQuestion?.order || answered + 1}` : `正式问题 ${currentQuestion?.order || answered + 1}`}</p>
-              <h1>{closing ? "感谢你的参与，请听完面试官的结束说明。" : planning ? "面试官正在准备下一话题…" : currentQuestion?.question_text || "面试官正在组织下一句话…"}</h1>
+              <h1>{closing ? "感谢你的参与，请听完面试官的结束说明。" : planning ? `${planningPresentation.heading}…` : currentQuestion?.question_text || "面试官正在组织下一句话…"}</h1>
             </div>
             <CandidateProgress answered={answered} totalQuestions={totalQuestions} adaptive={adaptive} />
           </div>
-          {!notice && <ConversationState phase={visibleExperience.phase} endpoint={experience.endpoint} formal
+          {!notice && <ConversationState phase={visibleExperience.phase} endpoint={experience.endpoint} formal planningContext={planningContext}
             speechDetected={experience.microphone.localDetected || experience.captions.forming} />}
           <CaptionPanel
             captions={experience.captions}
@@ -758,14 +761,15 @@ export function CandidateProgress({ answered, totalQuestions, adaptive = false }
   </div>;
 }
 
-export function ConversationState({ phase, endpoint, formal = false, speechDetected }) {
+export function ConversationState({ phase, endpoint, formal = false, speechDetected, planningContext }) {
+  const planningPresentation = candidatePlanningPresentation(planningContext);
   return <div className="candidate-waiting-row" role="status" aria-live="polite">
     <span>
-      <strong>{phase === "listening" && speechDetected === false ? "正在聆听，等待你开口" : phaseText(phase)}</strong>
+      <strong>{phase === "listening" && speechDetected === false ? "正在聆听，等待你开口" : phaseText(phase, planningPresentation)}</strong>
       <small>{["listening", "preparing"].includes(phase) && endpoint.active ? endpoint.deadlineAt == null
         ? "自然表达即可。需要思考、想换个话题或已经讲完，都可以直接告诉面试官。"
         : "说完后稍等片刻，就能查看试音字幕。"
-        : phaseDetail(phase, formal)}</small>
+        : phaseDetail(phase, formal, planningPresentation)}</small>
     </span>
     <span className={`conversation-phase is-${phase}`} aria-hidden="true" />
   </div>;
@@ -788,7 +792,7 @@ export function AnswerRecoveryAction({ recovery, act, disabled = false }) {
   </div>;
 }
 
-export function CandidateSignalList({ experience, blocked = false, stoppedDetail: stoppedDetailOverride }) {
+export function CandidateSignalList({ experience, blocked = false, stoppedDetail: stoppedDetailOverride, planningContext }) {
   const connectionRecovery = candidateConnectionNotice(experience);
   const processingFailure = understandingRecoveryState(experience.problem);
   const stopped = blocked || Boolean(experience.questionAudioRecovery) || ["paused", "completed", "closing", "answer_retry_required", "planning"].includes(experience.phase)
@@ -804,7 +808,7 @@ export function CandidateSignalList({ experience, blocked = false, stoppedDetail
     : processingFailure ? "录音已保留，输入通道暂未就绪"
     : experience.calibration?.status === "awaiting_confirmation" ? "试音已收好，请确认下方字幕"
     : experience.calibration?.status === "confirming" ? "正在进入正式面试"
-    : experience.phase === "planning" ? "面试官正在准备下一话题"
+    : experience.phase === "planning" ? candidatePlanningPresentation(planningContext || { session: experience.session }).heading
     : "这段回答已收好，面试官正在整理");
   return <div className="candidate-signal-list">
     <SignalState label={recovering ? "连接有些慢，正在恢复" : "麦克风"} active={local && !recovering}
@@ -873,7 +877,7 @@ function PublicHeader({ children }) {
   </header>;
 }
 
-function phaseText(phase) {
+function phaseText(phase, planningPresentation) {
   return ({
     connecting: "正在进入面试",
     preparing: "准备听你回答",
@@ -884,7 +888,7 @@ function phaseText(phase) {
     answer_recovering: "连接有些慢，正在恢复",
     answer_retry_required: "这段回答需要重试",
     understanding: "正在整理你的回答",
-    planning: "正在准备下一话题",
+    planning: planningPresentation.title,
     responding: "面试官正在回应，可随时开口打断",
     paused: "面试已暂停",
     completed: "面试已完成",
@@ -892,7 +896,7 @@ function phaseText(phase) {
   }[phase] || "请稍等片刻");
 }
 
-function phaseDetail(phase, formal) {
+function phaseDetail(phase, formal, planningPresentation) {
   return ({
     connecting: "请稍等片刻。",
     preparing: "准备好后就可以开口了。",
@@ -903,7 +907,7 @@ function phaseDetail(phase, formal) {
     answer_recovering: "请稍等，已收到的回答会保留。",
     answer_retry_required: "点击“重试本题”后，再回答一次。",
     understanding: "这段回答已收好，请等面试官回应后再说。",
-    planning: "这段回答已保留，请稍等面试官继续。",
+    planning: planningPresentation.detail,
     closing: "你的回答已提交，无需继续作答。感谢你的时间。",
     responding: "如果想补充，可以直接开口。",
     paused: "请联系面试安排人协助恢复。",

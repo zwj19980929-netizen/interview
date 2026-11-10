@@ -7,11 +7,81 @@ from types import SimpleNamespace
 import pytest
 
 from test_expression_stale_fence import _harness, _mutate
+from app.core.prompt.interviewer_supervisor import TRANSITIONS
 from app.domain.interview_agent import Replayability
 from app.persistence.provider import persistence_for
 from app.repositories.sqlite import SQLiteStore
 from app.services import interview_agent
 from app.services.interview_agent import AgentChannel, InterviewAgentRuntime
+
+
+@pytest.mark.parametrize("transition_key", TRANSITIONS)
+@pytest.mark.parametrize("history", ["warmup_only", "unsubmitted_previous", "future_answer", "current_answer"])
+def test_question_without_a_previous_submitted_answer_has_no_transition(transition_key, history):
+    async def scenario():
+        runtime, channel, _, _ = _harness()
+
+        def seed(session):
+            current = session["turns"][0]
+            session["agent_runtime"].update(
+                next_transition_key=transition_key,
+                calibration_transcript="这是不参与正式问答的合成试音。",
+            )
+            if history == "unsubmitted_previous":
+                session["turns"].insert(0, {
+                    "id": "unsubmitted", "current_understanding": {"intent": "answer_declined"},
+                })
+            elif history == "future_answer":
+                session["turns"].append({
+                    "id": "future", "current_understanding": {"intent": "answer_declined"},
+                })
+                session["answers"] = [{"id": "a_future", "turn_id": "future"}]
+            elif history == "current_answer":
+                session["answers"] = [{"id": "a_current", "turn_id": current["id"]}]
+
+        _mutate(runtime, channel, seed)
+        channel._select_act = AsyncMock()
+        session = runtime.interviews.get_interview(channel.interview_id)
+        turn = next(item for item in session["turns"] if item["id"] == session["current_turn_id"])
+        await channel._select_turn(turn, None)
+        assert channel._select_act.await_args.kwargs["text"] == turn["question_spoken_text"]
+        assert runtime.interviews.get_interview(channel.interview_id) == session
+
+    asyncio.run(scenario())
+
+
+def test_acknowledgement_after_a_submitted_answer_is_preserved():
+    async def scenario():
+        runtime, channel, _, _ = _harness()
+
+        def seed(session):
+            session["turns"].insert(0, {
+                "id": "recent", "current_understanding": {"intent": "answer"},
+            })
+            session["answers"] = [{"id": "a_recent", "turn_id": "recent"}]
+            session["agent_runtime"]["next_transition_key"] = "acknowledge"
+
+        _mutate(runtime, channel, seed)
+        channel._select_act = AsyncMock()
+        turn = runtime.interviews.get_interview(channel.interview_id)["turns"][1]
+        await channel._select_turn(turn, None)
+        assert channel._select_act.await_args.kwargs["text"] == "谢谢你的说明。" + turn["question_spoken_text"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("act_type", ["followup", "repeat"])
+def test_non_question_delivery_keeps_its_approved_text(act_type):
+    async def scenario():
+        runtime, channel, _, _ = _harness()
+        _mutate(runtime, channel, lambda session: session["agent_runtime"].update(next_transition_key="acknowledge"))
+        channel._select_act = AsyncMock()
+        turn = runtime.interviews.get_interview(channel.interview_id)["turns"][0]
+        await channel._select_turn(turn, None, act_type=act_type)
+        assert channel._select_act.await_args.kwargs["act_type"] == act_type
+        assert channel._select_act.await_args.kwargs["text"] == turn["question_spoken_text"]
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("recent_understanding", [

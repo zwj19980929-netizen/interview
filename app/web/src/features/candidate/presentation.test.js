@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { candidateEntryMessage, candidateEntryFailure, candidateNotice, candidateStoppedPresentation } from "./presentation.js";
+import { candidateEntryMessage, candidateEntryFailure, candidateNotice, candidateStoppedPresentation, candidatePlanningPresentation } from "./presentation.js";
 
 describe("candidate stopped presentation uses confirmed session facts", () => {
   it("does not equate a local paused phase with an acknowledged server pause", () => {
@@ -22,6 +22,66 @@ describe("candidate stopped presentation uses confirmed session facts", () => {
 });
 
 describe("candidate copy separates actions from diagnostics", () => {
+  it.each([
+    { id: "first", status: "asking" },
+    { id: "first", status: "pending" },
+    { id: "first", status: "transcribing" },
+    { id: "other", status: "asking" },
+    { id: "other", status: "pending" },
+    { id: "incomplete" },
+    { status: "completed" },
+  ])("does not treat a current or incomplete HTTP question as a previous topic ($status)", turn => {
+    const context = { session: { completed_answers: 0, current_turn_id: null }, history: {
+      current_turn_id: "first", turns: [{ ...turn, question_spoken_text: "合成第一题？" }], answers: [],
+    } };
+    expect(candidatePlanningPresentation(context)).toMatchObject({
+      heading: "面试官正在准备面试问题", detail: "请稍等面试官继续提问。",
+      retryTitle: "面试问题暂时没准备好", retryDetail: "可以重试继续面试。",
+    });
+  });
+
+  it.each([undefined, { turns: [], answers: [], current_turn_id: "first" }, { turns: [] }])(
+    "uses neutral copy until the first-question history is consistent (%s)", history => {
+      expect(candidatePlanningPresentation({ session: { completed_answers: 0 }, history }).heading)
+        .toBe("面试官正在准备面试问题");
+    },
+  );
+
+  it("uses formal presented questions and submitted answers, never trial captions or future plan rows", () => {
+    const context = { session: { completed_answers: 0 }, history: {
+      turns: [{ id: "future", order: 1 }], answers: [],
+      warmup_transcript: "合成试音内容。",
+    } };
+    expect(candidatePlanningPresentation(context)).toMatchObject({
+      heading: "面试官正在准备第一题", title: "正在准备第一题",
+    });
+    context.history.turns[0].question_spoken_text = "合成已呈现问题？";
+    context.history.turns[0].status = "completed";
+    expect(candidatePlanningPresentation(context)).toMatchObject({
+      heading: "面试官正在准备下一话题", detail: "请稍等面试官继续提问。",
+    });
+    context.history.turns[0].status = "skipped";
+    expect(candidatePlanningPresentation(context)).toMatchObject({
+      heading: "面试官正在准备面试问题", detail: "请稍等面试官继续提问。",
+    });
+    context.history.answers.push({ turn_id: "future" });
+    expect(candidatePlanningPresentation(context).detail).toContain("回答已保留");
+    expect(candidatePlanningPresentation({ session: { completed_answers: 1 } }).detail).toContain("回答已保留");
+    expect(candidatePlanningPresentation()).toMatchObject({
+      heading: "面试官正在准备面试问题", detail: "请稍等面试官继续提问。",
+    });
+  });
+
+  it("does not call the first planning retry a later question or a saved answer", () => {
+    const notice = candidateNotice({ action: "retry_planning", recoverable: true }, false, "planning", {
+      session: { completed_answers: 0 }, history: { turns: [], answers: [] },
+    });
+    expect(notice.title).toBe("第一题暂时没准备好");
+    expect(notice.detail).toBe("试音已完成，可以重试开始提问。");
+    expect(notice).toMatchObject({ retry: true, action: "planning.retry" });
+    expect(JSON.stringify(notice)).not.toMatch(/下一话题|回答已保留/);
+  });
+
   it("offers an explicit follow-up audio retry while retaining the previous answer", () => {
     const notice = candidateNotice({ code: "QUESTION_AUDIO_RETRY_REQUIRED", recoverable: true,
       action: "retry_question_audio", message: "secret provider output" });
@@ -135,7 +195,8 @@ describe("candidate copy separates actions from diagnostics", () => {
 });
 
 it("routes a planning failure to its own retry and keeps diagnostics private", () => {
-  const notice = candidateNotice({ recoverable: true, action: "retry_planning", code: "PLAN_ERROR", message: "secret prompt provider" });
+  const notice = candidateNotice({ recoverable: true, action: "retry_planning", code: "PLAN_ERROR", message: "secret prompt provider" },
+    false, "planning", { session: { completed_answers: 2 } });
   expect(notice).toMatchObject({ retry: true, action: "planning.retry" });
   expect(notice.detail).toContain("回答已保留");
   expect(JSON.stringify(notice)).not.toMatch(/secret|prompt|provider/);

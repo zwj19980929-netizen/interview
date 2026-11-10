@@ -2168,7 +2168,11 @@ class AgentChannel:
             # into future turns retained by a fixed plan, for an old refusal.
             previous = next((item for item in reversed(turns[:current_index])
                              if item["id"] in answered), None)
-            if ((previous or {}).get("current_understanding") or {}).get("intent") == "answer_declined":
+            if previous is None:
+                # Warm-up and unsubmitted speech are not a previous answer.
+                # A planner's style suggestion cannot invent that history.
+                key = "none"
+            elif (previous.get("current_understanding") or {}).get("intent") == "answer_declined":
                 key = "declined"
             elif key == "declined":
                 # A planner can carry a historical refusal into its proposed

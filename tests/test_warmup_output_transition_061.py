@@ -203,7 +203,7 @@ def test_playing_trial_to_real_planner_selects_and_speaks_exactly_one_first_ques
         source = source_session()
         excluded = {"id", "version", "agent_runtime", "agent_events", "candidate", "candidate_id"}
         _mutate(h.runtime, h.channel, lambda s: s.update({k: v for k, v in source.items() if k not in excluded}))
-        h.runtime.interviews.supervisor = supervisor(Gateway(decision()), h.runtime.store)
+        h.runtime.interviews.supervisor = supervisor(Gateway(decision(transition_key="acknowledge")), h.runtime.store)
         try:
             signal = ClientSignal(type="warmup.confirm", idempotency_key="start_formal")
             await h.channel.send(signal)
@@ -215,6 +215,10 @@ def test_playing_trial_to_real_planner_selects_and_speaks_exactly_one_first_ques
             assert current["status"] == "in_progress"
             assert len(current["turns"]) == 1 and current["answers"] == []
             assert current["turns"][0]["question_spoken_text"] == "说明python的边界。"
+            spoken_questions = [act for act in current["turns"][0]["conversation_acts"]
+                                if act["act_type"] == "question"]
+            assert len(spoken_questions) == 1
+            assert spoken_questions[0]["text"] == "说明python的边界。"
             assert len(h.outputs) == 2
             assert h.outputs[0].publisher.interruption_before_abort
             assert h.channel._speech_output is h.outputs[1].output
