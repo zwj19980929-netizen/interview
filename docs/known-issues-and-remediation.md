@@ -2,7 +2,7 @@
 
 ## 098：辅助语音故障误报与接话内容重复失败
 
-状态：in_progress。iv_1379a399cfba4d77已确认辅助S2S队列溢出后主STT继续，但辅助dialogue.error被当作problem；补充接话两次因reception_cannot_ask_question拒绝，后又因reception_current_control_conflict拒绝。097独立预算正常执行，未覆盖具体内容纠错。新增能力降级投影、仅可信presence的审核文案替代、同来源剩余额度内内容纠错以及队列安全指标；不能从现有证据断言积压来自突发还是供应商慢。已通过后端5212项/8环境跳过、前端589项与构建，619份源码/测试无漂移。实施/验证证据见[098操作日志](change-log.md)，尚未加载，不标verified或closed。
+状态：verified（仓库全量与本机加载；真人连续交流待验）。iv_1379a399cfba4d77已确认辅助S2S队列溢出后主STT继续，但dialogue.error被当作problem；补充接话两次因reception_cannot_ask_question拒绝，后又因reception_current_control_conflict拒绝。097独立预算正常执行，未覆盖具体内容纠错。本项实现辅助能力降级投影、仅可信presence反问的审核文案替代、同来源剩余额度内内容纠错与有界队列诊断。实现2f34b90通过后端5212项/8环境跳过、前端589项及构建；API75940/worker75941和前端实际HTTP已核验，84场核心与全部录制文档保持。现有历史证据仍不能区分积压来自突发输入还是供应商慢；真人交流及供应商长期可靠性待验，独立主STT积压不归为本项已解决，不标closed。见[098操作日志](change-log.md)。
 
 ## 097：短回复失败占用后续确认恢复额度与错误原因缺失
 
