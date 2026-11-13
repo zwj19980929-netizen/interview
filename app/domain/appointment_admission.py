@@ -7,6 +7,7 @@ from app.core.errors import ApiError
 from app.core.interview_agent_release import realtime_agent_release_status
 from app.domain.avatar_asset import inspect_licensed_vrm
 from app.domain.speech_profile import speech_asset_matches_profile
+from app.domain.session_assessment_scope import scope_window_check
 from app.model_gateway import capabilities as cap
 from app.services.model_route_readiness import purpose_readiness
 
@@ -44,6 +45,12 @@ class AppointmentAdmission:
         ttl_seconds: int = 60,
     ) -> Dict[str, Any]:
         checks = []
+        if appointment and appointment.get("scheduled_start_at") and appointment.get("scheduled_end_at"):
+            scope_time = scope_window_check((plan or {}).get("assessment_contract"),
+                max(now, parse_utc(appointment["scheduled_start_at"])), appointment["scheduled_end_at"])
+            if scope_time is not None:
+                checks.append({"name": "assessment_time_budget", **scope_time,
+                    "production_ready": scope_time["ready"], "invite_ready": scope_time["ready"]})
         local_mode = os.getenv("INTERVIEWER_RUNTIME_ENV", "development").lower() != "production"
         organization_id = str(
             (appointment or {}).get("organization_id")
@@ -160,12 +167,17 @@ class AppointmentAdmission:
         batch_production_ready = self._route_ready(
             transaction, cap.STT_BATCH, "candidate_answer_repair", now
         )
+        real_audio_configured = self._non_mock_route_configured(
+            transaction, cap.STT_STREAMING, "candidate_answer_transcription"
+        ) or self._non_mock_route_configured(transaction, cap.STT_BATCH, "candidate_answer_repair")
+        batch_development_fixture = local_mode and not real_audio_configured
         checks.append(
             {
                 "name": "stt_batch",
-                "ready": local_mode or batch_production_ready,
+                "ready": batch_development_fixture or batch_production_ready,
                 "production_ready": batch_production_ready,
-                "mode": "mock_development" if local_mode else "real_provider_required",
+                "mode": "configured_route" if batch_production_ready else
+                        "mock_development" if batch_development_fixture else "real_provider_required",
             }
         )
         streaming_production_ready = self._route_ready(
@@ -456,6 +468,22 @@ class AppointmentAdmission:
         return bool(purpose_readiness(transaction, capability, purpose, now)["ready"])
 
     @staticmethod
+    def _non_mock_route_configured(transaction: Any, capability: str, purpose: str) -> bool:
+        """Only wholly explicit mock routes may use development transcript fixtures."""
+        routes = [route for route in transaction.model_routes.list()
+                  if route.get("capability") == capability and route.get("enabled", True)]
+        route = next((item for item in routes if item.get("purpose") == purpose), None)
+        if route is None:
+            route = next((item for item in routes if item.get("purpose") == "default"), None)
+        if route is None:
+            return False
+        for target in [route.get("primary") or {}, *(route.get("fallbacks") or [])]:
+            model = transaction.model_configurations.get(target.get("model_configuration_id"))
+            if not model or model.get("provider_id") != "mock":
+                return True
+        return False
+
+    @staticmethod
     def _route_configured(transaction: Any, capability: str, purpose: str) -> bool:
         """判断管理员是否显式选择了某条运行时路由，不把未配置等同于故障。"""
 
@@ -499,6 +527,15 @@ class AppointmentAdmission:
             raise ApiError("APPOINTMENT_TOO_EARLY", "Appointment start window has not opened.", status_code=409)
         if current > end:
             raise ApiError("APPOINTMENT_WINDOW_CLOSED", "Appointment start window has closed.", status_code=410)
+
+        scope_time = next((item for item in plan_readiness.get("checks", [])
+                           if item.get("name") == "assessment_time_budget"), None)
+        if scope_time is not None:
+            available = max(0, int((parse_utc(appointment["scheduled_end_at"]) - current).total_seconds()))
+            if available < scope_time["required_seconds"]:
+                raise ApiError("ASSESSMENT_START_TIME_INSUFFICIENT",
+                    "剩余预约时间不足以完成本场已确定的考察范围，请联系面试官改期。", status_code=422,
+                    details={"required_seconds": scope_time["required_seconds"], "available_seconds": available})
 
         device = appointment.get("device_readiness") or {}
         if not device.get("ready") or not device.get("expires_at") or parse_utc(device["expires_at"]) < current:

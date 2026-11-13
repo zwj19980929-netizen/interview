@@ -67,6 +67,7 @@ def session_for(intents, *, followups=False):
             "suggested_action": "next", "provider": {"provider_id": "synthetic"}, "created_at": NOW,
         }
         turn = {"id": turn_id, "order": index + 1, "is_followup": is_followup,
+                "parent_turn_id": "turn_0" if is_followup else None,
                 "root_turn_id": root_turn_id, "question_snapshot": snapshot,
                 "question_snapshot_id": snapshot["id"], "status": "completed",
                 "current_understanding": understanding, "utterances": [{

@@ -194,7 +194,7 @@ def test_position_resume_appointment_audio_and_review_loop(tmp_path, monkeypatch
             "candidate_profile_id": candidate_id,
             "resume_review_id": review_id,
             "knowledge_base_ids": [knowledge_base_id],
-            "question_count": 1,
+            "question_count": 2,
         },
     )
     assert plan.status_code == 200, plan.text

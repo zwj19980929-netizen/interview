@@ -179,6 +179,9 @@ def test_corrected_final_understanding_retry_can_use_saved_prefix_without_new_sp
         _voice_then_pause(endpoint, clock)
         endpoint.start()
         await _until(lambda: len(prepared) == 2 and len(opened) == 1)
+        # A provider entering its coroutine is not completion of the owned
+        # preparation. Advance the fake clock after failure/backoff is set.
+        await _until(lambda: endpoint._prepare_failures == 1 and endpoint._inference_task is None)
         assert not commits
         clock.value += 2
         await _until(lambda: commits)

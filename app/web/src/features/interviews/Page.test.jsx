@@ -131,8 +131,131 @@ describe("appointment invitation readiness wait", () => {
     expect(button("重试签发邀请").disabled).toBe(false);
     expect(host.querySelector('[role="status"]')).toBeNull();
     expect(workbench.request.mock.calls.filter(([path]) => path === "/api/v1/interview-appointments")).toHaveLength(1);
-    expect(workbench.toast).toHaveBeenCalledWith("邀请仍未就绪", expect.any(String), "error");
+    expect(workbench.toast).toHaveBeenCalledWith("邀请签发失败", expect.any(String), "error");
   });
+});
+
+describe("saved appointment invitation diagnostics", () => {
+  const failInvite = async (fields) => {
+    workbench.request.mockImplementation(async (path) => {
+      if (path.endsWith("/invite")) throw Object.assign(new Error("private-provider-response secret-token"), fields);
+      return APPOINTMENT;
+    });
+    await prepareForm();
+    await act(async () => submit());
+    return host.querySelector('[aria-label="邀请签发失败原因"]');
+  };
+
+  it("explains an insufficient frozen assessment window as a scheduling issue", async () => {
+    const failure = await failInvite({ code: "APPOINTMENT_NOT_READY", details: { checks: [
+      { name: "assessment_time_budget", ready: false, invite_ready: false, required_seconds: 1830, available_seconds: 300 },
+    ] } });
+    expect(failure.textContent).toContain("本场考察所需时间");
+    expect(failure.textContent).toContain("请延长预约或重新准备更短的计划");
+    expect(failure.textContent).not.toMatch(/其他服务检查|检查配置|assessment_time_budget|稍后|等待/);
+  });
+
+  it.each(["development", "production"])("lists only actual invitation blockers in %s without exposing diagnostic payloads", async (environment) => {
+    const failure = await failInvite({ code: "APPOINTMENT_NOT_READY", details: {
+      runtime_environment: environment,
+      private_payload: "secret-token",
+      checks: [
+        { name: "agent_expression_tts", ready: false, invite_ready: true },
+        { name: "experience_question_speech", blocking: false, ready: false, invite_ready: false },
+        { name: "livekit_media_plane", ready: true, invite_ready: false },
+        { name: "stt_streaming", ready: true, production_ready: false },
+        { name: "warmup_stt_streaming", ready: false, production_ready: true },
+        { name: "turn_understanding", ready: false, route_readiness: { status: "failed", reason_code: "provider_timeout" } },
+        { name: "controlled_followup", ready: true },
+        { name: "question_speech", ready: false },
+        { name: "secret-token", ready: false, route_readiness: { status: "constructor", reason_code: "__proto__", error: "secret-token" } },
+      ],
+    } });
+    const rows = [...failure.querySelectorAll("li")].map((row) => row.textContent);
+    expect(rows).toHaveLength(5);
+    expect(failure.textContent).toContain("实时音视频服务（LiveKit）");
+    expect(failure.textContent).toContain("对话理解服务：供应商响应超时");
+    expect(failure.textContent).toContain("题目语音资源");
+    expect(failure.textContent).toContain("其他服务检查");
+    expect(failure.textContent).toContain(environment === "production" ? "实时语音识别服务" : "入场语音校准服务");
+    expect(failure.textContent).not.toContain(environment === "production" ? "入场语音校准服务" : "实时语音识别服务");
+    expect(failure.textContent).not.toContain("语音合成服务");
+    expect(failure.textContent).not.toContain("经历题语音资源");
+    expect(failure.textContent).not.toContain("追问生成服务");
+    expect(host.textContent).not.toMatch(/secret-token|private-provider|__proto__|readiness/);
+    expect(JSON.stringify(workbench.toast.mock.calls)).not.toMatch(/secret-token|private-provider/);
+    expect(workbench.request).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["provider_timeout", "供应商响应超时", true],
+    ["provider_rate_limited", "供应商请求受限", true],
+    ["provider_billing_required", "供应商账户计费或额度受限", false],
+    ["provider_auth_failed", "供应商凭据验证失败", false],
+    ["provider_cost_limit_exceeded", "应用配置的费用上限", false],
+    ["provider_audio_final_missing", "供应商未返回完整语音", false],
+    ["provider_audio_format_unsupported", "音频格式不受支持", false],
+    ["ROUTE_DISABLED", "模型调用配置已停用", false],
+  ])("explains %s without conflating billing, configuration and cooldown", async (reason, message, cooldown) => {
+    const failure = await failInvite({ code: "APPOINTMENT_NOT_READY", details: { checks: [
+      { name: "agent_expression_tts", ready: false, route_readiness: {
+        status: reason === "ROUTE_DISABLED" ? "configuration_invalid" : "failed",
+        reason_code: reason, can_refresh: false, retry_at: "2099-01-01T00:00:00Z",
+      } },
+    ] } });
+    expect(failure.textContent).toContain("面试官语音合成服务（TTS）");
+    expect(failure.textContent).toContain(message);
+    expect(failure.textContent.includes("冷却期")).toBe(cooldown);
+    if (reason === "provider_cost_limit_exceeded") expect(failure.textContent).not.toContain("供应商账户计费");
+  });
+
+  it.each([
+    ["REQUEST_TIMEOUT", 0, "邀请请求超时"],
+    ["NETWORK_UNAVAILABLE", 0, "无法连接邀请服务"],
+    ["REQUEST_CANCELLED", 0, "邀请请求已取消"],
+    ["AUTHENTICATION_INVALID", 401, "登录状态已失效"],
+    ["AUTHORIZATION_FORBIDDEN", 403, "没有签发邀请的权限"],
+    ["INVITATION_EXPIRY_INVALID", 400, "邀请有效期已过"],
+    ["APPOINTMENT_NOT_INVITABLE", 409, "预约状态不允许签发邀请"],
+    ["INTERVIEW_PLAN_NOT_APPROVED", 409, "面试计划未获批准"],
+    ["provider_auth_failed", 400, "供应商凭据验证失败"],
+    ["private-secret-code", 500, "邀请签发失败"],
+  ])("keeps %s visible without reporting it as a readiness failure", async (code, status, message) => {
+    const failure = await failInvite({ code, status, details: { raw: "secret-token" } });
+    expect(failure.textContent).toContain(message);
+    expect(failure.textContent).not.toContain("面试服务检查未通过");
+    expect(host.textContent).not.toMatch(/readiness|secret-token|private-provider|private-secret-code/);
+    expect(JSON.stringify(workbench.toast.mock.calls)).not.toMatch(/secret-token|private-provider|private-secret-code/);
+  });
+
+  it("replaces the visible failure after a manual retry and preserves the saved appointment", async () => {
+    await failInvite({ code: "REQUEST_TIMEOUT" });
+    workbench.request.mockRejectedValueOnce(Object.assign(new Error("private retry body"), {
+      code: "APPOINTMENT_NOT_READY", details: { checks: [
+        { name: "agent_expression_tts", ready: false, route_readiness: { status: "failed", reason_code: "provider_billing_required" } },
+      ] },
+    }));
+    await act(async () => button("重试签发邀请").click());
+    const failure = host.querySelector('[aria-label="邀请签发失败原因"]');
+    expect(failure.textContent).toContain("供应商账户计费或额度受限");
+    expect(failure.textContent).not.toContain("邀请请求超时");
+    expect(button("重试签发邀请").disabled).toBe(false);
+    expect(workbench.request.mock.calls.map(([path]) => path)).toEqual([
+      "/api/v1/interview-appointments",
+      "/api/v1/interview-appointments/appointment_synthetic/invite",
+      "/api/v1/interview-appointments/appointment_synthetic/invite",
+    ]);
+    expect(JSON.stringify(workbench.toast.mock.calls)).not.toContain("private retry body");
+  });
+
+  it.each([undefined, { checks: "private-invalid-checks" }, { checks: [null, false, {}] }])(
+    "uses safe guidance when readiness details are absent or malformed", async (details) => {
+      const failure = await failInvite({ code: "APPOINTMENT_NOT_READY", details });
+      expect(failure.textContent).toContain("未收到具体未通过项目");
+      expect(failure.querySelectorAll("li")).toHaveLength(0);
+      expect(host.textContent).not.toContain("private-invalid-checks");
+    },
+  );
 });
 
 describe("interview list removal", () => {

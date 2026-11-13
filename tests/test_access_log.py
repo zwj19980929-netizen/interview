@@ -1,8 +1,10 @@
 import logging
+import pytest
 
 from app.core.access_log import (
     SensitiveMediaLogFilter,
     SensitiveQueryAccessLogFilter,
+    SensitiveWebSocketLogFilter,
     install_sensitive_access_log_filter,
     redact_sensitive_query,
 )
@@ -24,6 +26,31 @@ def test_media_log_redaction_install_is_idempotent():
     install_sensitive_access_log_filter()
     assert sum(isinstance(item, SensitiveMediaLogFilter)
                for item in logging.getLogger("livekit").filters) == 1
+    assert sum(isinstance(item, SensitiveWebSocketLogFilter)
+               for item in logging.getLogger("uvicorn.error").filters) == 1
+
+
+@pytest.mark.parametrize("template,extra", [
+    ('%s - "WebSocket %s" [accepted]', ()),
+    ('%s - "WebSocket %s" 403', ()),
+    ('%s - "WebSocket %s" %d', (401,)),
+])
+def test_websocket_handshake_logs_redact_ticket_in_error_logger(template, extra):
+    record = logging.LogRecord("uvicorn.error", logging.INFO, __file__, 1, template,
+        ("127.0.0.1:1234", "/api/v1/interviews/synthetic/agent?ticket=synthetic-secret&view=full") + extra, None)
+    assert SensitiveWebSocketLogFilter().filter(record)
+    message = record.getMessage()
+    assert "synthetic-secret" not in message
+    assert "ticket=REDACTED&view=full" in message
+    assert 'WebSocket /api/v1/interviews/synthetic/agent?' in message
+
+
+def test_websocket_redaction_keeps_unrelated_server_diagnostics():
+    record = logging.LogRecord("uvicorn.error", logging.ERROR, __file__, 1,
+        "Connection %s failed: %s", ("synthetic", "connection refused"), None)
+    before = record.getMessage()
+    SensitiveWebSocketLogFilter().filter(record)
+    assert record.getMessage() == before
 
 
 def test_sensitive_query_values_are_redacted_without_losing_route_context() -> None:

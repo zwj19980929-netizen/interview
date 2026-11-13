@@ -9,7 +9,7 @@ from urllib.parse import urlencode, urlparse
 
 import websockets
 
-from app.core.speech_diagnostics import record_stt_sentence
+from app.core.speech_diagnostics import STTHypothesisDiagnostics, record_stt_sentence
 
 from app.model_gateway import capabilities as cap
 from app.model_gateway.errors import ProviderError
@@ -76,7 +76,16 @@ class DashScopeProvider(OpenAICompatibleProvider):
         try:
             return await super().invoke(capability, request, context)
         except ProviderError as exc:
+            # A trusted single-attempt workflow must observe every provider
+            # request. Do not hide another HTTP call behind schema transport
+            # compatibility; legacy requests without this limit keep it.
+            single_attempt = (
+                isinstance(original_request, ChatJSONRequest)
+                and original_request.execution_budget is not None
+                and original_request.execution_budget.max_provider_attempts == 1
+            )
             if (capability != cap.LLM_CHAT_JSON or context.purpose != "interview_turn_understanding"
+                    or single_attempt
                     or str(context.config.get("structured_output_mode") or self.structured_output_mode) != "json_schema"
                     or exc.code != "provider_bad_request" or exc.details.get("http_status") != 400):
                 raise
@@ -362,6 +371,8 @@ class DashScopeSTTStream:
         self.socket = socket
         self.task_id = str(uuid.uuid4())
         self.stream_id = "stt_stream_%s" % self.task_id.replace("-", "")
+        self._hypothesis_diagnostics = STTHypothesisDiagnostics(interview_id=request.interview_id,
+            turn_id=request.turn_id, stream_id=self.stream_id, provider_id=provider.provider_id, model=context.model)
         self.sequence = 1
         self.closed = False
         self._finish_lock = asyncio.Lock()
@@ -375,6 +386,9 @@ class DashScopeSTTStream:
         self._partial_sentence_key: Any = None
         self._has_unstable_tail = False
         self._text_seen = False
+        self._observed_text_keys: set = set()
+        self._unkeyed_text_seen = False
+        self._empty_completion_reconciled = False
         self._preview_revision = 0
         self._preview_timestamps_valid = True
         self._preview_segment_count = 0
@@ -613,6 +627,25 @@ class DashScopeSTTStream:
         # This local fact only prohibits an empty replacement from erasing it.
         return self._text_seen
 
+    @property
+    def empty_completion_reconciled(self) -> bool:
+        """This task explicitly withdrew every nonempty interim sentence.
+
+        The fact is local to this stream and is published only after all
+        audio drained and task-finished acknowledged the complete input.
+        It cannot reconcile words observed by an earlier failed task.
+        """
+        return self._empty_completion_reconciled
+
+    def _all_observed_text_retracted(self) -> bool:
+        return bool(
+            self._observed_text_keys and not self._unkeyed_text_seen
+            and not self._pending_sentences and not self._has_unstable_tail
+            and all(key in self._committed_sentences
+                    and self._committed_sentences[key] is None
+                    for key in self._observed_text_keys)
+        )
+
     async def preview(self) -> Optional[StableTranscriptPreview]:
         """Read sentence-final facts without ending or flushing the task.
 
@@ -677,16 +710,18 @@ class DashScopeSTTStream:
                 events.extend(self._consume_reader_item(item))
             self._raise_reader_error()
             text, segments = self._transcript_projection()
-            if not text and (self._text_seen or self._has_unstable_tail or self._pending_sentences):
-                raise ProviderError("provider_final_transcript_missing", "DashScope ASR returned no final transcript.", retryable=True)
+            if not text and self._text_seen:
+                if not self._all_observed_text_retracted():
+                    raise ProviderError("provider_final_transcript_missing", "DashScope ASR returned no final transcript.", retryable=True)
+                self._empty_completion_reconciled = True
             for segment in segments:
                 if segment not in self.committed:
                     self._trace_sentence(segment, final=False)
             events.append(
                 self._event(
                     # task-finished is the vendor's normal completion ACK.
-                    # With every audio frame sent and no text ever observed or
-                    # hypothesis pending, report recognition without words.
+                    # Explicitly withdrawn, identified interim sentences are
+                    # also a completed no-word result, never lost evidence.
                     # This does not certify silence or candidate intent.
                     "transcript.final" if text else "transcript.empty",
                     text=text,
@@ -715,6 +750,7 @@ class DashScopeSTTStream:
         # ``closed`` stops audio acceptance immediately; it must not mean that
         # a partially cancelled socket close has already completed. All abort
         # callers join one independently owned cleanup instead of skipping it.
+        self._hypothesis_diagnostics.finish(disposition="aborted")
         if self._abort_task is None:
             self.closed = True
             self._abort_task = asyncio.create_task(self._abort_cleanup())
@@ -894,6 +930,8 @@ class DashScopeSTTStream:
                 raise ProviderError("provider_schema_invalid", "ASR sentence flags are invalid.", retryable=True)
             if not sentence.get("heartbeat"):
                 self._consume_sentence(sentence)
+        elif event == "task-finished":
+            self._hypothesis_diagnostics.finish()
         return event
 
     def _consume_sentence(self, sentence: Dict[str, Any]) -> None:
@@ -912,6 +950,11 @@ class DashScopeSTTStream:
             raise ProviderError("provider_schema_invalid", "ASR sentence text is invalid or too large.", retryable=True)
         text = raw_text.strip()
         self._text_seen |= bool(text)
+        if text:
+            if key is None:
+                self._unkeyed_text_seen = True
+            else:
+                self._observed_text_keys.add(key)
         end = sentence.get("end_time")
         valid_end = type(end) is int and end >= 0
         # Paraformer can omit the sentence end while providing word timings.
@@ -988,6 +1031,8 @@ class DashScopeSTTStream:
                 if (self._partial_sentence_key is not None and self._partial_sentence_key[0] == "id"
                         and sentence_id < self._partial_sentence_key[1]):
                     self._preview_revision += 1
+                    self._hypothesis_diagnostics.observe(key, text=text,
+                        start_ms=begin if valid_begin else None, end_ms=end if valid_end else None, final=False)
                     return
             elif self._partial_sentence_key is not None and key != self._partial_sentence_key:
                 # Without an explicit ID there is no proof whether this is a
@@ -1000,6 +1045,9 @@ class DashScopeSTTStream:
             self.partial_segment = segment
             self._partial_sentence_key = key
             self._has_unstable_tail = True
+        self._hypothesis_diagnostics.observe(key, text=text,
+            start_ms=begin if valid_begin else None, end_ms=end if valid_end else None,
+            final=bool(sentence.get("sentence_end")))
 
     def _trace_sentence(self, segment: TranscriptSegment, *, final: bool) -> None:
         record_stt_sentence(interview_id=self.request.interview_id, turn_id=self.request.turn_id,

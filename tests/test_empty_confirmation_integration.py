@@ -11,10 +11,15 @@ from test_automatic_turn_integration import (
     _VOICE, _CONTINUATION, _PREFIX,
 )
 from test_evidence_owner_recovery_integration import _wait_until
-from test_spoken_supplement_integration import _synthetic_tts, _speaking, _finish_playback
+from test_spoken_supplement_integration import (
+    _synthetic_tts, _speaking, _finish_playback, _synthetic_confirmed_understanding,
+    _audio_aligned_transcripts,
+)
 
 
 def test_no_word_noise_after_finish_does_not_reask_or_recompute_or_duplicate_recording(tmp_path, monkeypatch):
+    _synthetic_confirmed_understanding(monkeypatch)
+    _audio_aligned_transcripts(monkeypatch, [_PREFIX, "没有补充了。", ""])
     original_finish = MockSTTStream.finish
     empty_completions, replies = [], []
     async def finish(stream):
@@ -25,19 +30,21 @@ def test_no_word_noise_after_finish_does_not_reask_or_recompute_or_duplicate_rec
         empty_completions.append(stream.stream_id)
         return [StreamingSTTEvent(stream_id=stream.stream_id, sequence=stream.sequence,
             type="transcript.empty", is_final=True, provider=stream.provider)]
-    async def classify(self, reply, organization_id):
+    async def classify(self, reply, organization_id, **context):
         replies.append(reply)
         return {"intent": "finish", "confidence": .98, "evidence_quote": reply}
     monkeypatch.setattr(MockSTTStream, "finish", finish)
     monkeypatch.setattr(ConversationUnderstandingService, "classify_supplement_reply", classify)
     async def scenario():
-        async with _automatic_session(tmp_path, monkeypatch, [_PREFIX, "没有补充了。", ""], spoken_confirmation=True) as (store, runtime, channel, managed):
+        async with _automatic_session(tmp_path, monkeypatch, [""], spoken_confirmation=True) as (store, runtime, channel, managed):
             spoken = _synthetic_tts(runtime)
             endpoint, clock = managed._answer_endpoint, _Clock()
             endpoint.clock = clock
             prepared, release = [], asyncio.Event()
             original_prepare = managed.chain.prepare_decision
             async def slow(final, **kwargs):
+                if kwargs.get("semantic_first") and not kwargs.get("completion_confirmed"):
+                    return await original_prepare(final, **kwargs)
                 prepared.append(final.text)
                 await release.wait()
                 return await original_prepare(final, **kwargs)
@@ -49,6 +56,9 @@ def test_no_word_noise_after_finish_does_not_reask_or_recompute_or_duplicate_rec
             await _feed(managed._ingress, _CONTINUATION, 5)
             clock.value += 1
             await _wait_until(lambda: len(prepared) == 1)
+            # The played question has already cut an empty stream to establish
+            # its fresh-reply boundary. Only the next cut belongs to this noise.
+            empty_before_noise = len(empty_completions)
             # Acoustic input revokes completion. The actual server stream must
             # finish cleanly before the old preparation may rejoin the commit.
             await _feed(managed._ingress, _VOICE, 5)
@@ -59,7 +69,8 @@ def test_no_word_noise_after_finish_does_not_reask_or_recompute_or_duplicate_rec
             release.set()
             await _wait_until(lambda: len(_current(runtime)["answers"]) == 1)
             await _wait_until(lambda: all(c["status"] == "completed" for c in store.evidence_commands.values()))
-            assert len(empty_completions) == 1 and replies == ["没有补充了。"]
+            assert len(empty_completions) == empty_before_noise + 1
+            assert replies == ["没有补充了。"]
             assert spoken == [SUPPLEMENT_SPEECH["check"]] and len(prepared) == 1
             _assert_one_automatic_answer(store, runtime, _PREFIX + "没有补充了。", voice_frames=10, continuation_frames=5)
     asyncio.run(scenario())

@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional
 
 from app.adapters.local_media import pcm_wav_header
@@ -28,6 +31,9 @@ from app.services.private_assets import PrivateAssetImporter
 
 _REFERENCE_PREFIX = "agent-expression://"
 _ALLOWED_PURPOSES = frozenset({"agent_expression_audio", "question_speech"})
+_ARCHIVE_SLOTS = threading.BoundedSemaphore(4)
+_ARCHIVE_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="expression_archive")
+_LOG = logging.getLogger(__name__)
 
 
 def expression_audio_reference(file_id: str) -> str:
@@ -102,11 +108,72 @@ class AgentExpressionAudioService:
         if result is None:
             return None
         pcm, sample_rate_hz, channels = result
-        return self.store_pcm(
+        return await self.store_pcm_async(
             organization_id=request.organization_id, interview_id=interview_id, turn_id=turn_id,
             pcm_s16le=pcm, sample_rate_hz=sample_rate_hz, channels=channels,
             source_type="tts_complete_pcm",
         )
+
+    async def store_pcm_async(self, *, timeout_s: float = 10.0, **audio: Any) -> Dict[str, Any]:
+        """Bound blocking storage without blocking capture or losing late assets.
+
+        Cancelling a Python waiter cannot stop a storage thread. Keep that task
+        owned, and delete any late successful asset rather than publishing an
+        archive reference after its output has already failed or been revoked.
+        """
+        return await self._store_async(self.store_pcm, timeout_s=timeout_s, **audio)
+
+    async def _store_async(self, operation, *, timeout_s: float = 10.0, **payload: Any) -> Dict[str, Any]:
+        if not _ARCHIVE_SLOTS.acquire(blocking=False):
+            raise ApiError("AGENT_AUDIO_ARCHIVE_BUSY", "Speech archive capacity is busy.", status_code=503)
+        state = {"cancelled": False, "result": None}
+        lock = threading.Lock()
+
+        def discard(result):
+            try:
+                self._discard_unpublished(result["audio_uri"], payload["organization_id"])
+            except Exception as exc:
+                _LOG.warning("Expression archive cleanup failed: error_type=%s", type(exc).__name__)
+            finally:
+                _ARCHIVE_SLOTS.release()
+
+        def store():
+            try:
+                result = operation(**payload)
+            except BaseException:
+                _ARCHIVE_SLOTS.release()
+                raise
+            with lock:
+                state["result"] = result
+                cancelled = state["cancelled"]
+            if cancelled:
+                discard(result)
+            return result
+
+        # Cleanup lives in the same bounded executor, including after the
+        # event loop shuts down. Cancellation cannot abandon a storage thread.
+        task = asyncio.wrap_future(_ARCHIVE_EXECUTOR.submit(store))
+        task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        try:
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=max(0.01, timeout_s))
+        except BaseException:
+            with lock:
+                state["cancelled"] = True
+                late = state.pop("result", None)
+            if late is not None:
+                _ARCHIVE_EXECUTOR.submit(discard, late)
+            raise
+        _ARCHIVE_SLOTS.release()
+        return result
+
+    def _discard_unpublished(self, audio_uri: str, organization_id: str) -> None:
+        file_id = audio_uri.removeprefix(_REFERENCE_PREFIX)
+        with self.persistence.transaction(organization_id) as transaction:
+            asset = transaction.file_objects.get(file_id)
+            if asset is None:
+                return
+            self.storage.delete(asset["object_key"])
+            transaction.file_objects.delete(file_id, expected_version=asset["version"])
 
     def store_pcm(
         self,
@@ -172,7 +239,7 @@ class AgentExpressionAudioService:
                 "duration_ms": duration_ms,
             }
         content, _ = await self.importer.audio(str(audio_uri), content_type)
-        return self._store(
+        return await self._store_async(self._store,
             organization_id=organization_id,
             interview_id=interview_id,
             turn_id=turn_id,

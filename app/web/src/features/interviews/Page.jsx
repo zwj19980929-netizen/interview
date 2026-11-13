@@ -5,6 +5,7 @@ import { createAppointmentAndInvite } from "../../../interviews/appointment.js";
 import { useWorkbench } from "../../core/WorkbenchProvider.jsx";
 import { Empty, Field, ModalForm, Status, formatDate } from "../../core/ui.jsx";
 import { createEnterpriseInterviewMonitor } from "./agent-monitor.js";
+import { invitationFailure } from "./invitation-failure.js";
 import InterviewReview, { useInterviewReview } from "./Review.jsx";
 
 export default function InterviewsPage() {
@@ -103,9 +104,9 @@ function InterviewList() {
         if (result.inviteError) {
           openModal({
             title: "预约已保留，邀请待重试",
-            body: <RetryInvite appointment={result.appointment} />,
+            body: <RetryInvite appointment={result.appointment} inviteError={result.inviteError} />,
           });
-          toast("预约已保留", result.inviteError.message, "error");
+          toast("预约已保留", invitationFailure(result.inviteError).title, "error");
         } else {
           openModal({
             title: "候选人邀请",
@@ -326,10 +327,11 @@ function AppointmentForm({ data, request, API, onDone }) {
   </ModalForm>;
 }
 
-function RetryInvite({ appointment }) {
+function RetryInvite({ appointment, inviteError }) {
   const { API, request, openModal, toast } = useWorkbench();
   const pending = useRef(false);
   const [busy, setBusy] = useState(false);
+  const [failure, setFailure] = useState(() => invitationFailure(inviteError));
   const retry = async () => {
     if (pending.current) return;
     pending.current = true;
@@ -341,14 +343,22 @@ function RetryInvite({ appointment }) {
       );
       openModal({ title: "候选人邀请", body: <InvitationLink invitation={invitation} /> });
     } catch (error) {
-      toast("邀请仍未就绪", error.message, "error");
+      const nextFailure = invitationFailure(error);
+      setFailure(nextFailure);
+      toast("邀请签发失败", nextFailure.title, "error");
     } finally {
       pending.current = false;
       setBusy(false);
     }
   };
   return <div>
-    <p>预约已经安全保存，不会重复创建。readiness 就绪后可重试。</p>
+    <p>预约已经安全保存，不会重复创建。</p>
+    <section role="alert" aria-label="邀请签发失败原因">
+      <strong>{failure.title}</strong>
+      <p>{failure.message}</p>
+      {failure.checks.length > 0 && <ul>{failure.checks.map((check, index) =>
+        <li key={index}><strong>{check.label}：</strong>{check.message}</li>)}</ul>}
+    </section>
     {busy && <p role="status">正在检查模型服务并签发邀请，可能需要约 30 秒，请勿重复点击。</p>}
     <button className="button button-primary" disabled={busy} onClick={retry}>{busy ? "正在检查模型服务…" : "重试签发邀请"}</button>
   </div>;
@@ -449,14 +459,18 @@ function LiveInterview() {
 
   if (!interview) return <Empty title="面试不可用" copy="未找到指定会话" />;
 
-  const current = interview.turns?.find((item) => item.id === interview.current_turn_id);
+  const persistedCurrent = interview.turns?.find((item) => item.id === interview.current_turn_id);
+  const current = monitorState.session
+    ? monitorState.session.current_question && { ...monitorState.session.current_question,
+      id: monitorState.session.current_question.turn_id, question_spoken_text: monitorState.session.current_question.question_text }
+    : persistedCurrent;
   const persistedStatus = review?.status || monitorState.session?.status || interview.status;
   const effectiveStatus = persistedStatus === "cancelled" && interview.termination_reason === "appointment_window_expired"
     ? "expired"
     : persistedStatus;
   const activeTakeover = monitorState.takeover?.status === "active";
   const ownsTakeover = activeTakeover && monitorState.takeover?.actor_id === auth?.actor_id;
-  const latestCaption = [...monitorState.captions].reverse().find((item) => item.text);
+  const latestCaption = [...monitorState.captions].reverse().find((item) => item.text && item.turnId === current?.id);
   const capture = monitorState.session?.media_capture;
   const hasVideo = Boolean(monitorState.candidateStream?.getVideoTracks?.().length);
   const hasAudio = Boolean(monitorState.candidateStream?.getAudioTracks?.().length);
@@ -561,7 +575,7 @@ function LiveInterview() {
       <aside className="session-panel enterprise-agent-panel">
         <div className="question-panel">
           <p className="eyebrow">{current?.is_followup ? "受控追问" : "当前问题"}</p>
-          <h2>{current?.question_spoken_text || monitorState.session?.current_question?.question_text || "当前没有待答题目"}</h2>
+          <h2>{current?.question_spoken_text || "当前没有待答题目"}</h2>
           <div className="enterprise-live-caption" aria-live="polite">
             <small>服务端权威转写</small>
             <p>{latestCaption?.text || "候选人开口后，实时字幕会显示在这里。"}</p>

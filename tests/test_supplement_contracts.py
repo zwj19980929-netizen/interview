@@ -1,5 +1,6 @@
 import asyncio
 import json
+from copy import deepcopy
 
 import httpx
 import pytest
@@ -14,29 +15,53 @@ from app.services.conversation_understanding import ConversationUnderstandingSer
 from test_dashscope_provider import make_provider, context
 
 
+@pytest.mark.parametrize("kind", ["check", "continue", "clarify"])
+def test_new_supplement_approval_uses_central_version_and_keeps_frozen_history(kind):
+    from app.core.prompt.contracts import SUPPLEMENT_SPEECH, SUPPLEMENT_SPEECH_VERSION
+    from app.services.interview_agent import InterviewAgentRuntime
+    from test_interview_agent_contracts import _runtime_session
+
+    store = InMemoryStore()
+    session = _runtime_session(store)
+    runtime = InterviewAgentRuntime(store)
+    arguments = {"act_type": "supplement_" + kind, "text": SUPPLEMENT_SPEECH[kind],
+        "turn_id": "turn_1", "evidence_quotes": [], "approved_by": "synthetic",
+        "organization_id": "org_default"}
+    current = runtime._approve_conversation_act(session["id"], **arguments)
+    assert current.prompt_version == SUPPLEMENT_SPEECH_VERSION == "supplement_confirmation.v2"
+    assert runtime._approve_conversation_act(session["id"], **arguments).act_id == current.act_id
+
+    legacy_arguments = {**arguments, "text": "历史补充话语。", "prompt_version": "supplement_confirmation.v1"}
+    legacy = runtime._approve_conversation_act(session["id"], **legacy_arguments)
+    replay = runtime._approve_conversation_act(session["id"], **{**arguments, "text": legacy.text})
+    assert replay.act_id == legacy.act_id and replay.prompt_version == "supplement_confirmation.v1"
+    saved = runtime.interviews.get_interview(session["id"])["turns"][0]["conversation_acts"]
+    assert [item["prompt_version"] for item in saved] == [SUPPLEMENT_SPEECH_VERSION, "supplement_confirmation.v1"]
+
+
 @pytest.mark.parametrize("change", [
     {"intent": "yes"}, {"confidence": 2}, {"evidence_id": " "},
     {"unknown": "field"}, {"intent": None}, {"confidence": True}, {"evidence_id": "E999"},
 ])
 def test_confirmation_reply_has_strict_nonempty_bounded_contract(change):
     contract = prompt_contract("supplement_reply", {"reply": "没有补充"})
-    assert contract.version == "supplement_reply.v3"
+    assert contract.version == "supplement_reply.v11"
     with pytest.raises(StructuredResponseValidationError):
-        validate_structured_response({"intent": "finish", "confidence": 0.9, "evidence_id": "E1", **change}, contract.response_schema)
+        validate_structured_response({"intent": "finish", "confidence": 0.9, "evidence_id": "E1", "reply_text": "", "answer_effect": "unchanged", **change}, contract.response_schema)
 
 
 def test_confirmation_understanding_has_traceable_version_and_ignores_old_control_intents():
     context = {"transcript": "我还没有说完。有补充。用探针核验状态。没有补充了。", "capability_points": ["探针"], "completion_confirmed": True}
     contract = prompt_contract("interview_turn_understanding", context)
-    assert contract.version == "interview_turn_understanding.v9"
+    assert contract.version == "interview_turn_understanding.v107"
     assert "不作为能力主张或评分证据" in "".join(m.content for m in contract.messages)
-    assert prompt_contract("interview_turn_decision", context).version == "interview_turn_decision.v8"
+    assert prompt_contract("interview_turn_decision", context).version == "interview_turn_decision.v138"
 
 
 def test_reply_evidence_cannot_be_invented_even_after_valid_json():
     class Gateway:
         async def invoke(self, capability, request):
-            return ChatJSONResponse(data={"intent": "finish", "confidence": 0.99, "evidence_id": "E999"},
+            return ChatJSONResponse(data={"intent": "finish", "confidence": 0.99, "evidence_id": "E999", "reply_text": "", "answer_effect": "unchanged"},
                 usage=Usage(), provider=ProviderMeta(provider_id="fake", model="fake", request_id="test", latency_ms=0))
     async def scenario():
         service = ConversationUnderstandingService(InMemoryStore(), gateway=Gateway())
@@ -45,13 +70,23 @@ def test_reply_evidence_cannot_be_invented_even_after_valid_json():
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("version", ["supplement_reply.v1", "supplement_reply.v2", "supplement_reply.v3"])
+@pytest.mark.parametrize("version", ["supplement_reply.v1", "supplement_reply.v2", "supplement_reply.v3", "supplement_reply.v4", "supplement_reply.v5", "supplement_reply.v6", "supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10", "supplement_reply.v11", "supplement_reply.v12"])
 def test_supplement_versions_remain_readable_in_mock_and_invocation_audit(version):
     from app.providers.mock.provider import MockProvider
 
     async def scenario():
         contract = prompt_contract("supplement_reply", {"reply": "我说的内容和字幕不一样。"})
-        schema = contract.response_schema if version == "supplement_reply.v3" else supplement_reply_canonical_schema()
+        schema = deepcopy(supplement_reply_canonical_schema() if version in {
+            "supplement_reply.v1", "supplement_reply.v2"} else contract.response_schema)
+        if version not in {"supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10", "supplement_reply.v11", "supplement_reply.v12"}:
+            schema["required"].remove("answer_effect")
+            schema["properties"].pop("answer_effect")
+            schema["properties"]["intent"]["enum"].remove("confirmation_unchanged")
+        if version not in {"supplement_reply.v6", "supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10", "supplement_reply.v11", "supplement_reply.v12"}:
+            # Historical contracts never required generated conversation text.
+            schema["required"].remove("reply_text")
+            for key in ("reply_text", "repeat_target"):
+                schema["properties"].pop(key)
         request = ChatJSONRequest(purpose="interview_turn_understanding", messages=contract.messages,
             json_schema=schema, metadata={"prompt_version": version})
         response = await MockProvider().invoke("llm.chat_json", request, context("llm.chat_json", "mock-json"))
@@ -80,13 +115,13 @@ def test_transcription_dispute_uses_versioned_contract_without_relaxing_evidence
         async def invoke(self, capability, request):
             seen.append(request)
             return ChatJSONResponse(data={"intent": "unclear", "confidence": .98,
-                "evidence_id": "E1"}, usage=Usage(),
+                "evidence_id": "E1", "reply_text": "你可以说一下需要更正的内容。", "answer_effect": "uncertain"}, usage=Usage(),
                 provider=ProviderMeta(provider_id="synthetic", model="synthetic", request_id="synthetic", latency_ms=0))
 
     result = asyncio.run(ConversationUnderstandingService(InMemoryStore(), gateway=Gateway()).classify_supplement_reply(reply, "org_default"))
     assert result["intent"] == "unclear" and result["evidence_quote"] in reply
-    assert seen[0].metadata["prompt_version"] == "supplement_reply.v3"
-    assert set(seen[0].json_schema["required"]) == {"intent", "confidence", "evidence_id"}
+    assert seen[0].metadata["prompt_version"] == "supplement_reply.v11"
+    assert set(seen[0].json_schema["required"]) == {"intent", "answer_effect", "confidence", "evidence_id", "reply_text"}
     assert seen[0].json_schema["additionalProperties"] is False
     system = "".join(message.content for message in seen[0].messages if message.role == "system")
     assert "优先unclear" in system and "假设或引用用户投诉" in system and "消除了争议" in system
@@ -101,7 +136,7 @@ def test_native_400_uses_one_json_object_attempt_and_keeps_full_schema_validatio
         seen.append(payload)
         if len(seen) == 1:
             return httpx.Response(400, json={"error": {"message": "invalid schema sensitive-prompt-secret"}})
-        data = {"intent": "finish", "confidence": 0.95, "evidence_id": "E1"}
+        data = {"intent": "finish", "confidence": 0.95, "evidence_id": "E1", "reply_text": "", "answer_effect": "unchanged"}
         if invalid:
             data["unsafe_extra"] = "not allowed"
         return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(data)}}]})
@@ -149,18 +184,18 @@ def test_long_reply_restores_only_referenced_verbatim_evidence_with_bounded_infe
             assert request.execution_budget.max_provider_retries == 0
             assert request.execution_budget.timeout_s == 8
             assert "evidence_quote" not in request.json_schema["properties"]
-            return ChatJSONResponse(data={"intent": "finish", "confidence": .98, "evidence_id": last_id},
+            return ChatJSONResponse(data={"intent": "finish", "confidence": .98, "evidence_id": last_id, "reply_text": "", "answer_effect": "updated"},
                 usage=Usage(), provider=ProviderMeta(provider_id="synthetic", model="synthetic", request_id="synthetic", latency_ms=0))
     result = asyncio.run(ConversationUnderstandingService(InMemoryStore(), gateway=Gateway()).classify_supplement_reply(reply, "org_default"))
     assert result["evidence_quote"] == refs["evidence"][last_id]
     assert result["evidence_quote"] in reply and len(result["evidence_quote"]) <= 240
-    assert set(result) == {"intent", "confidence", "evidence_quote"}
+    assert set(result) == {"intent", "answer_effect", "confidence", "evidence_quote", "reply_text", "repeat_target"}
 
 
 def test_schema_diagnostics_identify_rule_without_including_rejected_value():
     contract = prompt_contract("supplement_reply", {"reply": "没有了"})
     request = ChatJSONRequest(purpose="interview_turn_understanding", messages=contract.messages, json_schema=contract.response_schema)
-    response = ChatJSONResponse(data={"intent": "finish", "confidence": "private-response-value", "evidence_id": "E1"},
+    response = ChatJSONResponse(data={"intent": "finish", "confidence": "private-response-value", "evidence_id": "E1", "reply_text": "", "answer_effect": "unchanged"},
         usage=Usage(), provider=ProviderMeta(provider_id="synthetic", model="synthetic", request_id="synthetic", latency_ms=0))
     with pytest.raises(ProviderError) as result:
         ModelGateway(InMemoryStore())._validate_response("llm.chat_json", request, response)
@@ -174,7 +209,7 @@ def test_followup_speaks_validated_question_without_repeating_hesitant_evidence(
     result = ConversationUnderstandingService(InMemoryStore())._approved_followup_selection(
         {"id": "turn_synthetic", "followup_depth": 0},
         {"selected": True, "evidence_quote": quote, "question_text": question, "target_capability_points": ["状态管理"]},
-        {"policy": {"max_probe_chars": 300}, "root_turn_id": "turn_synthetic"},
+        {"policy": {"max_probe_chars": 300}, "root_turn_id": "turn_synthetic", "missing_targets": ["状态管理"]},
         provider={"provider_id": "synthetic"}, prompt_version="interview_turn_decision.v8",
     )
     assert result["question_text"] == question

@@ -252,6 +252,178 @@ def test_livekit_ingress_yields_to_sink_when_audio_iterator_is_eager() -> None:
     asyncio.run(scenario())
 
 
+def test_livekit_ingress_burst_with_cooperative_sink_drains_without_dropping_frames(caplog) -> None:
+    caplog.set_level("INFO", logger="app.adapters.livekit_audio_ingress")
+    async def scenario() -> None:
+        room = _FakeRoom()
+        received = []
+        frames = [_FakeFrame(index.to_bytes(2, "little") * 320) for index in range(600)]
+
+        async def collect_frame(frame):
+            # The real Evidence/STT pipeline has multiple scheduling points.
+            # Yielding is not a stalled network or a slow consumer.
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            received.append((frame.sequence, frame.pcm_s16le))
+
+        stream = _FakeAudioStream(frames)
+        ingress = LiveKitCandidateAudioIngress(
+            _media_plane(),
+            LiveKitAudioIngressBinding("interview-1", "candidate:connection_1", "evidence:interview-1"),
+            on_audio_frame=collect_frame,
+            room_factory=lambda: room,
+            audio_stream_factory=lambda _track: stream,
+            audio_track_validator=lambda _track: True,
+        )
+        await ingress.connect()
+        room.emit("track_subscribed", object(), _publication(), _participant())
+        try:
+            await asyncio.wait_for(ingress._track_task, timeout=1)
+            assert received == [(index + 1, frame.data) for index, frame in enumerate(frames)]
+            assert ingress._sink_queue_capacity_frames == 250
+            assert ingress._sink_state.accepted_sequence == 600
+            assert ingress._sink_state.delivered_sequence == 600
+            assert await ingress.drain(timeout_seconds=0.1) == 600
+            assert ingress.last_track_failure is None
+            assert stream.closed
+        finally:
+            await ingress.close()
+
+    asyncio.run(scenario())
+    messages = [record.message for record in caplog.records if record.message.startswith("livekit_sink_backpressure")]
+    assert any("outcome=waiting" in message for message in messages)
+    assert any("outcome=recovered" in message for message in messages)
+    assert all("outcome=timed_out" not in message for message in messages)
+    assert all("queue_capacity=250" in message and "wait_ms=" in message for message in messages)
+    assert all("interview-1" not in message and "candidate:" not in message for message in messages)
+
+
+async def _saturated_ingress(sink):
+    room = _FakeRoom()
+    stream = _FakeAudioStream([_FakeFrame(b"\x00\x00" * 320) for _ in range(80)])
+    ingress = LiveKitCandidateAudioIngress(
+        _media_plane(),
+        LiveKitAudioIngressBinding("interview-1", "candidate:connection_1", "evidence:interview-1"),
+        on_audio_frame=sink, room_factory=lambda: room,
+        audio_stream_factory=lambda _track: stream, audio_track_validator=lambda _track: True,
+        sink_backpressure_seconds=0.25,
+    )
+    await ingress.connect()
+    room.emit("track_subscribed", object(), _publication(), _participant())
+
+    async def saturated():
+        while ingress._sink_state is None or ingress._sink_state.congested_at is None:
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(saturated(), timeout=1)
+    return ingress, stream
+
+
+def test_livekit_ingress_sustained_slow_sink_cannot_renew_congestion_budget_per_frame(caplog) -> None:
+    async def scenario():
+        received = []
+
+        async def slow_sink(frame):
+            await asyncio.sleep(0.035)
+            received.append(frame.sequence)
+
+        ingress, stream = await _saturated_ingress(slow_sink)
+        try:
+            assert ingress._sink_queue_capacity_frames == 13
+            with pytest.raises(LiveKitAudioIngressBackpressureError, match="backpressure budget"):
+                await asyncio.wait_for(ingress._track_task, timeout=0.8)
+            assert 1 <= len(received) < 13
+            assert received == list(range(1, len(received) + 1))
+            assert stream.closed
+        finally:
+            await ingress.close()
+
+    asyncio.run(scenario())
+    assert "outcome=timed_out" in caplog.text
+    assert "queue_capacity=13" in caplog.text
+
+
+def test_livekit_ingress_full_queue_preserves_sink_failure_and_wakes_drain(caplog) -> None:
+    async def scenario():
+        release = asyncio.Event()
+        failure = RuntimeError("synthetic private provider detail must not be logged")
+
+        async def failed_sink(_frame):
+            await release.wait()
+            raise failure
+
+        ingress, stream = await _saturated_ingress(failed_sink)
+        try:
+            state = ingress._sink_state
+            watermark = state.accepted_sequence
+            draining = asyncio.create_task(ingress.drain(timeout_seconds=1))
+            await asyncio.sleep(0)
+            assert not draining.done()
+            release.set()
+            results = await asyncio.wait_for(asyncio.gather(ingress._track_task, draining, return_exceptions=True), timeout=0.2)
+            assert all(result is failure for result in results)
+            assert state.accepted_sequence == watermark
+            assert state.delivered_sequence == 0
+            assert stream.closed
+            assert state.task.done()
+        finally:
+            await ingress.close()
+
+    asyncio.run(scenario())
+    assert "synthetic private provider detail" not in caplog.text
+
+
+def test_livekit_ingress_close_cancels_full_queue_wait_without_accepting_an_extra_frame() -> None:
+    async def scenario():
+        never = asyncio.Event()
+
+        async def blocked_sink(_frame):
+            await never.wait()
+
+        ingress, stream = await _saturated_ingress(blocked_sink)
+        state = ingress._sink_state
+        track_task = ingress._track_task
+        watermark = state.accepted_sequence
+        draining = asyncio.create_task(ingress.drain(timeout_seconds=1))
+        await asyncio.sleep(0)
+        await asyncio.wait_for(ingress.close(), timeout=0.2)
+        results = await asyncio.wait_for(asyncio.gather(draining, return_exceptions=True), timeout=0.2)
+        assert isinstance(results[0], asyncio.CancelledError)
+        assert track_task.cancelled() and state.task.cancelled()
+        assert state.accepted_sequence == watermark
+        assert state.delivered_sequence == 0
+        assert stream.closed
+
+    asyncio.run(scenario())
+
+
+def test_livekit_ingress_full_queue_drain_only_seals_its_accepted_watermark() -> None:
+    async def scenario():
+        release = asyncio.Event()
+        received = []
+
+        async def held_sink(frame):
+            await release.wait()
+            await asyncio.sleep(0)
+            received.append(frame.sequence)
+
+        ingress, _stream = await _saturated_ingress(held_sink)
+        try:
+            target = ingress._sink_state.accepted_sequence
+            assert target < 80
+            draining = asyncio.create_task(ingress.drain(timeout_seconds=1))
+            await asyncio.sleep(0)
+            release.set()
+            assert await draining == target
+            assert ingress._sink_state.delivered_sequence >= target
+            await asyncio.wait_for(ingress._track_task, timeout=1)
+            assert received == list(range(1, 81))
+        finally:
+            await ingress.close()
+
+    asyncio.run(scenario())
+
+
 def test_livekit_ingress_drain_waits_for_the_accepted_frame_watermark() -> None:
     async def scenario() -> None:
         room = _FakeRoom()

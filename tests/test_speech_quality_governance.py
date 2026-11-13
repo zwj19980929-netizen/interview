@@ -81,6 +81,23 @@ def test_clarification_focus_is_original_speech_and_cannot_invent_a_term():
         resolve_understanding_references(wire, refs)
 
 
+def test_identical_evidence_text_keeps_occurrence_offsets_for_company_exclusion():
+    text = "这家公司做什么？我用幂等键。这家公司做什么？"
+    refs = understanding_references(text, ["幂等键"])
+    question = "这家公司做什么？"
+    assert refs["evidence"]["E1"] == refs["evidence"]["E3"] == question
+    wire = {"company_question": {"evidence_id": "E3", "quote": question},
+            "evidence_ids": ["E3", "E2", "E1"], "claims": [],
+            "covered_point_ids": [], "missing_point_ids": []}
+    before = deepcopy(wire)
+    resolved = resolve_understanding_references(wire, refs)
+    assert resolved["evidence_quotes"] == [question, "我用幂等键。"]
+    assert resolved["company_question"] == {
+        "start": text.rindex(question), "end": len(text), "quote": question,
+    }
+    assert wire == before and refs["offsets"]["E1"] == 0
+
+
 @pytest.mark.anyio
 async def test_targeted_clarification_keeps_capture_and_complete_answer_until_correction():
     capture = Capture()
@@ -107,11 +124,16 @@ async def test_targeted_clarification_keeps_capture_and_complete_answer_until_co
     endpoint.confirmation.floor_returned(endpoint)
     clock.value += 100
     await endpoint.confirmation.step(endpoint, 100)
-    assert len(spoken) == 1 and not commits, "Silence after a clarification cannot accept or endlessly re-ask it"
+    assert spoken == [("answer_clarify", {"focus_quote": "redios"}), ("reception_idle_check", {})]
+    assert endpoint.confirmation.speaking and capture.is_open and not commits
+    endpoint.confirmation.floor_returned(endpoint)
+    clock.value += 600
+    await endpoint.confirmation.step(endpoint, 600)
+    assert len(spoken) == 2 and not commits, "Silence may get one presence check, never acceptance or endless clarification"
     corrected = _final(original.text + "我说的是 Redis，作为缓存，R E D I S。没有了。", confidence=None)
     capture.current_final = corrected
     capture.prepare_impl = None
-    endpoint.speech_started()
+    endpoint.observe_transcript(corrected.text)
     endpoint.confirmation.confirmed = True
     endpoint._proposal_revision = endpoint.revision
     await endpoint._propose(final_snapshot=corrected)

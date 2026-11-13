@@ -15,6 +15,9 @@ class InMemoryStore:
         self.question_speech_assets: Dict[str, Dict[str, Any]] = {}
         self.role_requirements: Dict[str, Dict[str, Any]] = {}
         self.interview_plans: Dict[str, Dict[str, Any]] = {}
+        self.interview_skills: Dict[str, Dict[str, Any]] = {}
+        self.interview_skill_revisions: Dict[str, Dict[str, Any]] = {}
+        self.interview_customizations: Dict[str, Dict[str, Any]] = {}
         self.candidate_profiles: Dict[str, Dict[str, Any]] = {}
         self.resume_documents: Dict[str, Dict[str, Any]] = {}
         self.file_objects: Dict[str, Dict[str, Any]] = {}

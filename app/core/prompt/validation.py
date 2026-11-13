@@ -19,6 +19,15 @@ def validate_structured_response(value: Any, schema: Dict[str, Any]) -> None:
 
 
 def _validate(value: Any, schema: Dict[str, Any], *, path: str) -> None:
+    if "anyOf" in schema:
+        for alternative in schema["anyOf"]:
+            try:
+                _validate(value, alternative, path=path)
+                break
+            except StructuredResponseValidationError:
+                continue
+        else:
+            _fail("does not match any allowed shape", path)
     if "enum" in schema and value not in schema["enum"]:
         _fail("failed enum validation", path)
     schema_type = schema.get("type")
@@ -90,6 +99,7 @@ def _fail(reason: str, path: str) -> None:
         "is above maximum": "maximum",
         "is too short or blank": "min_length",
         "is too long": "max_length",
+        "does not match any allowed shape": "any_of",
     }[reason]
     raise StructuredResponseValidationError(
         "AI response %s at %s." % (reason, path), reason_code=code, schema_path=path,

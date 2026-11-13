@@ -1,4 +1,5 @@
 import { OrderedAgentEventStream } from "./agent-event-runtime.js";
+import { questionFromAct } from "./question-tree.js";
 
 export function createEnterpriseInterviewMonitor({
   apiBase = "/api/v1",
@@ -205,7 +206,12 @@ class EnterpriseMonitorRun {
       this.patch({ captions });
     }
     if (event.type === "conversation.act.selected") {
-      this.patch({ acts: [...this.state.acts, { ...payload, turnId: event.turn_id }].slice(-50) });
+      const currentQuestion = questionFromAct(this.state.session?.current_question, event);
+      this.patch({
+        acts: [...this.state.acts, { ...payload, turnId: event.turn_id }].slice(-50),
+        ...(currentQuestion ? { session: { ...this.state.session,
+          current_turn_id: currentQuestion.turn_id, current_question: currentQuestion } } : {}),
+      });
     }
     if (event.type === "takeover.changed") {
       this.patch({

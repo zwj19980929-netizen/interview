@@ -13,6 +13,8 @@ from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.domain.speech_quality import TranscriptConfidenceSpan
+
 
 class FloorOwner(str, Enum):
     AGENT = "agent"
@@ -88,6 +90,23 @@ class ClientSignal(BaseModel):
         return self
 
 
+class SpeechDialogueDegradation(BaseModel):
+    """An optional expression loss, without any evidence/recovery authority."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    capability: Literal["speech.dialogue_realtime"]
+    fallback: Literal["cascade"]
+    reason_code: Literal[
+        "provider_dialogue_input_overflow", "provider_dialogue_input_timeout", "provider_dialogue_input_failed",
+        "provider_dialogue_event_overflow", "provider_dialogue_response_mismatch", "provider_timeout",
+        "provider_unavailable", "provider_route_missing", "provider_configuration_invalid", "provider_auth_failed",
+        "provider_billing_required", "provider_rate_limited", "provider_circuit_open", "provider_schema_invalid",
+        "provider_audio_unavailable", "provider_stream_closed",
+    ]
+    capture_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
+
+
 class AgentEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -108,6 +127,7 @@ class AgentEvent(BaseModel):
         "avatar.performance.interrupted",
         "avatar.performance.stopped",
         "takeover.changed",
+        "capability.degraded",
         "problem",
         "completed",
     ]
@@ -116,6 +136,14 @@ class AgentEvent(BaseModel):
     occurred_at: str = Field(min_length=1, max_length=64)
     replayability: Replayability
     payload: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def bound_optional_degradation(self) -> "AgentEvent":
+        if self.type == "capability.degraded":
+            SpeechDialogueDegradation.model_validate(self.payload)
+            if self.replayability != Replayability.TRANSIENT:
+                raise ValueError("Auxiliary degradation is a current transient notice")
+        return self
 
 
 class VisemeCue(BaseModel):
@@ -243,6 +271,7 @@ class ConversationUtterance(BaseModel):
     authoritative: bool
     audio_uri: Optional[str] = Field(default=None, max_length=2048)
     stt_confidence: Optional[float] = Field(default=None, ge=0, le=1, allow_inf_nan=False, strict=True)
+    stt_segments: List["TranscriptConfidenceSpan"] = Field(default_factory=list, max_length=12_000)
     source: Literal["server_streaming", "server_batch", "approved_act", "human_intervention"]
     created_at: str = Field(min_length=1, max_length=64)
 
@@ -254,6 +283,16 @@ class ConversationUtterance(BaseModel):
             or not self.audio_uri
         ):
             raise ValueError("authoritative utterance requires server final and persisted audio")
+        if self.stt_segments:
+            if self.source not in {"server_streaming", "server_batch"}:
+                raise ValueError("Speech quality requires a server transcript source")
+            cursor = 0
+            for segment in self.stt_segments:
+                if segment.start != cursor or self.text[segment.start:segment.end] != segment.text:
+                    raise ValueError("Speech quality requires complete exact transcript segments")
+                cursor = segment.end
+            if cursor != len(self.text):
+                raise ValueError("Speech quality requires complete exact transcript segments")
         return self
 
 
@@ -278,9 +317,23 @@ class UnderstandingProblem(BaseModel):
     action: Literal["clarify", "pause"]
     retryable: bool
     reason_code: Optional[Literal[
-        "provider_unavailable", "wire_schema_invalid", "point_duplicates",
+        "provider_unavailable", "provider_timeout", "provider_auth_failed", "provider_billing_required",
+        "provider_rate_limited", "provider_circuit_open", "call_budget_exhausted",
+        "wire_schema_invalid", "point_duplicates", "clarification_targets_conversation_control",
         "point_not_frozen", "point_partition_invalid", "evidence_not_verbatim",
-        "answer_evidence_empty", "claim_evidence_undeclared", "answer_declined_contract_invalid",
+        "answer_evidence_empty", "claim_evidence_undeclared", "answer_declined_contract_invalid", "off_topic_contract_invalid",
+        "semantic_control_contract_invalid",
+        "semantic_current_speech_conflict",
+        "company_question_contract_invalid", "company_question_covers_technical_evidence",
+        "company_question_span_invalid", "clarification_focus_not_verbatim",
+        "clarification_target_contract_invalid",
+        "completion_basis_required", "completion_basis_unexpected", "content_none_has_technical_evidence",
+        "technical_content_claims_missing", "declined_answer_has_technical_content",
+        "declined_answer_completion_scope_invalid", "completion_confidence_insufficient",
+        "completion_action_invalid", "completion_followup_permission_invalid", "finish_answer_without_content",
+        "completion_has_unresolved_ambiguity", "completion_intent_content_mismatch",
+        "semantic_completion_evidence_invalid", "unresolved_answer_contract_invalid",
+        "unresolved_clarification_required", "unresolved_clarification_source_invalid",
     ]] = None
     attempts: int = Field(default=1, ge=1, le=2)
 
@@ -297,23 +350,60 @@ class ClarificationTarget(BaseModel):
         return self
 
 
+class CompletionBasis(BaseModel):
+    """Semantic permission bound to exact server speech, never to silence."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    source: Literal["explicit_server_intent"]
+    evidence_quotes: List[str] = Field(min_length=1, max_length=4)
+
+    @field_validator("evidence_quotes")
+    @classmethod
+    def bounded_unique_quotes(cls, value):
+        if len(value) != len(set(value)) or any(not item.strip() or len(item) > 300 for item in value):
+            raise ValueError("Completion evidence must be bounded, unique and nonempty")
+        return value
+
+
+class CompanyQuestionSpan(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    start: int = Field(ge=0)
+    end: int = Field(ge=1)
+    quote: str = Field(min_length=1, max_length=240)
+
+    @model_validator(mode="after")
+    def exact_range(self):
+        if self.end - self.start != len(self.quote) or not self.quote.strip():
+            raise ValueError("company question span invalid")
+        return self
+
+
 class TurnUnderstanding(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     understanding_id: str = Field(min_length=1, max_length=128)
     revision: int = Field(ge=1)
     # v1 remains readable for immutable historical understandings only.
-    prompt_version: Literal["interview_turn_understanding.v1", "interview_turn_understanding.v2", "interview_turn_understanding.v3", "interview_turn_understanding.v4", "interview_turn_understanding.v5", "interview_turn_understanding.v6", "interview_turn_understanding.v7", "interview_turn_understanding.v8", "interview_turn_understanding.v9", "interview_turn_decision.v1", "interview_turn_decision.v2", "interview_turn_decision.v3", "interview_turn_decision.v4", "interview_turn_decision.v5", "interview_turn_decision.v6", "interview_turn_decision.v7", "interview_turn_decision.v8"]
+    prompt_version: Literal["interview_turn_understanding.v1", "interview_turn_understanding.v2", "interview_turn_understanding.v3", "interview_turn_understanding.v4", "interview_turn_understanding.v5", "interview_turn_understanding.v6", "interview_turn_understanding.v7", "interview_turn_understanding.v8", "interview_turn_understanding.v58", "interview_turn_understanding.v70", "interview_turn_understanding.v82", "interview_turn_understanding.v94", "interview_turn_understanding.v106", "interview_turn_understanding.v44", "interview_turn_understanding.v60", "interview_turn_understanding.v72", "interview_turn_understanding.v84", "interview_turn_understanding.v96", "interview_turn_understanding.v108", "interview_turn_understanding.v9", "interview_turn_understanding.v59", "interview_turn_understanding.v71", "interview_turn_understanding.v83", "interview_turn_understanding.v95", "interview_turn_understanding.v107", "interview_turn_understanding.v45", "interview_turn_understanding.v61", "interview_turn_understanding.v73", "interview_turn_understanding.v85", "interview_turn_understanding.v97", "interview_turn_understanding.v109", "interview_turn_understanding.v10", "interview_turn_decision.v1", "interview_turn_decision.v2", "interview_turn_decision.v3", "interview_turn_decision.v4", "interview_turn_decision.v5", "interview_turn_decision.v6", "interview_turn_decision.v7", "interview_turn_decision.v8", "interview_turn_decision.v9", "interview_turn_understanding.v11", "interview_turn_decision.v10", "interview_turn_understanding.v12", "interview_turn_understanding.v13", "interview_turn_decision.v11", "interview_turn_decision.v12", "interview_turn_understanding.v14", "interview_turn_understanding.v15", "interview_turn_decision.v13", "interview_turn_decision.v14", "interview_turn_understanding.v16", "interview_turn_understanding.v17", "interview_turn_understanding.v18", "interview_turn_understanding.v19", "interview_turn_decision.v15", "interview_turn_decision.v16", "interview_turn_decision.v17", "interview_turn_decision.v18", "interview_turn_understanding.v20", "interview_turn_understanding.v21", "interview_turn_understanding.v22", "interview_turn_understanding.v23", "interview_turn_decision.v19", "interview_turn_decision.v20", "interview_turn_decision.v21", "interview_turn_decision.v22", "interview_turn_decision.v23", "interview_turn_decision.v24", "interview_turn_understanding.v24", "interview_turn_understanding.v25", "interview_turn_understanding.v26", "interview_turn_understanding.v27", "interview_turn_decision.v25", "interview_turn_decision.v26", "interview_turn_decision.v27", "interview_turn_decision.v28", "interview_turn_decision.v29", "interview_turn_decision.v30", "interview_turn_understanding.v28", "interview_turn_understanding.v29", "interview_turn_understanding.v30", "interview_turn_understanding.v31", "interview_turn_decision.v31", "interview_turn_decision.v32", "interview_turn_decision.v33", "interview_turn_decision.v34", "interview_turn_decision.v35", "interview_turn_decision.v36", "interview_turn_decision.v37", "interview_turn_decision.v38", "interview_turn_decision.v39", "interview_turn_decision.v40", "interview_turn_understanding.v32", "interview_turn_understanding.v36", "interview_turn_understanding.v40", "interview_turn_understanding.v50", "interview_turn_understanding.v62", "interview_turn_understanding.v74", "interview_turn_understanding.v86", "interview_turn_understanding.v98", "interview_turn_understanding.v110", "interview_turn_understanding.v118", "interview_turn_understanding.v46", "interview_turn_understanding.v54", "interview_turn_understanding.v66", "interview_turn_understanding.v78", "interview_turn_understanding.v90", "interview_turn_understanding.v102", "interview_turn_understanding.v114", "interview_turn_understanding.v122", "interview_turn_understanding.v33", "interview_turn_understanding.v37", "interview_turn_understanding.v41", "interview_turn_understanding.v51", "interview_turn_understanding.v63", "interview_turn_understanding.v75", "interview_turn_understanding.v87", "interview_turn_understanding.v99", "interview_turn_understanding.v111", "interview_turn_understanding.v119", "interview_turn_understanding.v47", "interview_turn_understanding.v55", "interview_turn_understanding.v67", "interview_turn_understanding.v79", "interview_turn_understanding.v91", "interview_turn_understanding.v103", "interview_turn_understanding.v115", "interview_turn_understanding.v123", "interview_turn_understanding.v34", "interview_turn_understanding.v38", "interview_turn_understanding.v42", "interview_turn_understanding.v52", "interview_turn_understanding.v64", "interview_turn_understanding.v76", "interview_turn_understanding.v88", "interview_turn_understanding.v100", "interview_turn_understanding.v112", "interview_turn_understanding.v120", "interview_turn_understanding.v126", "interview_turn_understanding.v130", "interview_turn_understanding.v48", "interview_turn_understanding.v56", "interview_turn_understanding.v68", "interview_turn_understanding.v80", "interview_turn_understanding.v92", "interview_turn_understanding.v104", "interview_turn_understanding.v116", "interview_turn_understanding.v124", "interview_turn_understanding.v128", "interview_turn_understanding.v132", "interview_turn_understanding.v35", "interview_turn_understanding.v39", "interview_turn_understanding.v43", "interview_turn_understanding.v53", "interview_turn_understanding.v65", "interview_turn_understanding.v77", "interview_turn_understanding.v89", "interview_turn_understanding.v101", "interview_turn_understanding.v113", "interview_turn_understanding.v121", "interview_turn_understanding.v127", "interview_turn_understanding.v131", "interview_turn_understanding.v49", "interview_turn_understanding.v57", "interview_turn_understanding.v69", "interview_turn_understanding.v81", "interview_turn_understanding.v93", "interview_turn_understanding.v105", "interview_turn_understanding.v117", "interview_turn_understanding.v125", "interview_turn_understanding.v129", "interview_turn_understanding.v133", "interview_turn_decision.v41", "interview_turn_decision.v42", "interview_turn_decision.v43", "interview_turn_decision.v44", "interview_turn_decision.v45", "interview_turn_decision.v46", "interview_turn_decision.v47", "interview_turn_decision.v48", "interview_turn_decision.v49", "interview_turn_decision.v50", "interview_turn_decision.v51", "interview_turn_decision.v52", "interview_turn_decision.v53", "interview_turn_decision.v59", "interview_turn_decision.v65", "interview_turn_decision.v71", "interview_turn_decision.v81", "interview_turn_decision.v93", "interview_turn_decision.v105", "interview_turn_decision.v117", "interview_turn_decision.v129", "interview_turn_decision.v141", "interview_turn_decision.v149", "interview_turn_decision.v77", "interview_turn_decision.v85", "interview_turn_decision.v97", "interview_turn_decision.v109", "interview_turn_decision.v121", "interview_turn_decision.v133", "interview_turn_decision.v145", "interview_turn_decision.v153", "interview_turn_decision.v54", "interview_turn_decision.v60", "interview_turn_decision.v66", "interview_turn_decision.v72", "interview_turn_decision.v82", "interview_turn_decision.v94", "interview_turn_decision.v106", "interview_turn_decision.v118", "interview_turn_decision.v130", "interview_turn_decision.v142", "interview_turn_decision.v150", "interview_turn_decision.v78", "interview_turn_decision.v86", "interview_turn_decision.v98", "interview_turn_decision.v110", "interview_turn_decision.v122", "interview_turn_decision.v134", "interview_turn_decision.v146", "interview_turn_decision.v154", "interview_turn_decision.v55", "interview_turn_decision.v61", "interview_turn_decision.v67", "interview_turn_decision.v73", "interview_turn_decision.v83", "interview_turn_decision.v95", "interview_turn_decision.v107", "interview_turn_decision.v119", "interview_turn_decision.v131", "interview_turn_decision.v143", "interview_turn_decision.v151", "interview_turn_decision.v157", "interview_turn_decision.v161", "interview_turn_decision.v79", "interview_turn_decision.v87", "interview_turn_decision.v99", "interview_turn_decision.v111", "interview_turn_decision.v123", "interview_turn_decision.v135", "interview_turn_decision.v147", "interview_turn_decision.v155", "interview_turn_decision.v159", "interview_turn_decision.v163", "interview_turn_decision.v56", "interview_turn_decision.v62", "interview_turn_decision.v68", "interview_turn_decision.v74", "interview_turn_decision.v84", "interview_turn_decision.v96", "interview_turn_decision.v108", "interview_turn_decision.v120", "interview_turn_decision.v132", "interview_turn_decision.v144", "interview_turn_decision.v152", "interview_turn_decision.v158", "interview_turn_decision.v162", "interview_turn_decision.v80", "interview_turn_decision.v88", "interview_turn_decision.v100", "interview_turn_decision.v112", "interview_turn_decision.v124", "interview_turn_decision.v136", "interview_turn_decision.v148", "interview_turn_decision.v156", "interview_turn_decision.v160", "interview_turn_decision.v164", "interview_turn_decision.v57", "interview_turn_decision.v63", "interview_turn_decision.v69", "interview_turn_decision.v89", "interview_turn_decision.v101", "interview_turn_decision.v113", "interview_turn_decision.v125", "interview_turn_decision.v137", "interview_turn_decision.v75", "interview_turn_decision.v91", "interview_turn_decision.v103", "interview_turn_decision.v115", "interview_turn_decision.v127", "interview_turn_decision.v139", "interview_turn_decision.v58", "interview_turn_decision.v64", "interview_turn_decision.v70", "interview_turn_decision.v90", "interview_turn_decision.v102", "interview_turn_decision.v114", "interview_turn_decision.v126", "interview_turn_decision.v138", "interview_turn_decision.v76", "interview_turn_decision.v92", "interview_turn_decision.v104", "interview_turn_decision.v116", "interview_turn_decision.v128", "interview_turn_decision.v140"]
     utterance_id: str = Field(min_length=1, max_length=128)
     intent: Literal[
         "answer",
         "answer_declined",
+        "answer_unresolved",
         "request_repeat",
         "not_finished",
         "pause",
         "clarification_request",
         "off_topic",
+        "company_question",
     ]
+    # Optional solely for immutable historical understandings. The semantic
+    # wire contract requires all four fields on every newly prepared result.
+    answer_content: Optional[Literal["technical", "partial", "none"]] = None
+    turn_intent: Optional[Literal["answering", "thinking", "finish_answer", "finish_topic", "decline_topic", "stop_interview", "repeat", "clarify", "correction", "pause", "ask_company"]] = None
+    company_question: Optional[CompanyQuestionSpan] = None
+    completion_basis: Optional["CompletionBasis"] = None
+    followup_allowed: bool = True
     answer_summary: str = Field(max_length=800)
     claims: List[ClaimEvidence] = Field(default_factory=list, max_length=12)
     evidence_quotes: List[str] = Field(default_factory=list, max_length=12)
@@ -324,7 +414,7 @@ class TurnUnderstanding(BaseModel):
     clarification_target: Optional[ClarificationTarget] = None
     confidence: float = Field(ge=0, le=1)
     suggested_action: Literal[
-        "accept", "clarify", "repeat", "continue_listening", "pause", "followup", "next"
+        "accept", "clarify", "repeat", "continue_listening", "pause", "followup", "next", "respond_company"
     ]
     provider: Dict[str, Any]
     problem: Optional[UnderstandingProblem] = None
@@ -348,6 +438,8 @@ class ApprovedConversationAct(BaseModel):
         "supplement_check",
         "supplement_continue",
         "supplement_clarify",
+        "company_answer",
+        "conversation_acknowledgement",
     ]
     text: str = Field(min_length=1, max_length=1000)
     turn_id: Optional[str] = Field(default=None, max_length=128)

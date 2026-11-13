@@ -1,5 +1,190 @@
 # 领域模型
 
+## 098：辅助降级与表达修复
+
+辅助表达能力不可用与权威证据采集失败是独立事实；降级不结束当前题目、capture或回答，也不能覆盖其他失败状态。纯presence的固定接话只能在当前意图、证据、答案影响及控制冲突验证通过后选择，实际送达仍由正常播放回执确认。
+
+`capability.degraded`为当前会话/turn/capture的辅助能力事实：能力固定为speech.dialogue_realtime，替代路径固定为cascade，原因限批准枚举。它不代表正式答案、确认事实、失权恢复或播放送达，客户端独立投影不能替换其他处理失败。
+
+补充分类定向纠错是绑定实际失败原因及当前来源的进程内请求状态，不是已接受的语义对象、完成事实或额外调用额度。控制冲突与文案违规分别处理，来源变化使旧纠错失效；无新表或DDL，不迁移历史面试、回答或评分。
+
+## 097：补充分类恢复期（实施中）
+
+补充分类的恢复期是当前capture内的一段有界失败处理，不是候选人完成事实，也不是完整技术分析额度。每份完整权威文字在同一显式epoch内至多两次调用；该期总量四次、期限40秒。当前有效分类成功可结束失败期，但不清除逐文本已消耗记录；新的字句、声学活动和供应商切流不能无限续期。显式重试与继续分别维持既有保留/撤销确认语义，控制权、来源和实际送达仍独立核验。全部是进程内状态，无新表、DDL或持久授权字段。
+
+## 096：服务端语义完成证明
+
+新增进程内语义完成证明及独立组合收据，区分语义事实与提交资格：`answer_effect` 表达完整新增回复对已准备答案的影响，`finish+unchanged` 表达当前明确完成，`confirmation_unchanged+unchanged` 仅延续同一条服务端已验证完成事实。原 `PreparedCompletionReceipt` 及其纯控制判断保持；新证明不可从任意字典、裸历史确认布尔值、持久投影或客户端负载构造，不能跨进程恢复为许可。
+
+证明绑定原准备、原及当前完整 final/分段/质量/供应商来源、精确回复边界、实际确认问题的 act/event/performance 与当前捕获/所有权/上下文。新增声音先撤销当前提交资格，随后只凭新 final 及新语义证明组合；真实技术更新、转写修订、来源或控制权变更、上下文变化及不确定语义使复用失效。保留完整音频转写，完成控制和无关附言不新增计分题或能力证据；最终提交仍复验全部事实。无新表、持久权限字段、DDL或历史回答迁移，旧审计版本继续可读。
+
+候选人显式选择继续补充时，同时撤销旧完成final、来源边界事实、语义证明和已确认组合收据；原技术准备仍保存。处理重试不代表继续发言，可以重用仍有效的完成事实；无新增文字的旧final不能复活被显式继续撤销的事实。
+
+## 095：有界恢复交流与合同诊断
+
+当前采集的answer_preparation可选状态clarifying只表达一次恢复提示已经完整送达、可继续说明，不表示Answer/Understanding生成或结束许可。失败预算保持，提示资格在I/O前消费，不随噪声、同文、显式重试或断续播放反复授予。原音频与来源保留；新权威发言经正常权限/语境门禁分析。模型诊断新增白名单contract_detail细分company_question_contract_invalid，保留原aggregate原因与路径，不保存响应正文或改变旧记录；不新增表或DDL。
+
+纠错响应要求显式给出可空的company_question，不改变领域对象含义。理解130–133/决策161–164与本轮早期126–129/157–160及旧版本均可读取；历史记录不迁移，缺失字段不能被补造为公司提问来源。
+
+## 094：解析故障诊断与独立提案
+
+既有ModelInvocation审计JSON追加可空`json_failure_kind`（仅`empty_content`或`invalid_json_object`）和`content_length`（整数0–10000000）；无响应正文、候选原文或凭据。中央Schema错误仍使用原`schema_reason/schema_path`，不能冒充解析故障。成功重试记录真实模型调用次数；批准目录回退沿原`approved_catalog_fallback.v1`和`fallback_reason=provider_schema_invalid`收据，不增加会话状态或将失败输出写入领域对象。无DDL或历史回填。
+
+## 090：预算内的冻结考察范围
+
+新题库计划使用 `interview_assessment.v2`，新增 `assessment_scope`（`session_assessment_scope.v1` / `budgeted_core_competencies.v1`）：`selected_units`、`source_question_counts`、`included_competency_ids`、`excluded_competency_ids`、`available_competency_ids`、`estimated_required_seconds`。范围和能力权重在面试前冻结并参与 hash；完整批准题池、原题单元及来源绑定保留。只有入选单元可用于本场主题，追问继续附属于原根题而不独立计权；旧 v1 不迁移。
+
+新增会话 JSON 事实 `candidate_input_completion_detail`，在预算结束事务记录时间/主题数/题池耗尽的准确触发条件。企业读取可从旧结束时刻和冻结预算作有证据的只读投影，不回填历史。
+
+媒体 capture 增加可选 `finalization_error={code,category,retryable,occurred_at}`，只含安全枚举/原因码；配置缺失与完整性失败不能伪装成供应商仍在处理，成功封存清除错误。Outbox 仍负责尝试次数和死信事实，恢复沿既有幂等接口，不改写已提交答案/评分。无新增表或 DDL。
+
+## 089：主题预算与告别投影
+
+主题为非followup的正式根轮次，岗位和简历来源共用总量；追问是零独立权重子轮次，不占8–10道主题预算。候选原题及其拆分单元属于可选范围，不能自动转成必须全部询问的数量。执行总上限不改写历史冻结合同或既有答案；预算到达后在当前回答完成的边界收口，未考察的能力保持insufficient_evidence，不制造零分或覆盖充分事实。
+
+`candidate_input_completed_at`是候选输入已结束的持久事实，礼貌告别是否仍播放属于独立的连接呈现状态。实时快照可携带仅连接级的`completion_presentation="closing"`，保留完成回执但阻止原前端提前关闭播放器；它不持久化、不使会话重新可作答、不迁移给新连接。最终播放排空或有界失败后正常发出completed。见[接口设计089](api-design.md)和[操作日志089](change-log.md)。
+
+`InterviewSession.execution_question_budget`为可选JSON事实：`policy_version=combined_primary_questions.v1`、`max_root_questions`、`frozen_max_root_questions`、`applied_at`。仅当历史冻结上限超过10时，在首次启动/合法题间生命周期事务写入一次，并追加`interview.question_budget_applied`；它参与规划上下文指纹，不修改冻结合同hash，已终态历史不回填。v2超额且未开始的根题标记`skipped / primary_question_budget_exhausted`，保留权重与已答追问，报告作未评估处理。
+
+规划收据与`agent_runtime.last_planning`可追加安全诊断`selection_strategy=approved_catalog_fallback.v1`及白名单`fallback_reason`；不保存原始供应商响应或异常正文，不改变批准题目的范围。
+
+## 086：退出控制与技术答案分离（仓库与本机已验证）
+
+来源有效的接话结果只允许请求独立退出确认，不形成CandidateAnswer。确认问题实际送达后，新的权威确认回复经分类和owner/capture/final复核，可形成仅进程内的PreparedCandidateExit；它没有技术claims、评分或回答分类。最终事务封存本题原始发言与音频证据为`turn.exit_evidence`并记录退出确认，沿既有END_CANDIDATE_INPUT结束收音。未完成题保留原文供人工复核，不能伪造拒答或零分；报告明确区分已答题与退出时未评估的保留发言。新字段参与媒体保留、隐私清理与租户隔离，无新表或DDL。
+
+## 085：澄清证据来源（仓库与本机已验证）
+
+`content_clarification.v1`的实际送达记录仍是权威来源。联合wire target区分旧疑点已解决、同一旧疑点未解决及新疑点；同一旧疑点只引用服务器固定C1，新疑点引用真实原文E及最小焦点。解析后沿用现有canonical结构，不新增数据库字段或结束权限。新回复与旧请求按实际边界划分，新疑点不能借旧澄清获得完成许可，原始转写不改写。见[085](followup-clarification-085.md)。
+
+## 084：补充交流与完成许可
+
+补充交流决策是仅用于路由的进程内结果，不是TurnUnderstanding或答案提交许可。服务端从当前题真实送达投影not_delivered/awaiting_reply，confirmed只能来自已有确认权限；投影进入准备指纹。未知/不确定自然语言不构成领域错误，也不能生成结束依据。无新表或持久状态字段，见[084](supplement-dialogue-routing-084.md)。
+
+## 083：纠错原因不是理解结果
+
+调用预算中的待接续纠错记录仅属于进程内准备状态：固定原因和摘要必须绑定实际capture/owner、完整STT、业务/交流语境、确认模式及当前合同。它不保存未校验响应，不生成CandidateAnswer、领域理解或完成许可，不持久化也不新增迁移。成功纠正后仍走全部原有结果与提交校验，详见[083](bounded-correction-continuation-083.md)。
+
+## 081：准备生命周期与复用资格
+
+保留准备是绑定完整证据、准备模式和当前capture的进程内纯分析任务，不是完成许可。音频活动只撤销其等待者的推进资格；真实证据/语境/所有权变化仍拒绝旧结果。恢复接回标记只绑定当前revision/capture，正常通知ACK后须重新取权威final；不持久化、不新增会话字段或迁移。未确认分析与最终提交分别校验，详见[081](answer-preparation-cancellation-081.md)。
+
+## 079：模型调用诊断作用域
+
+`ModelCallScope`为进程内诊断上下文，父子作用域及受控取消来源只用于归因，不提供业务权限。既有`ModelInvocationLog` JSON增加非流式`cancelled`终态及可选会话/题目/采集关联、诊断scope/parent、阶段、实际时间预算和取消原因字段。每attempt仍只有一条终态审计；未开始或因调用额度拒绝的业务处理仅写诊断事件，不虚构供应商请求。历史缺字段可读，原会话状态和答案数据不变，无DDL迁移。详见[供应商日志约束](model-provider-plugins.md)及[操作日志079](change-log.md)。
+
+## 078：补充确认组合与处理恢复（仓库与本机已验证）
+
+`PreparedCompletionReceipt`是进程内原准备/原final/送达边界/新纯结束回复的组合证明；不持久化许可、不代替当前owner和完整final核验。`agent_runtime.answer_preparation`增加blocked及白名单诊断stage/reason_code/attempt/max_attempts/retryable。`evidence.retry_processing`只恢复当前失败处理，`continue_speaking`仍表示继续补充。详见[078](answer-recovery-and-reuse-078.md)。
+
+## 077：试音完成与确认输出的阶段边界
+
+非评分试音STT完成后，`awaiting_confirmation`与其校准修订是后续提示音的输入事实；提示音异常不得重置为STT重试。零输出且当前owner/control/capture/修订仍有效的可选提示失败保留显式确认；未知已选中输出沿已有生命周期暂停并保留字幕状态，不代表确认已通过。前端确认还须会话未暂停，不能只看字幕或calibration_status。未新增领域字段或迁移。
+
+## 075：固定提示音与追问音频恢复（已实现）
+
+`agent_runtime.question_audio_recovery`记录当前正式追问音频恢复事实：`status`为`retry_required|retrying`，绑定`turn_id/act_id/selection_event_id/updated_at`；只引用当前服务端批准行为，重试创建同一行为的新选择收据。它不能形成送达或作答证据，真正播放完成后才清除；切题、暂停、接管或失权不得复活旧播放。候选投影仅提供status/turn_id/selection_event_id，不提供内部诊断。
+
+固定提示音是进程内有界优化缓存：只有版本化白名单的试音确认、补充确认与退出确认固定文案可进入，按组织、路由/模型/连接配置指纹、文案版本、音色、语言、格式及合成参数精确匹配；完整验证PCM才发布，重启或失效后后台预热，丢失不改变领域状态。不复用候选录音、动态追问或跨配置音色；命中仍创建新输出身份并经过实际播放回执。无DDL。
+
+## 074：试音确认与表达失败
+
+试音字幕待确认与确认提示音成功是独立事实；零 PCM、当前所有权和当前选择均成立时，提示音失败不得把已取得的试音字幕当作无效证据，也不能自动授予确认。恢复后仍为 `awaiting_confirmation`，不创建正式题、答案或确认许可。会话级 `session_conversation_acts` 复用既有选择与送达回执形状；失败选中记录为 failed，不能当作已送达或正式评分证据。不新增会话状态或 DDL。模型调用诊断增加可空 `vendor_code`、`provider_request_id`、`transport_phase`、`transport_phase_ms`、`transport_elapsed_ms`、`transport_outcome`，仅保存白名单值；调用 token 用量不表示账户剩余额度。详见[074说明](warmup-tts-resilience-074.md)。
+
+## 073：补充确认的送达事实
+
+普通 `answer/off_topic + finish_answer` 表示模型对发言结束的判断，不能单独授权提交；正常语音作答先进入补充询问，当前 owner/turn/capture 下问题实际播完并取得新的服务端语音答复后才可确认。`CompletionBasis` 的逐字来源校验不等同产品确认。此规则取代056普通口头结束不再询问补充的行为。
+
+`SpokenSupplementConfirmation` 的问题待播放与已送达标记是进程内事实；选中、开始播放、超时、打断或仅调用 floor_returned 都不能授予确认。实际播放完成后取得权威 final 固定回复边界；继续补充仍在同一采集内保留内容和已问上下文。明确按钮、拒答/关闭话题、具备实际内容澄清证明的待核实收尾及整场退出继续使用各自门禁。无新持久字段或数据库迁移。见[073说明](supplement-confirmation-stability-073.md)。
+
+## 068：清楚跑题与交互恢复
+
+`ConversationUnderstanding.intent=off_topic` 表示当前发言含义清楚但没有与题意相关的可用回答；与 `clarification_request`、`answer_declined`、`answer_unresolved` 区分。`turn_intent` 仍独立决定是否思考、结束本题或请求退出，所有完成依据仍须当前权威语音来源。原文及可靠 claims 保留，相关技术回答不能因夹带无关叙述被整段丢弃。无新存储字段或迁移。
+
+稳定预览的 15 秒与正式权威 final 的 20 秒期限独立，取代067所述由稳定预览开始共用整轮时限；同词元数据/VAD不续期，显式重试或新权威文本可重建。理解阻断不阻断已选中播放的超时维护。前端控制连接状态与业务答题阶段分开，重连保留题目及退出确认。见[068说明](off-topic-and-reconnect-068.md)。
+
+### INTERACTION-RECOVERY-066（仓库与本机验证完成）
+
+- `TurnUnderstanding.intent=answer_unresolved` 表示候选人已结束本题，但在一次已实际播放的内容澄清后仍存在无法核实的转写；允许 `turn_intent=finish_answer`、禁止自动追问，保留已核实 claims，不等于 `answer_declined`。明确整场退出可用 `stop_interview` 进入065独立确认，无须强迫先完成技术澄清；提交必须校验独立退出收据。
+- 私有 `content_clarification.v1` 证明包含 request_text、focus_quote、reply_text、question_act_id、delivered；实际播放后的权威 final 固定前缀，只有之后的新话语可构成回复。准备及提交均校验当前 capture、批准话术、原文前缀及完整上下文指纹。
+- 回答处理失败属于当前 capture 的恢复状态。自动重试有界，连续失败只提示一次；新文字不会无限重置失败预算。显式重试开始新预算，成功理解清除失败状态。
+- 未核实内容的评分结果不输出数值及能力淘汰结论；报告可正常形成，但标明人工复核。正常低 STT 置信度告警的既有评分规则不变。
+
+065恢复提示：既有agent_runtime.supplement_confirmation.status增加awaiting_exit_reply，仅投影当前场、当前题和capture的等待状态；它不持久化确认许可或代替问题送达证据，owner重建后仍须重新确认。
+
+065：PreparedTurnDecision.exit_confirmation为服务器私有来源绑定语境，包含当前session/turn/capture、question_act_id、确认问题播完时已收到的完整原文、新回复与全文SHA256。确认提交后Turn.candidate_exit_confirmation保存confirmed_at和来源哈希；END_CANDIDATE_INPUT成功后Session.candidate_exit_confirmed_at记录事实。它与普通completion_confirmed独立；缺省字段安全兼容、不需DDL。
+
+064：`reception_exchanges.kind`为可选、受限接话类别；`conversation_input_context.v1`仅是从当前题已选交流及原文位置派生的临时投影，不是新答案或结束授权。准备指纹包括交流回执、关联act内容与选中事件。公共`completion`是既有输入完成事实的安全派生回执，支持评分尚未完成时刷新，非新状态字段。`candidate_input_completed_at`已存在时媒体失败不能重新暂停输入，评分和录制失败各自留存。无DDL迁移；详见[064说明](conversation-intent-and-end-064.md)。
+
+062新增可选 `InterviewTurn.reception_exchanges`：最多六组 `{exchange_id, request_text, request_sha256, act_id, selected_event_id, session_sequence, created_at, source_stream_id}`。`request_text`为经权威final验证的新请求尾部，最多1600字符；只关联同capture/owner/turn的真实选中回应。它是交流上下文，不是CandidateAnswer、评分证据或可听完成证明；旧记录缺字段按空读，不需表迁移。`dialogue_focus`仅供重说解释，不能覆盖当前冻结题目。详见[062说明](multiturn-context-062.md)。
+
+## 060 · 复核和历史来源边界
+
+接话复核是进程内一份`final/revision/capture/kind`记录，不是答案或完成授权；新输入和清理撤销。追问修复只允许替换未批准提案的问句，不能替换理解、目标、理由、原文引用或已有父子题关系。修复结果再次通过当前范围、预算和证据校验后才批准；失败保留理解。
+
+按题历史读取仅选择当前会话内唯一已提交Turn/Answer，返回理解revision及最多12条仍可绑定原文的主张；引用重复时次数保留、位置null，不伪造精确定位。答案来源哈希加入总控提案指纹；后台分数变化不参与该指纹。控制连接代次的等待提示去重属于进程内恢复信息，不增字段或迁移。父子答案、根题一次权重及现有录音事实不变，详见[060说明](agent-autonomy-improvements-060.md)。
+
+## 057 对话状态边界
+
+回答内容与控制意图独立：一句可理解的实际做法即使尚未覆盖rubric也可构成partial claim；后续明确关闭话题不删除该内容。不连贯语音和术语疑问不构成拒答。转场的安抚前缀只根据紧邻的已提交回答，不向更早的拒答或未来轮次寻找依据。
+
+一次静音提醒资格属于当前`SpokenSupplementConfirmation`进程内状态，不是新领域表或答案事实；普通等待与明确thinking/wait分离。候选话语、主读题播放完毕和输入revision共同约束提醒；没有新增数据库字段、迁移或对历史问答的改写。正式追问继续独立子Turn/Answer并关联root/parent。
+
+## 053 · 候选端播放故障与暂停诊断
+
+候选端白名单运行故障通过内部 `PAUSE.runtime_problem_code` 在一个生命周期事务内记录暂停与 `agent_runtime.problems`。首次故障暂停的 `interruption.kind=runtime`；已经手动暂停时不改原始 interruption。每项受限诊断仅保存固定 code/message/action、发生时间、`pause_occurred_at` 和 `pause_epoch`；epoch 使用当前暂停生命周期事件 ID，区分同一秒内恢复后再次暂停。同次暂停同码报告不重复保存，恢复后新的暂停仍可记录同码；记录最多 20 项，无新表或迁移。候选快照只投影当前暂停的单个 `runtime_problem_code`，不给诊断历史或原始错误文本。
+
+## 052：推理准备、结束许可与播放消费事实
+
+`SpeculativeTurnPreparation` 是进程内最多一份、可撤销、有时限的稳定转写准备，不是新的会话状态或持久答案。预览可提前运行理解，只有当前权威 final 的文字、置信度、语言、分段和 Provider 来源全部匹配，且当前 capture / owner / 上下文 / 输入代次仍有效时才可复用结果。准备完成不授权交卷；恢复收听后提交仍需新的完整 final 和音频水位校验。final 新增文字时，即使 VAD 或 partial 没报告续说，也须撤销旧 `confirmed` 及确认快照，重新判断当下意图。
+
+权威 final 的字幕投影只更新展示，先覆盖已有文字再恢复识别，不把自身修正视为新输入。后续真实 partial 或声音仍能撤销旧提案。自然接话采用现有非评分 `conversation_acknowledgement`，不产生能力证据、题目选择或暂停成功事实；企业资料和 Skill 仍各自可选。
+
+`ApprovedSpeechOutput` 的 `producer_finished` 表示供应商和发送端结束；`drained` 表示候选播放器已消费全部源样本且设备输出越过末帧，两者分离。052 的源样本计数不随断供静音增长，替代 012 的 MediaStream 墙钟推断；媒体轨道为录制保留，可听输出由精确绑定的 PCM 播放器承担。没有新表、迁移、评分字段或持久预览缓存。具体实现与验收范围见[052 改造说明](continuous-conversation-052.md)。
+
+## 2026-09-16：计划准备的临时进度（049）
+
+准备进度是一次请求的临时投影，不是新的计划状态或持久任务。复用数据来自已有不可变approved计划，经同组织与来源版本/内容/能力范围校验后复制到新计划，不修改旧计划，也不复用候选人的答案或评分。仍然只有最终事务成功后才产生新计划。没有新表、迁移或候选资料缓存；简历题复用受候选人及简历审查范围约束。
+
+## 2026-09-14：QuestionBankPreparation
+
+新工作台计划保存 `preparation_mode=question_bank`、`approval_source=automatic_preparation`、`role_requirement_id=null` 和 `assessment_basis`。basis 冻结 `kind=question_bank`、岗位 ID/version/name/description 及所选题库引用；不创建伪造的 RoleRequirement。相同 basis 纳入 assessment contract 哈希，入场冻结到会话。真实岗位/题库仍承担隔离边界；已有基于 RoleRequirement 的计划保持原语义。
+
+新计划能力权重只覆盖已生成短问题实际映射的能力；候选源和最终单元两次校验，自动预算适应实际单元数，每能力至少一个可评分考察点，问题数按时长/可用内容/覆盖需求自动计算。未问及或证据不足仍按原评分规则报告，不冒充已覆盖。计划通过生成、来源版本、语音及评分依据校验后直接不可变地保存为 approved；不要求额外人工启用。
+
+
+### 046：交流回应与答案的区别
+
+Conversation reception 是作用于当前服务端转写与当前交流阶段的临时语义判断，不是 CandidateAnswer。短回应使用非评分 `conversation_acknowledgement`，保留当前题、录音与此前技术内容；同一已回应转写只回应一次，后续新增请求可再次回应。等待不给候选人自动倒计时结束，不因静音提交或跳题。输出与后续动作继续由当前 capture/revision/owner fence 约束。 `pause_requested`仅为进程内播放后的待执行状态；真实暂停通过现有生命周期事务并携带EvidenceCommitFence复核，不新增数据库表或迁移。
+
+### 邀请入场状态投影（045）
+
+公开 readiness 的 `entry_blocker` 是即时准入结果的安全投影，不是新增持久状态。`device_readiness.ready` 与 `can_start` 含义不同：前者描述设备检查，后者还要求本次预约已登记、明确同意、有效时间窗及面试服务就绪。前端确认状态必须来源于当前邀请的 registered 投影或同一预约的 matched/registered 登记回执，不可继承其他邀请。HTTP 连接通过也不能推断实时音视频链路通过。
+
+## 2026-09-10 · InterviewCustomization（044）
+
+组织级可选面试定制，持久字段包括唯一组织身份、version、default_skill_id（可空）、sealed_company_profile、内容hash、has_company_profile及创建/更新时间与操作者。引用既有InterviewSkill及其不可变revision；自由正文为空时清空默认绑定，不删除历史Skill或面试快照。无记录的兼容读取可选择最近更新的active/approved Skill作为初始默认，读取不写入；保存后由明确配置确定默认值。
+
+企业资料四字段company_name/business_overview/products_services/additional_info均可留空，属于管理员提供、可用于向候选人介绍公司的事实来源。不是岗位能力、评分依据或模型权重。新计划按准备时版本冻结实际上下文；公司问答不形成能力证据。具体存储与错误规则见[接口设计](api-design.md)。
+
+内部turn.company_question_exchanges保存公司问题原文范围、转写前缀、媒体检查点、资料hash与引用/表达信息；CandidateAnswer可派生scoring_transcript和non_scoring_spans，原音频与转写不改。它们仍属于候选人数据，按既有保留期一并清理；公司反问不构成能力证据。详见[公司问答合同](company-question-runtime.md)。
+
+
+## 2026-09-10 · 可选用户Skill与企业上下文（039）
+
+InterviewSkill是用户自由编写的可选行为扩展，不是企业认证/审批对象。新interview_skill.v2保存后active，名称和instructions以外字段可选；编译不要求固定style/method或用关键词限制写作。内容版本和权限仍可校验，正文不能授予模型任意执行权限。旧v1版本继续使用其原hash和编译合同，不静默重解释历史快照。
+
+PlanAssemblyRequest新增可选skill_id、company_context。skill_id与旧enterprise_skill_id为同一选择的两个入口，冲突拒绝；已存enterprise_skill_id/snapshot仅保留兼容字段名，不代表企业依赖。company_context是本场独立可选文本，空白视为缺省；非空随计划冻结到会话，纳入上下文指纹。两项都缺省也能完成动态选择、语音回答和报告，候选投影不会包含Skill或企业全文。
+
+## 2026-09-10 · 自适应考察与Skill领域（038）
+
+v3 `InterviewAssessmentContract` 冻结能力权重、最低证据数量、题池/单元、评分标准和预算。`InquiryUnit` 对应一个原关键点、一个批准口头问题、标准答案逐字引用及同源能力子集；实际呈现范围保存在turn/question_snapshot，不能按原长题全部标签和标准评分。
+
+会话初始题目集合为空，SELECT_NEXT按(question_id,inquiry_unit_id)去重追加轮次和QuestionSelection；decision_id与decision_revision约束幂等。无当前题时 dialogue_state=awaiting_next_decision，仍为in_progress；只有END_CANDIDATE_INPUT记录候选输入结束。覆盖充分、真实预算耗尽、候选请求与预约截止的前置条件不同，评分完成和空队列均不代替结束命令。实际字段及状态转换见[自适应合同](adaptive-interview-contract.md)。
+
+议程和能力证据账本从已提交轮次、答案和理解派生，最近上下文有界，不新增独立的权威记忆库。准备指纹绑定考察契约、Skill、决策与对话事实、控制事件；最终事务额外校验owner租约和连接控制代次。已提交安全决策回执与生命周期事实保存，不将提案当作执行成功。
+
+EnterpriseInterviewSkill包含不可变正文revision、聚合CAS版本和授权epoch。draft→validated→approved，retired禁止新计划引用但原批准快照可继续；revoked使对应快照失去执行资格并暂停绑定会话。新版本不热替换已冻结会话；密文正文、资源、工具权限及快照字段见[Skill合同](interview-skills-api.md)。
+
 ## 2026-09-10 · 补充重试与完整动态音频（034）
 
 同一服务端回答的补充分类失败预算复用 AnswerEndpoint 的内容摘要与显式操作epoch；不会由声音revision单独刷新。失败不生成 Answer，成功恢复逐字证据后才进入原完成/继续/澄清状态迁移，显式继续重置预算但不代表已回答完毕。
@@ -101,9 +286,7 @@ ModelRoute 在原 JSON 聚合内保存短期探针所有权和配置指纹，探
 
 ## ApprovedSpeechOutput（工作项 012）
 
-当前为默认关闭的实验输出实现。Chrome 停供实测已否定 MediaStream.currentTime 与内容样本同源；
-drained 的目标领域含义仍是实际排空，但现有媒体时钟适配器尚不能提供充分证据，不能默认启用或标为端到端 verified。
-下步必须补明确 source sample→RTP/播放位置映射，或经授权的可计数客户端 PCM 播放 seam；不靠固定尾音延迟伪造确认。
+012 当时的 MediaStream.currentTime 不能证明源样本消费，曾默认关闭。052 已实现精确绑定的客户端 PCM 播放 seam，默认开启；drained 要求源样本全部消费且设备输出越过末帧，不靠墙钟或固定尾音延迟确认。本机断供验证不代替跨浏览器、长会话和生产端到端验收。
 
 一个已批准 ConversationAct 对应一个可撤销语音输出：唯一 performance/output 标识、当前题/owner/selected-act fence、
 单独的最小权限 LiveKit publisher、严格验证的 PCM 流、播放确认与私有音频归档。
@@ -1048,3 +1231,26 @@ stateDiagram-v2
 - 物理文件删除在聚合状态提交前执行；删除失败时不把数据库伪标为已清理。已清理的签名 token 无法再解析到 ready FileObject。
 - 每次周期留存工作同时回收 `capture_revision < current` 的已放弃 Evidence media；对象键只以 SHA-256 进入审计，重复执行不会重复删除对象或影响当前 revision。
 - 留存清理是管理员显式、不可逆动作；审计事件不得包含被删除正文或联系方式。
+
+## FOLLOWUP-CONTEXT-055：对话焦点与证据链
+
+正式考察追问继续复用InterviewTurn的parent_turn_id/root_turn_id/followup_depth及独立CandidateAnswer，在播报前提交持久状态。交流回应不能提出新的技术考察题；重读、安抚、补充确认和术语澄清不创建计分子题。turn.dialogue_focus可选保存最近题意/术语澄清的act_id，引用同turn已批准的表达；缺省回到该turn实际问题。只读兼容历史v2已说出的问句以供重读，不猜测拆分历史混合录音。父子评分输入带按序evidence_chain和原始回答版本指纹，回答修改撤销旧计算的提交资格。
+
+### 056 完成回答与结束话题
+
+`TurnUnderstanding.turn_intent=finish_answer` 表示候选人明确完成了当前这一次回答，已有技术内容与逐字结束证据保留，`followup_allowed=true`；073起普通语音回答仍须实际询问补充并获得新的确认答复，取代056直接推进的行为。`finish_topic/decline_topic/stop_interview` 分别表示关闭当前话题、拒答、结束整场，继续令 `followup_allowed=false`。按钮确认没有口头结束证据时不伪造 `completion_basis`。此扩展无需迁移旧理解记录，不能把历史 `finish_topic` 猜测改成新意图或补造追问。
+
+正式子问题可以核实已提及能力点的具体做法与依据，`claim_detail_verification` 记录这种选择原因；覆盖某点不等于其细节已经充分。是否选择由有证据约束的模型决定，受冻结范围、既有追问次数与深度、剩余时间和候选边界约束。
+
+## 2026-09-22 · 059 会话上下文与识别假设
+
+新增信息均是当前采集周期内的短期交流状态，无表或迁移：补充确认保存实际确认问题、前次已确认原文及对应来源；未定稿识别保存重试额度与等待新输入标记。前次确认仅供理解当前短尾，不能恢复旧完成许可；capture 更换、owner 变更或输入修订时继续检查并拒绝陈旧决定。空识别段不形成 Answer，暂定字幕不属于已提交证据。父子题/独立回答/评分引用不变，见[059改进计划](agent-conversation-improvement-plan-059.md)。
+
+`UnderstandingProblem.reason_code` 增加固定诊断枚举 `semantic_control_contract_invalid`，表示已判断的交流意图与动作/追问许可冲突，例如 thinking 却要求 next。它不携带候选正文，不形成结束授权；托管实时会话仍按原有保留音频、有限纠正、提示重试的失败路径处理。旧理解快照与合同版本保留。
+# 067：交流选择、送达与交互预算
+
+服务端将 `conversation.act.selected` 的审批事实与 `selection_receipts` 一同保存到所属 ConversationAct。收据绑定 event、turn、act、sequence 和原文摘要，每个 act 保留最近 8 次选择；客户端重放历史裁剪不删除当前选择事实。送达状态按 performance 身份从 selected/playing 进入 delivered、interrupted 或 failed；只有当前播放的合法 drain/stop 回执可标记 delivered，旧播放不能更新新播放。审批与供应商产出均不代表候选人听完。退出/内容澄清仍须通过原有 capture、新回复与实际送达校验。
+
+服务端完整稳定文本开始推理后共享 20 秒准备预算；同一文本的元数据修订、未稳定假设和声学噪声不能续期。新稳定文本或显式重试建立新的预算，预备理解、内部重试、模型与首音准备共用剩余时间；仍须当前权威final才可表达或提交。超时保留原始证据，不产生完成或退出授权。
+
+浏览器仍持有当前performance和selection时，failed可经用户重播恢复为playing/delivered；输出已撤销或清空后不得重新打开旧送达事实。未播语音失败恢复须同时复原本地speaking及本次已处理游标，不回退更早已送达历史。

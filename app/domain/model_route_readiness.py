@@ -9,7 +9,8 @@ from typing import Any, Optional
 
 
 SAFE_PROBE_CODES = frozenset({
-    "provider_auth_failed", "provider_bad_request", "provider_capability_missing",
+    "provider_audio_final_missing", "provider_audio_format_unsupported",
+    "provider_auth_failed", "provider_bad_request", "provider_billing_required", "provider_capability_missing",
     "provider_circuit_open", "provider_connection_disabled", "provider_cost_limit_exceeded",
     "provider_health_failed", "provider_model_unavailable", "provider_network_error",
     "provider_not_implemented", "provider_not_installed", "provider_rate_limited",

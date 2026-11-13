@@ -10,6 +10,10 @@ from app.core.interview_agent_metrics import (
 )
 from app.core.interview_agent_release import realtime_agent_release_status
 from app.operations.interview_agent_acceptance import (
+    MINIMUM_CASES_PER_INTENT,
+    MINIMUM_CASES_PER_MULTITURN_SCENARIO,
+    MULTITURN_MINIMUM_TURNS,
+    REQUIRED_META_INTENTS,
     build_acceptance_report,
     validate_acceptance_report,
 )
@@ -39,10 +43,9 @@ def _passing_dataset() -> dict:
         }
         for _ in range(100)
     ]
-    classifications = [
-        {"actual": "repeat", "predicted": "repeat"},
-        {"actual": "answer", "predicted": "answer"},
-    ] * 50
+    classifications = [{"actual": intent, "predicted": intent}
+                       for intent in sorted(REQUIRED_META_INTENTS)
+                       for _ in range(MINIMUM_CASES_PER_INTENT)]
     return {
         "release_scope": {
             "deployment_id": "prod-us-west-2",
@@ -51,10 +54,11 @@ def _passing_dataset() -> dict:
         "latency_samples": latency,
         "stt_cases": stt,
         "meta_intent_cases": classifications,
-        "capability_coverage_cases": classifications,
-        "followup_cases": [{"relevant": True} for _ in range(100)],
+        "capability_coverage_cases": deepcopy(classifications),
+        "followup_cases": [{"relevant": True, "safety_violation": False, "answer_leak": False,
+                            "sensitive_attribute": False, "over_budget": False} for _ in range(100)],
         "recovery_cases": [
-            {"lost_confirmed_frames": 0, "duplicate_answers": 0}
+            {"interruption_seconds": 30, "lost_confirmed_frames": 0, "duplicate_answers": 0}
             for _ in range(20)
         ],
         "video_privacy_cases": [
@@ -69,6 +73,12 @@ def _passing_dataset() -> dict:
             {"browser": browser, "passed": True}
             for browser in ("chrome", "edge", "safari")
             for _ in range(10)
+        ],
+        "multiturn_cases": [
+            {"scenario": scenario, "turn_count": minimum, "passed": True,
+             "duplicate_responses": 0, "duplicate_answers": 0, "unauthorized_endings": 0}
+            for scenario, minimum in MULTITURN_MINIMUM_TURNS.items()
+            for _ in range(MINIMUM_CASES_PER_MULTITURN_SCENARIO)
         ],
     }
 
@@ -164,7 +174,11 @@ def test_candidate_and_internal_metric_vocabularies_are_disjoint() -> None:
         "stt_recognition_opened",
         "stt_recognition_finished",
         "stt_preview_prepared",
+        "stt_preview_reused",
         "stt_preview_final_revised",
+        "answer_model_call_started",
+        "answer_model_call_budget_exhausted",
+        "confirmed_answer_preparation_reused",
     }
     assert CANDIDATE_INTERVIEW_AGENT_METRICS.isdisjoint(
         INTERNAL_INTERVIEW_AGENT_METRICS

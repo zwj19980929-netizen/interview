@@ -11,12 +11,14 @@ from app.schemas.api import (
     InterviewAppointmentPatch,
     InterviewInvitationCreate,
     InterviewPlanGenerateRequest,
+    InterviewPlanPrepareRequest,
     InterviewPlanPatch,
     RoleRequirementCreate,
 )
 from app.services.plan_assembly import PlanAssemblyPolicy, PlanAssemblyRequest
 from app.transport.http.fields.public_interview import PUBLIC_INTERVIEW_FIELDS
 from app.transport.http.responses import ApiJSONResponse, api_response, collection_response
+from app.transport.http.progress import progress_response
 from app.transport.service_locator import services
 
 
@@ -47,6 +49,14 @@ async def list_role_requirements() -> Dict[str, Any]:
     return collection_response(services()["roles"].list_role_requirements())
 
 
+@router.post("/api/v1/interview-plans/prepare")
+async def prepare_interview_plan(payload: InterviewPlanPrepareRequest, accept: str = Header(default="application/json")) -> Any:
+    prepare = services()["plan_assembly"].prepare
+    if "text/event-stream" in accept.lower():
+        return progress_response(lambda notify: prepare(**payload.model_dump(), on_progress=notify))
+    return await prepare(**payload.model_dump())
+
+
 @router.post("/api/v1/interview-plans/generate")
 async def generate_interview_plan(payload: InterviewPlanGenerateRequest) -> Dict[str, Any]:
     return await services()["plan_assembly"].assemble(
@@ -65,6 +75,12 @@ async def generate_interview_plan(payload: InterviewPlanGenerateRequest) -> Dict
             candidate_profile_id=payload.candidate_profile_id,
             resume_review_id=payload.resume_review_id,
             approve=payload.approve,
+            execution_schema_version=payload.execution_schema_version,
+            adaptive_policy=payload.adaptive_policy.model_dump() if payload.adaptive_policy else None,
+            enterprise_skill_id=payload.enterprise_skill_id,
+            skill_id=payload.skill_id,
+            company_context=payload.company_context,
+            use_customization_defaults=payload.use_customization_defaults,
         )
     )
 

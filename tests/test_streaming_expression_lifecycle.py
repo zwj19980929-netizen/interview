@@ -16,11 +16,23 @@ from test_approved_speech_output import _Publisher, _RawTTS
 from test_expression_stale_fence import _harness, _mutate
 
 
+def _install_no_confirmation_handoff(managed):
+    # These output-only fixtures have no AnswerEndpoint/confirmation. Match
+    # the real Managed session's no-op result for that absence explicitly.
+    managed.begin_confirmation_handoff = lambda: None
+
+    async def cancel_confirmation_handoff(handoff):
+        assert handoff is None
+
+    managed.cancel_confirmation_handoff = cancel_confirmation_handoff
+
+
 def _streaming_harness(monkeypatch, *, gate_before_first=False, gate_eof=False):
     runtime, channel, coordinator, grant = _harness()
     monkeypatch.setattr(interview_agent, "ManagedLiveKitEvidenceSession", SimpleNamespace)
     managed = channel._evidence_session
     managed.assert_controller = lambda _channel: None
+    _install_no_confirmation_handoff(managed)
 
     async def detach(_channel):
         managed._stopped = True
@@ -31,14 +43,31 @@ def _streaming_harness(monkeypatch, *, gate_before_first=False, gate_eof=False):
 
     managed.pause_capture = pause_capture
     outputs = []
+    emitted = []
+    emit = channel._emit
+    async def record_emit(*args, **kwargs):
+        event = await emit(*args, **kwargs)
+        emitted.append(event.model_dump(mode="json"))
+        return event
+    channel._emit = record_emit
 
-    async def open_streamed(_interview_id, _turn_id, _text, _org, *, performance_id, assert_current):
+    async def open_streamed(_interview_id, _turn_id, _text, _org, *, performance_id, assert_current, before_abort=None):
         raw = _RawTTS([b"\1\0" * 480, b"\2\0" * 480])
         if gate_before_first:
             raw.read_gate = asyncio.Event()
         if gate_eof:
             raw.eof_gate = asyncio.Event()
         publisher = _Publisher()
+        publisher.interruption_before_abort = False
+        abort = publisher.abort
+        async def abort_with_notice():
+            if before_abort is not None and not publisher.abort_calls and not publisher.close_calls:
+                await before_abort()
+            publisher.interruption_before_abort = any(
+                event["type"] == "avatar.performance.interrupted" and event["payload"].get("performance_id") == performance_id
+                for event in emitted)
+            await abort()
+        publisher.abort = abort_with_notice
         publisher.publication = replace(
             publisher.publication, performance_id=performance_id,
             participant_identity="expression:" + performance_id,
@@ -60,7 +89,7 @@ def _streaming_harness(monkeypatch, *, gate_before_first=False, gate_eof=False):
         return output
 
     monkeypatch.setattr(runtime, "_open_streamed_expression", open_streamed)
-    return SimpleNamespace(runtime=runtime, channel=channel, coordinator=coordinator, grant=grant, outputs=outputs)
+    return SimpleNamespace(runtime=runtime, channel=channel, coordinator=coordinator, grant=grant, outputs=outputs, emitted=emitted)
 
 
 async def _select(h, turn_id="turn_1", text="请说明测试方案。"):
@@ -111,6 +140,7 @@ async def _replacement_channel(h):
         connection_id=opened.connection_id, local_instance_id=h.grant.local_instance_id,
     )
     managed = SimpleNamespace(ownership=grant, _stopped=False)
+    _install_no_confirmation_handoff(managed)
 
     def assert_controller(_channel):
         with h.runtime.persistence.transaction(replacement.organization_id) as transaction:
@@ -129,12 +159,11 @@ async def _client_ready(h):
     await h.channel.send(ClientSignal(type="client.ready", idempotency_key="replacement_client_ready"))
 
 
-@pytest.mark.parametrize("enabled", [None, "false", "FALSE", "0", ""])
-def test_streaming_tts_is_closed_by_default_or_explicitly_without_provider_or_publisher_calls(monkeypatch, enabled):
+@pytest.mark.parametrize("enabled", ["false", "FALSE", "0", ""])
+def test_explicitly_disabled_streaming_avoids_provider_or_publisher_calls(monkeypatch, enabled):
     async def scenario():
         runtime, channel, _coordinator, _grant = _harness()
-        # Dynamic follow-ups would use streaming when explicitly enabled;
-        # a primary question would mask a broken default by returning early.
+        # A primary question could mask a broken override by returning early.
         _mutate(runtime, channel, lambda session: session["turns"][0].update(is_followup=True))
         if enabled is None:
             monkeypatch.delenv("INTERVIEWER_STREAMING_TTS_ENABLED", raising=False)
@@ -162,17 +191,22 @@ def test_streaming_tts_is_closed_by_default_or_explicitly_without_provider_or_pu
 
 
 @pytest.mark.parametrize("owner_current", [True, False])
-def test_explicit_streaming_opt_in_retains_owner_fence_and_ready_before_pcm(monkeypatch, owner_current):
+@pytest.mark.parametrize("enabled", [None, "true"])
+def test_default_and_enabled_streaming_retain_owner_fence_and_ready_before_pcm(monkeypatch, owner_current, enabled):
     async def scenario():
         runtime, channel, _coordinator, _grant = _harness()
         _mutate(runtime, channel, lambda session: session["turns"][0].update(is_followup=True))
-        monkeypatch.setenv("INTERVIEWER_STREAMING_TTS_ENABLED", "true")
+        if enabled is None:
+            monkeypatch.delenv("INTERVIEWER_STREAMING_TTS_ENABLED", raising=False)
+        else:
+            monkeypatch.setenv("INTERVIEWER_STREAMING_TTS_ENABLED", enabled)
         raw = _RawTTS([b"\1\0" * 480])
         stream = ValidatedTTSStream(raw, provider_id="synthetic_tts", model=raw.meta.model, read_timeout_s=1)
         publisher = _Publisher()
         requests, publications = [], []
 
-        async def provider(request):
+        async def provider(request, *, first_audio_deadline):
+            assert first_audio_deadline > 0
             requests.append(request)
             return stream
 
@@ -205,7 +239,7 @@ def test_explicit_streaming_opt_in_retains_owner_fence_and_ready_before_pcm(monk
             assert requests[0].purpose == "interview_agent_expression"
             assert len(publications) == 1 and publications[0]["assert_current"] is fence
             assert publications[0]["performance_id"] == "performance_synthetic"
-            assert publisher.opened == 0 and publisher.published == [] and not raw.started.is_set()
+            assert publisher.opened == 1 and publisher.published == [] and not raw.started.is_set()
         finally:
             await output.abort()
 
@@ -310,7 +344,13 @@ def test_owner_loss_while_provider_read_is_stalled_aborts_without_new_pcm_or_lat
             assert item.raw.read_cancelled and item.publisher.abort_calls >= 1
             after = _session(h)
             assert after["status"] == before["status"] == "in_progress"
-            assert after["agent_runtime"] == before["agent_runtime"]
+            assert {key: value for key, value in after["agent_runtime"].items()
+                    if key not in {"last_sequence", "last_event_at"}} == {
+                        key: value for key, value in before["agent_runtime"].items()
+                        if key not in {"last_sequence", "last_event_at"}}
+            notices = [event for event in h.emitted if event["type"] == "avatar.performance.interrupted"]
+            assert len(notices) == 1 and notices[0]["payload"]["performance_id"] == performance.performance_id
+            assert after["agent_runtime"]["last_sequence"] == before["agent_runtime"]["last_sequence"] + 1
             assert after["agent_events"] == before["agent_events"]
             assert h.channel._speech_output is None and h.channel._speech_output_task is None
         finally:

@@ -6,6 +6,17 @@ from typing import Any, Dict, List, Optional, Sequence
 from app.core.errors import ApiError
 from app.core.ids import new_id
 from app.core.time import utc_now
+from app.domain.candidate_runtime import CANDIDATE_RUNTIME_PROBLEM_REASONS, runtime_pause_epoch
+from app.domain.evaluation_evidence import evidence_fingerprint
+from app.domain.interview_completion import budget_completion_detail
+from app.domain.session_assessment_scope import require_scope_window, scope_allows_followup
+from app.domain.primary_question_budget import (
+    apply_primary_question_budget, primary_question_budget, started_primary_question_count,
+)
+from app.domain.adaptive_interview import (
+    append_adaptive_question, assessment_contract, budget_summary, coverage_summary,
+    closed_source_question_ids, is_adaptive, record_decision, validate_decision,
+)
 
 
 Document = Dict[str, Any]
@@ -27,6 +38,8 @@ class LifecycleCommandType(str, Enum):
     UTTERANCE_REJECTED = "utterance_rejected"
     ANSWER_SUBMITTED = "answer_submitted"
     FOLLOWUP_REQUESTED = "followup_requested"
+    SELECT_NEXT = "select_next"
+    END_CANDIDATE_INPUT = "end_candidate_input"
     REGRADE_REQUESTED = "regrade_requested"
     EVALUATION_SUCCEEDED = "evaluation_succeeded"
     EVALUATION_FAILED = "evaluation_failed"
@@ -85,6 +98,8 @@ class InterviewSessionLifecycle:
             LifecycleCommandType.UTTERANCE_REJECTED: self._utterance_rejected,
             LifecycleCommandType.ANSWER_SUBMITTED: self._answer_submitted,
             LifecycleCommandType.FOLLOWUP_REQUESTED: self._followup_requested,
+            LifecycleCommandType.SELECT_NEXT: self._select_next,
+            LifecycleCommandType.END_CANDIDATE_INPUT: self._end_candidate_input,
             LifecycleCommandType.REGRADE_REQUESTED: self._regrade_requested,
             LifecycleCommandType.EVALUATION_SUCCEEDED: self._evaluation_succeeded,
             LifecycleCommandType.EVALUATION_FAILED: self._evaluation_failed,
@@ -122,7 +137,11 @@ class InterviewSessionLifecycle:
     def _create(self, session: Document, payload: Document, now: str, events: List[Document], effects: List[Document]) -> None:
         if session.get("status") != "scheduled":
             self._invalid("A new InterviewSession must be scheduled.")
-        if not session.get("turns"):
+        if is_adaptive(session):
+            assessment_contract(session)
+            session.setdefault("decision_revision", 0)
+            session.setdefault("adaptive_decision_receipts", [])
+        if not session.get("turns") and not is_adaptive(session):
             self._invalid("An InterviewSession must contain at least one turn.")
         if events or session.get("lifecycle_events"):
             return
@@ -153,19 +172,45 @@ class InterviewSessionLifecycle:
             return
         if session["status"] not in {"scheduled", "waiting"}:
             self._invalid("Only a scheduled or waiting InterviewSession can be started.")
+        if session.get("scheduled_end_at"):
+            require_scope_window(session.get("plan_snapshot", {}).get("assessment_contract"),
+                                 now, session["scheduled_end_at"], starting=True)
         session["status"] = "in_progress"
         session["started_at"] = session.get("started_at") or now
         session["interruption"] = None
+        self._apply_primary_question_budget(session, now, events)
         turn = self._first_turn_with_status(session, ("asking", "pending"))
         if turn is not None:
             turn["status"] = "asking"
             turn["started_at"] = turn.get("started_at") or now
             session["current_turn_id"] = turn["id"]
             session["phase"] = turn.get("phase", session.get("phase", "position_bank"))
+        elif is_adaptive(session):
+            session["dialogue_state"] = "awaiting_next_decision"
         self._emit(session, events, "interview.started", {"current_turn_id": session.get("current_turn_id")}, now)
 
     def _pause(self, session: Document, payload: Document, now: str, events: List[Document], effects: List[Document]) -> None:
-        self._interrupt(session, payload, now, events, event_type="interview.paused", kind="manual")
+        code = payload.get("runtime_problem_code")
+        if code is None:
+            self._interrupt(session, payload, now, events, event_type="interview.paused", kind="manual")
+            return
+        reason = CANDIDATE_RUNTIME_PROBLEM_REASONS.get(code)
+        if reason is None:
+            raise ApiError("CANDIDATE_RUNTIME_PROBLEM_INVALID", "Candidate runtime problem code is not supported.", status_code=422)
+        self._interrupt(session, {"reason": reason}, now, events, event_type="interview.paused", kind="runtime")
+        # Diagnostics survive an earlier manual pause, without rewriting its
+        # cause. The event identity also distinguishes same-second pauses.
+        pause_at = (session.get("interruption") or {}).get("occurred_at", now)
+        pause_epoch = runtime_pause_epoch(session)
+        problems = session.setdefault("agent_runtime", {}).setdefault("problems", [])
+        if any(problem.get("code") == code and problem.get("pause_epoch") == pause_epoch for problem in problems):
+            return
+        problems.append({
+            "code": code, "message": "Candidate runtime could not continue safely.",
+            "recoverable": False, "action": "await_human_takeover",
+            "occurred_at": now, "pause_occurred_at": pause_at, "pause_epoch": pause_epoch,
+        })
+        del problems[:-20]
 
     def _timeout(self, session: Document, payload: Document, now: str, events: List[Document], effects: List[Document]) -> None:
         self._interrupt(session, payload, now, events, event_type="interview.timed_out", kind="timeout")
@@ -185,6 +230,7 @@ class InterviewSessionLifecycle:
         if session["status"] != "in_progress":
             self._invalid("Only an in-progress InterviewSession can be interrupted.")
         session["status"] = "paused"
+        self._clear_uncertain_question_audio(session)
         session["interruption"] = {
             "kind": kind,
             "reason": payload.get("reason", kind),
@@ -192,6 +238,17 @@ class InterviewSessionLifecycle:
             "occurred_at": now,
         }
         self._emit(session, events, event_type, deepcopy(session["interruption"]), now)
+
+    @staticmethod
+    def _clear_uncertain_question_audio(session: Document) -> None:
+        state = session.get("agent_runtime") or {}
+        marker = state.get("question_audio_recovery") or {}
+        if marker.get("status") == "retrying":
+            # Human resume restarts the existing question through the normal
+            # repeat control. Unknown playback must never survive as a retry.
+            state.update(question_audio_recovery=None, expression_replay_act_event_id=None,
+                         active_expression_act_event_id=None, active_performance_id=None,
+                         active_output_id=None, floor="none")
 
     def _resume(self, session: Document, payload: Document, now: str, events: List[Document], effects: List[Document]) -> None:
         self._restore(session, payload, now, events, effects, "interview.resumed")
@@ -212,6 +269,7 @@ class InterviewSessionLifecycle:
             return
         if session["status"] != "paused":
             self._invalid("Only a paused InterviewSession can be restored.")
+        self._clear_uncertain_question_audio(session)
         interruption = deepcopy(session.get("interruption"))
         session["status"] = "in_progress"
         session["interruption"] = None
@@ -289,6 +347,8 @@ class InterviewSessionLifecycle:
         events: List[Document],
         effects: List[Document],
     ) -> None:
+        if is_adaptive(session) and not session.get("candidate_input_completed_at"):
+            self._invalid("Adaptive candidate input must be closed through END_CANDIDATE_INPUT.")
         if session["status"] in {"report_generating", "report_ready"}:
             return
         if session["status"] not in {"in_progress", "paused", "completed"}:
@@ -344,6 +404,70 @@ class InterviewSessionLifecycle:
             self._activate_next_without_waiting_for_evaluation(
                 session, now, events, effects
             )
+        elif is_adaptive(session):
+            session["dialogue_state"] = "awaiting_next_decision"
+
+    def _select_next(self, session: Document, payload: Document, now: str,
+                     events: List[Document], effects: List[Document]) -> None:
+        if not is_adaptive(session):
+            self._invalid("SELECT_NEXT requires execution schema version 3.")
+        if not validate_decision(session, payload, "select_next"):
+            return
+        self._apply_primary_question_budget(session, now, events)
+        turn = append_adaptive_question(session, payload.get("question_id"), payload["decision_id"], now,
+                                        inquiry_unit_id=payload.get("inquiry_unit_id"))
+        record_decision(session, payload, "select_next", now)
+        self._emit(session, events, "question.selected", {"turn_id": turn["id"],
+                   "question_id": turn["question_id"], "decision_id": payload["decision_id"],
+                   "competency_ids": deepcopy(turn["competency_ids"])}, now)
+        self._emit(session, events, "turn.advanced", {"turn_id": turn["id"], "scoring_in_background": True}, now)
+
+    def _end_candidate_input(self, session: Document, payload: Document, now: str,
+                             events: List[Document], effects: List[Document]) -> None:
+        adaptive = is_adaptive(session)
+        if not adaptive and payload.get("reason") != "candidate_requested":
+            self._invalid("Only candidate-requested termination is supported for execution schema version 2.")
+        if not validate_decision(session, payload, "end_candidate_input"):
+            return
+        reason = payload.get("reason")
+        reasons = {"evidence_sufficient", "budget_exhausted", "candidate_requested", "appointment_window_expired", "media_failure"}
+        if reason not in reasons:
+            self._invalid("An approved candidate-input completion reason is required.")
+        allowed = {"in_progress", "paused"}
+        if reason == "appointment_window_expired":
+            allowed.update({"scheduled", "waiting"})
+        if session.get("status") not in allowed or session.get("candidate_input_completed_at"):
+            self._invalid("Candidate input has already ended or cannot be ended from this state.")
+        self._apply_primary_question_budget(session, now, events)
+        coverage = coverage_summary(session) if adaptive else {
+            "sufficient": False, "missing_required_competencies": [],
+            "reason": "candidate_requested_before_fixed_plan_completion",
+        }
+        if reason == "evidence_sufficient" and (not coverage["sufficient"] or session.get("current_turn_id")):
+            self._invalid("Normal completion requires sufficient frozen coverage and no active question.")
+        if reason == "budget_exhausted":
+            budget = budget_summary(session, now)
+            if not budget["exhausted"] or (session.get("current_turn_id") and budget["remaining_seconds"] > 0):
+                self._invalid("The frozen assessment budget does not authorize ending this active question.")
+            session["candidate_input_completion_detail"] = budget_completion_detail(session, now, allow_pool=True)
+        if reason == "appointment_window_expired":
+            from datetime import datetime
+            deadline = session.get("scheduled_end_at")
+            if not deadline or datetime.fromisoformat(now.replace("Z", "+00:00")) < datetime.fromisoformat(deadline.replace("Z", "+00:00")):
+                self._invalid("The frozen appointment deadline has not expired.")
+        for turn in session.get("turns", []):
+            if turn.get("status") in {"pending", "asking", "transcribing", "answering"}:
+                turn.update(status="skipped", completed_at=now, skip_reason=reason)
+                self._emit(session, events, "turn.skipped", {"turn_id": turn["id"], "reason": reason}, now)
+        session.update(candidate_input_completed_at=now, candidate_input_completion_reason=reason,
+                       termination_reason=reason, current_turn_id=None, status="in_progress",
+                       dialogue_state="candidate_input_completed", interruption=None,
+                       assessment_coverage=coverage)
+        record_decision(session, payload, "end_candidate_input", now)
+        self._emit(session, events, "interview.candidate_input_completed", {
+            "reason": reason, "decision_id": payload["decision_id"],
+            "missing_required_competencies": coverage["missing_required_competencies"]}, now)
+        self._activate_next_or_report(session, now, events, effects)
 
     def _followup_requested(
         self,
@@ -370,6 +494,41 @@ class InterviewSessionLifecycle:
         )
         if existing is not None:
             return
+        if is_adaptive(session):
+            if session.get("current_turn_id") or any(
+                int(turn.get("order", 0)) > int(parent.get("order", 0)) for turn in session.get("turns", [])
+            ):
+                self._invalid("A late follow-up cannot replace a newer presented question.")
+            budget = assessment_contract(session)["budget"]
+            follows = [turn for turn in session.get("turns", []) if turn.get("is_followup")]
+            same_root = [turn for turn in follows if turn.get("root_turn_id") == root_turn_id]
+            remaining_seconds = budget_summary(session, now)["remaining_seconds"]
+            if (session.get("candidate_input_completed_at") or remaining_seconds <= 0
+                    or not scope_allows_followup(session, remaining_seconds)
+                    or len(follows) >= budget["max_total_followups"]
+                    or len(same_root) >= budget["max_followups_per_root"]):
+                self._invalid("The frozen follow-up budget has been exhausted.")
+            if root.get("question_id") in closed_source_question_ids(session):
+                self._invalid("The candidate has closed this question's topic.")
+            if root.get("inquiry_unit_id"):
+                root_snapshot = root["question_snapshot"]
+                root_points = root_snapshot["key_points"]
+                ids = {point["id"] if isinstance(point, dict) else str(point) for point in root_points}
+                texts = {str(point.get("text") if isinstance(point, dict) else point).strip() for point in root_points}
+                followup_snapshot = followup.get("question_snapshot") or {}
+                child_points = followup_snapshot.get("key_points") or []
+                child_ids = {point["id"] if isinstance(point, dict) else str(point) for point in child_points}
+                if (not child_ids or not child_ids.issubset(ids)
+                        or not set(followup.get("target_key_points") or []).issubset(texts)
+                        or followup_snapshot.get("standard_answer") != root_snapshot["standard_answer"]
+                        or followup_snapshot.get("rubric") != root_snapshot["rubric"]):
+                    self._invalid("A follow-up cannot expand the approved inquiry unit's scoring scope.")
+                followup_snapshot.update(inquiry_unit_id=root["inquiry_unit_id"],
+                    assessed_rubric_point_ids=sorted(child_ids),
+                    source_rubric_point_ids=deepcopy(root_snapshot["source_rubric_point_ids"]),
+                    not_assessed_rubric_point_ids=deepcopy(root_snapshot["not_assessed_rubric_point_ids"]))
+                followup.update(inquiry_unit_id=root["inquiry_unit_id"], assessed_rubric_point_ids=sorted(child_ids),
+                                competency_ids=deepcopy(root["competency_ids"]))
         if session.get("status") != "in_progress" or parent.get("status") != "evaluating":
             self._invalid("A follow-up can only be selected while its parent answer is awaiting evaluation.")
         if root.get("is_followup") or int(root.get("followup_depth", 0)) != 0:
@@ -381,9 +540,13 @@ class InterviewSessionLifecycle:
         primary_count = len(
             [item for item in session.get("turns", []) if not item.get("is_followup")]
         )
-        max_total = min(4, primary_count, max(0, int(policy.get("max_total", 0))))
-        max_per_root = min(2, max(0, int(policy.get("max_per_root", 2))))
-        max_depth = min(2, max(0, int(policy.get("max_depth", 2))))
+        if is_adaptive(session):
+            max_total = budget["max_total_followups"]
+            max_per_root = max_depth = budget["max_followups_per_root"]
+        else:
+            max_total = min(4, primary_count, max(0, int(policy.get("max_total", 0))))
+            max_per_root = min(2, max(0, int(policy.get("max_per_root", 2))))
+            max_depth = min(2, max(0, int(policy.get("max_depth", 2))))
         all_followups = [item for item in session.get("turns", []) if item.get("is_followup")]
         root_followups = [
             item for item in all_followups if item.get("root_turn_id") == root_turn_id
@@ -418,6 +581,8 @@ class InterviewSessionLifecycle:
         session.setdefault("turns", []).append(followup)
         session.setdefault("turn_ids", []).append(followup["id"])
         session["current_turn_id"] = followup["id"]
+        if is_adaptive(session):
+            session["dialogue_state"] = "asking"
         session["phase"] = followup.get("phase", parent.get("phase", session.get("phase")))
         requested_payload = {
             "root_turn_id": root["id"],
@@ -564,6 +729,10 @@ class InterviewSessionLifecycle:
         )
         if evidence_answer_ids:
             event_payload["evidence_answer_ids"] = list(evidence_answer_ids)
+            answers_by_id = {item["id"]: item for item in session.get("answers", [])}
+            event_payload["evidence_fingerprint"] = evidence_fingerprint(
+                [answers_by_id[item_id] for item_id in evidence_answer_ids]
+            )
         self._emit(session, events, "evaluation.requested", event_payload, now)
         effects.append({"type": "evaluation.requested", "payload": deepcopy(event_payload)})
 
@@ -598,8 +767,12 @@ class InterviewSessionLifecycle:
             or [answer["id"]]
         )
         answer["current_evidence_answer_ids"] = evidence_answer_ids
+        answer["current_evidence_fingerprint"] = (evaluation.get("evidence_fingerprint")
+            or payload.get("evidence_fingerprint") or answer.get("pending_evidence_fingerprint")
+            or evidence_fingerprint([self._answer(session, item_id) for item_id in evidence_answer_ids]))
         answer["evidence_group_status"] = "completed"
         answer.pop("pending_evidence_answer_ids", None)
+        answer.pop("pending_evidence_fingerprint", None)
         self._emit(
             session,
             events,
@@ -653,6 +826,14 @@ class InterviewSessionLifecycle:
                 and not self._has_unresolved_evaluations(session)
             ):
                 self._activate_next_or_report(session, now, events, effects)
+        elif turn.get("is_followup"):
+            # Correcting/regrading an already completed child must invalidate
+            # the score-bearing root too; its turn no longer says evaluating.
+            self._maybe_request_evidence_group_evaluation(
+                session, str(turn.get("root_turn_id") or ""), now, events, effects,
+            )
+            if previous_id and session.get("current_report_id") and not self._has_unresolved_evaluations(session):
+                self._request_report(session, "answer_regraded", now, events, effects, force=True)
         elif previous_id and session.get("current_report_id"):
             self._request_report(session, "answer_regraded", now, events, effects, force=True)
         elif (
@@ -739,6 +920,10 @@ class InterviewSessionLifecycle:
         *,
         force: bool = False,
     ) -> None:
+        if is_adaptive(session) and not session.get("candidate_input_completed_at"):
+            self._invalid("Adaptive interview reports require explicit candidate-input completion.")
+        if is_adaptive(session) and self._has_unresolved_evaluations(session):
+            self._invalid("Adaptive interview reports require all accepted answer evaluations.")
         if session["status"] == "report_generating":
             return
         if session["status"] == "report_ready" and not force:
@@ -834,6 +1019,10 @@ class InterviewSessionLifecycle:
     ) -> None:
         if self._has_unresolved_evaluations(session):
             return
+        if is_adaptive(session) and not session.get("candidate_input_completed_at"):
+            if not session.get("current_turn_id"):
+                self._await_next_decision(session, now, events)
+            return
         next_turn = self._next_playable_turn(session, now, events)
         if next_turn is not None:
             previous_phase = session.get("phase")
@@ -870,6 +1059,9 @@ class InterviewSessionLifecycle:
         next_turn = self._next_playable_turn(session, now, events)
         if next_turn is None:
             session["current_turn_id"] = None
+            if is_adaptive(session) and not session.get("candidate_input_completed_at"):
+                self._await_next_decision(session, now, events)
+                return
             # Candidate input and asynchronous scoring are deliberately
             # separate milestones.  Closing the conversational/media plane
             # must not wait for a scoring worker, while the domain session
@@ -907,9 +1099,22 @@ class InterviewSessionLifecycle:
             now,
         )
 
+    def _await_next_decision(self, session: Document, now: str, events: List[Document]) -> None:
+        if session.get("dialogue_state") != "awaiting_next_decision":
+            session["dialogue_state"] = "awaiting_next_decision"
+            self._emit(session, events, "interview.awaiting_next_decision", {}, now)
+
     def _next_playable_turn(self, session: Document, now: str, events: List[Document]) -> Optional[Document]:
+        self._apply_primary_question_budget(session, now, events)
         while True:
             turn = self._first_turn_with_status(session, ("pending",))
+            if (turn is not None and not turn.get("is_followup")
+                    and started_primary_question_count(session) >= primary_question_budget(session)["max_root_questions"]):
+                turn.update(status="skipped", skip_reason="primary_question_budget_exhausted", completed_at=now)
+                self._emit(session, events, "turn.skipped", {
+                    "turn_id": turn["id"], "reason": turn["skip_reason"],
+                }, now)
+                continue
             if turn is None or not turn.get("deferred_speech"):
                 return turn
             prepared = turn.get("speech_preparation") or {}
@@ -921,6 +1126,11 @@ class InterviewSessionLifecycle:
             self._emit(session, events, "turn.skipped", {
                 "turn_id": turn["id"], "reason": turn["skip_reason"], "source_type": "resume_experience",
             }, now)
+
+    def _apply_primary_question_budget(self, session: Document, now: str, events: List[Document]) -> None:
+        applied = apply_primary_question_budget(session, now)
+        if applied is not None:
+            self._emit(session, events, "interview.question_budget_applied", applied, now)
 
     @staticmethod
     def _has_unresolved_evaluations(session: Document) -> bool:
@@ -977,10 +1187,15 @@ class InterviewSessionLifecycle:
         root_answer = answers_by_turn.get(root_turn_id)
         if root_answer is None:
             return
-        evidence_answer_ids = [item["id"] for item in evidence_answers]
-        if root_answer.get("pending_evidence_answer_ids") == evidence_answer_ids:
+        if any(item.get("evaluation_status") != "completed" for item in evidence_answers):
             return
-        if root_answer.get("current_evidence_answer_ids") == evidence_answer_ids:
+        evidence_answer_ids = [item["id"] for item in evidence_answers]
+        fingerprint = evidence_fingerprint(evidence_answers)
+        if (root_answer.get("pending_evidence_answer_ids") == evidence_answer_ids
+                and root_answer.get("pending_evidence_fingerprint") == fingerprint):
+            return
+        if (root_answer.get("current_evidence_answer_ids") == evidence_answer_ids
+                and root_answer.get("current_evidence_fingerprint") == fingerprint):
             return
         existing = [
             item
@@ -996,6 +1211,7 @@ class InterviewSessionLifecycle:
         root_answer["evaluation_status"] = "pending"
         root_answer["evidence_group_status"] = "pending"
         root_answer["pending_evidence_answer_ids"] = evidence_answer_ids
+        root_answer["pending_evidence_fingerprint"] = fingerprint
         root_answer["updated_at"] = now
         self._emit(
             session,

@@ -1,6 +1,8 @@
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from app.domain.adaptive_interview import AdaptiveInterviewPolicy
+from app.domain.candidate_runtime import CandidateRuntimeProblemCode
 
 
 class KeyPointInput(BaseModel):
@@ -188,6 +190,22 @@ class InterviewPlanStrategy(BaseModel):
     deduplication_threshold: float = Field(default=0.72, ge=0.0, le=1.0)
 
 
+class InterviewPlanPrepareRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    job_position_id: str = Field(min_length=1)
+    candidate_profile_id: str = Field(min_length=1)
+    knowledge_base_ids: List[str] = Field(min_length=1, max_length=10)
+    duration_minutes: int = Field(default=45, ge=5, le=120)
+
+    @field_validator("knowledge_base_ids")
+    @classmethod
+    def distinct_banks(cls, value):
+        if any(not item.strip() for item in value) or len(value) != len(set(value)):
+            raise ValueError("Select distinct, nonempty knowledge base IDs.")
+        return value
+
+
 class InterviewPlanGenerateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -195,10 +213,27 @@ class InterviewPlanGenerateRequest(BaseModel):
     job_position_id: str = Field(min_length=1)
     candidate_profile_id: str = Field(min_length=1)
     knowledge_base_ids: List[str] = Field(min_length=1)
-    question_count: int = Field(default=8, ge=1, le=50)
+    question_count: int = Field(default=8, ge=1, le=10)
     strategy: InterviewPlanStrategy = Field(default_factory=InterviewPlanStrategy)
     resume_review_id: Optional[str] = None
     approve: bool = False
+    execution_schema_version: Literal[2, 3] = 2
+    adaptive_policy: Optional[AdaptiveInterviewPolicy] = None
+    skill_id: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    company_context: Optional[str] = Field(default=None, max_length=12000)
+    use_customization_defaults: bool = Field(default=True, strict=True)
+    enterprise_skill_id: Optional[str] = Field(default=None, min_length=1, max_length=200)
+
+    @field_validator("company_context")
+    @classmethod
+    def normalize_optional_company_context(cls, value):
+        return value.strip() or None if value is not None else None
+
+    @model_validator(mode="after")
+    def unambiguous_skill_reference(self):
+        if self.skill_id and self.enterprise_skill_id and self.skill_id != self.enterprise_skill_id:
+            raise ValueError("skill_id and the legacy enterprise_skill_id must refer to the same Skill.")
+        return self
 
 
 class InterviewPlanPatch(BaseModel):
@@ -294,12 +329,7 @@ class CandidateRuntimeProblemReport(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    code: Literal[
-        "AVATAR_ASSET_UNAVAILABLE",
-        "AVATAR_MODEL_LOAD_FAILED",
-        "AVATAR_RENDERER_FAILED",
-        "CANDIDATE_RUNTIME_FAILED",
-    ]
+    code: CandidateRuntimeProblemCode
 
 
 class TakeoverMediaPermitCreate(BaseModel):

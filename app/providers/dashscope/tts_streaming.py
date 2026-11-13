@@ -6,8 +6,10 @@ optional downloadable URL; that URL is neither fetched nor returned here.
 """
 
 import base64
+import asyncio
 import binascii
 import json
+import logging
 import struct
 from contextlib import AsyncExitStack
 from typing import Any, AsyncIterator, Dict
@@ -18,6 +20,14 @@ from app.core.ids import new_id
 from app.model_gateway.errors import ProviderError
 from app.model_gateway.schemas import ProviderContext, ProviderMeta, Usage
 from app.model_gateway.tts_streaming import TTSStreamEvent
+from app.providers.dashscope.tts_diagnostics import (
+    TransportTrace, annotate_cancellation, bounded_error_payload, response_error, vendor_fields,
+)
+from app.providers.dashscope.tts_http_pool import tts_http_client
+
+
+_CLOSE_TIMEOUT = 1.0
+_LOG = logging.getLogger(__name__)
 
 
 # Observed Qwen HTTP SSE WAVE prefix. Only this exact PCM16/24k/mono
@@ -41,16 +51,6 @@ def _usage(payload: Dict[str, Any]) -> Usage:
 
 def _invalid(message: str) -> ProviderError:
     return ProviderError("provider_schema_invalid", message, retryable=True)
-
-
-def _http_error(status: int) -> ProviderError:
-    if status in {401, 403}:
-        return ProviderError("provider_auth_failed", "DashScope TTS credentials were rejected.", retryable=False)
-    if status == 429:
-        return ProviderError("provider_rate_limited", "DashScope TTS rate limit was reached.", retryable=True)
-    if status >= 500:
-        return ProviderError("provider_server_error", "DashScope TTS is unavailable.", retryable=True)
-    return ProviderError("provider_bad_request", "DashScope rejected the TTS stream request.", retryable=False)
 
 
 async def _sse_data(response: httpx.Response, *, max_event_bytes: int = 524288) -> AsyncIterator[str]:
@@ -106,33 +106,90 @@ class DashScopeTTSStream:
         self._sequence = 1
         self._request_id = ""
         self._bytes = 0
+        self._trace = TransportTrace()
+        self._close_task = None
+        self._terminal_error = None
         self.ready_event = self._event("stream.ready")
+
+    @property
+    def terminal_error(self):
+        return self._terminal_error
+
+    @property
+    def cleanup_confirmed(self) -> bool:
+        task = self._close_task
+        return (task is not None and task.done() and not task.cancelled()
+                and task.exception() is None)
 
     @classmethod
     async def open(cls, client_factory, context: ProviderContext, *, endpoint: str, api_key: str, payload: Dict[str, Any]):
+        caller_task = asyncio.current_task()
+        previous = getattr(caller_task, "_dashscope_tts_open_error", None)
+        if previous is not None:
+            if getattr(caller_task, "provider_error", None) is previous:
+                del caller_task.provider_error
+            del caller_task._dashscope_tts_open_error
         self = cls(context)
         try:
-            client = await self._stack.enter_async_context(client_factory(
-                timeout=context.timeout_s,
-                trust_env=bool(context.config.get("use_environment_proxy", False)),
-                follow_redirects=False,
-            ))
+            client = await self._stack.enter_async_context(tts_http_client(client_factory, context, endpoint))
             self._response = await self._stack.enter_async_context(client.stream(
                 "POST", endpoint,
-                headers={"Authorization": "Bearer %s" % api_key, "Content-Type": "application/json", "X-DashScope-SSE": "enable"},
+                headers={"Authorization": "Bearer %s" % api_key, "Content-Type": "application/json", "X-DashScope-SSE": "enable", "Accept-Encoding": "identity"},
                 json=payload,
+                timeout=context.timeout_s,
+                extensions={"trace": self._trace},
             ))
             if self._response.status_code != 200:
-                raise _http_error(self._response.status_code)
+                fields = {}
+                self._trace.enter("response_body")
+                body_outcome = "http_error"
+                try:
+                    fields = await bounded_error_payload(self._response)
+                except (httpx.TimeoutException, asyncio.TimeoutError):
+                    body_outcome = "timeout"
+                except httpx.HTTPError:
+                    # A broken error body cannot hide the already known status.
+                    body_outcome = "network_error"
+                failure = response_error(self._response.status_code, fields)
+                failure.details.update(self._trace.snapshot(body_outcome))
+                raise failure
             if self._response.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "text/event-stream":
                 raise ProviderError("provider_streaming_not_supported", "DashScope did not return the requested SSE transport.", retryable=False)
             return self
         except BaseException as exc:
-            await self.abort()
+            outcome = "cancelled" if isinstance(exc, asyncio.CancelledError) else "timeout" if isinstance(exc, httpx.TimeoutException) else "network_error" if isinstance(exc, httpx.HTTPError) else "http_error"
+            diagnostics = self._trace.snapshot(outcome)
+            status = getattr(getattr(self, "_response", None), "status_code", None)
+            if type(status) is int and 100 <= status <= 599:
+                diagnostics["http_status"] = status
+            if isinstance(exc, ProviderError):
+                exc.details = {**diagnostics, **exc.details}
+                self._terminal_error = exc
+                # The enclosing deadline may leave zero cleanup wait budget.
+                # Expose the known rejection before the first cleanup await.
+                caller_task.provider_error = exc
+                caller_task._dashscope_tts_open_error = exc
+            elif isinstance(exc, asyncio.CancelledError):
+                # Headers already prove a rejection even when its body stalls.
+                # Retain the adapter's standard classification for a gateway
+                # deadline without replacing the caller's cancellation.
+                failure = response_error(status, {}) if "http_status" in diagnostics and status != 200 else None
+                if failure is not None:
+                    failure.details.update(diagnostics)
+                annotate_cancellation(exc, diagnostics, provider_error=failure)
+            try:
+                await self.abort()
+            except asyncio.CancelledError as cancelled:
+                # A known HTTP rejection can be waiting for transport cleanup
+                # when the caller's deadline arrives. Keep its standard cause
+                # on the cancellation; the unopened stream cannot be observed.
+                if isinstance(exc, ProviderError):
+                    annotate_cancellation(cancelled, diagnostics, provider_error=exc)
+                raise
             if isinstance(exc, httpx.TimeoutException):
-                raise ProviderError("provider_timeout", "DashScope TTS stream open timed out.", retryable=True) from exc
+                raise ProviderError("provider_timeout", "DashScope TTS stream open timed out.", retryable=True, details=diagnostics) from exc
             if isinstance(exc, httpx.HTTPError):
-                raise ProviderError("provider_network_error", "DashScope TTS stream could not connect.", retryable=True) from exc
+                raise ProviderError("provider_network_error", "DashScope TTS stream could not connect.", retryable=True, details=diagnostics) from exc
             raise
 
     def _event(self, kind: str, **kwargs) -> TTSStreamEvent:
@@ -151,6 +208,7 @@ class DashScopeTTSStream:
         done_received = False
         metadata_received = False
         try:
+            self._trace.enter("response_body")
             async for data in _sse_data(self._response):
                 if self._closed:
                     raise ProviderError("provider_stream_closed", "DashScope TTS stream was cancelled.", retryable=False)
@@ -170,11 +228,8 @@ class DashScopeTTSStream:
                 status = payload.get("status_code", 200)
                 if type(status) is not int:
                     raise _invalid("DashScope TTS status is invalid.")
-                if status != 200:
-                    raise _http_error(status)
-                if payload.get("code"):
-                    # Do not echo vendor messages, which can contain input text.
-                    raise ProviderError("provider_server_error", "DashScope TTS returned a stream error.", retryable=True)
+                if status != 200 or payload.get("code"):
+                    raise response_error(status, vendor_fields(payload), stream=True)
                 request_id = payload.get("request_id")
                 if not isinstance(request_id, str) or not request_id or len(request_id) > 200:
                     raise _invalid("DashScope TTS request identity is missing.")
@@ -225,13 +280,42 @@ class DashScopeTTSStream:
                 raise ProviderError("provider_audio_final_missing", "DashScope TTS disconnected before its final payload.", retryable=True)
             yield final
         except httpx.TimeoutException as exc:
-            raise ProviderError("provider_timeout", "DashScope TTS stream read timed out.", retryable=True) from exc
+            raise ProviderError("provider_timeout", "DashScope TTS stream read timed out.", retryable=True,
+                                details=self._trace.snapshot("timeout")) from exc
         except httpx.HTTPError as exc:
-            raise ProviderError("provider_network_error", "DashScope TTS stream disconnected.", retryable=True) from exc
+            raise ProviderError("provider_network_error", "DashScope TTS stream disconnected.", retryable=True,
+                                details=self._trace.snapshot("network_error")) from exc
+        except ProviderError as exc:
+            exc.details.update(self._trace.snapshot("stream_error"))
+            self._terminal_error = exc
+            raise
+        except asyncio.CancelledError as exc:
+            annotate_cancellation(exc, self._trace.snapshot("cancelled"))
+            raise
         finally:
             await self.abort()
 
     async def abort(self) -> None:
         if not self._closed:
             self._closed = True
-            await self._stack.aclose()
+            self._close_task = asyncio.create_task(self._stack.aclose())
+            task = self._close_task
+
+            def consume(done):
+                if not done.cancelled():
+                    done.exception()
+
+            try:
+                done, _ = await asyncio.wait({task}, timeout=_CLOSE_TIMEOUT)
+                if done:
+                    task.result()
+                else:
+                    task.cancel()
+                    task.add_done_callback(consume)
+                    _LOG.warning("DashScope TTS cleanup exceeded its time limit.")
+            except asyncio.CancelledError:
+                task.cancel()
+                task.add_done_callback(consume)
+                raise
+            except Exception as exc:
+                _LOG.warning("DashScope TTS cleanup failed: error_type=%s", type(exc).__name__)

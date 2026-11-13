@@ -7,10 +7,12 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from app.core.ids import new_id
 from app.core.prompt.contracts import prompt_contract
+from app.core.prompt.evaluation_evidence import validate_evaluation_chain, evaluation_evidence_sources
+from app.core.prompt.validation import StructuredResponseValidationError
 from app.core.time import utc_now
 from app.domain.interview_agent import TurnUnderstanding
 from app.domain.scoring_quality import evaluation_answers, project_evaluation, recognition_context
-from app.domain.speech_quality import limit_semantic_confidence
+from app.domain.speech_quality import limit_semantic_confidence, transcript_identity, transcript_is_verified
 from app.services.recognition_vocabulary import recognition_terms
 from app.model_gateway.errors import ProviderError
 from app.model_gateway.gateway import ModelGateway
@@ -214,6 +216,19 @@ class EvaluationService:
             source_session = transaction.interview_sessions.get(answer["interview_id"])
         quality_answers = (evaluation_answers(source_session, {"answer_id": answer["id"],
             "evidence_answer_ids": answer.get("evidence_answer_ids")}) if source_session else [answer])
+        self._validate_evidence_chain(answer, question_snapshot, source_session)
+        unresolved = self._unresolved_evidence(answer, source_session)
+        if unresolved:
+            data = {"score": None, "confidence": 0.0, "dimension_scores": {},
+                    "covered_key_points": [], "missing_key_points": [], "incorrect_claims": [], "evidence": [],
+                    "review_flags": ["answer_content_unresolved", "transcription_ambiguity"],
+                    "summary": "候选人已结束本次回答，但部分技术转写仍无法核实；原始录音、转写和可确认的主张已保留，本题暂不计分，待人工回听核验后重评。",
+                    "suggested_followup": None}
+            model_info = {"provider_id": "system", "model": "unresolved_answer_policy", "request_id": None,
+                          "prompt_version": None, "scoring_rule_version": "unresolved_answer.v1",
+                          "unresolved_answers": unresolved}
+            return project_evaluation(self._evaluation_revision(answer, question_snapshot, data, model_info),
+                                      quality_answers, capture_verification=True)
         scoring_answer, declined = self._declined_evidence(answer)
         if declined and not scoring_answer["final_transcript"]:
             data, model_info = self._declined_score(answer, question_snapshot, declined)
@@ -226,10 +241,15 @@ class EvaluationService:
                 "rubric": question_snapshot.get("rubric", {}),
                 "role_requirement": (role_requirement or {}).get("description", ""),
                 "answer_text": scoring_answer["final_transcript"],
+                "evidence_chain": scoring_answer.get("evidence_chain"),
+                "company_questions_excluded": bool(scoring_answer.get("company_questions_excluded")),
                 "key_points": question_snapshot["key_points"],
                 "question_type": question_snapshot.get("source_type", "position_bank"),
                 "recognition_quality": recognition_context(quality_answers),
                 "recognition_terms": recognition_terms({"question_snapshot": question_snapshot}),
+                "inquiry_scope": ({"inquiry_unit_id": question_snapshot["inquiry_unit_id"],
+                                   "assessed_rubric_point_ids": question_snapshot["assessed_rubric_point_ids"]}
+                                  if question_snapshot.get("inquiry_unit_id") else None),
             },
         )
         request = ChatJSONRequest(
@@ -241,6 +261,7 @@ class EvaluationService:
                 json_schema=contract.response_schema,
                 metadata={
                     "answer_text": scoring_answer["final_transcript"],
+                    "evidence_chain": scoring_answer.get("evidence_chain"),
                     "key_points": question_snapshot["key_points"],
                     "question_id": question_snapshot.get("source_question_id", question_snapshot["id"]),
                     "question_snapshot_id": question_snapshot["id"],
@@ -275,7 +296,153 @@ class EvaluationService:
                 evidence_filter_version="declined_answer.v1",
                 excluded_declined_answers=declined,
             )
-        return project_evaluation(self._evaluation_revision(answer, question_snapshot, response.data, model_info), quality_answers, capture_verification=True)
+        data = deepcopy(response.data)
+        if scoring_answer.get("evidence_chain"):
+            try:
+                data["evidence_sources"] = evaluation_evidence_sources(data, scoring_answer["evidence_chain"],
+                    [p["id"] if isinstance(p, dict) else str(p) for p in question_snapshot["key_points"]])
+            except StructuredResponseValidationError as exc:
+                raise ProviderError("evaluation_evidence_invalid", "评分引用未能关联到对应问题的回答，请重试评分。", retryable=True) from exc
+        return project_evaluation(self._evaluation_revision(answer, question_snapshot, data, model_info), quality_answers, capture_verification=True)
+
+    @staticmethod
+    def _validate_evidence_chain(answer, question_snapshot, session):
+        """Group inputs must exactly match this tenant's persisted Q/A revisions."""
+        if not (answer.get("evidence_chain") or len(answer.get("evidence_answer_ids") or []) > 1
+                or answer.get("transcript_source") == "server_authoritative_evidence_group"):
+            return
+        try:
+            chain = answer.get("evidence_chain")
+            root_id = answer.get("root_turn_id") or answer["turn_id"]
+            validate_evaluation_chain(chain, root_answer_id=answer["id"], root_turn_id=root_id,
+                point_ids=[p["id"] if isinstance(p, dict) else str(p) for p in question_snapshot["key_points"]])
+            if not session or session["organization_id"] != answer.get("organization_id", "org_default"):
+                raise ValueError("Missing authoritative group.")
+            answers = {a["id"]: a for a in session.get("answers", [])}
+            turns = {t["id"]: t for t in session.get("turns", [])}
+            expected, orders = [], []
+            for item in chain:
+                source = answers[item["answer_id"]]
+                turn = turns[source["turn_id"]]
+                snapshot = turn["question_snapshot"]
+                corrected = source.get("transcript_source") == "human_correction" and any(
+                    revision.get("source") == "human_correction" and revision.get("reviewer_id")
+                    and revision.get("revision") == int(source.get("current_transcript_revision", 1))
+                    and revision.get("text") == source.get("final_transcript")
+                    for revision in source.get("transcript_revisions", []))
+                if ((source.get("root_turn_id") or source["turn_id"]) != root_id
+                        or (turn.get("root_turn_id") or turn["id"]) != root_id
+                        or source.get("organization_id", session["organization_id"]) != session["organization_id"]
+                        or source.get("question_snapshot_id") != snapshot["id"]
+                        or not source.get("audio_uri")
+                        or (source.get("transcript_source") not in {"server_streaming", "server_batch"} and not corrected)):
+                    raise ValueError("Invalid authoritative group source.")
+                expected.append({"answer_id": source["id"], "turn_id": turn["id"],
+                    "parent_turn_id": turn.get("parent_turn_id"), "root_turn_id": root_id,
+                    "question_text": turn.get("question_spoken_text") or snapshot.get("question_text", ""),
+                    "answer_text": source["final_transcript"],
+                    "target_point_ids": list(turn.get("assessed_rubric_point_ids") or snapshot.get("assessed_rubric_point_ids")
+                        or [p["id"] if isinstance(p, dict) else str(p) for p in snapshot.get("key_points", [])]),
+                    "transcript_revision": int(source.get("current_transcript_revision", 1))})
+                orders.append(int(turn.get("order", 0)))
+            merged_text = "\n\n".join("【%s】\n%s" % (
+                "主回答" if index == 0 else "追问%d回答" % index, entry["answer_text"].strip())
+                for index, entry in enumerate(expected))
+            if (chain != expected or orders != sorted(orders)
+                    or [entry["answer_id"] for entry in chain] != answer.get("evidence_answer_ids")
+                    or answer["turn_id"] != root_id or answer.get("final_transcript") != merged_text
+                    or answer.get("question_snapshot_id") != question_snapshot["id"]
+                    or question_snapshot != turns[root_id]["question_snapshot"]):
+                raise ValueError("Stale or inconsistent group.")
+        except (ValueError, TypeError, KeyError) as exc:
+            raise ProviderError("evaluation_evidence_invalid", "父子问答证据已变化或关联不完整，请重新评分。", retryable=False) from exc
+
+    @staticmethod
+    def _unresolved_evidence(answer, session):
+        """Only persisted, source-bound unresolved speech can defer a score.
+
+        Client tags and stale understandings cannot manufacture this state.
+        A verified human transcript revision may be scored through the normal
+        model path; old evaluation revisions remain immutable and unscored.
+        """
+        if not session or session.get("organization_id") != answer.get("organization_id", "org_default"):
+            return []
+        answers = {item["id"]: item for item in session.get("answers", [])}
+        turns = {item["id"]: item for item in session.get("turns", [])}
+        ids = answer.get("evidence_answer_ids") or [answer["id"]]
+        if (not isinstance(ids, list) or not ids or ids[0] != answer["id"]
+                or len(set(ids)) != len(ids) or any(item not in answers for item in ids)):
+            return []
+        root = answers[ids[0]]
+        if any(answer.get(key) != root.get(key) for key in (
+                "turn_id", "question_snapshot_id", "understanding_id", "utterance_id")):
+            return []
+        if len(ids) == 1 and answer.get("final_transcript") != root.get("final_transcript"):
+            return []
+        unresolved = []
+        for answer_id in ids:
+            item = answers[answer_id]
+            turn = turns.get(item.get("turn_id"), {})
+            raw = turn.get("current_understanding") or {}
+            if raw.get("intent") != "answer_unresolved" or transcript_is_verified(item):
+                continue
+            try:
+                understanding = TurnUnderstanding.model_validate(raw)
+            except (ValueError, TypeError):
+                continue
+            utterance = next((value for value in turn.get("utterances", [])
+                              if value.get("utterance_id") == item.get("utterance_id")), {})
+            text = str(item.get("final_transcript") or "").strip()
+            target = understanding.clarification_target
+            basis = understanding.completion_basis
+            from app.core.prompt.semantic_turn import validate_semantic_turn
+            try:
+                validate_semantic_turn(understanding.model_dump(mode="json"), text)
+            except (ValueError, KeyError, TypeError):
+                continue
+            points = set(EvaluationService._key_point_texts((turn.get("question_snapshot") or {}).get("key_points", [])))
+            covered, missing = set(understanding.covered_capability_points), set(understanding.missing_capability_points)
+            verified = (
+                covered | missing == points and not covered & missing
+                and len(covered) == len(understanding.covered_capability_points)
+                and len(missing) == len(understanding.missing_capability_points)
+                and not understanding.contradictions
+                and understanding.understanding_id == item.get("understanding_id")
+                and understanding.utterance_id == item.get("utterance_id")
+                and understanding.turn_intent in {"finish_answer", "stop_interview"} and understanding.suggested_action == "next"
+                and not understanding.followup_allowed and understanding.problem is None
+                and understanding.confidence >= .75 and bool(understanding.ambiguities)
+                and basis is not None and all(quote.strip() and quote in text for quote in basis.evidence_quotes)
+                and target is not None and target.evidence_quote in text and target.focus_quote in target.evidence_quote
+                and bool(understanding.evidence_quotes) and all(quote.strip() and quote in text for quote in understanding.evidence_quotes)
+                and all(claim.evidence_quote in text and claim.evidence_quote in understanding.evidence_quotes
+                        for claim in understanding.claims)
+                and bool(text) and bool(item.get("audio_uri"))
+                and item.get("question_snapshot_id") == (turn.get("question_snapshot") or {}).get("id")
+                and item.get("transcript_source") in {"server_streaming", "server_batch"}
+                and utterance.get("authoritative") is True and utterance.get("is_final") is True
+                and utterance.get("source") == item.get("transcript_source")
+                and utterance.get("speaker") == "candidate" and utterance.get("audio_uri") == item.get("audio_uri")
+                and str(utterance.get("text") or "").strip() == text
+            )
+            if verified and understanding.turn_intent == "stop_interview":
+                from app.services.candidate_exit_confirmation import text_hash
+                from app.core.prompt.candidate_exit import EXIT_CONFIRMATION_SPEECH_VERSION
+                receipt = turn.get("candidate_exit_confirmation") or {}
+                if (receipt.get("version") != EXIT_CONFIRMATION_SPEECH_VERSION
+                        or receipt.get("state") != "confirmed" or not receipt.get("confirmed_at")
+                        or not receipt.get("question_act_id") or not receipt.get("capture_id")
+                        or receipt.get("transcript_sha256") != text_hash(text)
+                        or not all(isinstance(receipt.get(key), str)
+                                   and re.fullmatch(r"[0-9a-f]{64}", receipt[key])
+                                   for key in ("request_sha256", "reply_sha256"))):
+                    raise ProviderError("evaluation_evidence_invalid", "退出确认与待核实回答证据未能对应，请人工复核。", retryable=False)
+            if verified:
+                unresolved.append({"answer_id": item["id"], "understanding_id": understanding.understanding_id,
+                                   "utterance_id": understanding.utterance_id,
+                                   "understanding_prompt_version": understanding.prompt_version,
+                                   "transcript_identity": transcript_identity(item)})
+        return unresolved
 
     def _declined_evidence(self, answer: Dict[str, Any]) -> tuple[Dict[str, Any], List[Dict[str, Any]]]:
         """Resolve declined facts from persisted server evidence, never input labels."""
@@ -311,16 +478,24 @@ class EvaluationService:
         if answer.get("final_transcript") != expected_text:
             return answer, []
         declined, retained = [], []
+        company_excluded = False
         for index, item in enumerate(evidence):
             turn = turns.get(item.get("turn_id"), {})
             raw = turn.get("current_understanding") or {}
+            scoring_item = item
+            if turn.get("company_question_exchanges"):
+                from app.services.company_questions import scoring_projection
+                text, excluded = scoring_projection(item["final_transcript"], turn, media_evidence=item.get("media_evidence"))
+                if excluded:
+                    company_excluded = True
+                    scoring_item = {**item, "final_transcript": text}
             if raw.get("intent") != "answer_declined":
-                retained.append((index, item))
+                retained.append((index, scoring_item))
                 continue
             try:
                 understanding = TurnUnderstanding.model_validate(raw)
             except (ValueError, TypeError):
-                retained.append((index, item))
+                retained.append((index, scoring_item))
                 continue
             utterance = next((value for value in turn.get("utterances", [])
                               if value.get("utterance_id") == item.get("utterance_id")), {})
@@ -348,10 +523,18 @@ class EvaluationService:
                                  "understanding_prompt_version": understanding.prompt_version,
                                  "confidence": understanding.confidence})
             else:
-                retained.append((index, item))
-        if not declined:
+                retained.append((index, scoring_item))
+        if not declined and not company_excluded:
             return answer, []
         scoring_answer = deepcopy(answer)
+        scoring_answer["company_questions_excluded"] = company_excluded
+        if scoring_answer.get("evidence_chain"):
+            retained_by_id = {item["id"]: item for _, item in retained}
+            scoring_answer["evidence_chain"] = [
+                {**entry, "answer_text": retained_by_id[entry["answer_id"]]["final_transcript"]}
+                for entry in scoring_answer["evidence_chain"] if entry["answer_id"] in retained_by_id
+                and str(retained_by_id[entry["answer_id"]]["final_transcript"]).strip()
+            ]
         if len(retained) == 1 and retained[0][0] == 0:
             # Keep the root's original scoring input byte-for-byte when its
             # follow-ups add no technical evidence.
@@ -401,6 +584,9 @@ class EvaluationService:
             "answer_id": answer["id"],
             "question_id": question_snapshot.get("source_question_id", question_snapshot["id"]),
             "question_snapshot_id": question_snapshot["id"],
+            "inquiry_unit_id": question_snapshot.get("inquiry_unit_id"),
+            "assessed_rubric_point_ids": deepcopy(question_snapshot.get("assessed_rubric_point_ids", [])),
+            "not_assessed_rubric_point_ids": deepcopy(question_snapshot.get("not_assessed_rubric_point_ids", [])),
             "score": data["score"],
             "confidence": data["confidence"],
             "dimension_scores": data["dimension_scores"],
@@ -408,6 +594,7 @@ class EvaluationService:
             "missing_key_points": data["missing_key_points"],
             "incorrect_claims": data.get("incorrect_claims", []),
             "evidence": data.get("evidence", []),
+            "evidence_sources": deepcopy(data.get("evidence_sources", [])),
             "review_flags": data.get("review_flags", []),
             "feedback": data["summary"],
             "suggested_followup": data.get("suggested_followup"),

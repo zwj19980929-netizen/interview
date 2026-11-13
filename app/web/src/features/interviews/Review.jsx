@@ -1,9 +1,35 @@
 import { useEffect, useRef, useState } from "react";
 import { useWorkbench } from "../../core/WorkbenchProvider.jsx";
 import { Status, formatDate } from "../../core/ui.jsx";
+import { flattenQuestions, questionTree } from "./question-tree.js";
 
 const recordingLabels = { completed: "录像已保存", hash_pending: "录像正在封存校验", stopping: "录像正在收尾", recording: "正在录制", failed: "录像处理失败", unavailable: "暂无全场录像", cancelled: "未开始录制", retention_purged: "录像已按留存策略清除" };
 const fitLabels = { strong_match: "高度匹配", match: "匹配", partial_match: "部分匹配", insufficient_evidence: "证据不足", manual_review: "建议人工复核" };
+const completionLabels = { evidence_sufficient: "已取得约定范围的考察证据", budget_exhausted: "考察时间或题数预算已用完", candidate_requested: "候选人主动提前退出", appointment_window_expired: "预约时间已结束", media_failure: "音视频故障导致结束" };
+const recordingFailureLabels = {
+  configuration: "媒体存储配置待修复，请管理员修复后恢复封存。",
+  retry_exhausted: "自动重试次数已用完，请检查原因后重试封存。",
+  integrity: "录像完整性或访问保护校验未通过，请管理员检查存储文件。",
+  provider: "录像服务暂不可用，请检查服务后重试封存。",
+};
+function completionLabel(reason, completion) {
+  if (reason === "budget_exhausted") {
+    if (completion?.trigger === "time_limit") return Number.isFinite(completion.limit_minutes) && completion.limit_minutes > 0
+      ? `达到 ${completion.limit_minutes} 分钟时长上限` : "达到本场时长上限";
+    if (completion?.trigger === "primary_question_limit") return Number.isInteger(completion.primary_question_limit) && completion.primary_question_limit > 0
+      ? `达到 ${completion.primary_question_limit} 道主问题上限` : "达到本场主问题数量上限";
+    if (completion?.trigger === "candidate_pool_exhausted") return "本场可用问题已问完";
+  }
+  return completionLabels[reason] || "本场考察已结束";
+}
+const decisionLabels = { ...completionLabels, coverage_gap: "补充能力证据", relevant_experience: "了解相关经历", topic_change: "转换考察方向", coverage_complete: "已取得约定范围的考察证据" };
+const toolLabels = { "questions.search": "检索批准题池", "questions.read": "读取批准问题", "resume.read_evidence": "读取简历证据", "interview.read_context": "读取考察上下文", "company.read_reference": "读取企业资料", "specialists.consult": "咨询专业证据专家" };
+const evaluationFailures = {
+  provider_output_truncated: "评分输出达到模型上限，未生成完整结果。",
+  provider_billing_required: "评分模型供应商账户计费或额度需要处理。请管理员处理后重试评分。",
+};
+const evaluationFailure = (code) => Object.hasOwn(evaluationFailures, code)
+  ? evaluationFailures[code] : "本题后台评分失败，可重试未完成处理。";
 
 export function useInterviewReview(interviewId) {
   const { API, request } = useWorkbench();
@@ -36,6 +62,7 @@ export default function InterviewReview({ interviewId, review, error, reload, ca
   const { API, request, toast } = useWorkbench();
   const [selectedId, setSelectedId] = useState("");
   const [media, setMedia] = useState(null);
+  const [mediaScope, setMediaScope] = useState(null);
   const [busy, setBusy] = useState(false);
   const [mediaError, setMediaError] = useState("");
   const generation = useRef(0);
@@ -46,13 +73,36 @@ export default function InterviewReview({ interviewId, review, error, reload, ca
   if (!review) return <section className="report-panel" aria-label="面试复核"><p role="status">{error || "正在加载评分与回放…"}</p></section>;
   const processing = review.processing || {};
   const recording = review.recording || {};
+  const recordingFailed = recording.processing_status === "failed" || recording.status === "failed";
+  const recordingLabel = recordingFailed ? "录像封存失败" : recordingLabels[recording.status] || "暂无全场录像";
+  const recordingCanRetry = typeof recording.can_retry === "boolean" ? recording.can_retry
+    : !recordingFailed && ["hash_pending", "stopping"].includes(recording.status);
+  const recordingFailure = Object.hasOwn(recordingFailureLabels, recording.failure_reason)
+    ? recordingFailureLabels[recording.failure_reason] : "请管理员检查后恢复封存。";
+  const questionCounts = review.question_counts;
+  const elapsedSeconds = Number.isFinite(review.completion?.elapsed_seconds) && review.completion.elapsed_seconds >= 0
+    ? Math.floor(review.completion.elapsed_seconds) : null;
   const turns = review.turns || [];
-  const selected = turns.find((turn) => turn.turn_id === selectedId) || turns[0];
+  const questionGroups = questionTree(turns);
+  const selected = selectedId === "__none__" ? null : turns.find((turn) => turn.turn_id === selectedId) || turns[0];
+  const selectedRoot = questionGroups.find(node => node.id !== selected?.turn_id
+    && flattenQuestions(node.children).some(child => child.id === selected?.turn_id));
   const report = review.report;
+  const sessionAssessment = report?.score_scope === "session_assessment"
+    && report?.assessment_scope?.schema_version === "session_assessment_scope.v1";
+  const transcriptReviewRequired = report?.overall_score == null
+    && (report?.manual_review_required === true || report?.pending_verification_answer_ids?.length > 0);
+  const selectedTranscriptReviewRequired = selected?.evaluation?.score == null
+    && (selected?.evaluation?.manual_review_required === true
+      || report?.pending_verification_answer_ids?.includes(selected?.answer?.id));
+  const adaptive = review.execution_schema_version === 3 || report?.execution_schema_version === 3;
+  const completionReason = review.candidate_input_completion_reason || report?.candidate_input_completion_reason;
+  const planningDecisions = review.planning?.decisions?.length ? review.planning.decisions : review.planning?.last_decision?.decision_id ? [review.planning.last_decision] : [];
   const status = { ready: "报告已生成", pending_verification: "报告已生成", failed: "报告待处理：后台评分或报告生成失败", processing: "正在后台评分，完成后自动生成报告", awaiting_submission: "面试进行中" }[processing.report_status] || "正在同步处理状态";
-  const select = (id) => { generation.current += 1; setSelectedId(id); setMedia(null); setMediaError(""); };
+  const select = (id) => { generation.current += 1; setSelectedId(id === selected?.turn_id ? "__none__" : id); setMedia(null); setMediaError(""); setMediaScope(null); };
   const play = async (kind, turn = null) => {
     const current = ++generation.current;
+    setMediaScope(turn?.turn_id || null);
     setMediaError("");
     setMedia(null);
     try {
@@ -60,7 +110,8 @@ export default function InterviewReview({ interviewId, review, error, reload, ca
         ? `${API}/interviews/${interviewId}/answers/${turn.answer.id}/audio-url`
         : `${API}/interviews/${interviewId}/recording-url`, { method: "POST" });
       if (generation.current !== current) return;
-      setMedia({ kind, url: grant.url, label: turn ? `第 ${turn.order} 题${kind === "audio" ? "回答录音" : "视频片段"}` : "整场音视频",
+      setMedia({ kind, url: grant.url, label: turn ? `${turn.is_followup ? "追问" : "本题"}${kind === "audio" ? "回答录音" : "视频片段"}` : "整场音视频",
+        turnId: turn?.turn_id || null,
         start: kind === "video" && turn ? turn.playback.start_seconds : 0,
         end: kind === "video" && turn ? turn.playback.end_seconds : null });
     } catch (problem) {
@@ -85,70 +136,145 @@ export default function InterviewReview({ interviewId, review, error, reload, ca
   const stopAtEnd = (event) => {
     if (media?.end != null && event.currentTarget.currentTime >= media.end) event.currentTarget.pause();
   };
-  return <section className="interview-review" aria-label="面试报告与回放">
-    <section className="report-panel">
-      <h2>面试报告与回放</h2>
-      <p role="status"><strong>{status}</strong></p>
-      {processing.submitted_at && <p>回答已收齐 · {formatDate(processing.submitted_at)}</p>}
-      <p>已评分 {processing.completed || 0} / {processing.total || 0} 题 · 待处理 {processing.pending || 0} 题 · 失败 {processing.failed || 0} 题</p>
-      {processing.failed > 0 && <p role="alert">评分失败不会丢失回答和录音。修复模型问题后可重试，评分完成后会自动生成报告。</p>}
-      {error && <p role="alert">状态刷新失败：{error}</p>}
-      <p>{recordingLabels[recording.status] || "暂无全场录像"} · {recording.hash_verified ? "完整性校验通过" : "尚未通过完整性校验"}</p>
-      <div className="page-actions">
-        <button className="button button-secondary" onClick={reload}>刷新结果</button>
-        {recording.available && <button className="button button-secondary" onClick={() => play("video")}>播放整场音视频</button>}
-        {canManage && (processing.can_retry || ["hash_pending", "stopping"].includes(recording.status)) && <button className="button button-primary" disabled={busy} onClick={retry}>{busy ? "正在排队…" : "重试未完成处理"}</button>}
-      </div>
-      {report && <div className="review-report-summary">
-        {report.overall_score == null ? <p role="status"><strong>{report.score_status === "processing" ? "正在重新评分" : "正在等待有效评分"}</strong></p> : <strong className="score-value">{report.overall_score}<small> / 100</small></strong>}
-        {report.recognition_notice && <p className="form-hint">{report.recognition_notice}</p>}
-        <h3>{fitLabels[report.job_fit_level] || "待人工复核"}</h3>
-        {report.summary && <p>{report.summary}</p>}
-        <p>最终决定由企业人员完成。</p>
-        {[["优势", report.strengths], ["风险与待核验项", report.risks], ["建议", report.followup_suggestions]].map(([title, items]) => items?.length > 0 && <div key={title}><h4>{title}</h4><ul>{items.map((item, index) => <li key={index}>{typeof item === "string" ? item : item.text || item.description || item.reason || JSON.stringify(item)}</li>)}</ul></div>)}
-      </div>}
-    </section>
-    {turns.length > 0 && <section className="report-panel review-question-panel">
-      <h3>逐题复核</h3>
-      <div className="review-question-tabs" role="group" aria-label="选择回答题目">
-        {turns.map((turn) => <button key={turn.turn_id} className={`button ${turn.turn_id === selected?.turn_id ? "button-primary" : "button-secondary"}`} aria-pressed={turn.turn_id === selected?.turn_id} onClick={() => select(turn.turn_id)}>
-          第 {turn.order} 题{turn.is_followup ? " · 追问" : ""} · {turn.skip_reason === "resume_speech_not_ready" ? "语音未就绪，已跳过" : turn.answer?.evaluation_status === "failed" ? "评分失败" : turn.answer?.evaluation_status === "pending" ? "正在评分" : turn.evaluation?.score != null ? `${turn.evaluation.score}分` : turn.answer ? "待评分" : "未作答"}
-        </button>)}
-      </div>
-      {selected && <article className="review-answer">
-        <h3>{selected.question?.question_text}</h3>
+  const playbackPanel = (media || mediaError) && <section className="review-player-panel">
+      <h3>{media?.label || "音视频回放"}</h3>
+      {mediaError && <p role="alert">{mediaError} 如地址已过期，请重新点击上方播放按钮。</p>}
+      {media?.kind === "video" && <video key={media.url} ref={player} src={media.url} controls playsInline preload="metadata" onLoadedMetadata={begin} onTimeUpdate={stopAtEnd} onError={() => setMediaError("视频加载失败或签名已过期。请重新获取播放地址。")}/>}
+      {media?.kind === "audio" && <audio key={media.url} ref={player} src={media.url} controls autoPlay preload="metadata" onError={() => setMediaError("录音加载失败或签名已过期。请重新获取播放地址。")}/>}
+  </section>;
+  const selectedDetail = selected && <article className="review-answer">
+        {selectedRoot && <p className="form-hint">所属主问题：{selectedRoot.text}</p>}
+        <h3>{selected.question_spoken_text || selected.question?.question_text}</h3>
         {selected.skip_reason === "resume_speech_not_ready" && <p role="status">本题读题语音在提问时尚未就绪，系统已跳过，不计入评分。</p>}
+        {selected.status === "skipped" && completionLabels[selected.skip_reason] && <p role="status">{completionLabels[selected.skip_reason]}，本题没有形成完整回答证据，不计零分。</p>}
+        {adaptive && !selected.is_followup && selected.presented_unit_ids?.includes("complete_question") && <p className="form-hint">本题评分范围：完整呈现的题目与全部 {selected.assessed_rubric_point_ids?.length || 0} 项关键点。</p>}
+        {selected.inquiry_unit_id && !selected.is_followup && <p className="form-hint">本题仅考察当前问题对应的 {selected.assessed_rubric_point_ids?.length || 0} 项关键点。{selected.question?.not_assessed_rubric_point_ids?.length ? `原题另外 ${selected.question.not_assessed_rubric_point_ids.length} 项不在本次提问的评分范围内。` : ""}</p>}
+        {adaptive && selected.is_followup && <p className="form-hint">此追问作为主问题的补充证据，在总分中不重复计权。</p>}
         <div className="page-actions">
           <button className="button button-secondary" disabled={!selected.playback?.audio_available} onClick={() => play("audio", selected)}>播放本题音频</button>
           <button className="button button-secondary" disabled={!selected.playback?.video_available} onClick={() => play("video", selected)}>播放本题视频</button>
         </div>
+        {!selected.playback?.audio_available && <p className="form-hint">本题没有可回听的独立回答录音。</p>}
+        {!selected.playback?.video_available && <p className="form-hint">{recording.available ? "本题缺少可定位的视频时间段，可使用上方的整场音视频回放。" : `${recordingLabel}，暂不能播放本题视频。`}</p>}
         {selected.playback?.video_available && <p className="form-hint">{selected.playback.timing_source === "server_capture_window" ? "视频按服务端回答采集时间定位。" : "历史视频按服务端题目时间窗口定位，包含读题和回答。"}音频为本题独立回答录音。</p>}
         <h4>回答转写</h4><p className="review-transcript">{selected.answer?.final_transcript || "本题没有已提交回答。"}</p>
-        {selected.answer?.evaluation_status === "failed" && <p role="alert">{selected.answer.evaluation_failure_code === "provider_output_truncated" ? "评分输出达到模型上限，未生成完整结果。" : "本题后台评分失败，可重试未完成处理。"}</p>}
+        {selected.answer?.evaluation_status === "failed" && <p role="alert">{evaluationFailure(selected.answer.evaluation_failure_code)}</p>}
         {selected.answer?.evaluation_status === "pending" && selected.evaluation && <p role="status">本题正在重新评分，下方为上一版本的评分依据，完成后会自动更新。</p>}
         {selected.answer && <p className="form-hint">识别置信度：{selected.answer.stt_confidence == null ? "未知（未提供可用数值）" : `${Math.round(selected.answer.stt_confidence * 100)}%（识别服务报告值，非准确率保证）`} · {selected.answer.transcript_verified ? "转写已回听核验" : "支持按需回听纠错"}</p>}
         {selected.evaluation && <><h4>{selected.evaluation.score == null ? "本题尚无有效评分" : `评分与依据 · ${selected.evaluation.score} 分`}</h4>
-          {selected.evaluation.recognition_warning && <p className="form-hint">本题部分转写存在不确定性，已按可理解的内容直接评分；回听和纠错均为可选。</p>}
+          {selected.evaluation.recognition_warning && <p className="form-hint">{selectedTranscriptReviewRequired
+            ? "本题回答转写待人工核验。请先回听录音，核验实际表达后再重新评分。"
+            : "本题部分转写存在不确定性，已按可理解的内容直接评分；回听和纠错均为可选。"}</p>}
           <p>{selected.evaluation.feedback}</p>
           <dl className="review-dimensions">{Object.entries(selected.evaluation.dimension_scores || {}).map(([name, value]) => <div key={name}><dt>{({ semantic_correctness: "语义正确性", key_point_coverage: "关键点覆盖", reasoning_depth: "推理深度", role_relevance: "岗位相关性", communication: "表达清晰度", specificity: "具体程度", technical_depth: "技术深度", evidence_consistency: "证据一致性", reflection: "反思" })[name] || name}</dt><dd>{value} 分</dd></div>)}</dl>
           <h4>命中证据</h4><ul>{selected.evaluation.covered_key_points?.map((point, index) => <li key={index}>{point.evidence}</li>)}</ul>
           <h4>缺失点</h4><ul>{selected.evaluation.missing_key_points?.map((point, index) => <li key={index}>{selected.question?.key_points?.find((item) => item.id === point.key_point_id)?.text || point.key_point_id}：{point.reason}</li>)}</ul>
           {!!selected.evaluation.review_flags?.length && <p>评分提示：{selected.evaluation.review_flags.map((flag) => ({ transcription_ambiguity: "转写存在歧义", low_stt_confidence: "识别置信度较低" })[flag] || flag).join("、")}</p>}
         </>}
-        {canManage && selected.answer && selected.evaluation && <TranscriptVerification key={`${selected.answer.id}:${selected.evaluation.id}:${selected.answer.current_transcript_revision || 1}`} interviewId={interviewId} turn={selected} reload={reload} />}
-      </article>}
+        {canManage && selected.answer && selected.evaluation && <TranscriptVerification key={`${selected.answer.id}:${selected.evaluation.id}:${selected.answer.current_transcript_revision || 1}`} interviewId={interviewId} turn={selected} reload={reload} required={selectedTranscriptReviewRequired} />}
+        {mediaScope === selected.turn_id && playbackPanel}
+  </article>;
+  return <section className="interview-review" aria-label="面试报告与回放">
+    <section className="report-panel">
+      <h2>面试报告与回放</h2>
+      <p role="status"><strong>{status}</strong></p>
+      {processing.submitted_at && <p>{completionReason ? "候选人作答已结束" : "回答已收齐"} · {formatDate(processing.submitted_at)}</p>}
+      {completionReason && <p>结束原因：{completionLabel(completionReason, review.completion)}</p>}
+      {elapsedSeconds !== null && <p>本场用时 {Math.floor(elapsedSeconds / 60)} 分 {elapsedSeconds % 60} 秒</p>}
+      {completionReason === "candidate_requested" && <p role="status">提前退出待人工复核，最终决定由企业人员完成。</p>}
+      {Number.isInteger(questionCounts?.primary) && Number.isInteger(questionCounts?.followup)
+        && <p>已提问 {questionCounts.primary} 道主问题 · {questionCounts.followup} 道追问</p>}
+      <p>已评分 {processing.completed || 0} / {processing.total || 0} 份回答 · 待处理 {processing.pending || 0} 份 · 失败 {processing.failed || 0} 份</p>
+      {processing.failed > 0 && <p role="alert">评分失败不会丢失回答和录音。修复模型问题后可重试，评分完成后会自动生成报告。</p>}
+      {error && <p role="alert">状态刷新失败：{error}</p>}
+      <p role={recordingFailed ? "alert" : undefined}>{recordingLabel}{recordingFailed ? `：${recordingFailure}` : ""} · {recording.hash_verified ? "完整性校验通过" : "尚未通过完整性校验"}</p>
+      <div className="page-actions">
+        <button className="button button-secondary" onClick={reload}>刷新结果</button>
+        {recording.available && <button className="button button-secondary" onClick={() => play("video")}>播放整场音视频</button>}
+        {canManage && (processing.can_retry || recordingCanRetry) && <button className="button button-primary" disabled={busy} onClick={retry}>{busy ? "正在排队…" : "重试未完成处理"}</button>}
+      </div>
+      {report && <div className="review-report-summary">
+        {sessionAssessment && <h3>本场考察综合分</h3>}
+        {report.overall_score == null ? <p role="status"><strong>{report.score_status === "processing" ? "正在重新评分" : transcriptReviewRequired ? "回答转写待人工核验" : report.coverage_status === "insufficient_evidence" ? sessionAssessment ? "本场约定范围证据不足，暂不形成综合分" : "考察覆盖不足，暂不形成总分" : "正在等待有效评分"}</strong></p> : <strong className="score-value">{report.overall_score}<small> / 100</small></strong>}
+        {report.coverage_status === "insufficient_evidence" && <p>已考察题目的有效分数仍可查看。未考察的范围不计零分，也不分摊到其他能力。</p>}
+        {sessionAssessment && <AssessmentScope scope={report.assessment_scope} />}
+        {report.recognition_notice && <p className="form-hint">{report.recognition_notice}</p>}
+        {report.scope_notice && <p className="form-hint">{report.scope_notice}</p>}
+        <h3>{fitLabels[report.job_fit_level] || "待人工复核"}</h3>
+        {report.summary && <p>{report.summary}</p>}
+        <p>最终决定由企业人员完成。</p>
+        {adaptive && report.dimension_scores?.length > 0 && <section aria-label="能力维度评分">
+          <h4>能力维度评分</h4>
+          <p className="form-hint">能力权重按企业批准的考察要求固定；追问计入主问题的证据，不重复计权。</p>
+          <table className="data-table"><thead><tr><th scope="col">能力</th><th scope="col">固定权重</th><th scope="col">评分</th><th scope="col">考察证据</th></tr></thead>
+            <tbody>{report.dimension_scores.map((dimension) => <tr key={dimension.dimension}>
+              <th scope="row">{dimension.dimension}</th>
+              <td>{typeof dimension.weight === "number" ? `${Number((dimension.weight * 100).toFixed(1))}%` : "—"}</td>
+              <td>{dimension.score == null ? "未形成评分" : `${dimension.score} 分`}</td>
+              <td>{dimension.evidence_root_count ? `${dimension.evidence_root_count} 道主问题 · ${dimension.evidence_status === "sufficient" ? "达到证据要求" : "证据不足"}` : "未考察"}</td>
+            </tr>)}</tbody>
+          </table>
+        </section>}
+        {[["优势", report.strengths], ["风险与待核验项", report.risks], ["建议", report.followup_suggestions]].map(([title, items]) => items?.length > 0 && <div key={title}><h4>{title}</h4><ul>{items.map((item, index) => <li key={index}>{typeof item === "string" ? item : item.text || item.description || item.reason || JSON.stringify(item)}</li>)}</ul></div>)}
+      </div>}
+    </section>
+    {mediaScope === null && playbackPanel}
+    {turns.length > 0 && <section className="report-panel review-question-panel">
+      <h3>逐题复核</h3>
+      <p className="form-hint">选择题目后，回答、评分和回放会在该题下方展开。</p>
+      <div className="review-question-tree" role="group" aria-label="选择回答题目">
+        {questionGroups.map(node => <ReviewQuestionNode key={node.id} node={node} selectedId={selected?.turn_id} select={select} detail={selectedDetail} />)}
+      </div>
     </section>}
-    {(media || mediaError) && <section className="report-panel review-player-panel">
-      <h3>{media?.label || "音视频回放"}</h3>
-      {mediaError && <p role="alert">{mediaError} 如地址已过期，请重新点击上方播放按钮。</p>}
-      {media?.kind === "video" && <video key={media.url} ref={player} src={media.url} controls playsInline preload="metadata" onLoadedMetadata={begin} onTimeUpdate={stopAtEnd} onError={() => setMediaError("视频加载失败或签名已过期。请重新获取播放地址。")}/>}
-      {media?.kind === "audio" && <audio key={media.url} ref={player} src={media.url} controls autoPlay preload="metadata" onError={() => setMediaError("录音加载失败或签名已过期。请重新获取播放地址。")}/>}
+    {planningDecisions.length > 0 && <section className="report-panel" aria-label="面试官决策记录">
+      <h3>面试官决策记录</h3>
+      <p className="form-hint">记录已提交的选题与结束原因，供复核考察过程。</p>
+      <details><summary>查看 {planningDecisions.length} 条决策记录</summary>
+        <ol>{planningDecisions.map((decision) => <li key={decision.decision_id}>
+          <strong>{decisionLabels[decision.reason_code || decision.reason] || "已提交考察决策"}</strong>
+          {decision.committed_at && <span> · {formatDate(decision.committed_at)}</span>}
+          {decision.tools_used?.length > 0 && <p>调用能力：{decision.tools_used.map((name) => toolLabels[name] || "受控工具").join("、")}</p>}
+          {Number.isInteger(decision.model_calls) && <p>模型调用 {decision.model_calls} 次{decision.prompt_version ? ` · 策略版本 ${decision.prompt_version}` : ""}</p>}
+          <small>决策编号：{decision.decision_id}</small>
+        </li>)}</ol>
+      </details>
     </section>}
   </section>;
 }
 
+function AssessmentScope({ scope }) {
+  const included = scope.included_competency_ids || [];
+  const excluded = scope.excluded_competency_ids || [];
+  const sources = scope.source_question_counts || {};
+  const positionCount = sources.position_bank ?? 0;
+  const resumeCount = sources.resume_experience ?? 0;
+  return <section aria-label="本场事前约定的考察范围">
+    <h4>本场事前约定的考察范围</h4>
+    <p>只汇总面试开始前约定的 {included.length} 项能力；题库其他范围不计入本场综合分。</p>
+    <p>纳入本场：{included.join("、")}</p>
+    {Number.isInteger(positionCount) && Number.isInteger(resumeCount)
+      && <p>计划题源：岗位题 {positionCount} 道 · 简历题 {resumeCount} 道，追问另计。</p>}
+    {!!excluded.length && <details><summary>未纳入本场考察的能力（{excluded.length} 项）</summary><p>{excluded.join("、")}</p></details>}
+  </section>;
+}
 
-function TranscriptVerification({ interviewId, turn, reload }) {
+function ReviewQuestionNode({ node, selectedId, select, detail }) {
+  const turn = node.turn;
+  const status = turn.skip_reason === "resume_speech_not_ready" ? "语音未就绪，已跳过"
+    : turn.status === "skipped" && completionLabels[turn.skip_reason] ? "面试结束，未考察"
+      : turn.answer?.evaluation_status === "failed" ? "评分失败"
+        : turn.answer?.evaluation_status === "pending" ? "正在评分"
+          : turn.evaluation?.score != null ? `${turn.evaluation.score}分` : turn.evaluation?.manual_review_required ? "转写待核验" : turn.answer ? "待评分" : "未作答";
+  return <div className={`review-question-node${node.id === selectedId ? " is-selected" : ""}`} data-turn-id={node.id}>
+    <button className={`button ${node.id === selectedId ? "button-primary" : "button-secondary"}`}
+      aria-expanded={node.id === selectedId} onClick={() => select(node.id)}>{node.label} · {status}{node.id !== selectedId && <span className="review-question-open-label"> · 查看回答与回放</span>}</button>
+    {node.id === selectedId ? detail : <p className="review-question-text">{node.text}</p>}
+    {!!node.children.length && <ol className="question-record-children">{node.children.map(child => <li key={child.id}><ReviewQuestionNode node={child} selectedId={selectedId} select={select} detail={detail} /></li>)}</ol>}
+  </div>;
+}
+
+
+function TranscriptVerification({ interviewId, turn, reload, required = false }) {
   const { API, request, toast } = useWorkbench();
   const [text, setText] = useState(turn.answer.final_transcript || "");
   const [reason, setReason] = useState("");
@@ -174,7 +300,7 @@ function TranscriptVerification({ interviewId, turn, reload }) {
     } catch (problem) { toast("核验未保存", problem.message || "请刷新当前版本后重试", "error"); }
     finally { submitting.current = false; setBusy(false); }
   };
-  return <details className="review-verification"><summary>按需回听与修正转写</summary>
+  return <details className="review-verification"><summary>{required ? "回听并核验转写" : "按需回听与修正转写"}</summary>
     <p>请先播放本题录音。仅纠正识别错误，保持候选人实际表达，不补写知识答案；原录音和历史版本会保留。</p>
     <form onSubmit={submit}>
       <label>核验后的转写<textarea aria-label="核验后的转写" value={text} onChange={(event) => setText(event.target.value)} maxLength={12000} required rows={6}/></label>

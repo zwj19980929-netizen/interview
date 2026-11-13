@@ -1,13 +1,16 @@
 from copy import deepcopy
 import asyncio
 import hashlib
-from io import BytesIO
-import wave
+import os
+from time import monotonic
 from typing import Any, Dict, List, Optional
 
 from app.core.errors import ApiError
 from app.core.ids import new_id
 from app.core.prompt.contracts import prompt_contract
+from app.core.prompt.model_probes import (
+    BATCH_STT_PROBE_TEXT, BATCH_STT_PROBE_VERSION, batch_stt_probe_audio, batch_stt_probe_matches,
+)
 from app.core.prompt.realtime_dialogue import session_instruction
 from app.core.time import utc_now
 from app.model_gateway import capabilities as cap
@@ -488,6 +491,8 @@ class ModelAdminService:
             request = self._probe_request(capability, organization_id, "model_configuration_test")
             if capability in {cap.STT_STREAMING, cap.SPEECH_DIALOGUE_REALTIME}:
                 result = await self._probe_stream_handshake(capability, request, route)
+            elif capability == cap.STT_BATCH:
+                result = await self._probe_batch_speech(request, route)
             else:
                 response = await self.gateway.invoke(capability, request, route=route)
                 result = response.model_dump()
@@ -555,13 +560,146 @@ class ModelAdminService:
 
     async def _probe_route(self, route: Dict[str, Any], organization_id: str) -> Dict[str, Any]:
         request = self._probe_request(route["capability"], organization_id, route["purpose"])
-        if route["capability"] in {cap.STT_STREAMING, cap.SPEECH_DIALOGUE_REALTIME}:
+        if (route["capability"] == cap.TTS_SYNTHESIZE
+                and route["purpose"] == "interview_agent_expression"
+                and os.getenv("INTERVIEWER_STREAMING_TTS_ENABLED", "true").lower() == "true"):
+            result = await self._probe_tts_stream(request, route)
+        elif route["capability"] in {cap.STT_STREAMING, cap.SPEECH_DIALOGUE_REALTIME}:
             result = await self._probe_stream_handshake(route["capability"], request, route)
+        elif route["capability"] == cap.STT_BATCH:
+            result = await self._probe_batch_speech(request, route)
         else:
             response = await self.gateway.invoke(route["capability"], request, route=route)
             result = response.model_dump()
             await self._close_avatar_probe(response, route, organization_id)
         return result
+
+    async def _probe_batch_speech(self, request: BatchSTTRequest, route: Dict[str, Any]) -> Dict[str, Any]:
+        # Certify this primary with one paid request, not a hidden retry or a
+        # successful fallback. Candidate recovery retains its runtime policy.
+        probe_route = deepcopy(route)
+        probe_route["policy"] = {**(route.get("policy") or {}), "retry_count": 0}
+        probe_route["fallbacks"] = []
+        response = await self.gateway.invoke(cap.STT_BATCH, request, route=probe_route)
+        if response.provider.provider_id == "mock":
+            with self.persistence.transaction(request.organization_id) as transaction:
+                targets = [route.get("primary") or {}, *(route.get("fallbacks") or [])]
+                models = [transaction.model_configurations.get(target.get("model_configuration_id")) for target in targets]
+            if not models or any(not model or model.get("provider_id") != "mock" for model in models):
+                raise ProviderError("provider_probe_failed", "Real speech probe cannot use mock transcription.", retryable=False)
+        if not batch_stt_probe_matches(response.text):
+            raise ProviderError("provider_probe_failed", "Speech recognition did not match the synthetic probe.", retryable=True)
+        return {"probe_mode": "known_speech", "probe_version": BATCH_STT_PROBE_VERSION,
+                "audio_bytes": len(request.audio_bytes), "transcript_matched": True}
+
+    async def _probe_tts_stream(self, request: TTSSynthesizeRequest, route: Dict[str, Any]) -> Dict[str, Any]:
+        """Check the configured voice through the runtime protocol, without caching audio.
+
+        This verifies route defaults, not a particular interview's frozen voice.
+        Gateway validation must accept the complete PCM stream and its terminal
+        event before the route can become healthy.
+        """
+        loop = asyncio.get_running_loop()
+        budget = self._route_readiness_refresher.probe_timeout
+        deadline = loop.time() + budget
+        cleanup_budget = min(0.1, budget / 10)
+        work_budget = max(0, budget - cleanup_budget)
+        first_audio_deadline = monotonic() + min(12.0, work_budget)
+        state: Dict[str, Any] = {}
+
+        async def consume() -> Dict[str, Any]:
+            try:
+                stream = await self.gateway.open_tts_stream(
+                    request, route=route, first_audio_deadline=first_audio_deadline,
+                )
+            except ProviderError as exc:
+                if (exc.code != "provider_streaming_not_supported"
+                        or exc.details.get("audio_started", False)
+                        or exc.details.get("fallback_allowed") is False):
+                    raise
+                # Match runtime's batch-only adapter compatibility. This is
+                # still the same request/route and the same probe deadline.
+                # Any unclaimed open from this call must finish closing first.
+                cleanup = getattr(asyncio.current_task(), "tts_cleanup_completion", None)
+                if cleanup is not None:
+                    if not cleanup.done():
+                        await asyncio.wait({cleanup}, timeout=max(0, deadline - cleanup_budget - loop.time()))
+                    cleanup_error = getattr(cleanup, "provider_error", None)
+                    if isinstance(cleanup_error, ProviderError) and cleanup_error.code != "provider_streaming_not_supported":
+                        raise cleanup_error
+                    if (not cleanup.done() or cleanup.cancelled()
+                            or cleanup.exception() is not None or cleanup.result() is not True):
+                        raise ProviderError("provider_probe_cleanup_failed", "TTS probe resource cleanup was not confirmed.", retryable=True) from exc
+                if loop.time() >= deadline - cleanup_budget:
+                    raise ProviderError("provider_timeout", "TTS route probe exceeded its time budget.", retryable=True) from exc
+                response = await self.gateway.invoke(cap.TTS_SYNTHESIZE, request, route=route)
+                return response.model_dump()
+            state["stream"] = stream
+            chunks, byte_count, final = 0, 0, False
+            try:
+                async for event in stream.events():
+                    if event.type == "audio.chunk":
+                        chunks += 1
+                        byte_count += len(event.pcm_s16le)
+                    elif event.type == "audio.final":
+                        final = True
+                if not chunks or not byte_count or not final:
+                    raise ProviderError("provider_audio_final_missing", "TTS probe did not produce complete audio.", retryable=True)
+                if not stream.cleanup_confirmed:
+                    raise ProviderError("provider_probe_cleanup_failed", "TTS probe resource cleanup was not confirmed.", retryable=True)
+                return {"probe_mode": "tts_stream", "audio_chunks": chunks, "audio_bytes": byte_count}
+            except ProviderError as exc:
+                state["error"] = exc
+                raise
+            finally:
+                try:
+                    await stream.abort()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    error = state.get("error") or getattr(stream, "terminal_error", None)
+                    if isinstance(error, ProviderError):
+                        raise error
+                    raise ProviderError("provider_probe_cleanup_failed", "TTS probe resource cleanup failed.", retryable=True) from exc
+
+        task = asyncio.create_task(consume())
+
+        def known_error() -> Optional[ProviderError]:
+            cleanup_error = getattr(getattr(task, "tts_cleanup_completion", None), "provider_error", None)
+            errors = [state.get("error"), getattr(state.get("stream"), "terminal_error", None),
+                      getattr(task, "provider_error", None),
+                      cleanup_error if getattr(cleanup_error, "code", None) != "provider_streaming_not_supported" else None]
+            if task.done() and not task.cancelled():
+                errors.append(task.exception())
+            errors = [error for error in errors if isinstance(error, ProviderError)
+                      and error.code != "provider_cancelled"]
+            return next((error for error in errors if not error.retryable), errors[0] if errors else None)
+
+        def retain_error() -> None:
+            error = known_error()
+            if error is not None:
+                # The readiness owner may cancel at the same deadline. Keep an
+                # already known rejection available without swallowing cancel.
+                asyncio.current_task().provider_error = error
+
+        try:
+            done, _ = await asyncio.wait({task}, timeout=work_budget)
+            if not done or loop.time() >= deadline - cleanup_budget:
+                raise known_error() or ProviderError("provider_timeout", "TTS route probe exceeded its time budget.", retryable=True)
+            try:
+                return task.result()
+            except Exception as exc:
+                raise known_error() or ProviderError("provider_probe_failed", "TTS route probe failed.", retryable=True) from exc
+        finally:
+            retain_error()
+            if not task.done():
+                task.cancel()
+                try:
+                    await asyncio.wait({task}, timeout=min(cleanup_budget, max(0, deadline - loop.time())))
+                finally:
+                    retain_error()
+                    if not task.done():
+                        task.add_done_callback(lambda finished: None if finished.cancelled() else finished.exception())
 
     async def _probe_stream_handshake(
         self,
@@ -753,8 +891,9 @@ class ModelAdminService:
                 purpose=purpose,
                 audio_uri="probe-audio://connection-test.wav",
                 content_type="audio/wav",
-                metadata={"development_transcript": "连接测试"},
-                audio_bytes=_probe_wav(),
+                metadata={"development_transcript": BATCH_STT_PROBE_TEXT,
+                          "probe_version": BATCH_STT_PROBE_VERSION},
+                audio_bytes=batch_stt_probe_audio(),
             )
         if capability == cap.STT_STREAMING:
             return StreamingSTTRequest(
@@ -812,14 +951,3 @@ class ModelAdminService:
         fallback_on = policy.get("fallback_on")
         if fallback_on is not None and (not isinstance(fallback_on, list) or not all(isinstance(item, str) for item in fallback_on)):
             raise ApiError("MODEL_ROUTE_INVALID", "fallback_on must be a list of error codes.", status_code=400)
-
-
-def _probe_wav() -> bytes:
-    """Small valid silent WAV used only for provider contract/authorization probes."""
-    target = BytesIO()
-    with wave.open(target, "wb") as output:
-        output.setnchannels(1)
-        output.setsampwidth(2)
-        output.setframerate(16000)
-        output.writeframes(b"\x00\x00" * 1600)
-    return target.getvalue()

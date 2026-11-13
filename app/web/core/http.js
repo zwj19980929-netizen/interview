@@ -1,3 +1,5 @@
+import { readProgressStream } from "./progress-stream.js";
+
 export class HttpError extends Error {
   constructor(message, { status = 0, code = "HTTP_ERROR", details = {}, payload = null } = {}) {
     super(message);
@@ -61,6 +63,9 @@ export function createHttpClient({
     }
     try {
       const response = await fetchImpl(path, fetchOptions);
+      if (response.ok && response.headers?.get("content-type")?.includes("text/event-stream")) {
+        return await readProgressStream(response, options.onProgress, HttpError);
+      }
       const text = await response.text();
       let payload = {};
       if (text) {

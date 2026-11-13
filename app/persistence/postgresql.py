@@ -8,19 +8,59 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from app.persistence.errors import ConcurrencyConflict, RecordAlreadyExists
-from app.persistence.interface import Document, PersistenceTransaction, Predicate, TransactionBackend
+from app.persistence.interface import Document, InterviewWatchdogKind, PersistenceTransaction, Predicate, TransactionBackend
+from app.persistence.read_only import ReadOnlyTransactionBackend
+from app.persistence.realtime_state import REALTIME_PATHS, realtime_state_from_values
 from app.repositories.postgresql import PostgreSQLStore
 
 
 MIGRATIONS = [
     Path(__file__).resolve().parents[2] / "migrations" / "001_postgresql_persistence.sql",
     Path(__file__).resolve().parents[2] / "migrations" / "002_model_configuration_v2.sql",
+    Path(__file__).resolve().parents[2] / "migrations" / "003_interview_skills.sql",
+    Path(__file__).resolve().parents[2] / "migrations" / "004_optional_interview_skills.sql",
+    Path(__file__).resolve().parents[2] / "migrations" / "005_interview_customization.sql",
+    Path(__file__).resolve().parents[2] / "migrations" / "006_evidence_command_poll.sql",
+    Path(__file__).resolve().parents[2] / "migrations" / "007_interview_watchdog_candidates.sql",
 ]
 
 
+def _json_falsy(field: str) -> str:
+    # Match existing Python truthiness, including legacy empty containers, but
+    # not nonempty strings that happen to spell "false", "0" or "{}".
+    return "COALESCE(data->'%s', 'null'::jsonb) IN " % field + (
+        "('null'::jsonb, 'false'::jsonb, '0'::jsonb, '\"\"'::jsonb, '[]'::jsonb, '{}'::jsonb)"
+    )
+
+
+_INTERVIEW_WATCHDOG_PREDICATES = {
+    "takeover": "jsonb_typeof(data#>'{agent_runtime,takeover}') = 'object' "
+                "AND data#>'{agent_runtime,takeover}' <> '{}'::jsonb AND " + _json_falsy("list_removed_at"),
+    "deadline": "data->>'status' IN ('scheduled', 'waiting', 'in_progress', 'paused') AND "
+                + _json_falsy("candidate_input_completed_at"),
+}
+
+
+_REALTIME_FIELDS = ", ".join("d.data#>'{%s}'" % ",".join(path) for path in REALTIME_PATHS)
+_REALTIME_QUERY = """
+SELECT jsonb_build_array(""" + _REALTIME_FIELDS + """) AS fields,
+       jsonb_typeof(d.data->'plan_snapshot') AS plan_type,
+       jsonb_typeof(d.data->'agent_runtime') AS runtime_type,
+       jsonb_typeof(d.data#>'{agent_runtime,takeover}') AS takeover_type,
+       (SELECT jsonb_build_array(e.value->'event_id', e.value#>'{payload,act_id}', e.value#>'{payload,approved}')
+          FROM jsonb_array_elements(CASE WHEN jsonb_typeof(d.data->'agent_events') = 'array'
+                                        THEN d.data->'agent_events' ELSE '[]'::jsonb END)
+               WITH ORDINALITY e(value, position)
+         WHERE e.value->>'type' = 'conversation.act.selected'
+         ORDER BY e.position DESC LIMIT 1) AS selected
+FROM documents d WHERE d.collection = 'interviews' AND d.id = %s AND d.organization_id = %s
+"""
+
+
 class _PostgreSQLTransactionBackend(TransactionBackend):
-    def __init__(self, connection: psycopg.Connection) -> None:
+    def __init__(self, connection: psycopg.Connection, *, read_only: bool = False) -> None:
         self.connection = connection
+        self.read_only = read_only
 
     def database_now(self) -> datetime:
         row = self.connection.execute(
@@ -33,14 +73,51 @@ class _PostgreSQLTransactionBackend(TransactionBackend):
 
     def get_document(self, collection: str, item_id: str) -> Optional[Document]:
         row = self.connection.execute(
-            "SELECT data FROM documents WHERE collection = %s AND id = %s FOR UPDATE",
+            "SELECT data FROM documents WHERE collection = %s AND id = %s"
+            + ("" if self.read_only else " FOR UPDATE"),
             (collection, item_id),
         ).fetchone()
         return dict(row["data"]) if row else None
 
+    def get_interview_realtime_state(
+        self, *, organization_id: str, interview_id: str,
+    ) -> Optional[Document]:
+        row = self.connection.execute(_REALTIME_QUERY, (interview_id, organization_id)).fetchone()
+        if not row:
+            return None
+        return realtime_state_from_values(
+            row["fields"], row["selected"], plan_type=row["plan_type"], runtime_type=row["runtime_type"],
+            takeover_type=row["takeover_type"],
+        )
+
     def list_documents(self, collection: str) -> List[Document]:
         rows = self.connection.execute(
             "SELECT data FROM documents WHERE collection = %s ORDER BY id", (collection,)
+        ).fetchall()
+        return [dict(row["data"]) for row in rows]
+
+    def list_unsettled_evidence_commands(
+        self, *, organization_id: str, interview_id: str,
+    ) -> List[Document]:
+        # Candidate discovery takes no additional row locks. claim_next has
+        # already locked ownership, then re-gets each command FOR UPDATE.
+        rows = self.connection.execute(
+            "SELECT data FROM documents WHERE collection = 'evidence_commands' "
+            "AND organization_id = %s AND data->>'interview_id' = %s "
+            "AND data->>'status' IN ('pending', 'running')",
+            (organization_id, interview_id),
+        ).fetchall()
+        return [dict(row["data"]) for row in rows]
+
+    def list_interview_watchdog_candidates(
+        self, *, organization_id: str, kind: InterviewWatchdogKind,
+    ) -> List[Document]:
+        if kind not in ("takeover", "deadline"):
+            raise ValueError("Unknown interview watchdog kind.")
+        rows = self.connection.execute(
+            "SELECT data FROM documents WHERE collection = 'interviews' "
+            "AND organization_id = %s AND " + _INTERVIEW_WATCHDOG_PREDICATES[kind],
+            (organization_id,),
         ).fetchall()
         return [dict(row["data"]) for row in rows]
 
@@ -106,7 +183,8 @@ class _PostgreSQLTransactionBackend(TransactionBackend):
 
     def get_work_item(self, item_id: str) -> Optional[Document]:
         row = self.connection.execute(
-            "SELECT data FROM outbox_work_items WHERE id = %s FOR UPDATE", (item_id,)
+            "SELECT data FROM outbox_work_items WHERE id = %s"
+            + ("" if self.read_only else " FOR UPDATE"), (item_id,)
         ).fetchone()
         return dict(row["data"]) if row else None
 
@@ -190,7 +268,18 @@ class PostgreSQLPersistence:
                     to_regclass('public.documents') AS documents,
                     to_regclass('public.outbox_work_items') AS outbox_work_items,
                     to_regclass('public.provider_secrets') AS provider_secrets,
-                    to_regclass('public.model_invocations') AS model_invocations
+                    to_regclass('public.model_invocations') AS model_invocations,
+                    to_regclass('public.uq_interview_skill_revision') AS interview_skill_revision_index,
+                    (SELECT oid FROM pg_constraint
+                     WHERE conrelid = to_regclass('public.documents')
+                       AND conname = 'ck_interview_skill_active_version') AS interview_skill_active_state,
+                    to_regclass('public.uq_interview_customization_organization') AS interview_customization_index,
+                    to_regclass('public.idx_evidence_commands_unsettled') AS evidence_command_poll_index,
+                    to_regclass('public.idx_interviews_watchdog_takeover') AS interview_takeover_watchdog_index,
+                    to_regclass('public.idx_interviews_watchdog_deadline') AS interview_deadline_watchdog_index,
+                    (SELECT oid FROM pg_constraint
+                     WHERE conrelid = to_regclass('public.documents')
+                       AND conname = 'ck_interview_customization') AS interview_customization_contract
                 """
             ).fetchone()
             missing = [name for name, value in dict(row).items() if value is None]
@@ -202,14 +291,21 @@ class PostgreSQLPersistence:
                 )
 
     @contextmanager
-    def transaction(self, organization_id: str) -> Iterator[PersistenceTransaction]:
+    def transaction(
+        self, organization_id: str, *, read_only: bool = False,
+    ) -> Iterator[PersistenceTransaction]:
         try:
             with self._connect() as connection:
+                if read_only:
+                    connection.execute("SET TRANSACTION READ ONLY")
                 connection.execute("SELECT set_config('app.organization_id', %s, true)", (organization_id,))
-                yield PersistenceTransaction(_PostgreSQLTransactionBackend(connection), organization_id)
+                backend = _PostgreSQLTransactionBackend(connection, read_only=read_only)
+                yield PersistenceTransaction(
+                    ReadOnlyTransactionBackend(backend) if read_only else backend, organization_id,
+                )
         except psycopg.errors.UniqueViolation as exc:
             raise RecordAlreadyExists("PostgreSQL unique constraint rejected the transaction.") from exc
-        except psycopg.errors.SerializationFailure as exc:
+        except (psycopg.errors.SerializationFailure, psycopg.errors.DeadlockDetected) as exc:
             raise ConcurrencyConflict("PostgreSQL serialization conflict.") from exc
 
 

@@ -2,7 +2,7 @@ from contextlib import AbstractContextManager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import os
-from typing import Any, Callable, Dict, List, Optional, Protocol
+from typing import Any, Callable, Dict, List, Literal, Optional, Protocol
 
 from app.core.ids import new_id
 from app.core.sensitive_data import ProviderSecretVault
@@ -12,6 +12,20 @@ from app.persistence.errors import ConcurrencyConflict, RecordAlreadyExists, Rec
 
 Document = Dict[str, Any]
 Predicate = Callable[[Document], bool]
+InterviewWatchdogKind = Literal["takeover", "deadline"]
+
+
+def is_interview_watchdog_candidate(item: Document, kind: InterviewWatchdogKind) -> bool:
+    """Discovery only: clocks, lease validity and lifecycle stay in the service."""
+    if kind == "deadline":
+        return item.get("status") in ("scheduled", "waiting", "in_progress", "paused") and not item.get(
+            "candidate_input_completed_at"
+        )
+    if kind == "takeover":
+        runtime = item.get("agent_runtime")
+        lease = runtime.get("takeover") if isinstance(runtime, dict) else None
+        return isinstance(lease, dict) and bool(lease) and not item.get("list_removed_at")
+    raise ValueError("Unknown interview watchdog kind.")
 
 
 class TransactionBackend(Protocol):
@@ -19,7 +33,19 @@ class TransactionBackend(Protocol):
 
     def get_document(self, collection: str, item_id: str) -> Optional[Document]: ...
 
+    def get_interview_realtime_state(
+        self, *, organization_id: str, interview_id: str,
+    ) -> Optional[Document]: ...
+
     def list_documents(self, collection: str) -> List[Document]: ...
+
+    def list_unsettled_evidence_commands(
+        self, *, organization_id: str, interview_id: str,
+    ) -> List[Document]: ...
+
+    def list_interview_watchdog_candidates(
+        self, *, organization_id: str, kind: InterviewWatchdogKind,
+    ) -> List[Document]: ...
 
     def insert_document(self, collection: str, item: Document) -> None: ...
 
@@ -135,6 +161,35 @@ class VersionedDocumentRepository:
             raise ValueError("%s organization_id does not match the transaction tenant." % self._entity_name)
 
 
+class InterviewSessionRepository(VersionedDocumentRepository):
+    def __init__(self, backend: TransactionBackend, organization_id: str) -> None:
+        super().__init__(backend, organization_id, collection="interviews", entity_name="InterviewSession")
+
+    def realtime_state(self, interview_id: str) -> Optional[Document]:
+        """Fresh durable media guard fields only; not suitable for update()."""
+        item = self._backend.get_interview_realtime_state(
+            organization_id=self._organization_id, interview_id=interview_id,
+        )
+        if not item or item.get("organization_id") != self._organization_id or item.get("id") != interview_id:
+            return None
+        return deepcopy(item)
+
+    def watchdog_candidates(self, kind: InterviewWatchdogKind) -> List[Document]:
+        # Validate before delegating even if this tenant has no stored rows.
+        if kind not in ("takeover", "deadline"):
+            raise ValueError("Unknown interview watchdog kind.")
+        result: List[Document] = []
+        for stored in self._backend.list_interview_watchdog_candidates(
+            organization_id=self._organization_id, kind=kind,
+        ):
+            if stored.get("organization_id") != self._organization_id or not is_interview_watchdog_candidate(stored, kind):
+                continue
+            item = deepcopy(stored)
+            item.setdefault("version", 1)
+            result.append(item)
+        return result
+
+
 class QuestionRepository(VersionedDocumentRepository):
     def __init__(self, backend: TransactionBackend, organization_id: str) -> None:
         super().__init__(
@@ -168,6 +223,45 @@ class QuestionRepository(VersionedDocumentRepository):
             item.setdefault("version", 1)
             result.append(item)
         return result
+
+
+class InterviewSkillRevisionRepository(VersionedDocumentRepository):
+    """Content identity cannot change during authorization lifecycle updates."""
+
+    _CONTENT_FIELDS = (
+        "skill_id", "revision", "sealed_package", "content_hash", "name",
+        "description", "language", "style", "interview_method", "allowed_tools", "compiler_version", "schema_version",
+    )
+
+    def __init__(self, backend: TransactionBackend, organization_id: str) -> None:
+        super().__init__(backend, organization_id, collection="interview_skill_revisions",
+                         entity_name="InterviewSkillRevision")
+
+    def add(self, document: Document) -> Document:
+        self._require_tenant(document)
+        if any(item.get("skill_id") == document.get("skill_id")
+               and item.get("revision") == document.get("revision") for item in self.list()):
+            raise RecordAlreadyExists("Skill content revision already exists.")
+        return super().add(document)
+
+    def update(self, document: Document, *, expected_version: int) -> Document:
+        current = self.get(document["id"])
+        if current and any(current.get(key) != document.get(key) for key in self._CONTENT_FIELDS):
+            raise ConcurrencyConflict("Skill content revisions are immutable; create a new revision.")
+        return super().update(document, expected_version=expected_version)
+
+
+class InterviewCustomizationRepository(VersionedDocumentRepository):
+    """One versioned default configuration per tenant."""
+
+    def __init__(self, backend: TransactionBackend, organization_id: str) -> None:
+        super().__init__(backend, organization_id, collection="interview_customizations",
+                         entity_name="InterviewCustomization")
+
+    def _require_tenant(self, item: Document) -> None:
+        super()._require_tenant(item)
+        if item.get("id") != self._organization_id:
+            raise ValueError("Interview customization identity must equal its organization.")
 
 
 class OutboxRepository:
@@ -349,6 +443,26 @@ class OutboxRepository:
             raise ConcurrencyConflict("Work item lease is no longer owned: %s" % item["id"])
 
 
+class EvidenceCommandRepository(VersionedDocumentRepository):
+    """Query only this interview's live command candidates, never its history.
+
+    This read grants no lease: the journal still locks/revalidates each selected
+    command under the current owner fence before claiming or rejecting it.
+    """
+
+    def __init__(self, backend: TransactionBackend, organization_id: str) -> None:
+        super().__init__(backend, organization_id, collection="evidence_commands", entity_name="EvidenceCommand")
+
+    def list_unsettled(self, interview_id: str) -> List[Document]:
+        return [deepcopy(item) for item in self._backend.list_unsettled_evidence_commands(
+            organization_id=self._organization_id, interview_id=interview_id,
+        ) if (
+            item.get("organization_id") == self._organization_id
+            and item.get("interview_id") == interview_id
+            and item.get("status") in {"pending", "running"}
+        )]
+
+
 class ProviderSecretRepository:
     def __init__(self, backend: TransactionBackend, organization_id: str) -> None:
         self._backend = backend
@@ -419,6 +533,11 @@ class PersistenceTransaction:
         self.interview_plans = VersionedDocumentRepository(
             backend, organization_id, collection="interview_plans", entity_name="InterviewPlan"
         )
+        self.interview_skills = VersionedDocumentRepository(
+            backend, organization_id, collection="interview_skills", entity_name="EnterpriseInterviewSkill"
+        )
+        self.interview_skill_revisions = InterviewSkillRevisionRepository(backend, organization_id)
+        self.interview_customizations = InterviewCustomizationRepository(backend, organization_id)
         self.candidate_profiles = VersionedDocumentRepository(
             backend, organization_id, collection="candidate_profiles", entity_name="CandidateProfile"
         )
@@ -446,9 +565,7 @@ class PersistenceTransaction:
         self.candidate_intakes = VersionedDocumentRepository(
             backend, organization_id, collection="candidate_intakes", entity_name="CandidateIntake"
         )
-        self.interview_sessions = VersionedDocumentRepository(
-            backend, organization_id, collection="interviews", entity_name="InterviewSession"
-        )
+        self.interview_sessions = InterviewSessionRepository(backend, organization_id)
         self.interview_media_captures = VersionedDocumentRepository(
             backend,
             organization_id,
@@ -467,12 +584,7 @@ class PersistenceTransaction:
             collection="evidence_ownerships",
             entity_name="EvidenceOwnership",
         )
-        self.evidence_commands = VersionedDocumentRepository(
-            backend,
-            organization_id,
-            collection="evidence_commands",
-            entity_name="EvidenceCommand",
-        )
+        self.evidence_commands = EvidenceCommandRepository(backend, organization_id)
         self.evidence_media_streams = VersionedDocumentRepository(
             backend,
             organization_id,
@@ -511,7 +623,11 @@ class PersistenceTransaction:
 
 
 class Persistence(Protocol):
-    def transaction(self, organization_id: str) -> AbstractContextManager[PersistenceTransaction]: ...
+    def transaction(
+        self, organization_id: str, *, read_only: bool = False,
+    ) -> AbstractContextManager[PersistenceTransaction]:
+        """Read-only discovery never claims work; mutations retain write transactions."""
+        ...
 
 
 def new_work_item(

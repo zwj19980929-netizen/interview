@@ -12,6 +12,10 @@ from typing import Any, Callable, Dict, Optional
 from pydantic import BaseModel
 
 from app.core.ids import new_id
+from app.core.model_diagnostics import (
+    current_model_call_scope, model_call_scope, model_timing_fields, record_model_diagnostic,
+    safe_model_call_context, safe_model_diagnostic_fields,
+)
 from app.core.prompt.validation import StructuredResponseValidationError, validate_structured_response
 from app.core.time import utc_now
 from app.model_gateway import capabilities as cap
@@ -51,17 +55,36 @@ def _nonnegative_int(value: Any) -> int:
         return 0
 
 
-async def _abort_unclaimed_stream(provider_stream: Any, timeout_s: float) -> None:
+async def _abort_unclaimed_stream(provider_stream: Any, timeout_s: float, *,
+                                  completion: Optional[asyncio.Future] = None) -> None:
     """Release an opened stream when validation/audit prevents handoff.
 
     Shield a separately bounded cleanup so a second caller cancellation cannot
     orphan the provider socket. Cleanup must never mask the original failure.
     """
+    def finished(done=None):
+        released = done is not None and not done.cancelled() and done.exception() is None
+        if completion is not None and not completion.done():
+            completion.set_result(released)
+
     async def cleanup() -> None:
+        abort_task = None
         try:
-            await asyncio.wait_for(provider_stream.abort(), timeout=max(0.01, min(2.0, timeout_s)))
+            abort_task = asyncio.create_task(provider_stream.abort())
+            # A bounded wrapper can return while a provider ignores cancel.
+            # Ownership ends only when the actual abort has finished.
+            abort_task.add_done_callback(finished)
+            done, _ = await asyncio.wait({abort_task}, timeout=max(0.01, min(2.0, timeout_s)))
+            if done:
+                abort_task.result()
         except (Exception, asyncio.CancelledError):
             pass
+        finally:
+            if abort_task is not None:
+                if not abort_task.done():
+                    abort_task.cancel()
+            else:
+                finished()
 
     task = asyncio.create_task(cleanup())
     try:
@@ -195,7 +218,72 @@ class ModelGateway:
         self.providers = provider_registry or ProviderRegistry(provider_clients)
         self.circuits = circuit_breaker or PersistentCircuitBreaker(self.persistence)
 
+    def tts_routing_snapshot(self, request: TTSSynthesizeRequest) -> Dict[str, Any]:
+        """Resolve a ready primary and an opaque identity for fixed speech.
+
+        A cache cannot authorize a disabled configuration or silently reuse
+        another voice. Credentials are read only to invalidate the fingerprint
+        on rotation; neither credentials nor connection settings leave here.
+        """
+        self._validate_request(cap.TTS_SYNTHESIZE, request)
+        route = self._resolve_route(request.organization_id, cap.TTS_SYNTHESIZE, request.purpose)
+        if (not route.get("enabled", True)
+                or route.get("organization_id", request.organization_id) != request.organization_id
+                or route.get("capability") != cap.TTS_SYNTHESIZE
+                or route.get("purpose") != request.purpose):
+            raise ProviderError("provider_route_invalid", "TTS route is unavailable.", retryable=False)
+        model, connection, credentials = self._model_connection(
+            request.organization_id,
+            str((route.get("primary") or {}).get("model_configuration_id") or ""),
+            cap.TTS_SYNTHESIZE,
+        )
+        if (model.get("organization_id") != request.organization_id
+                or connection.get("organization_id") != request.organization_id
+                or model.get("provider_id") != connection.get("provider_id")
+                or model.get("model_type") != cap.CAPABILITY_MODEL_TYPES[cap.TTS_SYNTHESIZE]):
+            raise ProviderError("provider_route_invalid", "TTS configuration identity is inconsistent.", retryable=False)
+        if connection.get("credential_status") == "invalid":
+            raise ProviderError("provider_auth_failed", "TTS connection credentials have failed validation.", retryable=False)
+        # Resolve the plugin too: a ready row alone does not prove support.
+        adapter = self.providers.adapter(model["provider_id"], cap.TTS_SYNTHESIZE)
+        if model["provider_id"] == "mock" or not callable(getattr(adapter, "open_tts_stream", None)):
+            raise ProviderError("provider_streaming_not_supported", "Fixed speech requires a real PCM provider.", retryable=False)
+        # Model defaults may tune speech, never change the tenant, purpose or
+        # approved text. Freeze validated effective values before cache keys
+        # and the later provider call apply defaults a second time.
+        defaults = {key: value for key, value in (model.get("default_parameters") or {}).items()
+                    if key in {"language", "voice_profile_id", "format", "speaking_rate"}}
+        effective = self._apply_model_defaults(request, defaults)
+        try:
+            effective = TTSSynthesizeRequest.model_validate(effective.model_dump(warnings=False))
+        except ValueError:
+            # Invalid defaults can contain private configuration values; do
+            # not emit serializer warnings or expose validation input values.
+            raise ProviderError("provider_bad_request", "TTS defaults do not satisfy the speech request contract.", retryable=False) from None
+        fingerprint = hashlib.sha256(json.dumps({
+            "route": route, "model": model, "connection": connection,
+            "credential_fingerprint": hashlib.sha256(json.dumps(credentials, sort_keys=True).encode()).hexdigest(),
+        }, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        primary_route = deepcopy(route)
+        primary_route["fallbacks"] = []
+        primary_route["policy"] = {**(primary_route.get("policy") or {}), "fallback_on": []}
+        return {
+            "route": primary_route,
+            "identity": {"organization_id": request.organization_id,
+                         "provider_id": model["provider_id"], "model": model["provider_model_id"],
+                         "fingerprint": fingerprint},
+            "request": effective,
+        }
+
     async def invoke(
+        self, capability: str, request: InvocationRequest, *, route: Optional[Dict[str, Any]] = None,
+    ) -> InvocationResponse:
+        metadata = safe_model_call_context(getattr(request, "metadata", None))
+        with model_call_scope(interview_id=metadata.get("interview_id"), turn_id=metadata.get("turn_id"),
+                              capture_id=metadata.get("capture_id"), stage=metadata.get("stage") or "provider"):
+            return await self._invoke(capability, request, route=route)
+
+    async def _invoke(
         self,
         capability: str,
         request: InvocationRequest,
@@ -229,6 +317,7 @@ class ModelGateway:
         execution_budget = getattr(request, "execution_budget", None)
         if execution_budget is not None:
             retry_count = min(retry_count, execution_budget.max_provider_retries)
+        attempt_limit = execution_budget.max_provider_attempts if execution_budget is not None else None
         backoff_ms = min(1000, max(0, int(policy.get("retry_backoff_ms", 0))))
         circuit_threshold = max(0, int(policy.get("circuit_failure_threshold", 3)))
         circuit_recovery_seconds = max(0.0, float(policy.get("circuit_recovery_seconds", 30)))
@@ -247,6 +336,23 @@ class ModelGateway:
                 total_attempts += 1
                 started_at = perf_counter()
                 model_configuration: Dict[str, Any] = {}
+                diagnostic_scope = current_model_call_scope()
+                diagnostic_fields = {**safe_model_call_context(request.metadata, diagnostic_scope),
+                                     **model_timing_fields(timeout_s), "provider_invoked": False}
+                attempt_started = False
+                audit_started = False
+
+                def observe_attempt(event, **details):
+                    record_model_diagnostic(event, **{
+                        **diagnostic_fields, "invocation_id": invocation_id,
+                        "capability": capability, "purpose": purpose,
+                        "organization_id": request.organization_id, "route_id": resolved_route.get("id"),
+                        "provider_connection_id": provider_connection_id,
+                        "model_configuration_id": model_configuration_id, "provider_id": provider_id,
+                        "model": model, "attempt": attempt, "fallback_index": fallback_index,
+                        "elapsed_ms": int((perf_counter() - started_at) * 1000), **details,
+                    })
+
                 try:
                     model_configuration, provider_connection, credentials = self._model_connection(
                         request.organization_id,
@@ -299,9 +405,13 @@ class ModelGateway:
                         credentials=credentials,
                         metadata=request.metadata,
                     )
+                    effective_request = self._apply_model_defaults(request, context.default_parameters)
+                    diagnostic_fields["provider_invoked"] = True
+                    observe_attempt("attempt_started", outcome="started")
+                    attempt_started = True
                     try:
                         response = await asyncio.wait_for(
-                            adapter.invoke(capability, self._apply_model_defaults(request, context.default_parameters), context),
+                            adapter.invoke(capability, effective_request, context),
                             timeout=timeout_s,
                         )
                     except asyncio.TimeoutError as exc:
@@ -323,6 +433,9 @@ class ModelGateway:
                             "Provider response exceeded the configured per-call cost limit.",
                             retryable=False,
                         )
+                    observe_attempt("attempt_finished", outcome="fallback_success" if fallback_index else "success",
+                                    provider_request_id=response.provider.request_id)
+                    audit_started = True
                     self._log_invocation(
                         invocation_id=invocation_id,
                         organization_id=request.organization_id,
@@ -341,31 +454,69 @@ class ModelGateway:
                         response=response,
                         estimated_cost_usd=estimated_cost,
                         prompt_version=request.metadata.get("prompt_version"),
+                        diagnostic_context={**diagnostic_fields, "outcome": "fallback_success" if fallback_index else "success"},
                     )
                     self.circuits.record_success(circuit_key)
                     return response
+                except asyncio.CancelledError:
+                    # Caller cancellation is not a provider outage or permission
+                    # to retry. Its owning deadline is correlated by scope ID.
+                    if not attempt_started:
+                        observe_attempt("attempt_started", outcome="started")
+                    reason = diagnostic_scope.cancel_reason if diagnostic_scope else "caller_cancelled"
+                    cancelled_fields = {**diagnostic_fields, "cancel_reason": reason, "outcome": "cancelled"}
+                    observe_attempt("attempt_finished", outcome="cancelled", cancel_reason=reason,
+                                    error_code="provider_cancelled")
+                    try:
+                        self._log_invocation(
+                            invocation_id=invocation_id, organization_id=request.organization_id,
+                            capability=capability, purpose=purpose, route=resolved_route,
+                            provider_connection_id=provider_connection_id, model_configuration_id=model_configuration_id,
+                            provider_id=provider_id, model=model, status="cancelled",
+                            latency_ms=int((perf_counter() - started_at) * 1000), attempt=attempt,
+                            fallback_index=fallback_index, request_hash=request_hash, error_code="provider_cancelled",
+                            error_details={"transport_outcome": "cancelled"},
+                            prompt_version=request.metadata.get("prompt_version"), diagnostic_context=cancelled_fields,
+                        )
+                    except Exception:
+                        observe_attempt("audit_failed", outcome="cancelled", cancel_reason=reason)
+                    raise
                 except ProviderError as exc:
+                    if audit_started:
+                        observe_attempt("audit_failed", outcome="success")
+                        raise
                     last_error = exc
-                    self._log_invocation(
-                        invocation_id=invocation_id,
-                        organization_id=request.organization_id,
-                        capability=capability,
-                        purpose=purpose,
-                        route=resolved_route,
-                        provider_connection_id=provider_connection_id,
-                        model_configuration_id=model_configuration_id,
-                        provider_id=provider_id,
-                        model=model,
-                        status="failed",
-                        latency_ms=int((perf_counter() - started_at) * 1000),
-                        attempt=attempt,
-                        fallback_index=fallback_index,
-                        request_hash=request_hash,
-                        error_code=exc.code,
-                        error_details=exc.details,
-                        prompt_version=request.metadata.get("prompt_version"),
-                    )
-                    can_retry = exc.retryable and exc.code != "provider_circuit_open" and attempt <= retry_count
+                    if not attempt_started:
+                        observe_attempt("attempt_started", outcome="started")
+                    observe_attempt("attempt_finished", outcome="failed", error_code=exc.code,
+                                    retryable=exc.retryable, provider_request_id=exc.details.get("provider_request_id"))
+                    try:
+                        self._log_invocation(
+                            invocation_id=invocation_id,
+                            organization_id=request.organization_id,
+                            capability=capability,
+                            purpose=purpose,
+                            route=resolved_route,
+                            provider_connection_id=provider_connection_id,
+                            model_configuration_id=model_configuration_id,
+                            provider_id=provider_id,
+                            model=model,
+                            status="failed",
+                            latency_ms=int((perf_counter() - started_at) * 1000),
+                            attempt=attempt,
+                            fallback_index=fallback_index,
+                            request_hash=request_hash,
+                            error_code=exc.code,
+                            error_details=exc.details,
+                            prompt_version=request.metadata.get("prompt_version"),
+                            diagnostic_context={**diagnostic_fields, "outcome": "failed"},
+                        )
+                    except Exception:
+                        # Optional audit failures cannot replace the provider's
+                        # original code or change its retry/fallback decision.
+                        observe_attempt("audit_failed", outcome="failed", error_code=exc.code)
+                    can_retry = (exc.retryable and exc.code != "provider_circuit_open" and attempt <= retry_count
+                                 and (attempt_limit is None or total_attempts < attempt_limit))
                     if can_retry:
                         if backoff_ms:
                             await asyncio.sleep((backoff_ms * attempt) / 1000.0)
@@ -373,11 +524,34 @@ class ModelGateway:
                     if exc.retryable and exc.code != "provider_circuit_open":
                         self.circuits.record_failure(circuit_key, threshold=circuit_threshold)
                     break
+                except Exception:
+                    if not attempt_started:
+                        observe_attempt("attempt_started", outcome="started")
+                    observe_attempt("audit_failed" if audit_started else "attempt_finished",
+                                    outcome="failed", error_code="provider_unexpected_error")
+                    if not audit_started:
+                        try:
+                            self._log_invocation(
+                                invocation_id=invocation_id, organization_id=request.organization_id,
+                                capability=capability, purpose=purpose, route=resolved_route,
+                                provider_connection_id=provider_connection_id, model_configuration_id=model_configuration_id,
+                                provider_id=provider_id, model=model, status="failed",
+                                latency_ms=int((perf_counter() - started_at) * 1000), attempt=attempt,
+                                fallback_index=fallback_index, request_hash=request_hash,
+                                error_code="provider_unexpected_error", prompt_version=request.metadata.get("prompt_version"),
+                                diagnostic_context={**diagnostic_fields, "outcome": "failed"},
+                            )
+                        except Exception:
+                            observe_attempt("audit_failed", outcome="failed", error_code="provider_unexpected_error")
+                    # Keep unexpected adapter/audit errors unchanged. In
+                    # particular they do not purchase retries or open circuits.
+                    raise
 
             if last_error is None:
                 break
             has_fallback = fallback_index + 1 < len(targets)
-            if not has_fallback or not self._allows_fallback(last_error, policy):
+            if (not has_fallback or not self._allows_fallback(last_error, policy)
+                    or (attempt_limit is not None and total_attempts >= attempt_limit)):
                 self._annotate_error(last_error, invocation_id, resolved_route, total_attempts)
                 raise last_error
 
@@ -394,12 +568,42 @@ class ModelGateway:
         request: TTSSynthesizeRequest,
         *,
         route: Optional[Dict[str, Any]] = None,
+        first_audio_deadline: Optional[float] = None,
     ) -> ValidatedTTSStream:
         """Stream approved TTS text through the existing synthesis route policy.
 
         Retries/fallbacks may occur while opening, before any PCM is exposed.
         After returning, the managed stream never replays an invocation.
         """
+        caller_task = asyncio.current_task()
+        if hasattr(caller_task, "tts_cleanup_completion"):
+            del caller_task.tts_cleanup_completion
+        cleanup_completions = []
+
+        def register_cleanup():
+            completion = asyncio.get_running_loop().create_future()
+            cleanup_completions.append(completion)
+            joined = asyncio.get_running_loop().create_future()
+
+            def finish(_=None):
+                if not joined.done() and all(item.done() for item in cleanup_completions):
+                    errors = [getattr(item, "provider_error", None) for item in cleanup_completions]
+                    errors = [error for error in errors if isinstance(error, ProviderError)]
+                    if errors:
+                        joined.provider_error = next((error for error in errors if not error.retryable), errors[0])
+                    joined.set_result(all(not item.cancelled() and item.result() is True
+                                          for item in cleanup_completions))
+
+            for item in cleanup_completions:
+                item.add_done_callback(finish)
+            caller_task.tts_cleanup_completion = joined
+            return completion
+
+        previous_error = getattr(caller_task, "_tts_gateway_provider_error", None)
+        if previous_error is not None:
+            if getattr(caller_task, "provider_error", None) is previous_error:
+                del caller_task.provider_error
+            del caller_task._tts_gateway_provider_error
         capability = cap.TTS_SYNTHESIZE
         self._validate_request(capability, request)
         if not request.text.strip():
@@ -423,21 +627,108 @@ class ModelGateway:
         recovery = max(0.0, float(policy.get("circuit_recovery_seconds", 30)))
         total_attempts = 0
         last_error = None
+
+        def remaining_attempts(fallback_index: int, attempt: int) -> int:
+            # Reserve time only for fallbacks that can actually open. All route
+            # eligibility checks still run again immediately before their call.
+            count = retry_count + 2 - attempt
+            # A shorter slice can itself cause a timeout. Do not sacrifice the
+            # primary's time for a fallback that this timeout cannot reach.
+            if not self._allows_fallback(ProviderError("provider_timeout", "TTS open timed out.", retryable=True), policy):
+                return count
+            for candidate in targets[fallback_index + 1:]:
+                candidate_id = str(candidate.get("model_configuration_id") or "")
+                try:
+                    configuration, _, _ = self._model_connection(
+                        request.organization_id, candidate_id, capability,
+                        allow_unready=resolved_route.get("id") == "model_configuration_test",
+                    )
+                    adapter = self.providers.adapter(configuration["provider_id"], capability)
+                    key = "%s:%s:%s" % (request.organization_id, candidate_id, capability)
+                    if (callable(getattr(adapter, "open_tts_stream", None))
+                            and not self.circuits.is_open(key, threshold=threshold, recovery_seconds=recovery)):
+                        count += retry_count + 1
+                except ProviderError:
+                    continue
+            return max(1, count)
+
         for fallback_index, target in enumerate(targets):
             model_configuration_id = str(target.get("model_configuration_id") or "")
             timeout_s = max(0.01, float(target.get("timeout_s", 20)))
             provider_id = provider_connection_id = model = "unknown"
             circuit_key = "%s:%s:%s" % (request.organization_id, model_configuration_id, capability)
             for attempt in range(1, retry_count + 2):
+                if first_audio_deadline is not None and monotonic() >= first_audio_deadline:
+                    error = ProviderError("provider_timeout", "TTS first audio budget exhausted.", retryable=False)
+                    self._annotate_error(error, invocation_id, resolved_route, total_attempts)
+                    raise error
                 total_attempts += 1
                 started_at = perf_counter()
                 provider_stream = None
+                provider_task = None
+                cleanup_started = False
+                attempted = False
+                attempt_diagnostics = {}
+                attempt_state = {}
                 log_fields = dict(
                     invocation_id=invocation_id, organization_id=request.organization_id,
                     capability=capability, purpose=request.purpose, route=resolved_route,
                     model_configuration_id=model_configuration_id, attempt=attempt,
                     fallback_index=fallback_index, request_hash=request_hash,
                 )
+
+                async def cancel_open():
+                    nonlocal cleanup_started
+                    if provider_task is None or provider_stream is not None or cleanup_started:
+                        return
+                    cleanup_started = True
+                    completion = register_cleanup()
+
+                    def discard_result(done, cleanup_timeout=timeout_s, completion=completion):
+                        # A transport may finish opening while cancellation is
+                        # being delivered. It was never handed to a consumer.
+                        try:
+                            source = done.result()
+                        except (Exception, asyncio.CancelledError) as exc:
+                            reported = exc if isinstance(exc, ProviderError) else getattr(done, "provider_error", None)
+                            if isinstance(reported, ProviderError):
+                                # Late cleanup never writes into a caller Task
+                                # that may already be running another request.
+                                completion.provider_error = reported
+                            if not completion.done():
+                                completion.set_result(True)
+                            return
+                        asyncio.create_task(_abort_unclaimed_stream(source, cleanup_timeout, completion=completion))
+
+                    provider_task.add_done_callback(discard_result)
+                    provider_task.cancel()
+                    cleanup_budget = 1.0
+                    if first_audio_deadline is not None:
+                        cleanup_budget = min(cleanup_budget, max(0, first_audio_deadline - monotonic()))
+                    try:
+                        await asyncio.wait({provider_task}, timeout=cleanup_budget)
+                    finally:
+                        diagnostics = getattr(provider_task, "provider_diagnostics", {})
+                        if isinstance(diagnostics, dict):
+                            attempt_diagnostics.update(diagnostics)
+                        reported_error = getattr(provider_task, "provider_error", None)
+                        if provider_task.done() and not provider_task.cancelled():
+                            completed_error = provider_task.exception()
+                            if isinstance(completed_error, ProviderError):
+                                reported_error = completed_error
+                        if isinstance(reported_error, ProviderError):
+                            attempt_state["provider_error"] = reported_error
+
+                async def release_unclaimed():
+                    if provider_stream is None:
+                        return
+                    completion = register_cleanup()
+                    cleanup = asyncio.create_task(_abort_unclaimed_stream(provider_stream, timeout_s, completion=completion))
+                    if first_audio_deadline is None:
+                        await asyncio.shield(cleanup)
+                    else:
+                        await asyncio.wait({cleanup}, timeout=max(0, first_audio_deadline - monotonic()))
+
                 try:
                     configuration, connection, credentials = self._model_connection(
                         request.organization_id, model_configuration_id, capability,
@@ -452,26 +743,60 @@ class ModelGateway:
                     open_stream = getattr(adapter, "open_tts_stream", None)
                     if not callable(open_stream):
                         raise ProviderError("provider_streaming_not_supported", "Provider adapter does not implement TTS PCM streaming.", retryable=False)
+                    attempt_timeout = timeout_s
+                    if first_audio_deadline is not None:
+                        slots = remaining_attempts(fallback_index, attempt)
+                        remaining = first_audio_deadline - monotonic()
+                        if remaining <= 0:
+                            raise ProviderError("provider_timeout", "TTS first audio budget exhausted.", retryable=False)
+                        attempt_timeout = min(timeout_s, remaining / slots)
                     context = ProviderContext(
                         organization_id=request.organization_id, invocation_id=invocation_id,
                         route_id=str(resolved_route.get("id") or "route_inline"),
                         provider_connection_id=provider_connection_id,
                         model_configuration_id=model_configuration_id,
                         model_type=configuration["model_type"], capability=capability,
-                        purpose=request.purpose, model=model, timeout_s=timeout_s,
+                        purpose=request.purpose, model=model,
+                        timeout_s=attempt_timeout,
                         attempt=attempt, fallback_index=fallback_index,
                         connection_config=connection.get("connection_config") or {},
                         model_settings=configuration.get("settings") or {},
                         default_parameters=configuration.get("default_parameters") or {},
                         credentials=credentials, metadata=request.metadata,
                     )
+                    async def open_attempt(open_stream=open_stream, context=context, diagnostics=attempt_diagnostics, state=attempt_state):
+                        try:
+                            return await open_stream(self._apply_model_defaults(request, context.default_parameters), context)
+                        except asyncio.CancelledError as exc:
+                            cancellation_details = getattr(exc, "provider_diagnostics", None)
+                            if not isinstance(cancellation_details, dict):
+                                cancellation_details = getattr(asyncio.current_task(), "provider_diagnostics", {})
+                            if isinstance(cancellation_details, dict):
+                                diagnostics.update(cancellation_details)
+                            reported_error = getattr(exc, "provider_error", None)
+                            if not isinstance(reported_error, ProviderError):
+                                reported_error = getattr(asyncio.current_task(), "provider_error", None)
+                            if isinstance(reported_error, ProviderError):
+                                state["provider_error"] = reported_error
+                            raise
+
                     try:
-                        provider_stream = await asyncio.wait_for(
-                            open_stream(self._apply_model_defaults(request, context.default_parameters), context),
-                            timeout=timeout_s,
-                        )
+                        attempted = True
+                        provider_task = asyncio.create_task(open_attempt())
+                        done, _ = await asyncio.wait({provider_task}, timeout=context.timeout_s)
+                        if not done:
+                            await cancel_open()
+                            raise asyncio.TimeoutError()
+                        provider_stream = provider_task.result()
                     except asyncio.TimeoutError as exc:
-                        raise ProviderError("provider_timeout", "TTS stream open timed out.", retryable=True) from exc
+                        reported_error = attempt_state.get("provider_error")
+                        raise ProviderError(
+                            reported_error.code if reported_error else "provider_timeout",
+                            "TTS stream could not open within its time budget.",
+                            retryable=reported_error.retryable if reported_error else True,
+                            details={**(reported_error.details if reported_error else {}),
+                                     **attempt_diagnostics, "transport_outcome": "timeout"},
+                        ) from exc
                     log_fields.update(provider_connection_id=provider_connection_id, provider_id=provider_id, model=model)
 
                     def terminal(status: str, event: Optional[TTSStreamEvent], error: Optional[ProviderError]):
@@ -495,7 +820,8 @@ class ModelGateway:
 
                     stream = ValidatedTTSStream(
                         provider_stream, provider_id=provider_id, model=model,
-                        read_timeout_s=timeout_s, on_terminal=terminal,
+                        read_timeout_s=min(8.0, timeout_s), on_terminal=terminal,
+                        first_audio_deadline=first_audio_deadline,
                     )
                     self._log_invocation(
                         **log_fields,
@@ -503,13 +829,41 @@ class ModelGateway:
                         latency_ms=int((perf_counter() - started_at) * 1000),
                     )
                     return stream
+                except asyncio.CancelledError as cancelled:
+                    # An outer first-audio watchdog may win the race against
+                    # wait_for. Keep that deadline observable without changing
+                    # cancellation into a normal ProviderError return.
+                    expired = first_audio_deadline is not None and monotonic() >= first_audio_deadline
+                    try:
+                        await cancel_open()
+                    except asyncio.CancelledError:
+                        # A repeated cancellation is still propagated after
+                        # recording this attempt; cleanup already owns the task.
+                        pass
+                    reported_error = attempt_state.get("provider_error")
+                    if isinstance(reported_error, ProviderError):
+                        cancelled.provider_error = reported_error
+                        caller_task.provider_error = reported_error
+                        caller_task._tts_gateway_provider_error = reported_error
+                    log_fields.update(provider_connection_id=provider_connection_id, provider_id=provider_id, model=model)
+                    try:
+                        self._log_invocation(
+                            **log_fields, status="failed" if expired else "stream_cancelled",
+                            latency_ms=int((perf_counter() - started_at) * 1000),
+                            error_code=reported_error.code if reported_error else "provider_timeout" if expired else "provider_cancelled",
+                            error_details={**(reported_error.details if reported_error else {}), **attempt_diagnostics,
+                                           "transport_outcome": "timeout" if expired else "cancelled"},
+                        )
+                        if expired and attempted and (reported_error is None or reported_error.retryable):
+                            self.circuits.record_failure(circuit_key, threshold=threshold)
+                    except Exception:
+                        # A failing audit sink must not replace cancellation.
+                        pass
+                    finally:
+                        await release_unclaimed()
+                    raise
                 except ProviderError as exc:
-                    if provider_stream is not None:
-                        try:
-                            await asyncio.wait_for(provider_stream.abort(), timeout=min(5.0, timeout_s))
-                        except Exception:
-                            pass
-                    exc.details = {**exc.details, "audio_started": False, "fallback_allowed": True}
+                    exc.details = {"fallback_allowed": True, **exc.details, "audio_started": False}
                     last_error = exc
                     log_fields.update(provider_connection_id=provider_connection_id, provider_id=provider_id, model=model)
                     self._log_invocation(
@@ -517,12 +871,22 @@ class ModelGateway:
                         latency_ms=int((perf_counter() - started_at) * 1000),
                         error_code=exc.code, error_details=exc.details,
                     )
-                    if exc.retryable and exc.code != "provider_circuit_open" and attempt <= retry_count:
-                        if backoff_ms:
-                            await asyncio.sleep(backoff_ms * attempt / 1000.0)
-                        continue
-                    if exc.retryable and exc.code != "provider_circuit_open":
+                    if attempted and exc.retryable and exc.code != "provider_circuit_open":
                         self.circuits.record_failure(circuit_key, threshold=threshold)
+                    await release_unclaimed()
+                    if exc.retryable and exc.code != "provider_circuit_open" and attempt <= retry_count:
+                        if self.circuits.is_open(circuit_key, threshold=threshold, recovery_seconds=recovery):
+                            # This call already has a real failure. Stop trying
+                            # this target without replacing its cause, which
+                            # still governs whether a fallback is permitted.
+                            break
+                        if backoff_ms:
+                            delay = backoff_ms * attempt / 1000.0
+                            if first_audio_deadline is not None:
+                                delay = min(delay, max(0, first_audio_deadline - monotonic())
+                                            / (remaining_attempts(fallback_index, attempt + 1) + 1))
+                            await asyncio.sleep(delay)
+                        continue
                     break
             if fallback_index + 1 >= len(targets) or not self._allows_fallback(last_error, policy):
                 self._annotate_error(last_error, invocation_id, resolved_route, total_attempts)
@@ -993,6 +1357,7 @@ class ModelGateway:
         error_code: str = "",
         error_details: Optional[Dict[str, Any]] = None,
         prompt_version: Optional[str] = None,
+        diagnostic_context: Optional[Dict[str, Any]] = None,
     ) -> None:
         usage = getattr(response, "usage", None)
         diagnostics = error_details or {}
@@ -1027,22 +1392,66 @@ class ModelGateway:
             "estimated_cost_usd": estimated_cost_usd,
             "error_code": error_code,
             "prompt_version": prompt_version if prompt_version in {
+                "company_question_reply.v1", "answer_evaluation.v7", "answer_evaluation.v8", "controlled_followup.v2", "controlled_followup.v3", "controlled_followup.v4", "controlled_followup.v5", "controlled_followup.v6", "controlled_followup_repair.v1", "supplement_reply.v4", "supplement_reply.v5", "supplement_reply.v6", "supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10", "supplement_reply.v11", "supplement_reply.v12", "conversation_reception.v1", "conversation_reception.v2", "conversation_reception.v3", "conversation_reception.v4", "conversation_reception.v5", "conversation_reception.v6", "conversation_reception.v7", "conversation_reception.v8", "conversation_reception.v9", "conversation_reception.v10", "conversation_reception_speech.v1", "conversation_reception_speech.v2", "conversation_reception_speech.v3", "conversation_reception_speech.v4", "interviewer_supervisor.v1", "interviewer_supervisor.v2", "interviewer_supervisor.v3", "interviewer_supervisor.v4", "interviewer_evidence_expert.v1", "interviewer_evidence_expert.v2", "interviewer_transition.v1",
+                "interview_turn_understanding.v10", "interview_turn_decision.v9",
+                "interview_turn_understanding.v11", "interview_turn_decision.v10",
+                "interview_turn_understanding.v12", "interview_turn_understanding.v13",
+                "interview_turn_decision.v11", "interview_turn_decision.v12",
+                "interview_turn_understanding.v14", "interview_turn_understanding.v15", "interview_turn_decision.v13", "interview_turn_decision.v14", "interview_turn_understanding.v16", "interview_turn_understanding.v17", "interview_turn_understanding.v18", "interview_turn_understanding.v19", "interview_turn_decision.v15", "interview_turn_decision.v16", "interview_turn_decision.v17", "interview_turn_decision.v18", "interview_turn_understanding.v20", "interview_turn_understanding.v21", "interview_turn_understanding.v22", "interview_turn_understanding.v23", "interview_turn_decision.v19", "interview_turn_decision.v20", "interview_turn_decision.v21", "interview_turn_decision.v22",
                 "interview_turn_understanding.v1", "interview_turn_understanding.v2", "interview_turn_understanding.v3",
                 "interview_turn_understanding.v4", "interview_turn_understanding.v5",
                 "interview_turn_understanding.v6", "interview_turn_understanding.v7",
-                "interview_turn_understanding.v8", "interview_turn_understanding.v9",
+                "interview_turn_understanding.v8", "interview_turn_understanding.v58", "interview_turn_understanding.v70", "interview_turn_understanding.v82", "interview_turn_understanding.v94", "interview_turn_understanding.v106", "interview_turn_understanding.v44", "interview_turn_understanding.v60", "interview_turn_understanding.v72", "interview_turn_understanding.v84", "interview_turn_understanding.v96", "interview_turn_understanding.v108", "interview_turn_understanding.v9", "interview_turn_understanding.v59", "interview_turn_understanding.v71", "interview_turn_understanding.v83", "interview_turn_understanding.v95", "interview_turn_understanding.v107", "interview_turn_understanding.v45", "interview_turn_understanding.v61", "interview_turn_understanding.v73", "interview_turn_understanding.v85", "interview_turn_understanding.v97", "interview_turn_understanding.v109",
+                "interview_inquiry_units.v1", "interview_inquiry_units.v2", "answer_evaluation.v6",
                 "interview_turn_decision.v3", "interview_turn_decision.v4", "answer_evaluation.v2",
                 "answer_evaluation.v3", "answer_evaluation.v4", "answer_evaluation.v5",
                 "interview_turn_decision.v5", "interview_turn_decision.v6",
-                "interview_turn_decision.v7", "interview_turn_decision.v8",
-                "interview_turn_decision.v1", "interview_turn_decision.v2", "supplement_reply.v1", "supplement_reply.v2", "supplement_reply.v3",
+                "interview_turn_decision.v7", "interview_turn_decision.v8", "interview_turn_decision.v23", "interview_turn_decision.v24",
+                "interview_turn_understanding.v24", "interview_turn_understanding.v25", "interview_turn_understanding.v26", "interview_turn_understanding.v27", "interview_turn_decision.v25", "interview_turn_decision.v26", "interview_turn_decision.v27", "interview_turn_decision.v28", "interview_turn_decision.v29", "interview_turn_decision.v30", "interview_turn_understanding.v28", "interview_turn_understanding.v29", "interview_turn_understanding.v30", "interview_turn_understanding.v31", "interview_turn_decision.v31", "interview_turn_decision.v32", "interview_turn_decision.v33", "interview_turn_decision.v34", "interview_turn_decision.v35", "interview_turn_decision.v36", "interview_turn_decision.v37", "interview_turn_decision.v38", "interview_turn_decision.v39", "interview_turn_decision.v40", "interview_turn_understanding.v32", "interview_turn_understanding.v36", "interview_turn_understanding.v40", "interview_turn_understanding.v50", "interview_turn_understanding.v62", "interview_turn_understanding.v74", "interview_turn_understanding.v86", "interview_turn_understanding.v98", "interview_turn_understanding.v110", "interview_turn_understanding.v118", "interview_turn_understanding.v46", "interview_turn_understanding.v54", "interview_turn_understanding.v66", "interview_turn_understanding.v78", "interview_turn_understanding.v90", "interview_turn_understanding.v102", "interview_turn_understanding.v114", "interview_turn_understanding.v122", "interview_turn_understanding.v33", "interview_turn_understanding.v37", "interview_turn_understanding.v41", "interview_turn_understanding.v51", "interview_turn_understanding.v63", "interview_turn_understanding.v75", "interview_turn_understanding.v87", "interview_turn_understanding.v99", "interview_turn_understanding.v111", "interview_turn_understanding.v119", "interview_turn_understanding.v47", "interview_turn_understanding.v55", "interview_turn_understanding.v67", "interview_turn_understanding.v79", "interview_turn_understanding.v91", "interview_turn_understanding.v103", "interview_turn_understanding.v115", "interview_turn_understanding.v123", "interview_turn_understanding.v34", "interview_turn_understanding.v38", "interview_turn_understanding.v42", "interview_turn_understanding.v52", "interview_turn_understanding.v64", "interview_turn_understanding.v76", "interview_turn_understanding.v88", "interview_turn_understanding.v100", "interview_turn_understanding.v112", "interview_turn_understanding.v120", "interview_turn_understanding.v126", "interview_turn_understanding.v130", "interview_turn_understanding.v48", "interview_turn_understanding.v56", "interview_turn_understanding.v68", "interview_turn_understanding.v80", "interview_turn_understanding.v92", "interview_turn_understanding.v104", "interview_turn_understanding.v116", "interview_turn_understanding.v124", "interview_turn_understanding.v128", "interview_turn_understanding.v132", "interview_turn_understanding.v35", "interview_turn_understanding.v39", "interview_turn_understanding.v43", "interview_turn_understanding.v53", "interview_turn_understanding.v65", "interview_turn_understanding.v77", "interview_turn_understanding.v89", "interview_turn_understanding.v101", "interview_turn_understanding.v113", "interview_turn_understanding.v121", "interview_turn_understanding.v127", "interview_turn_understanding.v131", "interview_turn_understanding.v49", "interview_turn_understanding.v57", "interview_turn_understanding.v69", "interview_turn_understanding.v81", "interview_turn_understanding.v93", "interview_turn_understanding.v105", "interview_turn_understanding.v117", "interview_turn_understanding.v125", "interview_turn_understanding.v129", "interview_turn_understanding.v133", "interview_turn_decision.v41", "interview_turn_decision.v42", "interview_turn_decision.v43", "interview_turn_decision.v44", "interview_turn_decision.v45", "interview_turn_decision.v46", "interview_turn_decision.v47", "interview_turn_decision.v48", "interview_turn_decision.v49", "interview_turn_decision.v50", "interview_turn_decision.v51", "interview_turn_decision.v52", "interview_turn_decision.v53", "interview_turn_decision.v59", "interview_turn_decision.v65", "interview_turn_decision.v71", "interview_turn_decision.v81", "interview_turn_decision.v93", "interview_turn_decision.v105", "interview_turn_decision.v117", "interview_turn_decision.v129", "interview_turn_decision.v141", "interview_turn_decision.v149", "interview_turn_decision.v77", "interview_turn_decision.v85", "interview_turn_decision.v97", "interview_turn_decision.v109", "interview_turn_decision.v121", "interview_turn_decision.v133", "interview_turn_decision.v145", "interview_turn_decision.v153", "interview_turn_decision.v54", "interview_turn_decision.v60", "interview_turn_decision.v66", "interview_turn_decision.v72", "interview_turn_decision.v82", "interview_turn_decision.v94", "interview_turn_decision.v106", "interview_turn_decision.v118", "interview_turn_decision.v130", "interview_turn_decision.v142", "interview_turn_decision.v150", "interview_turn_decision.v78", "interview_turn_decision.v86", "interview_turn_decision.v98", "interview_turn_decision.v110", "interview_turn_decision.v122", "interview_turn_decision.v134", "interview_turn_decision.v146", "interview_turn_decision.v154", "interview_turn_decision.v55", "interview_turn_decision.v61", "interview_turn_decision.v67", "interview_turn_decision.v73", "interview_turn_decision.v83", "interview_turn_decision.v95", "interview_turn_decision.v107", "interview_turn_decision.v119", "interview_turn_decision.v131", "interview_turn_decision.v143", "interview_turn_decision.v151", "interview_turn_decision.v157", "interview_turn_decision.v161", "interview_turn_decision.v79", "interview_turn_decision.v87", "interview_turn_decision.v99", "interview_turn_decision.v111", "interview_turn_decision.v123", "interview_turn_decision.v135", "interview_turn_decision.v147", "interview_turn_decision.v155", "interview_turn_decision.v159", "interview_turn_decision.v163", "interview_turn_decision.v56", "interview_turn_decision.v62", "interview_turn_decision.v68", "interview_turn_decision.v74", "interview_turn_decision.v84", "interview_turn_decision.v96", "interview_turn_decision.v108", "interview_turn_decision.v120", "interview_turn_decision.v132", "interview_turn_decision.v144", "interview_turn_decision.v152", "interview_turn_decision.v158", "interview_turn_decision.v162", "interview_turn_decision.v80", "interview_turn_decision.v88", "interview_turn_decision.v100", "interview_turn_decision.v112", "interview_turn_decision.v124", "interview_turn_decision.v136", "interview_turn_decision.v148", "interview_turn_decision.v156", "interview_turn_decision.v160", "interview_turn_decision.v164", "interview_turn_decision.v57", "interview_turn_decision.v63", "interview_turn_decision.v69", "interview_turn_decision.v89", "interview_turn_decision.v101", "interview_turn_decision.v113", "interview_turn_decision.v125", "interview_turn_decision.v137", "interview_turn_decision.v75", "interview_turn_decision.v91", "interview_turn_decision.v103", "interview_turn_decision.v115", "interview_turn_decision.v127", "interview_turn_decision.v139", "interview_turn_decision.v58", "interview_turn_decision.v64", "interview_turn_decision.v70", "interview_turn_decision.v90", "interview_turn_decision.v102", "interview_turn_decision.v114", "interview_turn_decision.v126", "interview_turn_decision.v138", "interview_turn_decision.v76", "interview_turn_decision.v92", "interview_turn_decision.v104", "interview_turn_decision.v116", "interview_turn_decision.v128", "interview_turn_decision.v140",
+                "interview_turn_decision.v1", "interview_turn_decision.v2", "supplement_reply.v1", "supplement_reply.v2", "supplement_reply.v3", "candidate_exit_reply.v1",
             } else None,
-            "http_status": diagnostics.get("http_status") if diagnostics.get("http_status") in {400, 404, 409, 413, 422} else None,
+            "http_status": diagnostics.get("http_status") if type(diagnostics.get("http_status")) is int
+                and diagnostics.get("http_status") in {200, 400, 401, 402, 403, 404, 408, 409, 413, 422, 429, 500, 502, 503, 504} else None,
+            "vendor_code": diagnostics.get("vendor_code") if isinstance(diagnostics.get("vendor_code"), str)
+                and diagnostics.get("vendor_code") in {
+                "Arrearage", "AllocationQuota.FreeTierOnly", "InvalidApiKey", "Throttling",
+                "Throttling.RateQuota", "Throttling.AllocationQuota", "Throttling.AccessDenied",
+            } else None,
+            "provider_request_id": diagnostics.get("provider_request_id") if isinstance(diagnostics.get("provider_request_id"), str) and re.fullmatch(
+                r"(?:[A-Fa-f0-9]{32}|[A-Fa-f0-9]{8}(?:-[A-Fa-f0-9]{4}){3}-[A-Fa-f0-9]{12})",
+                str(diagnostics.get("provider_request_id", ""))) else None,
+            "transport_phase": diagnostics.get("transport_phase") if isinstance(diagnostics.get("transport_phase"), str)
+                and diagnostics.get("transport_phase") in {
+                "request_start", "connect", "tls", "request_write", "response_headers", "response_body",
+            } else None,
+            "transport_phase_ms": diagnostics.get("transport_phase_ms") if type(diagnostics.get("transport_phase_ms")) is int
+                and 0 <= diagnostics.get("transport_phase_ms") <= 86_400_000 else None,
+            "transport_elapsed_ms": diagnostics.get("transport_elapsed_ms") if type(diagnostics.get("transport_elapsed_ms")) is int
+                and 0 <= diagnostics.get("transport_elapsed_ms") <= 86_400_000 else None,
+            "transport_outcome": diagnostics.get("transport_outcome") if isinstance(diagnostics.get("transport_outcome"), str)
+                and diagnostics.get("transport_outcome") in {
+                "timeout", "cancelled", "network_error", "http_error", "stream_error", "success",
+            } else None,
             "schema_reason": diagnostics.get("schema_reason") if diagnostics.get("schema_reason") in {
                 "enum", "type", "required", "min_properties", "additional_properties", "min_items", "max_items",
                 "unique_items", "minimum", "maximum", "min_length", "max_length",
             } else None,
             "schema_path": diagnostics.get("schema_path") if re.fullmatch(r"\$[A-Za-z0-9_.\[\]]{0,160}", str(diagnostics.get("schema_path", ""))) else None,
+            "json_failure_kind": diagnostics.get("json_failure_kind")
+                if isinstance(diagnostics.get("json_failure_kind"), str)
+                and diagnostics.get("json_failure_kind") in {"empty_content", "invalid_json_object"} else None,
+            "json_decode_reason": diagnostics.get("json_decode_reason")
+                if isinstance(diagnostics.get("json_decode_reason"), str)
+                and diagnostics.get("json_decode_reason") in {"non_object", "extra_data", "syntax_error"} else None,
+            "json_error_offset": diagnostics.get("json_error_offset")
+                if type(diagnostics.get("json_error_offset")) is int
+                and 0 <= diagnostics.get("json_error_offset") <= 10_000_000 else None,
+            "requested_response_format": diagnostics.get("requested_response_format")
+                if isinstance(diagnostics.get("requested_response_format"), str)
+                and diagnostics.get("requested_response_format") in {"json_schema", "json_object", "prompt"} else None,
+            "content_length": diagnostics.get("content_length")
+                if type(diagnostics.get("content_length")) is int
+                and 0 <= diagnostics.get("content_length") <= 10_000_000 else None,
             "rejection_category": diagnostics.get("rejection_category") if diagnostics.get("rejection_category") in {
                 "request_rejected", "structured_schema_rejected", "output_limit_rejected",
             } else None,
@@ -1054,6 +1463,13 @@ class ModelGateway:
             "redacted_request_hash": request_hash,
             "created_at": utc_now(),
         }
+        if diagnostic_context:
+            item.update({key: value for key, value in safe_model_diagnostic_fields(diagnostic_context).items()
+                         if key not in item})
+        if status == "cancelled" and usage is None:
+            # Cancellation establishes no usage/billing fact; zero would imply
+            # an unverified free call even when a provider accepted the request.
+            item.update(input_tokens=None, output_tokens=None, total_tokens=None, estimated_cost_usd=None)
         with self.persistence.transaction(organization_id) as transaction:
             transaction.model_invocations.append(item)
 

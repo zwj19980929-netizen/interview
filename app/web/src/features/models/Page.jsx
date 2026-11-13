@@ -47,6 +47,7 @@ const ROUTE_REASONS = {
   NON_PRODUCTION_PROVIDER: "开发模拟模型不能证明正式链路可用",
   PROVIDER_NOT_IMPLEMENTED: "厂商插件尚未实现", PROVIDER_CAPABILITY_MISMATCH: "厂商插件不支持所需能力",
   provider_auth_failed: "厂商认证失败，请检查授权配置", provider_bad_request: "厂商请求参数不兼容",
+  provider_billing_required: "厂商账户计费或额度需要处理，请管理员处理后重试",
   provider_capability_missing: "厂商缺少所需能力", provider_circuit_open: "厂商调用正在保护冷却中",
   provider_connection_disabled: "厂商连接已停用", provider_cost_limit_exceeded: "模型调用预算已达上限",
   provider_health_failed: "厂商健康检测未通过", provider_model_unavailable: "厂商模型暂不可用",

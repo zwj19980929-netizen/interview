@@ -298,3 +298,56 @@ def test_refresh_endpoint_has_enterprise_rbac_and_no_public_alias(monkeypatch):
         assert api.post(path, headers={"Authorization": "Bearer " + key}).status_code == 403
     for key in ("admin", "interview"):
         assert api.post(path, headers={"Authorization": "Bearer " + key}).status_code == 404
+
+
+@pytest.mark.parametrize("case,code", [
+    ("invited", "INVITATION_REGISTRATION_REQUIRED"),
+    ("consent", "CONSENT_REQUIRED"),
+    ("early", "APPOINTMENT_TOO_EARLY"),
+    ("late", "APPOINTMENT_WINDOW_CLOSED"),
+    ("device", "APPOINTMENT_DEVICE_NOT_READY"),
+    ("services", "APPOINTMENT_NOT_READY"),
+    ("plan", "INTERVIEW_PLAN_NOT_APPROVED"),
+    ("ready", None),
+])
+def test_public_readiness_explains_admission_without_changing_registration(case, code):
+    service, probe = fixture("invited" if case == "invited" else "registered")
+    probe.healthy = case != "services"
+    if case == "early":
+        update(service, scheduled_start_at=iso(NOW + timedelta(minutes=5)))
+    if case == "late":
+        update(service, scheduled_end_at=iso(NOW - timedelta(minutes=1)))
+    if case == "device":
+        update(service, device_readiness={"ready": False})
+    if case in {"consent", "invited"}:
+        with service.persistence.transaction("org_default") as tx:
+            intake = tx.candidate_intakes.get("intake_fixture")
+            tx.candidate_intakes.delete("intake_fixture", expected_version=intake["version"])
+    if case == "plan":
+        with service.persistence.transaction("org_default") as tx:
+            plan = tx.interview_plans.get("plan_fixture")
+            plan["status"] = "draft"
+            tx.interview_plans.update(plan, expected_version=plan["version"])
+    before = service.get("appointment_fixture")
+    result = service.readiness("fixture-token")
+    assert result["can_start"] is (code is None)
+    assert result["entry_blocker"] == ({"code": code} if code else None)
+    assert service.get("appointment_fixture") == before
+    if case == "invited":
+        assert result["device_readiness"]["ready"] is True
+        assert service.get("appointment_fixture")["status"] == "invited"
+        with service.persistence.transaction("org_default") as tx:
+            assert tx.candidate_intakes.list() == []
+
+
+def test_public_entry_blocker_never_exposes_unknown_diagnostic_details(monkeypatch):
+    service, probe = fixture("registered")
+    probe.healthy = True
+    def deny(*args, **kwargs):
+        raise ApiError("INTERNAL_PROVIDER_DETAIL", "sensitive provider message", status_code=409,
+                       details={"credential": "never-public"})
+    monkeypatch.setattr(service.admission, "validate_start", deny)
+    result = service.readiness("fixture-token")
+    assert result["entry_blocker"] == {"code": "APPOINTMENT_NOT_READY"}
+    assert "never-public" not in json.dumps(result)
+    assert "sensitive provider" not in json.dumps(result)

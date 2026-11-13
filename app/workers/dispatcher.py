@@ -12,7 +12,7 @@ def dispatch_due_work() -> dict:
     organization_id = os.getenv("INTERVIEWER_ORGANIZATION_ID", "org_default")
     limit = max(1, int(os.getenv("INTERVIEWER_CELERY_DISPATCH_LIMIT", "100")))
     persistence = persistence_for(get_store())
-    with persistence.transaction(organization_id) as transaction:
+    with persistence.transaction(organization_id, read_only=True) as transaction:
         items = transaction.outbox.claimable(limit)
     for item in items:
         execute_work_item.delay(organization_id, item["id"])

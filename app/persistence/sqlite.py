@@ -5,8 +5,26 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Dict, Iterator, List, Optional, Set, Tuple
 
-from app.persistence.interface import Document, PersistenceTransaction, Predicate, TransactionBackend
-from app.repositories.sqlite import SQLiteStore
+from app.persistence.interface import Document, InterviewWatchdogKind, PersistenceTransaction, Predicate, TransactionBackend
+from app.persistence.read_only import ReadOnlyTransactionBackend
+from app.persistence.realtime_state import REALTIME_PATHS, realtime_state_from_values
+from app.repositories.sqlite import INTERVIEW_WATCHDOG_PREDICATES, SQLiteStore
+
+
+_REALTIME_FIELDS = ", ".join("'$.%s'" % ".".join(path) for path in REALTIME_PATHS)
+_REALTIME_QUERY = """
+SELECT json_extract(d.data, %s) AS fields,
+       json_type(d.data, '$.plan_snapshot') AS plan_type,
+       json_type(d.data, '$.agent_runtime') AS runtime_type,
+       json_type(d.data, '$.agent_runtime.takeover') AS takeover_type,
+       (SELECT json_extract(e.value, '$.event_id', '$.payload.act_id', '$.payload.approved')
+          FROM json_each(CASE WHEN json_type(d.data, '$.agent_events') = 'array'
+                             THEN json_extract(d.data, '$.agent_events') ELSE '[]' END) e
+         WHERE e.type = 'object' AND json_extract(e.value, '$.type') = 'conversation.act.selected'
+         ORDER BY e.key DESC LIMIT 1) AS selected
+FROM documents d WHERE d.collection = 'interviews' AND d.id = ?
+AND json_extract(d.data, '$.organization_id') = ?
+""" % _REALTIME_FIELDS
 
 
 class _SQLiteTransactionBackend(TransactionBackend):
@@ -38,10 +56,46 @@ class _SQLiteTransactionBackend(TransactionBackend):
         ).fetchone()
         return json.loads(row["data"]) if row else None
 
+    def get_interview_realtime_state(
+        self, *, organization_id: str, interview_id: str,
+    ) -> Optional[Document]:
+        row = self.connection.execute(_REALTIME_QUERY, (interview_id, organization_id)).fetchone()
+        if not row:
+            return None
+        return realtime_state_from_values(
+            json.loads(row["fields"]), json.loads(row["selected"]) if row["selected"] else None,
+            plan_type=row["plan_type"], runtime_type=row["runtime_type"],
+            takeover_type=row["takeover_type"],
+        )
+
     def list_documents(self, collection: str) -> List[Document]:
         rows = self.connection.execute(
             "SELECT data FROM documents WHERE collection = ? ORDER BY id",
             (collection,),
+        ).fetchall()
+        return [json.loads(row["data"]) for row in rows]
+
+    def list_unsettled_evidence_commands(
+        self, *, organization_id: str, interview_id: str,
+    ) -> List[Document]:
+        rows = self.connection.execute(
+            "SELECT data FROM documents WHERE collection = 'evidence_commands' "
+            "AND json_extract(data, '$.organization_id') = ? "
+            "AND json_extract(data, '$.interview_id') = ? "
+            "AND json_extract(data, '$.status') IN ('pending', 'running')",
+            (organization_id, interview_id),
+        ).fetchall()
+        return [json.loads(row["data"]) for row in rows]
+
+    def list_interview_watchdog_candidates(
+        self, *, organization_id: str, kind: InterviewWatchdogKind,
+    ) -> List[Document]:
+        if kind not in ("takeover", "deadline"):
+            raise ValueError("Unknown interview watchdog kind.")
+        rows = self.connection.execute(
+            "SELECT data FROM documents WHERE collection = 'interviews' "
+            "AND json_extract(data, '$.organization_id') = ? AND " + INTERVIEW_WATCHDOG_PREDICATES[kind],
+            (organization_id,),
         ).fetchall()
         return [json.loads(row["data"]) for row in rows]
 
@@ -229,19 +283,28 @@ class SQLitePersistence:
         self.store = store
 
     @contextmanager
-    def transaction(self, organization_id: str) -> Iterator[PersistenceTransaction]:
+    def transaction(
+        self, organization_id: str, *, read_only: bool = False,
+    ) -> Iterator[PersistenceTransaction]:
         connection = self.store._connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            if read_only:
+                # Every transaction owns and closes its connection. This pragma
+                # cannot leak into a later writer's connection.
+                connection.execute("PRAGMA query_only = ON")
+            connection.execute("BEGIN" if read_only else "BEGIN IMMEDIATE")
             backend = _SQLiteTransactionBackend(connection)
-            yield PersistenceTransaction(backend, organization_id)
+            yield PersistenceTransaction(
+                ReadOnlyTransactionBackend(backend) if read_only else backend, organization_id,
+            )
             connection.commit()
         except Exception:
             connection.rollback()
             raise
         finally:
             connection.close()
-        backend.sync_store_cache(self.store)
+        if not read_only:
+            backend.sync_store_cache(self.store)
 
 
 def _item_time(item: Document) -> Optional[str]:

@@ -1,7 +1,15 @@
 import asyncio
+import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+from app.core.runtime_release import runtime_release_snapshot
+
+# Freeze the startup source snapshot before loading application services.
+# Later diagnostics must never describe newly edited files as loaded code.
+runtime_release_snapshot("api")
 
 from app.adapters.livekit_media import prepare_local_rtc_environment
 
@@ -36,6 +44,9 @@ from app.core.access_log import install_sensitive_access_log_filter
 from app.core.speech_diagnostics import configure_speech_diagnostics
 from app.core.rate_limit import public_rate_limiter
 from app.model_gateway.errors import ProviderError
+from app.model_gateway.gateway import ModelGateway
+from app.providers.dashscope.tts_http_pool import start_tts_http_pools, close_tts_http_pools
+from app.services.fixed_speech_preparation import start_fixed_speech_preparation, close_fixed_speech_preparation
 from app.persistence.errors import PersistenceError
 
 
@@ -47,6 +58,18 @@ WEB_DIST_DIR = WEB_DIR / "dist"
 async def lifespan(app: FastAPI):
     install_sensitive_access_log_filter()
     configure_speech_diagnostics()
+    try:
+        logging.getLogger("uvicorn.error").info(
+            "runtime_release %s", json.dumps(runtime_release_snapshot("api"), sort_keys=True)
+        )
+    except Exception:
+        # Release diagnostics must never prevent normal application startup.
+        pass
+    start_tts_http_pools()
+    start_fixed_speech_preparation(
+        ModelGateway(get_store()),
+        organization_id=os.getenv("INTERVIEWER_ORGANIZATION_ID", "org_default"),
+    )
     task = None
     takeover_watchdog = asyncio.create_task(
         run_takeover_lease_watchdog(
@@ -84,6 +107,8 @@ async def lifespan(app: FastAPI):
         if task is not None:
             task.cancel()
         await shutdown_livekit_evidence_supervisors()
+        await close_fixed_speech_preparation()
+        await close_tts_http_pools()
         await event_bus.close()
         await public_rate_limiter.close()
 

@@ -83,6 +83,16 @@ describe("model route purpose coverage", () => {
 });
 
 describe("server-authoritative route readiness", () => {
+  it("shows the fixed supplier billing reason from a failed route", async () => {
+    workbench.data.routes = [makeRoute("interview_turn_understanding", "llm.chat_json", "failed", {
+      readiness: { status: "failed", reason_code: "provider_billing_required" },
+    })];
+    await render();
+    expect(row("interview_turn_understanding").textContent).toContain("厂商账户计费或额度需要处理");
+    expect(row("interview_turn_understanding").querySelector("code").textContent).toBe("provider_billing_required");
+    expect(workbench.request).not.toHaveBeenCalled();
+  });
+
   it("distinguishes every projected status, configured coverage and healthy coverage", async () => {
     const states = [
       ["warmup_calibration", "stt.streaming", "healthy", "健康有效"],

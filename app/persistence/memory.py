@@ -4,7 +4,12 @@ from datetime import datetime, timezone
 from threading import RLock
 from typing import Dict, Iterator, List, Optional
 
-from app.persistence.interface import Document, PersistenceTransaction, Predicate, TransactionBackend
+from app.persistence.interface import (
+    Document, InterviewWatchdogKind, PersistenceTransaction, Predicate, TransactionBackend,
+    is_interview_watchdog_candidate,
+)
+from app.persistence.read_only import ReadOnlyTransactionBackend
+from app.persistence.realtime_state import project_realtime_state
 from app.repositories.memory import InMemoryStore
 
 
@@ -16,6 +21,9 @@ DOCUMENT_COLLECTIONS = (
     "question_speech_assets",
     "role_requirements",
     "interview_plans",
+    "interview_skills",
+    "interview_skill_revisions",
+    "interview_customizations",
     "candidate_profiles",
     "resume_documents",
     "file_objects",
@@ -58,8 +66,33 @@ class _MemoryTransactionBackend(TransactionBackend):
     def get_document(self, collection: str, item_id: str) -> Optional[Document]:
         return deepcopy(self.documents[collection].get(item_id))
 
+    def get_interview_realtime_state(
+        self, *, organization_id: str, interview_id: str,
+    ) -> Optional[Document]:
+        item = self.documents["interviews"].get(interview_id)
+        if not item or item.get("organization_id") != organization_id:
+            return None
+        return project_realtime_state(item)
+
     def list_documents(self, collection: str) -> List[Document]:
         return [deepcopy(item) for item in self.documents[collection].values()]
+
+    def list_unsettled_evidence_commands(
+        self, *, organization_id: str, interview_id: str,
+    ) -> List[Document]:
+        return [deepcopy(item) for item in self.documents["evidence_commands"].values()
+                if item.get("organization_id") == organization_id
+                and item.get("interview_id") == interview_id
+                and item.get("status") in {"pending", "running"}]
+
+    def list_interview_watchdog_candidates(
+        self, *, organization_id: str, kind: InterviewWatchdogKind,
+    ) -> List[Document]:
+        if kind not in ("takeover", "deadline"):
+            raise ValueError("Unknown interview watchdog kind.")
+        return [deepcopy(item) for item in self.documents["interviews"].values()
+                if item.get("organization_id") == organization_id
+                and is_interview_watchdog_candidate(item, kind)]
 
     def insert_document(self, collection: str, item: Document) -> None:
         self.documents[collection][item["id"]] = deepcopy(item)
@@ -133,15 +166,21 @@ class MemoryPersistence:
         self._lock = RLock()
 
     @contextmanager
-    def transaction(self, organization_id: str) -> Iterator[PersistenceTransaction]:
+    def transaction(
+        self, organization_id: str, *, read_only: bool = False,
+    ) -> Iterator[PersistenceTransaction]:
         with self._lock:
             backend = _MemoryTransactionBackend(self.store)
-            transaction = PersistenceTransaction(backend, organization_id)
+            transaction = PersistenceTransaction(
+                ReadOnlyTransactionBackend(backend) if read_only else backend, organization_id,
+            )
             try:
                 yield transaction
             except Exception:
                 raise
             else:
+                if read_only:
+                    return
                 for collection in DOCUMENT_COLLECTIONS:
                     target = getattr(self.store, collection)
                     target.clear()

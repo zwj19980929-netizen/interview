@@ -183,7 +183,7 @@ def test_explicit_finish_is_optional_override_not_required_for_automatic_flow():
     asyncio.run(scenario())
 
 
-def test_new_voice_cancels_slow_prepare_and_discards_late_result():
+def test_new_voice_retains_slow_prepare_but_new_words_discard_its_late_result():
     async def scenario():
         capture = _Capture()
         entered, cancelled = asyncio.Event(), asyncio.Event()
@@ -204,12 +204,14 @@ def test_new_voice_cancels_slow_prepare_and_discards_late_result():
         await entered.wait()
         clock.value += 1
         endpoint.observe_audio(b"\0\x40" * 320)
-        await cancelled.wait()
         await _until(lambda: capture.resumes and "answer_listening" in notices)
-        assert not commits and "answer_listening" in notices
+        assert not cancelled.is_set() and not commits
         capture.prepare_impl = None
         capture.current_final = _final("合成回答结束。还有补充。")
+        endpoint.observe_transcript(capture.current_final.text)
+        assert not cancelled.is_set() and not commits
         clock.value += 0.8
+        await asyncio.wait_for(cancelled.wait(), 1)
         await _until(lambda: commits)
         assert len(commits) == 1 and commits[0].text.endswith("还有补充。")
         assert len(capture.prepares) == 2
@@ -255,7 +257,7 @@ def test_preparation_failures_keep_listening_without_repeated_calls_or_commit(fa
         if fault == "no_final":
             capture.current_final = None
         elif fault == "problem":
-            capture.problem = SimpleNamespace(code="schema_invalid")
+            capture.problem = SimpleNamespace(code="provider_unavailable", retryable=True)
         elif fault == "continue":
             capture.action = "continue_listening"
         else:
@@ -274,23 +276,17 @@ def test_preparation_failures_keep_listening_without_repeated_calls_or_commit(fa
             clock.value += 0.02
             await _until(lambda: capture.resumes >= 2)
             assert len(capture.prepares) == 2
-            clock.value += 1.99
-            await asyncio.sleep(0.07)
-            assert len(capture.prepares) == 2
-            clock.value += 0.02
-            await _until(lambda: capture.resumes >= 3)
-            assert len(capture.prepares) == 3
             clock.value += 60
             await asyncio.sleep(0.15)
-            assert len(capture.prepares) == 3, "Three failures exhaust this input's retry budget"
+            assert len(capture.prepares) == 2, "First attempt plus one automatic recovery exhausts these words"
             _voice_then_pause(endpoint, clock)
-            await _until(lambda: capture.resumes >= 4)
-            assert len(capture.prepares) == 3, "Audio alone cannot restart the same server evidence budget"
+            await _until(lambda: capture.resumes >= 3)
+            assert len(capture.prepares) == 2, "Audio alone cannot restart the same server evidence budget"
             capture.current_final = _final(capture.current_final.text + "新增服务端补充内容。")
             endpoint.observe_transcript(capture.current_final.text)
             clock.value += .8
-            await _until(lambda: len(capture.prepares) == 4)
-            assert len(capture.prepares) == 4, "New server words start a fresh bounded budget"
+            await _until(lambda: len(capture.prepares) == 3)
+            assert len(capture.prepares) == 3, "New server words allow a fresh evidence attempt"
         else:
             count = len(capture.prepares)
             clock.value += 60

@@ -1,5 +1,239 @@
 # 接口设计
 
+## 098：辅助语音降级与接话内容恢复
+
+仅可选语音表达通道的故障投影为能力降级，主识别、录音与正常TTS路径仍持续工作时不要求候选人重试回答；权威stream.error及录音/所有权故障保持原恢复语义。降级通知不能清除其他回答处理失败、宣称播报已送达或产生回答完成许可。
+
+新增Agent事件`capability.degraded`，payload为`capability=speech.dialogue_realtime`、`fallback=cascade`、固定白名单`reason_code`及可选`capture_id`（托管采集提供，直接STT路径可省略）。该事件为TRANSIENT，不写入事件历史或新增快照状态，只描述辅助表达降级，不占用或清除`problem`和`answer_preparation`；服务端按当前实例/generation/turn/capture/owner验证并只投影一次，客户端校验固定载荷后推进事件游标，不改变候选失败或播放状态。原因白名单为provider_dialogue_input_overflow、provider_dialogue_input_timeout、provider_dialogue_input_failed、provider_dialogue_event_overflow、provider_dialogue_response_mismatch、provider_timeout、provider_unavailable、provider_route_missing、provider_configuration_invalid、provider_auth_failed、provider_billing_required、provider_rate_limited、provider_circuit_open、provider_schema_invalid、provider_audio_unavailable、provider_stream_closed；未知原因归provider_unavailable。供应商正文不透传候选端。输入队列的后台安全诊断只记录有界字节数和耗时，日志失败不得影响主录音/STT。
+
+补充交流统一校验将当前意图、答案影响、证据和控制冲突与生成接话文案分开处理。仅presence、answer_effect=unchanged、confidence≥0.75且其余全部合同通过，唯一表达失败为reception_cannot_ask_question时，可用集中审核的固定回应替代反问文案，再执行完整校验；固定回应不提交、不换题、不结束。控制冲突必须对完整当前权威回复重新分类，不能当作润色修复。
+
+明确的JSON非对象、接话反问和当前控制冲突可在同来源剩余额度内触发一次版本化定向纠错；纠错原因须来自实际失败并绑定capture、完整final、回复边界、已送达问题与上下文，不能由客户端或模型授予。沿用同文本2次、连续失败期4次/40秒、单次8秒/零Provider内部重试。耗尽仍保留证据与有界中性恢复，真实暂停/退出/完成继续经过既有门禁。最终具体版本和验证记录见098操作日志。
+
+## 097：补充回复独立恢复与后置诊断
+
+补充问题实际送达后，服务端对完整权威新回复分类。分类恢复与完整技术答案理解的失败预算分离：每个capture/显式操作epoch内，同一完整文本最多两次实际调用；一次连续失败期最多四次调用，固定40秒从该期首个调用前起算，新字句、VAD或metadata不延期。所有调用在I/O前扣额，取消不退；新回复不能重置永久供应商阻断。只有分类及当前来源复验成功才结束连续失败期，逐文本账本仍保留；成功分类本身不是完成许可。显式处理重试可更新epoch且保留有效确认，显式继续更新epoch同时撤销旧完成事实。完整技术分析的两次额度不增加。
+
+格式失败仍只在同一来源、边界、实际已送达问题和当前上下文内使用原v10纠错；不接受非对象JSON，不强制完成。次数或期限耗尽保留原题、录音和转写，通过一次可信送达的中性恢复提示与显式重试恢复。公共REST/WebSocket字段、候选文本权限和退出/提交合同不变。
+
+安全诊断区分supplement_content（后置合同）、supplement_source（来源复验）和supplement_proof（证明构造）。只输出固定异常类型、原因、合同字段路径和版本；StructuredResponseValidationError归invalid_result，其他内部异常不能伪装供应商故障。不保存异常正文、模型响应或候选内容；日志失败不得改变原控制流。
+
+## 096：完成回复中的无关附言与语义复用
+
+内部 `supplement_reply.v9` 在既有严格对象合同上新增必填 `answer_effect=unchanged|updated|uncertain`，明确当前整段新回复是否改变本题答案。新增 `confirmation_unchanged` 仅解释已有服务端完成事实之后的无关附言；它不能凭客户端字段、模型声明或 `prior_confirmation=true` 创造完成许可。首次 `finish+unchanged` 可包含完成语和无关附言；技术补充、纠正、改口、请求或不确定内容不能借此略过正常理解。完整服务端转写与录音保持，模型只分类，不截断原文或改写评分证据。
+
+语义复用通过独立的服务端进程内证明传递，绑定完整新 final、原回答和回复边界、已实际送达的确认问题、当前上下文与 capture/generation/owner。模型或客户端不能提交该证明；新语音立即冻结旧提交资格，只有新权威 final 通过语义与来源复验后才能恢复。提交时仍核验原分析、实际送达和当前控制权。原078纯控制复用路径的词句规则保持，不以放宽它实现新行为。
+
+当前同来源补充分类最多两次自动调用；明确的可恢复顶层非对象JSON失败使剩余一次调用使用 `supplement_reply.v10` 的集中、版本化定向纠错，单次8秒/零供应商内部重试、外层10秒限制保持。不修补或接受非对象响应；连续失败保留原回答，允许一次真实完整送达后的同题恢复提示及既有显式重试，不将恢复提示视为已完成。公共 REST/WebSocket、客户端权限、正式答案和退出确认合同不变。
+
+新v9/v10明确优先级：存在有效前次确认且只是无新请求的附言时，应选择确认延续；无前次确认或主动另开话题仍走普通交流。未解决转写争议为uncertain、明确修正为updated，transcript_correction与unchanged组合严格拒绝。早期v7/v8真实探针结果保留，历史审计继续可读。
+
+显式“继续补充”撤销旧完成事实与组合收据，保留原技术准备和录音；同一旧final不能恢复已撤销的完成许可。“重试处理”只恢复已保存回答的处理，可保留来源仍有效的确认，两者不能混用。
+
+## 095：回答失败后的同题澄清
+
+既有answer_preparation投影增加status=clarifying，仍绑定当前turn_id/capture_id及原安全恢复字段；仅中性恢复提示已可信完整播完、当前owner/controller和输入仍有效时发布。客户端可继续说明或重试已保留语音；该状态不提交答案、不换题、不授权完成。取消、播放失败和过期通知不得进入clarifying。原retry_required/blocked及显式重试合同保持，恢复提示每个capture最多一次。批量STT管理探针改为版本化合成语音与内容匹配，结果只暴露有限健康诊断，不返回探针音频或转写正文。
+
+普通 `answer_listening` 只确认收音，不清除 `clarifying`；同采集的新 `answer_preparing`、理解恢复或撤销当前采集替换该提示。`floor.changed` 本身不授予 `clarifying`，客户端仅接受当前作用域且有序的权威快照。批量模型/路由测试只认证当前primary，一次真实调用，不通过fallback取得健康证明；业务重试策略不变。
+
+公司反问定向纠错（理解130–133/决策161–164）必须显式返回 `company_question`：公司问题为合法原文引用对象，其余请求为null。普通请求格式不变；ask_company/null仍由原语义规则拒绝，不自动填入候选原话。
+
+## 094：首题及题间规划自动恢复
+
+公共REST/WebSocket事件、候选权限及手动重试接口保持。明确的供应商空内容/JSON对象解析失败在原规划期限内最多自动重试一次；仍失败时从本场已批准目录提出合法题目。若权限、预算或目录校验不能通过，保留原失败投影和手动恢复入口。新增内部模型调用审计分类不投影到候选页面，也不授予客户端文本提交权限。见[供应商设计](model-provider-plugins.md)。
+
+## 092：播放完成和交接缓冲
+
+沿用`avatar.performance.stopped`及既有收音/恢复事件，无新REST、客户端音频文本权限或持久字段。当前有效播放回执之后的服务端PCM在STT快照和重开期间有界保留，不能因此推断答案完成或退出确认。告别正常由真实完成回执结束，丢失回执的兜底不再把长素材截为10秒；不能根据重复播放状态无限延期。详见[092设计](speech-handoff-and-farewell-092.md)。
+
+## 091：处理重试包含失败的交流识别
+
+既有retry_answer_processing/evidence.retry_processing可以恢复当前未成功的轻量接话，沿用当前turn/capture/owner门禁；不重开已结束会话、不撤销已送达确认，也不授予退出或答案提交许可。公共字段与错误合同保持，详见[091](reception-failure-retry-091.md)。
+
+## 090：事前考察范围、结束事实与媒体诊断
+
+CSV 报告导出追加 `score_scope` 与 JSON 编码的 `assessment_scope` 列，与 JSON 报告保持同一事前范围；旧报告留空，不把本场抽样分误标成整份题库总分。新增时间不足错误 `ASSESSMENT_APPOINTMENT_WINDOW_TOO_SHORT` / `ASSESSMENT_START_TIME_INSUFFICIENT`（422）仅暴露 `required_seconds/available_seconds`，候选就绪投影明确提示改期。
+
+新v2范围的预约创建、改期须验证窗口不小于预计必需耗时加告别预留；开场前剩余窗口不足亦明确拒绝并提示调整时间，不能默默缩减已冻结范围或等到中途才收口。旧v1预约兼容保持。
+
+新题库准备计划的 `assessment_contract` 使用 `interview_assessment.v2`：`assessment_scope`（`session_assessment_scope.v1`）在开始前冻结本场选中的单元、两来源名额、核心能力、未纳入能力与预计耗时；完整批准题池仍保留。报告追加 `score_scope=session_assessment` 和同一 `assessment_scope`，综合分只解释本场范围；旧 v1 不修改合同或分数。
+
+企业 `GET /api/v1/interviews/{id}/review` 追加 `completion`（可空）：`trigger=time_limit|primary_question_limit|candidate_pool_exhausted`、可选 `limit_minutes/elapsed_seconds/primary_question_limit`；新场次记录实际触发条件，旧场次仅在结束时间与冻结预算足以证明时投影，否则保留笼统原因。`question_counts={primary,followup}` 只统计实际呈现的主题和追问，评分进度仍为回答份数。
+
+`recording` 保留既有状态及严格可播放条件，新增 `processing_status=processing|failed|completed|unavailable`、`failure_reason=configuration|retry_exhausted|integrity|provider|unknown`（或空）、安全 `failure_code` 及 `can_retry`。失败/死信不能继续显示正常收尾；配置错误须先恢复配置再重试，记录成功仍必须通过真实对象哈希与存储保护校验。
+
+新增管理员只读 `GET /api/v1/admin/media-runtime`（admin RBAC、Cache-Control: no-store），worker 只读 inspect `media_runtime` 返回同一结构：`schema=media-runtime.v1`、`mode`、`configuration_sha256`、`recording_ready`、`issues`。在引导时冻结已解析媒体配置；不返回凭据、URL或绝对路径。摘要涵盖媒体模式、端点与存储路由及凭据存在性（不比较凭据值），用于核验 API/worker 配置一致性，不等于外部媒体服务健康证明，不替代原 readiness。既有 `runtime-release.v1` 源码身份协议不变。
+
+## 089：总主题预算与结束播放
+
+岗位题库和简历题库共用全场主题预算，常规新计划目标8–10道、总上限10道，追问单独计数；短预约或材料不足可更少。候选池数量不是必问题数，不再因为完整能力覆盖需要更多单元而抬高主题上限。冻结历史合同不原地改写，执行层仍在题间以统一上限校验下一题，保留回答与未考察能力的证据不足事实。
+
+实时`session.snapshot`新增可选投影`completion_presentation="closing"`：仅用于仍拥有有效Evidence控制权、告别尚在进行的原候选连接。真实session.status和completion回执保持；前端立即停止作答并保留媒体播放，等待最终`completed`或不含该标记的恢复快照才关闭。该标记不授予收音、提交、恢复或延迟真实结束的权限。公共HTTP读取、新连接及刷新不继承旧播放权限，仍可直接取得完成回执并显示结束；告别失败使用原有有界清理，不无限等待。
+
+下一题规划只在明确可恢复的模型超时/暂时不可用时，使用同一批准候选池内经过预算、去重与来源校验的后备选择，仍经原owner/context事务门禁提交；鉴权、旧语境、越界和非法合同不作通用兜底。诊断只记录固定原因码与策略标识，不包含模型响应、候选发言或凭据。实现及验收见[操作日志089](change-log.md)。
+
+## 088：运行版本核验（仓库与本机已验证）
+
+新增管理员只读 `GET /api/v1/admin/runtime-release`，沿用 admin RBAC。响应为 `schema=runtime-release.v1`、进程身份（随机 instance_id、pid、started_at、role）和启动源码快照（status、sha256、file_count）。源码范围只包含后端 `app/**/*.py` 与根 `main.py`，排除 `app/web`、`node_modules`、`__pycache__`；不读取配置环境、凭据、数据库、媒体或日志，也不返回绝对路径和源码正文。快照在应用/worker 引导时冻结，后续查询不能因磁盘代码更新而冒充新运行版本；不可读取时返回 unavailable 和空摘要，不影响原健康/就绪及正在进行的面试。API 与 Celery 只读 inspect 命令 `runtime_release` 使用同一计算规则；prefork 子进程具有独立进程身份，继承已冻结源码快照。发布前冻结源码并对照验收摘要，启动快照不代表后续动态加载代码的完整证明。
+
+本端点不提供升级、重启、重试或答案提交权限，不能替代实际语音链路和生产 readiness 验收。`/healthz` 响应保持不变，代码版本不匹配仅作为发布核验失败，不直接暂停面试。部署与验证记录见[操作日志088](change-log.md)。
+
+## 086：已确认退出的证据处理（仓库与本机已验证，加载记录见088）
+
+候选外部接口仍沿服务端语音、实际送达和独立退出确认。进程内证据完成结果区分`exit_confirmed`与答案accepted，不为退出控制发送answer.accepted或evaluation.queued；既有退出生命周期及结束快照通知驱动客户端收尾。客户端payload不能提供退出准备对象或制造确认。未完成题的保留发言不计为拒答/零分，报告列明未评估待复核。
+
+## 085：回答处理失败分类（仓库与本机已验证）
+
+沿用现有事件与快照协议：两次模型结果校验失败进入`retry_required`，候选可显式`retry_answer_processing`；真正不可重试的供应商故障仍为`blocked/contact_support`。不新增候选文本提交入口，不把重试视为完成许可。细节见[085](followup-clarification-085.md)。
+
+### ANSWER-RECOVERY-AND-REUSE-078（仓库与本机已验证）
+
+回答处理重试与`continue_speaking`继续补充分开。新增当前题/当前capture绑定的`retry_answer_processing`控制操作，映射durable `evidence.retry_processing`，只允许恢复已有回答的失败步骤，不重开采集、不撤销仍有效的补充确认、不直接授予答案提交或退出许可。自动恢复与显式重试遵守单任务执行约束；新的技术内容、转写修正、失权、换题及终态使旧准备失效。重复处理合并，旧capture、暂停、已作答、失权与终态拒绝；前端仅由当前causation匹配的恢复拒绝解除pending。
+
+`answer_preparation`的事件与快照保留安全字段`stage`（`answer_understanding|supplement_prompt`）、`reason_code`、`attempt`（0–2的失败摘要）、`max_attempts=2`与`retryable`。它们不含供应商响应或原始转写；attempt不代表实时模型调用序号。恢复中无重复按钮；不可重试故障投影`status=blocked`、`action=contact_support`，保留已有录音/转写。可恢复额度耗尽的兜底重试使用新操作；接口成功收据仍不等于答案已提交。详见[078说明](answer-recovery-and-reuse-078.md)。
+
+### WARMUP-SQLITE-CONFIRMATION-077（仓库已验证）
+
+保持既有warmup.confirm/warmup.retry、calibration_status与calibration_retry_required合同。前端对WARMUP_STT_PROBLEM、WARMUP_RETRY_REQUIRED及retry_warmup给出明确的显式重试提示；后续open门禁拒绝不把试音恢复提示覆盖成通用“请稍等”，重连快照可重建retry_required提示。只有服务端awaiting_confirmation可显示确认；完整字幕本身不授予确认权。确认提示音失败继续使用074的WARMUP_CONFIRMATION_AUDIO_UNAVAILABLE及零PCM恢复门禁，不新增客户端授权。
+
+若当前试音已选中输出但未知故障无法证明安全清理，服务端持久暂停并发送`WARMUP_CONFIRMATION_OUTPUT_FAILED`、`recoverable=false`、`action=pause_or_human_takeover`及暂停快照；不将其表示为试音STT失败、允许重新消费同一流或自动确认。当前开流causation匹配的WARMUP_RETRY_REQUIRED门禁拒绝立即清理前端pending；过期拒绝不得覆盖新的成功试音。
+
+### INVITATION-READINESS-DIAGNOSTICS-076
+
+签发邀请仍复用原 `POST /api/v1/interview-appointments/{id}/invite` 与 `APPOINTMENT_NOT_READY` 的 `details.checks`，不新增接口或绕过准入。工作台保留创建成功的预约，并在弹窗持续展示本次签发失败的安全原因；仅对就绪错误按 `blocking`、`invite_ready` 及 `runtime_environment` 对应的 `ready/production_ready` 提取阻塞项。超时、欠费/额度、鉴权、配置、检查冷却以及非模型的音频/媒体/部署检查分别说明；网络失败、权限不足、预约过期或状态不符不冒充模型未就绪。用户显式重试失败时更新同一弹窗，不自动重建预约或重复签发。
+
+启用流式表达时，既有路由测试接口对`interview_agent_expression`的TTS成功结果返回`{probe_mode: "tts_stream", audio_chunks: 正整数, audio_bytes: 正整数}`，不返回探测音频、URL或合成文本；其余TTS用途继续返回批量结果。安全路由失败分类补充`provider_audio_final_missing`与`provider_audio_format_unsupported`。预约就绪响应的结构、授权和签发事务保持原合同。
+
+明确不支持流式的既有模型保留同路由批量兼容结果；只限开流前无PCM且清理确认的协议不支持，不用于超时、计费或鉴权恢复，也不重新获得探测预算。
+
+### SAME-VOICE-TTS-STABILITY-075（已实现）
+
+沿用`request_repeat`/`meta.request_repeat`控制信号。正式追问音频待恢复时，客户端必须发送当前`turn_id`与`payload.question_audio_recovery_event_id`（当前快照的selection_event_id），使用既有幂等键；服务端只重试存储的原批准文本，客户端不得指定题干。新增可恢复problem `QUESTION_AUDIO_RETRY_REQUIRED`，`action=retry_question_audio`。角色安全snapshot增加可空`question_audio_recovery={status:retry_required|retrying,turn_id,selection_event_id}`；重试中状态不等同已送达，只有实际播放排空才能解除该状态并开放回答。
+
+零PCM、无不确定媒体写入、精确输出已关闭且当前owner/control/turn/selection均合法时才进入该恢复；部分播放继续失败关闭。重连展示原状态，不能自动消费重试许可或让旧回执、barge-in、直接打开采集绕过未送达题。不存在备用供应商配置变更。固定提示缓存仅服务端PCM复用，无新客户端共享资产URL或访问权限。
+
+### WARMUP-TTS-RESILIENCE-074
+
+沿用既有试音确认/重试操作，不新增端点或客户端授权。仅当前 owner/control/capture 下、无正式题且 `calibration_status=awaiting_confirmation` 的未发声确认提示失败，清理精确输出并保留显式操作；`WARMUP_CONFIRMATION_AUDIO_UNAVAILABLE` 为可恢复 problem，不能推断面试已暂停。已播放部分音频、失去所有权或新动作不走该恢复。正式试题、答案提交、退出确认权限保持各自围栏。详见[074说明](warmup-tts-resilience-074.md)。
+
+### SUPPLEMENT-CONFIRMATION-STABILITY-073
+
+无新增客户端授权或公共端点。服务端语义 `finish_answer` 对普通作答不再等于可直接提交，补充确认仍由服务端实际播放及新权威回复产生；客户端文本、播放状态上报或模型的引用字段均不单独授权。明确“提前结束回答”按钮保留其独立显式语义；整场退出继续独立确认。后续可选提醒失败不投影为`answer_preparation.retry_required`。见[073说明](supplement-confirmation-stability-073.md)。
+
+### FOLLOWUP-SPEECH-TIMEOUT-DIAGNOSTICS-071
+
+无新增端点或客户端权限。表达准备保留已明确的供应商/媒体错误，无明确底层原因的首音超时使用已有`AGENT_AUDIO_FIRST_PCM_TIMEOUT`结构化错误，候选提示仍走安全投影；诊断阶段信息仅在服务端保留。准备失败导致持久暂停后立即发既有`session.snapshot`，候选以快照中的`status=paused`确认暂停，不能仅凭fatal problem推断生命周期已提交。原题、追问和答案保持，详情见[071说明](followup-speech-timeout-071.md)。
+
+### OFF-TOPIC-AND-RECONNECT-068
+
+无新增 REST/WebSocket 字段或客户端授权。私有理解合同新增 `off_topic`；语义内容与 `turn_intent` 独立，跑题且明确结束本题可沿原提交接口推进，不能结束整场。前端收到当前 socket 的同场合法快照后才恢复控制按钮；10 秒快照握手超时、最多 6 次重连、稳定 10 秒才重置次数。`answer_preparation` 业务错误跨重连保持，题目、转写及退出确认不重置为首次进入。正式权威 final 的 20 秒期限独立于稳定预览的 15 秒期限，修正下方067的共同起点说明。详见[068说明](off-topic-and-reconnect-068.md)。
+
+### AGENT-CHAIN-IMPROVEMENTS-067
+
+管理端 Agent metrics 接口保留既有 `metrics`，新增 `aggregation`（`interview-agent-metrics.aggregate.v1`）：进程 `instance_id`、`started_at`、累计 counters、固定桶 histograms，以及 stage 的 success/failure/cancelled 结果数。聚合不包含候选原话、凭据或媒体；跨进程采集须按 instance_id 区分重启。`stt_preview_reused` 纳入服务端指标白名单。
+
+普通交流历史/私有 input context 新增 `delivery_status`，unknown/selected/playing/interrupted/failed 均不证明已播完；只供模型理解历史，不能由客户端提交为退出或答题许可。已收到当前权威发言后的认知与首音准备共用 20 秒期限，超时通过既有 retry_required 提示恢复，原始录音和转写保留。验收输入升级 v3，缺失类别、空恢复记录及非有限数值必须拒绝，不兼容把 v2 报告当作本轮验收通过。细节见[067说明](agent-chain-improvements-067.md)。
+
+### INTERACTION-RECOVERY-066（仓库与本机验证完成）
+
+当前 capture 的 `answer_preparation` 投影增加 `retrying` / `retry_required`，与 `preparing` 共用 `turn_id`、`capture_id`。失败在重连 snapshot 中保留；普通 listening/preparing 事件不得擦除。只有同 capture 的 `understanding_recovered`、有效答案提交、换题或终态清除。失败 problem 与恢复事件都携带 turn/capture 归属。重试复用 `continue_speaking` 控制，不授予完成回答或退出面试的权限。
+
+私有 PreparedTurnDecision 可携带 `content_clarification`：服务端已实际播完、绑定当前 turn/capture 的内容澄清证据与后续新话语；不接受客户端提供该对象。首次遇到不可解释的回答应问具体澄清问题；已澄清后仍明确结束时可返回 `answer_unresolved`，保留原始音频、文字、可核实事实与歧义，交人工复核，不能按不会计零分。
+
+065控制事件补充：服务端在退出确认等待或分类期间发送既有floor.changed的reason=exit_awaiting_reply，并附当前turn/capture标识；候选页面映射为awaiting_exit_confirmation，显示明确退出确认提示。该通知不授予完成许可，旧capture或其它题事件丢弃；普通supplement_awaiting_reply保留补充语义。
+
+065：首次语音退出请求只进入独立口头确认；确认问题必须先获准播放，只有其后新权威语音确认才可提交退出。既有提前结束回答按钮不能代替退出确认。无新REST或客户端文本权限，当前题目/录音保持至确认；断线/更换owner不能凭旧确认退出。确认收据内部存储，候选仍沿既有completed回执。
+
+064：无新增REST端点或客户端文本授权。沿既有语音结束命令与`completed`事件闭环，输入结束后即停止采集；评分可继续，录制/告别失败不阻止结束回执。候选问答历史仍返回完整`final_transcript`，页面明确标为完整发言。协议和验证见[064说明](conversation-intent-and-end-064.md)。
+
+064结束恢复补充：公共候选GET和`session.snapshot`新增安全`completion`字段（未结束为null；结束后仅含interview_id、status、submitted_at、recording_retention_notice、human_review_required，与既有completed回执一致）。以服务端candidate_input_completed_at或completed/report_generating/report_ready状态生成，即使评分仍pending，刷新也直接显示结束回执，不重新申请设备或发布音视频。输入已结束拒绝签发候选发布ticket（409 CANDIDATE_INPUT_COMPLETED），控制连接恢复只读取快照/历史、不重新attach收音owner。客户端收到完成后撤销启动与重连续行、心跳和控制连接；任何媒体关闭异常均不能跳过麦克风/摄像头轨道释放。初次启动或重连遇CANDIDATE_INPUT_COMPLETED时只读拉取公共GET的completion恢复结束页面；旧ticket的ready和媒体命令也不能重开输入。
+
+## 062 · 多轮交流与供应商账单错误
+
+接话内部合同升级 `conversation_reception.v5`：独立传递当前正式题、根题、最近解释、父子题身份与带角色的交流历史；可选 `repeat_target=current_question|last_clarification|null` 仅允许 repeat 非空，缺省重读当前正式题。无新增候选文本提交入口，交流记忆不形成答案。
+
+OpenAI-compatible 供应商返回 HTTP 402 时统一报告 `provider_billing_required`，`retryable=false`，对外沿用供应商不可用的 HTTP 503；中文提示明确账单或额度需检查，日志只保留安全原因和 `http_status=402`，不返回原始供应商响应。异步评分失败保留该错误码和已有答案，由管理员处理账单/配置后按现有重试入口重评，不自动充值、切换路由或重评。
+
+061补充：试音确认、试音重试与继续补充同样遵守精确输出撤销顺序。授权失效的旧输出在底层清空队列后、撤轨前发布`avatar.performance.interrupted`；显式撤销与后台失效共享有界通知，不取消后继输出。等待后重新复核状态与控制权。正常drained不发取消；真实传输故障仍暂停。接口形状与350ms前端异常检测不变，详见[061说明](first-question-audio-061.md)。
+
+## 060 · 按本场已提交题目补查交流证据
+
+只读工具 `interview.read_context` 保留 `argument=null` 的有界记忆摘要；`argument` 为本场已提交的 `turn_id` 时，可补查该题的已验证技术主张与原文引用。返回仅包含题目/父子身份、answer_id、回答摘要及至多12条实际属于对应final_transcript的claim，不返回评分、标准答案、媒体地址、Prompt或其他会话数据。引用重复时明确位置不唯一，不捏造对应某一次发言。未知、未提交或歧义引用继续返回 `INTERVIEW_TOOL_REFERENCE_INVALID`；Skill工具权限与会话绑定保持。没有新增REST入口、数据库字段或候选文本提交权限。
+
+## 052：连续字幕与批准 PCM 播放合同
+
+无新增 REST 路由。权威快照完成后先覆盖已确认转写、将 final 修正按现有 `transcript.partial` 显示，再恢复识别并继续处理后续字幕；显示更新不生成 CandidateAnswer 或结束许可。`conversation_reception.v2` 的自然回应沿既有 `conversation_acknowledgement`、`avatar.performance.*` 和 `floor.changed` 表达，候选端不能提交模型回复或任意执行动作。
+
+`delivery=streaming_tts` 继续使用下文的 `live_audio` 精确绑定及 ready / producer_finished / drained 控制合同；052 将候选可听输出改为 LiveKit 可靠数据包驱动的 AudioWorklet。只接受 `role=approved_expression`、精确 `publisher_identity` 和 `interviewer.approved-pcm.{output_id}` topic 的数据。每包为 16 字节头（ASCII `IAS1`；sequence、start_sample、sample_rate_hz 三个 uint32 大端整数）与 PCM16LE；固定 24kHz mono、每包最多 20ms / 976 字节，序号和源样本起点必须连续。PCM 不进入 AgentEvent、事件回放或 Redis。
+
+浏览器缓冲最多 2 秒；无效包、缺片、溢出或取消均停止当前输出，不能丢片后伪造 drained。RTC 音轨只保留录制用途，不再另挂音频播放器。仅在全部源样本消费完且 `getOutputTimestamp()` 确认设备输出越过最后渲染帧时发送 drained；断供期间插入的静音不推进源样本位置。未知发布者或旧 output 数据不进入当前播放器。当前默认流式开启，供应商不支持时仅首 PCM 前可回退完整资产；首 PCM 后失败不自动整段重播。详见[052 改造说明](continuous-conversation-052.md)。
+
+## 2026-09-16：计划准备进度（049）
+
+`POST /api/v1/interview-plans/prepare` 默认保持原JSON响应。工作台可发送 `Accept: text/event-stream`，沿用相同认证、请求体和组织隔离；响应为SSE，`progress` data包含stage（reading/preparing/saving）、completed_points/total_points/reused_points（仅preparing阶段），数量只在校验通过后增加。`complete` data为保存成功的原计划；`error` data含status及error.code/message/details，HTTP头发送后错误通过此终止事件表达。连接中断/超时不能当作成功，客户端应提示先查看计划列表再重试。每10秒心跳保持连接，不模拟进度；断开取消未完成模型任务，事务已提交时不会撤销已保存计划。此接口不创建预约或启动面试。
+
+## 2026-09-14：计划生成超时诊断（048）
+
+批次边界：每批只含一个原题的最多6个评分点；响应Schema的题目ID、知识点ID、能力与参考片段枚举只来自该题，unit数量等于该批实际点数。
+
+失败处理：统一格式或单元内容校验失败时，仅对失败小批次使用集中修正指令再尝试一次，已通过批次保留。修正仍占用3并发/180秒总预算；超时、鉴权或服务错误不在装配层重复调用，第二次无效仍失败关闭。校验日志只记录固定原因枚举与题目/考察点/批次数量，不记录原文。
+
+prepare/generate 的短问题整理仍在同一计划装配内完成；不会创建预约或启动面试。模型按最多6个评分点分批、最多3批并行，单次60秒、整体180秒预算；失败取消剩余任务且不保存半成品。超时返回503 `INQUIRY_UNIT_GENERATION_TIMEOUT`，模型不可用返回503 `INQUIRY_UNIT_PROVIDER_UNAVAILABLE`，模型格式/来源引用不合格返回503 `INQUIRY_UNIT_RESPONSE_INVALID`，意外错误返回503 `INQUIRY_UNIT_GENERATION_FAILED`；中文提示区分原因，不以超时推断题库或简历缺失。仅返回安全原因，不暴露供应商响应、凭据或题目原文。
+
+## 2026-09-14：按题库直接准备面试
+
+`POST /api/v1/interview-plans/prepare` 是工作台新建计划入口。请求仅需 `job_position_id`、`candidate_profile_id`、`knowledge_base_ids`（1–10个不重复ID），可选 `duration_minutes`（5–120，默认45）。不接收岗位要求、技能覆盖、题数、深度或批准开关；服务端自动解析题库、生成短问题与评分依据，完成校验后返回 `status=approved` 的 execution v3 计划，可直接安排预约。`approval_source=automatic_preparation` 表示自动准备通过，不表示人工审阅或录用决策。
+
+考察能力来自所选题库实际可用的问题和经校验的单元映射；旧岗位要求中的额外标签不阻断此入口。未关联/不可用题库、越权候选人、无可用问题、生成失败、来源版本变化仍以结构化错误返回，失败不写入半成品计划。可用简历问题和已保存 Skill/企业资料自动带入，无则不要求补填。保留 `/generate` 和已有草稿的原合同，历史计划不会被自动批准或改写。
+
+
+### 046：交流回应事件
+
+沿用现有 `conversation.act.selected`、`avatar.performance.*` 和 `floor.changed`，新增非评分 `conversation_acknowledgement` act_type。接话判断只允许选择版本化短回应或重读当前冻结题目，不接受模型提交答案或任意调用工具；暂停在回应实际播放完成后沿用原 pause 命令，插话可撤销待执行暂停。取消回答准备后发布 `answer_listening`，避免前端长时间保留失效的准备状态。没有新增公开 REST 路由。
+
+### 公开邀请入场诊断（045）
+
+`GET/POST /api/v1/public/interview-invitations/{token}/readiness` 在原有响应上新增 `entry_blocker`：`can_start=true` 时为 `null`，否则为 `{ "code": "稳定错误码" }`。仅投影安全准入代码，不携带异常消息、Provider 诊断或凭据。未登记返回 `INVITATION_REGISTRATION_REQUIRED`；其余沿用 `CONSENT_REQUIRED`、录制同意缺失、`APPOINTMENT_TOO_EARLY`、`APPOINTMENT_WINDOW_CLOSED`、`APPOINTMENT_DEVICE_NOT_READY`、`APPOINTMENT_NOT_READY`、`INTERVIEW_PLAN_NOT_APPROVED`；未知错误使用 `APPOINTMENT_NOT_READY`。无效/过期/撤销 token 仍按原有 HTTP 错误响应处理。此字段只解释拒绝原因，不改变最终 start 的事务准入校验。
+
+客户端将每份邀请投影与发起 GET 的 token 原子绑定；当前路由尚未得到匹配投影时显示加载状态，不沿用其他邀请的登记状态。连接检测只测量 HTTP 服务可达性，不代表身份登记或实时媒体通道已就绪。
+
+## 2026-09-10 · 面试定制（044）
+
+新增组织级 `GET /api/v1/interview-customization` 与 `PATCH /api/v1/interview-customization`，仅admin/interviewer可读写。GET无保存记录也返回200与version=0、空企业资料和可选既有可用Skill；不会因为缺少资料阻止普通面试。响应为 `{version, skill:{skill_id,name,instructions,revision,status}|null, company_profile:{company_name,business_overview,products_services,additional_info}, updated_at}`。不返回密文、编译Prompt或其它组织内容。
+
+PATCH需expected_version（0首次创建），并至少含skill_instructions或company_profile之一；未传模块保持原值。skill_instructions为用户自由正文，最多6000字；非空沿既有v2 Skill生成不可变revision，空字符串清空默认绑定。company_profile四字段均可空，含栏目标题和分隔符的完整文本最多12000字；各次保存替换该模块内容，空资料表示新面试不使用企业资料。Skill和配置同事务保存，版本冲突409，不自动覆盖他人编辑；字段内容私有加密且审计仅元数据。所有字段按严格Schema拒绝额外键。
+
+计划generate增加use_customization_defaults:boolean，默认true。未提供非空skill_id/enterprise_skill_id或company_context时，分别继承该组织已保存的默认Skill和企业资料；提供的非空值逐项覆盖，false可明确禁止继承。Web新建计划正常不再重复填写这两项，显示面试定制保存状态及入口。计划冻结具体Skill revision与企业资料文本，配置更新适用于之后的新准备，不改写已存在计划或活动会话。
+
+企业资料是管理员填入的候选人可用信息来源，不授权任意事实补全。公司问答沿现有权威语音/对话seam处理，具体集中Prompt与响应合同在实现时同步登记，不借此扩大评分或其它工具权限。
+
+内部公司问答新增ask_company/respond_company和准确原文范围，使用既有语音、act及快照协议，不新增客户端答案入口；集中Prompt版本、超时、评分排除和恢复语义见[公司问答合同](company-question-runtime.md)。
+
+
+## 2026-09-10 · 计划能力覆盖诊断（043）
+
+`POST /api/v1/interview-plans/generate` 的v3请求在模型准备前校验可用原题能力覆盖。缺口返回422 `ASSESSMENT_SOURCE_COVERAGE_MISSING`，中文message说明补齐题库或调整对应要求；details含`missing_competency_ids`（排序后能力ID）、`missing_role_competency_ids`（来自岗位正权重能力）、`missing_requested_competency_ids`（来自本次coverage，可与岗位来源重叠）。只检查当前岗位/题库及计划可用范围，不以其它租户题目或不可用版本补足。失败不产生计划和单元生成模型调用，重复发送同一设置不会修复缺口。Skill和企业资料独立可选，与此错误无关。
+
+原有冻结合同完整性错误和单元级缺口校验继续保留；此诊断不改变岗位、题库标签、能力权重或自动略去必考维度。
+
+## 2026-09-10 · 面试计划工作区交互（042）
+
+前端新增可分享定位的`/#plans/new`创建页和`/#plans/{plan_id}`详情页，`/#plans`保持列表；仅改变前端导航，不新增REST接口。详情按现有GET读取最新计划，创建仍POST generate生成v3待审草稿，用户审阅实际问题后PATCH approved并提交所见expected_version；v2保持只读。创建页根据岗位要求筛选已关联题库，Skill和企业资料均独立可选。列表不直接展示私有评分依据或逐条兼容说明，详情中按需审阅；角色与原API鉴权保持。
+
+## 2026-09-10 · 可选用户Skill与企业资料（039，实施中）
+
+企业级约束属于Agent运行时；Skill由用户自由编写。`/api/v1/interview-skills`新包`interview_skill.v2`只要求名称和自由instructions文本，description/resources可选，保存/修改即可使用，不要求审核或选择固定交流方法。接口仍验证结构、大小和资源身份，不执行文本中的代码或自动访问链接；旧版本可继续读取。
+
+`POST /api/v1/interview-plans/generate`新增可选`skill_id`与`company_context`（最多12000字），均可省略/为null，空白公司资料视为未提供。旧enterprise_skill_id保留兼容，同时传不同ID返回422。企业资料独立于Skill：只有资料时也可使用；都没有时直接按岗位、题库、简历和实际对话面试，不要求补充公司信息。公司资料只进入本场私有上下文和受控读取工具，候选投影不返回全文；不得据缺失资料编造企业事实。
+
+## 2026-09-10 · 自适应面试与企业Skill接口（038）
+
+计划生成接口增加 `execution_schema_version:2|3`、`adaptive_policy`、`enterprise_skill_id`。工作台发送v3并生成草稿，查看具体单元后通过现有PATCH与expected_version批准；省略版本仍为v2。v3返回冻结 `assessment_contract` 和审核单元；具体字段、边界、覆盖不足错误与状态迁移见[自适应合同](adaptive-interview-contract.md)。新增企业管理 `/api/v1/interview-skills`，包含创建、版本、校验、批准、停用、撤销和通知重试；角色、请求与响应在[Skill API](interview-skills-api.md)完整定义。
+
+内部 `InterviewerSupervisor.propose_next(...) -> NextInterviewDecision` 提供选择问题/结束/调用工具的严格结构化提案，选择绑定question_id和inquiry_unit_id。合同、模型尝试预算及控制代次围栏见[总控合同](interviewer-supervisor-contract.md)。只有 `InterviewService` 可在重新校验后提交SELECT_NEXT或END_CANDIDATE_INPUT；工具不接受客户端提供的任意组织、URL或凭据。
+
+候选安全快照增加 execution_schema_version、dialogue_state、planning_problem；v3 total_primary_questions为null，不把预算上限假装固定题量。WebSocket `planning.retry` 仅在当前候选人控制连接、已完成开场及等待规划状态接受；不承认任何客户端文本为答案。企业复核/报告和JSON/CSV导出增加能力覆盖、未考察范围、结束原因及安全决策记录，不向候选人公开隐藏标准或Skill正文。
+
 ## 2026-09-10 · 补充确认合同与候选人提示（034）
 
 不新增 REST、事件类型或客户端文本答案。内部模型 wire 合同 supplement_reply.v3 必须且只含 intent（continue/finish/supplement/pause/unclear）、confidence（0–1真实数值，非bool）、evidence_id（本次服务端原文编号枚举）。网关校验后，ConversationUnderstandingService 恢复原有 intent/confidence/evidence_quote 领域输出并再次校验；v1/v2审计仍可读。350输出token、8秒调用预算、0次网关内部重试；完整回答内容决定三次端点失败预算，acoustic revision不清零。
@@ -126,17 +360,15 @@ supplement_reply.v2保持continue/finish/supplement/pause/unclear三字段返回
 
 ## 批准语音的流式播放（工作项 012）
 
-**实验合同，默认关闭**（`INTERVIEWER_STREAMING_TTS_ENABLED=false`）。2026-09-06 Chrome 实测2秒PCM中间停供3秒，
-媒体 currentTime 在 EOF 已为5.122秒且未触发 waiting，不能证明内容样本的真实排空；以下流式播放/ACK只供显式测试，
-未通过 source sample→播放位置校验前不得作为默认正式表达。默认仍用完整私有资产和原生 ended，自动轮次与合并推理不受此开关影响。
+012 的 MediaStream 墙钟在停供时继续增长，因此当时默认关闭；052 已用源样本可计数 PCM 播放器取代该适配器，并通过本机 Chromium / LiveKit 断供场景验证。当前默认 `INTERVIEWER_STREAMING_TTS_ENABLED=true`；本节控制事件保持，候选播放和排空依据使用上文 052 数据协议，完整资产路径继续保留。
 
 `avatar.performance.started` 新增 `delivery=streaming_tts`：`audio_uri=null`，
 `live_audio={output_id,publisher_identity,track_sid,track_name,sample_rate_hz,channels}`。
-绑定来自本场已批准 act 的独立 LiveKit 音轨；客户端只播放精确匹配的绑定，不播放未知 participant。
+绑定来自本场已批准 act 的独立 LiveKit 音轨；052 客户端验证精确轨道绑定后，仅播放同一批准发布者、output topic 的 PCM，RTC 音轨不再重复挂载播放。
 客户端在绑定音轨并请求播放后发送 `avatar.performance.ready {performance_id,output_id}`；
 服务端等待当前候选人控制连接确认后才发布首个 PCM，防止首段先于订阅丢失。
 `avatar.performance.producer_finished {performance_id,output_id,total_samples,sample_rate_hz}`
-仅表示 Provider 唯一 final 与本机发送队列排空，不表示候选人听完；浏览器按本地媒体时钟实际排空后发送
+仅表示 Provider 唯一 final 与本机发送队列排空，不表示候选人听完；浏览器按源样本消费及设备输出末帧确认后发送
 `avatar.performance.stopped {performance_id,output_id,reason:drained}`，服务端校验当前输出与 EOF 后才移交话轮。
 新流式 started/producer_finished 均为 transient，不重放过期轨道；候选快照新增可选 `active_performance_id`，
 用于暂停、完成、换代时撤销播放。断开/owner 丢失/打断须取消 Provider、清空发送队列和撤销 track。
@@ -710,7 +942,15 @@ React 工作台必须在这个一次性响应弹窗中提供“复制链接”�
 | `GET` | `/api/v1/public/interviews/{interview_id}/avatar-model?grant=...` | 私有、不缓存交付经 hash/许可校验的 VRM；grant 与候选人/面试绑定 |
 | `POST` | `/api/v1/public/interviews/{interview_id}/runtime-problems` | 报告 allow-list 的候选人致命运行故障；校验 token 后真实暂停会话并返回最小确认，不接受浏览器错误文本 |
 
-候选人 token 由至少 32 字符的 `INTERVIEWER_CANDIDATE_TOKEN_SECRET` 对会话 ID 与创建时间做 HMAC-SHA256 派生，不明文持久化或出现在后台详情；验证使用常量时间比较，错误 token 返回 403。正式页面用它换取一次性 Agent/LiveKit ticket。`runtime-problems` 只接受 `AVATAR_ASSET_UNAVAILABLE/AVATAR_MODEL_LOAD_FAILED/AVATAR_RENDERER_FAILED/CANDIDATE_RUNTIME_FAILED`，由服务端映射去敏原因并幂等调用生命周期 pause；响应只含状态、问题码、动作和暂停时间，原始 JS/WebGL/网络异常既不上传也不持久化。候选人端不存在可直接提交录音、转写、Avatar 播报或云会话 close 的第二套业务接口。
+候选人 token 由至少 32 字符的 `INTERVIEWER_CANDIDATE_TOKEN_SECRET` 对会话 ID 与创建时间做 HMAC-SHA256 派生，不明文持久化或出现在后台详情；验证使用常量时间比较，错误 token 返回 403。正式页面用它换取一次性 Agent/LiveKit ticket。`runtime-problems` 只接受 `AVATAR_ASSET_UNAVAILABLE/AVATAR_MODEL_LOAD_FAILED/AVATAR_RENDERER_FAILED/CANDIDATE_RUNTIME_FAILED/AUDIO_TRACK_LOST/AUDIO_STREAM_INVALID/AUDIO_PLAYBACK_FAILED/AUDIO_PLAYBACK_TIMEOUT/AUDIO_OUTPUT_UNAVAILABLE`，由服务端映射去敏原因并在同一生命周期事务内写入 pause 与受限诊断；响应只含状态、问题码、动作和暂停时间，原始 JS/WebGL/网络异常既不上传也不持久化。已手动暂停时保留原暂停原因，但仍记录本次故障码；同次暂停的重复同码报告幂等。浏览器先提交 HTTP 故障报告，失败后才经已认证控制通道发送 `pause.payload.reason=<同一白名单问题码>`，使用同一持久化方法；不再先发送通用暂停覆盖故障原因。候选人端不存在可直接提交录音、转写、Avatar 播报或云会话 close 的第二套业务接口。
+
+053：当前流式输出的音轨撤销时，浏览器立即停止消费和发声，最多等待 350 ms 让独立控制通道的同代次 interrupted、替换或权威快照撤销该输出；若没有相应权威撤销则提交 `AUDIO_TRACK_LOST`。此窗口不回放、不会发送 drained，也不推进试音或正式题；真正断流仍持久暂停。
+
+服务端正常 barge-in、表达替换、补充播报超时和人工接管复用同一输出撤销函数：先按旧 performance ID 撤销授权并发布 interrupted，再等待媒体清理；旧 ID 的迟到清理不能取消新输出。手动或运行故障暂停先持久化并发布权威快照，再清理媒体。
+
+内部指标新增有界数值统计 `tts_provider_read_wait_ms`、`tts_transport_publish_ms`、`tts_content_duration_ms`、`tts_output_scheduler_lag_ms`；候选端不可上报，没有动态标签或文本内容，provider read wait 不包含传输背压等待。
+
+`session.snapshot.runtime_problem_code` 是可空的同一白名单枚举，仅在当前暂停存在相应诊断时返回；刷新后候选人页面按固定安全文案说明播放故障，不下发内部错误消息、诊断历史或凭据。
 
 短期本地 grant 指向隐藏的 `GET|HEAD /api/v1/private-files/{token}`。无 `Range` 时返回 `200`；一个合法的 `bytes=start-end`、`bytes=start-` 或 `bytes=-suffix` 返回 `206`，并携带 `Accept-Ranges: bytes`、精确 `Content-Range` 和所选区间 `Content-Length`；不可满足、畸形或多段范围返回空体 `416`、`Content-Range: bytes */{total}` 与 `Content-Length: 0`。`HEAD` 与等价 `GET` 返回相同状态、媒体类型和长度头但不返回正文。该传输合同适用于受同一 grant 保护的简历和音频，不暴露 object key，也不放宽 token、审计、`private, no-store` 或租户校验。
 
@@ -898,3 +1138,33 @@ ProviderConnection 与 ModelConfiguration 响应增加单调递增的 `configura
 流式能力的管理员测试采用分层语义：`stt.streaming` 和 `speech.dialogue_realtime` 在收到 Provider 的 ready/session-created/session-updated 确认后返回 `probe_mode=handshake`，证明端点、凭据、模型访问和 session 参数可用，并立即主动关闭连接。探针不要求静音产生 final transcript，也不生成自由回答；WER、真实 final、首音、音质和打断必须继续用脱敏语音样本及候选人端到端链路验收。模型路由测试复用相同握手合同。
 
 具体 Provider manifest、STT/TTS 请求响应和错误语义见 [模型供应商插件化设计](model-provider-plugins.md)。
+
+## FOLLOWUP-CONTEXT-055：父子问答投影
+
+候选人GET仍鉴权并隐藏未来题、标准答案、评分依据和内部提示；已呈现的主题/追问（含evaluating）提供question_spoken_text和parent_turn_id/root_turn_id/followup_depth。answers新增final_transcript，仅返回该会话已落库的服务端权威回答（含已审计的人工更正），不能通过此接口提交文本答案。复核turn新增同样的父子关系和实际question_spoken_text。报告question_evaluations按根题附带独立answer与followups问答链，各子节点说明考察范围及是否纳入该根题证据；追问无第二份总分权重。
+
+## CONVERSATION-RELIABILITY-057：实时快照与静音响应
+
+沿用现有REST、AgentEvent及角色投影，不新增候选人信号。新连接的fresh `session.snapshot`占用共享序号时，也按各接收者权限同步已有连接；Redis启用时广播同一最小快照事件。本地总线没有跨进程能力且当前进程没有本场订阅者时，worker不为无法投递的评分快照分配序号；业务状态已持久化，API心跳继续刷新。真实断线仍按既有恢复协议播放获批表达，显式重读继续有效。
+
+正式候选话轮首次无发言，或普通澄清/接话后等待约15秒，允许一次非评分`conversation_acknowledgement`温和确认。候选明确请求思考/等待时不触发该提示；新服务端话语才重新获得一次提醒机会。主问题播放不计候选静音，输出前复核当前题目、运行状态与candidate floor；新输入撤销旧提醒。该提示不形成答案、不换题、不代替补充确认。错误、重试、所有权恢复仍沿原端点合同。
+
+## INTERVIEW-REGRESSIONS-056：候选人回答历史交付
+
+`GET /api/v1/public/interviews/{interview_id}` 的最终 HTTP 字段白名单保留 `answers[].final_transcript`，与服务层候选人投影一致。每条回答只交付 `id`、`turn_id`、`evaluation_status` 和服务端已持久化的 `final_transcript`；仍必须校验 `X-Candidate-Session-Token` 与部署租户，不能返回其他场次回答、未来题目文字、音频地址、供应商片段、评分依据、标准答案或内部提示。
+
+候选人问答记录以该题是否存在回答对象判断提交状态：已有回答但文字缺失时显示“回答已提交，文字记录暂未同步”并提供重新同步；当前题尚无回答时显示正在交流；非当前题尚无回答才显示尚未提交。同步仅发生在既有题目/回答边界或显式重试，不以字幕 partial 或音频帧触发请求，页面显示的文字也不能形成新答案。
+
+056 音频诊断补充：候选端流式输出结束、打断或取消时，若已有有效消费统计，仅发送一次 `audio_playback_underflow_count` 与 `audio_playback_underflow_ms` 数值摘要，包含播放中发生并已恢复的欠载；没有首声、未知统计或已关闭连接不补报。沿用 `telemetry.observe` 的进程内固定词汇及非权威属性，不写问答、不触发暂停、不充当播放完成确认；遥测异常不能阻断播放清理。启动缓冲不计欠载，终止时仍未恢复的断供可能没有包含在此统计中，不能据零值推断任何环境下均无卡顿。
+
+问答树展示时按持久turn的order排序，主题编号扣除已知的前置追问，子题在父题内独立编号；稀疏历史记录仍保留既有order信息。该编号仅供展示，不更改turn_id、父子引用或评分归属。
+
+## 2026-09-22 · 059 会话上下文与识别假设
+
+本轮没有新增 REST 入口或客户端文本提交权限。既有候选字幕事件仍为当前题目的累计投影，partial 允许替换或撤回，final 替换同题旧稿；界面把暂定转写与最终回答明确区分。源 capture、turn 与 owner 检查继续生效；候选页面只展示安全的收音/识别状态，不返回内部 Prompt 或模型响应。参见[059改进计划](agent-conversation-improvement-plan-059.md)。
+
+059新增可恢复problem码`TRANSCRIPT_RETRY_REQUIRED`（`action=continue_listening`）：同一输入的完整final获取连续三次无结果，当前采集保持开启；候选人可继续说话或点击既有continue_speaking动作重试。它不是提交命令。恢复后的同题同capture正式状态/final才清除提示，旧题或旧capture不得清除。`TRANSCRIPT_UNAVAILABLE`仅表示正在等待识别完成，不再向候选人描述成普通倾听。
+
+控制连接重新绑定到同一仍在等待的采集时，重发一次当前提示；公共投影保留安全固定文案、turn_id 与 capture_id。发送前重新检查当前题目/采集/所有权及等待状态，新声音已解除等待则不补发。只恢复状态说明，不重新执行收尾、播报或提交。
+
+内部理解诊断 `reason_code=semantic_control_contract_invalid` 精确区分意图/动作矛盾与 JSON 结构错误；候选人继续收到原有可恢复理解提示，不暴露原始模型响应或校验正文，也不因该 reason 自动切题。

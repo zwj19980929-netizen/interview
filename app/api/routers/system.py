@@ -8,6 +8,8 @@ from app.core.errors import ApiError
 from app.adapters.livekit_media import LiveKitMediaPlane
 from app.core.readiness import deployment_readiness
 from app.core.interview_agent_metrics import interview_agent_metrics
+from app.core.runtime_release import runtime_release_snapshot
+from app.core.media_runtime import media_runtime_snapshot
 from app.core.auth import (
     current_principal,
     issue_interviewer_websocket_ticket,
@@ -54,6 +56,18 @@ async def readyz() -> Response:
     return api_response(result, status_code=200 if result["ready"] else 503)
 
 
+@router.get("/api/v1/admin/runtime-release")
+async def get_runtime_release() -> Response:
+    """Return the frozen process source snapshot, never current disk contents."""
+    return api_response(runtime_release_snapshot("api"), headers={"Cache-Control": "no-store"})
+
+
+@router.get("/api/v1/admin/media-runtime")
+async def get_media_runtime() -> Response:
+    """Expose frozen configuration identity only, not provider health or secrets."""
+    return api_response(media_runtime_snapshot(), headers={"Cache-Control": "no-store"})
+
+
 @router.get("/api/v1/admin/interview-agent-metrics")
 async def interview_agent_metric_snapshot() -> Dict[str, Any]:
     """Label-free bounded histograms; candidate or interview IDs never enter."""
@@ -61,6 +75,7 @@ async def interview_agent_metric_snapshot() -> Dict[str, Any]:
     return {
         "schema": "interview-agent-metrics.v1",
         "metrics": interview_agent_metrics().snapshot(),
+        "aggregation": interview_agent_metrics().aggregation(),
     }
 
 

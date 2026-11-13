@@ -7,6 +7,7 @@ Nothing in this module creates an answer or grants a client decision authority.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from time import monotonic
 from typing import Any, Awaitable, Callable, Optional
 
@@ -19,20 +20,25 @@ from app.domain.interview_agent import LiveSpeechBinding
 class ApprovedSpeechOutput:
     def __init__(
         self, *, performance_id: str, stream: Any, publisher: Any,
-        assert_current: Callable[[], None], archive: Callable[..., dict],
+        assert_current: Callable[[], None], archive: Callable[..., Any],
         ready_timeout: float = 5.0, drain_timeout: float = 5.0,
         total_timeout: float = 300.0, max_bytes: int = 20 * 1024 * 1024 - 44,
+        first_audio_deadline: Optional[float] = None,
+        output_id: Optional[str] = None, publication: Any = None,
     ) -> None:
         self.performance_id = performance_id
-        self.output_id = new_id("speech_output")
+        self.output_id = output_id or new_id("speech_output")
+        self._prepared_publication = publication
         self.stream, self.publisher = stream, publisher
         self._fence, self._archive = assert_current, archive
         self._ready_timeout, self._drain_timeout = ready_timeout, drain_timeout
         self._deadline = monotonic() + total_timeout
         self._created_at = monotonic()
+        self._first_audio_deadline = first_audio_deadline
         self._max_bytes = max_bytes
         self._ready, self._drained = asyncio.Event(), asyncio.Event()
         self._closed = False
+        self._cleanup_complete = False
         self._running = False
         self.producer_finished = False
         self.archive_reference: Optional[str] = None
@@ -44,7 +50,10 @@ class ApprovedSpeechOutput:
             if (self.stream.sample_rate_hz != 24_000 or self.stream.channels != 1
                     or self.stream.ready_event.provider.provider_id == "mock"):
                 raise ApiError("AGENT_STREAM_AUDIO_INVALID", "Formal streamed speech requires real mono 24 kHz PCM.", status_code=503)
-            publication = await self.publisher.open()
+            publication = self._prepared_publication
+            if publication is None:
+                self.publisher.bind_output(self.output_id)
+                publication = await self.publisher.open()
             self._assert_current()
             return LiveSpeechBinding(
                 output_id=self.output_id,
@@ -73,6 +82,19 @@ class ApprovedSpeechOutput:
     def matches(self, performance_id: str, output_id: str) -> bool:
         return not self._closed and performance_id == self.performance_id and output_id == self.output_id
 
+    @property
+    def playback_drained(self) -> bool:
+        return self._drained.is_set()
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    @property
+    def cleanup_complete(self) -> bool:
+        """Both transport cleanup calls returned, beyond fencing new writes."""
+        return self._cleanup_complete
+
     async def run(self, on_producer_finished: Callable[[dict], Awaitable[None]]) -> None:
         if self._running:
             raise ApiError("AGENT_STREAM_ALREADY_RUNNING", "Approved speech permits one producer.", status_code=409)
@@ -85,18 +107,24 @@ class ApprovedSpeechOutput:
             # A monitor fences even a stalled provider read. Cancelling it
             # reaches the validated provider stream and clears the audio source.
             consumer = asyncio.create_task(self._consume(pcm))
+            scheduler_lag = 0.0
             try:
                 while not consumer.done():
                     self._assert_current()
                     if monotonic() >= self._deadline:
                         raise ApiError("AGENT_AUDIO_OUTPUT_TIMEOUT", "Approved speech exceeded its time budget.", status_code=504)
+                    scheduled = monotonic() + 0.05
                     await asyncio.wait({consumer}, timeout=0.05)
+                    scheduler_lag = max(scheduler_lag, monotonic() - scheduled)
                 self._assert_current()
                 final = consumer.result()
             finally:
                 if not consumer.done():
                     consumer.cancel()
-                    await asyncio.gather(consumer, return_exceptions=True)
+                # A simultaneous owner/deadline rejection can bypass result()
+                # even when the consumer already failed. Always retrieve it.
+                await asyncio.gather(consumer, return_exceptions=True)
+                observe_interview_agent_metric("tts_output_scheduler_lag_ms", max(0.0, scheduler_lag) * 1000)
             self._assert_current()
             if final is None or not pcm:
                 raise ApiError("AGENT_AUDIO_FINAL_REQUIRED", "Approved speech requires a complete provider final.", status_code=502)
@@ -104,6 +132,9 @@ class ApprovedSpeechOutput:
             # events or playback, and interrupted bytes never masquerade as final.
             with measure_interview_agent_stage("tts_asset_import_ms"):
                 stored = self._archive(pcm_s16le=bytes(pcm), sample_rate_hz=24_000, channels=1)
+                if inspect.isawaitable(stored):
+                    stored = await asyncio.wait_for(stored, timeout=max(0.001, self._deadline - monotonic()))
+            self._assert_current()
             self.archive_reference = stored["audio_uri"]
             pcm.clear()
             await asyncio.wait_for(self.publisher.finish(), timeout=max(0.001, self._deadline - monotonic()))
@@ -124,8 +155,28 @@ class ApprovedSpeechOutput:
             await self.abort()
 
     async def _consume(self, pcm: bytearray) -> Any:
+        # These separate the awaited provider/decoder path from downstream
+        # transport backpressure. Record one bounded numeric total per output,
+        # including failed/cancelled attempts; no text or identity is retained.
+        timing = {"tts_provider_read_wait_ms": 0.0, "tts_transport_publish_ms": 0.0}
+        try:
+            return await self._consume_timed(pcm, timing)
+        finally:
+            for name, seconds in timing.items():
+                observe_interview_agent_metric(name, seconds * 1000)
+            observe_interview_agent_metric("tts_content_duration_ms", self.total_samples / 24)
+
+    async def _consume_timed(self, pcm: bytearray, timing: dict) -> Any:
         final = None
-        async for event in self.stream.events():
+        events = self.stream.events().__aiter__()
+        while True:
+            started = monotonic()
+            try:
+                event = await events.__anext__()
+            except StopAsyncIteration:
+                break
+            finally:
+                timing["tts_provider_read_wait_ms"] += monotonic() - started
             self._assert_current()
             if event.type == "audio.chunk":
                 chunk = event.pcm_s16le
@@ -138,7 +189,11 @@ class ApprovedSpeechOutput:
                 # larger than the gateway's independent bounded chunk contract.
                 for offset in range(0, len(chunk), 65_536):
                     self._assert_current()
-                    await self.publisher.publish(chunk[offset:offset + 65_536])
+                    started = monotonic()
+                    try:
+                        await self.publisher.publish(chunk[offset:offset + 65_536])
+                    finally:
+                        timing["tts_transport_publish_ms"] += monotonic() - started
                 self.total_samples += len(chunk) // 2
             elif event.type == "audio.final":
                 final = event
@@ -159,6 +214,10 @@ class ApprovedSpeechOutput:
         if self._closed:
             raise ApiError("AGENT_SPEECH_OUTPUT_STALE", "Approved speech output is no longer current.", status_code=409)
         self._fence()
+        if (self.total_samples == 0 and getattr(self.publisher, "total_samples", 0) == 0
+                and self._first_audio_deadline is not None
+                and monotonic() >= self._first_audio_deadline):
+            raise ApiError("AGENT_AUDIO_FIRST_PCM_TIMEOUT", "Approved speech did not start within its time budget.", status_code=504)
         if monotonic() >= self._deadline:
             raise ApiError("AGENT_AUDIO_OUTPUT_TIMEOUT", "Approved speech exceeded its time budget.", status_code=504)
 
@@ -168,3 +227,4 @@ class ApprovedSpeechOutput:
             await self.publisher.abort()
         finally:
             await self.stream.abort()
+        self._cleanup_complete = True

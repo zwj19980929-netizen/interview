@@ -11,12 +11,15 @@ import asyncio
 import inspect
 import math
 import re
+import struct
+from time import monotonic
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from livekit import rtc
 
 from app.adapters.livekit_media import LiveKitMediaPlane
+from app.adapters.livekit_connection import connect_room
 from app.core.errors import ApiError
 
 
@@ -56,6 +59,8 @@ class LiveKitApprovedAudioPublisher:
         rtc_module: Any = None,
         room_factory: Optional[Callable[[], Any]] = None,
         operation_timeout_seconds: float = 5.0,
+        before_abort: Optional[Callable[[], Awaitable[None]]] = None,
+        first_audio_deadline: Optional[float] = None,
     ) -> None:
         if not isinstance(room_name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,254}", room_name):
             raise ValueError("An exact server-issued room identifier is required")
@@ -63,6 +68,8 @@ class LiveKitApprovedAudioPublisher:
             raise ValueError("A server-issued performance identifier is required")
         if not callable(assert_current) or inspect.iscoroutinefunction(assert_current):
             raise ValueError("A synchronous current-expression fence is required")
+        if before_abort is not None and not callable(before_abort):
+            raise ValueError("Output interruption notification must be callable")
         if type(sample_rate_hz) is not int or sample_rate_hz not in {16_000, 24_000, 48_000}:
             raise ValueError("Approved PCM output supports 16, 24, or 48 kHz mono")
         if (type(operation_timeout_seconds) not in (int, float)
@@ -74,10 +81,17 @@ class LiveKitApprovedAudioPublisher:
         self.track_name = "approved-expression:%s" % performance_id
         self.sample_rate_hz = sample_rate_hz
         self.total_samples = 0
+        # Either sink may deliver before the other's await completes. Sample
+        # counters alone cannot prove that a failed first frame was unheard.
+        self.pcm_delivery_started = False
+        self._output_id: Optional[str] = None
+        self._sequence = 0
         self._fence = assert_current
+        self._before_abort = before_abort
         self._rtc = rtc if rtc_module is None else rtc_module
         self._room_factory = room_factory or self._rtc.Room
         self._timeout = float(operation_timeout_seconds)
+        self._first_audio_deadline = first_audio_deadline
         self._room: Any = None
         self._source: Any = None
         self._publication: Optional[LiveKitApprovedAudioPublication] = None
@@ -85,6 +99,14 @@ class LiveKitApprovedAudioPublisher:
         self._operation_lock = asyncio.Lock()
         self._cleanup_lock = asyncio.Lock()
         self._pending_operations: set[asyncio.Task] = set()
+
+    def bind_output(self, output_id: str) -> None:
+        """Bind the counted PCM transport before either output path opens."""
+        if self._state != "new" or self._output_id is not None:
+            raise ValueError("An output can only be bound once before publication")
+        if not isinstance(output_id, str) or not re.fullmatch(r"speech_output_[A-Za-z0-9_]{1,100}", output_id):
+            raise ValueError("An exact server-issued output identifier is required")
+        self._output_id = output_id
 
     @property
     def publication(self) -> Optional[LiveKitApprovedAudioPublication]:
@@ -115,6 +137,8 @@ class LiveKitApprovedAudioPublisher:
         task = asyncio.ensure_future(awaitable)
         self._pending_operations.add(task)
         deadline = asyncio.get_running_loop().time() + self._timeout
+        if self.total_samples == 0 and self._first_audio_deadline is not None:
+            deadline = min(deadline, asyncio.get_running_loop().time() + self._first_audio_deadline - monotonic())
         try:
             while True:
                 self._assert_current()
@@ -152,7 +176,7 @@ class LiveKitApprovedAudioPublisher:
                     room_name=self.room_name, performance_id=self.performance_id,
                 )
                 self._room = self._room_factory()
-                await self._current_operation(self._room.connect(
+                await self._current_operation(connect_room(self._room,
                     self.media_plane.url, token, self._rtc.RoomOptions(auto_subscribe=False),
                 ))
                 if self._room.local_participant.identity != self.participant_identity:
@@ -188,14 +212,51 @@ class LiveKitApprovedAudioPublisher:
             try:
                 frame_bytes = self.sample_rate_hz // 50 * 2
                 for offset in range(0, len(pcm_s16le), frame_bytes):
-                    self._assert_current()
                     data = pcm_s16le[offset:offset + frame_bytes]
                     frame = self._rtc.AudioFrame(data, self.sample_rate_hz, 1, len(data) // 2)
-                    await self._current_operation(self._source.capture_frame(frame))
+                    packet = None
+                    if self._output_id is not None:
+                        # Reliable data carries the same source PCM to the browser's
+                        # counted worklet. The RTC track remains for room recording;
+                        # it is never also attached for candidate playback.
+                        packet = struct.pack("!4sIII", b"IAS1", self._sequence + 1,
+                                             self.total_samples, self.sample_rate_hz) + data
+                    # Both independent sinks receive the same authorized frame
+                    # concurrently. The next frame still waits for both sinks;
+                    # one shared operation bounds both waits. Each sink also
+                    # checks authority when its queued task actually starts.
+                    await self._current_operation(self._publish_frame(frame, packet))
+                    if packet is not None:
+                        self._sequence += 1
                     self.total_samples += len(data) // 2
             except BaseException as exc:
                 await self.abort()
                 self._raise_safe(exc)
+
+    async def _publish_frame(self, frame: Any, packet: Optional[bytes]) -> None:
+        async def send_current(operation: Callable[[], Any]) -> None:
+            # Revocation can run after the outer fence but before this queued
+            # child starts. Validate at each actual SDK send, without yielding
+            # between authorization and creating/entering its operation.
+            self._assert_current()
+            self.pcm_delivery_started = True
+            await operation()
+
+        tasks = [asyncio.create_task(send_current(lambda: self._source.capture_frame(frame)))]
+        if packet is not None:
+            tasks.append(asyncio.create_task(send_current(lambda: self._room.local_participant.publish_data(
+                packet, reliable=True, topic="interviewer.approved-pcm." + self._output_id,
+            ))))
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            # gather does not cancel siblings on a native exception. Reap both
+            # before returning so no late packet escapes a failed frame.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            for task in tasks:
+                await self._reap(task)
 
     async def finish(self) -> LiveKitApprovedAudioPublication:
         async with self._operation_lock:
@@ -240,12 +301,27 @@ class LiveKitApprovedAudioPublisher:
         async with self._cleanup_lock:
             source, self._source = self._source, None
             room, self._room = self._room, None
+            cancelled = False
+            cleanup = []
+            if clear_queue and room is not None and self._publication is not None and self._before_abort is not None:
+                async def notify():
+                    await self._before_abort()
+                cleanup.append(notify)
             if room is not None and self._publication is not None:
-                await self._best_effort(room.local_participant.unpublish_track(self._publication.track_sid))
+                cleanup.append(lambda: room.local_participant.unpublish_track(self._publication.track_sid))
             if source is not None:
-                await self._best_effort(source.aclose())
+                cleanup.append(source.aclose)
             if room is not None:
-                await self._best_effort(room.disconnect())
+                cleanup.append(room.disconnect)
+            for operation in cleanup:
+                try:
+                    await self._best_effort(operation())
+                except asyncio.CancelledError:
+                    # Once references are detached, each native resource must
+                    # still receive bounded cleanup before cancellation exits.
+                    cancelled = True
+            if cancelled:
+                raise asyncio.CancelledError
 
     async def _best_effort(self, awaitable: Any) -> None:
         task = asyncio.ensure_future(awaitable)

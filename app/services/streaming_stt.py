@@ -6,6 +6,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from app.adapters.private_media import media_recording_storage
 from app.core.errors import ApiError
+from app.core.ids import new_id
 from app.domain.evidence_coordination import EvidenceCommitFence
 from app.core.prompt.realtime_dialogue import (
     approved_spoken_response_instruction,
@@ -13,7 +14,7 @@ from app.core.prompt.realtime_dialogue import (
 )
 from app.model_gateway.errors import ProviderError
 from app.model_gateway.gateway import ModelGateway
-from app.model_gateway.dialogue import ValidatedSpeechDialogueStream
+from app.model_gateway.dialogue import OptionalSpeechDialogueInput, dialogue_degradation_reason
 from app.model_gateway.schemas import (
     RealtimeSpeechDialogueRequest,
     RealtimeSpeechResponseCommand,
@@ -27,6 +28,7 @@ from app.persistence.interface import Persistence
 from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
 from app.services.interviews import InterviewService
+from app.services.candidate_exit_confirmation import PreparedCandidateExit
 from app.services.agent_expression_audio import AgentExpressionAudioService
 from app.services.evidence_media import (
     DurableEvidenceMedia,
@@ -60,7 +62,8 @@ class StreamingInterviewSTT:
         self.expression_audio = AgentExpressionAudioService(self.persistence)
         self.recording: Optional[Any] = None
         self.stream: Optional[ValidatedSTTStream] = None
-        self.dialogue: Optional[ValidatedSpeechDialogueStream] = None
+        self.dialogue: Optional[OptionalSpeechDialogueInput] = None
+        self._dialogue_cleanup_tasks: set[asyncio.Task] = set()
         self.turn_id: Optional[str] = None
         self.content_type = "audio/webm;codecs=opus"
         self.language = "zh-CN"
@@ -85,6 +88,8 @@ class StreamingInterviewSTT:
         self.last_media_checkpoint: Optional[Dict[str, Any]] = None
         self.continuous = False
         self._capture_generation = 0
+        self._dialogue_degradation: Optional[tuple] = None
+        self._dialogue_degradation_projected = False
 
     def validate_candidate_token(self, token: Optional[str]) -> None:
         self.interviews.validate_candidate_token(
@@ -96,6 +101,8 @@ class StreamingInterviewSTT:
             raise ApiError("STT_STREAM_ALREADY_OPEN", "An STT stream is already open.", status_code=409)
         self._capture_generation += 1
         generation = self._capture_generation
+        self._dialogue_degradation = None
+        self._dialogue_degradation_projected = False
         self.continuous = bool(payload.get("_continuous_capture"))
         try:
             return await self._open_capture(payload, generation)
@@ -224,7 +231,10 @@ class StreamingInterviewSTT:
                         except Exception:
                             pass
                         raise
-                self.dialogue = dialogue
+                self.dialogue = OptionalSpeechDialogueInput(
+                    dialogue, max_pending_bytes=max(1, sample_rate_hz * channels),
+                    diagnostic_context={"interview_id": self.interview_id, "turn_id": self.turn_id},
+                )
                 ready.extend(item.model_dump() for item in self.dialogue.ready_events)
             except ProviderError as exc:
                 # S2S is the low-latency expression track, never the evidence
@@ -278,26 +288,31 @@ class StreamingInterviewSTT:
         if not self.continuous:
             self._record_frame(chunk)
         try:
-            stt_task = self.stream.send_audio(chunk)
-            dialogue_task = self.dialogue.send_audio(chunk) if self.dialogue else None
-            if dialogue_task is None:
-                events = await stt_task
-                dialogue_events: List[Any] = []
-            else:
-                stt_result, dialogue_result = await asyncio.gather(
-                    stt_task, dialogue_task, return_exceptions=True
-                )
-                if isinstance(stt_result, Exception):
-                    raise stt_result
-                events = stt_result
-                if isinstance(dialogue_result, Exception):
+            events = await self.stream.send_audio(chunk)
+            dialogue_events: List[Any] = []
+            if self.dialogue is not None:
+                try:
+                    dialogue_result = await self.dialogue.send_audio(chunk)
+                except ApiError:
+                    # Ownership/recording guards are not optional Provider faults.
+                    raise
+                except Exception as exc:
                     dialogue_events = [
                         self._dialogue_error(
-                            getattr(dialogue_result, "code", "provider_stream_failed"),
+                            getattr(exc, "code", "provider_stream_failed"),
                             "S2S stream failed; authoritative STT continues.",
                         )
                     ]
-                    await self._abort_dialogue()
+                    # Detach immediately. Even optional-provider cleanup must
+                    # not make the next authoritative audio frame wait.
+                    dialogue, self.dialogue = self.dialogue, None
+                    task = asyncio.create_task(dialogue.abort())
+                    self._dialogue_cleanup_tasks.add(task)
+                    def done(completed):
+                        self._dialogue_cleanup_tasks.discard(completed)
+                        if not completed.cancelled():
+                            completed.exception()
+                    task.add_done_callback(done)
                 else:
                     dialogue_events = [item.model_dump() for item in dialogue_result]
         except ProviderError as exc:
@@ -356,9 +371,10 @@ class StreamingInterviewSTT:
                     raise ApiError("TURN_DECISION_STALE", "Audio arrived after snapshot.", status_code=409) from exc
                 raise
             if prepared_decision is not None:
-                self.interviews.assert_prepared_streaming_decision(
-                    prepared_decision, self.stream.confirmed_final(), self.organization_id,
-                )
+                validate = (self.interviews.assert_prepared_streaming_exit
+                            if isinstance(prepared_decision, PreparedCandidateExit)
+                            else self.interviews.assert_prepared_streaming_decision)
+                validate(prepared_decision, self.stream.confirmed_final(), self.organization_id)
 
     async def resume_capture(self) -> None:
         if isinstance(self.stream, ContinuousSTT):
@@ -370,6 +386,10 @@ class StreamingInterviewSTT:
     @property
     def recovery_required(self) -> bool:
         return isinstance(self.stream, ContinuousSTT) and self.stream.recovery_required
+
+    @property
+    def recovery_origin(self) -> Optional[int]:
+        return self.stream.recovery_origin if isinstance(self.stream, ContinuousSTT) else None
 
     @property
     def recovery_error(self) -> Any:
@@ -421,27 +441,34 @@ class StreamingInterviewSTT:
                                     retryable=False)
             final = next(item for item in events if item.type == "transcript.final")
             self._assert_commit_allowed()
-            result = await self.interviews.submit_streaming_answer(
-                self.interview_id,
-                {
-                    "turn_id": self.turn_id,
-                    "audio_uri": recording.audio_uri,
-                    "content_type": recording.mime_type,
-                    "final_transcript": final.text,
-                    "confidence": final.confidence,
-                    "language": final.language,
-                    "duration_seconds": recording.duration_seconds if recording.duration_seconds is not None else int(payload.get("duration_seconds", 0)),
-                    "recording_started_at": recording.started_at,
-                    "recording_finished_at": recording.finished_at,
-                    "provider": final.provider.model_dump() if final.provider else {},
-                    "segments": [item.model_dump() for item in final.segments],
-                    "media_evidence": self._media_evidence_payload(complete=True),
-                },
-                self.organization_id,
-                evidence_fence=self.commit_fence,
-                prepared_decision=prepared_decision,
-            )
+            submission = {
+                "turn_id": self.turn_id,
+                "audio_uri": recording.audio_uri,
+                "content_type": recording.mime_type,
+                "final_transcript": final.text,
+                "confidence": final.confidence,
+                "language": final.language,
+                "duration_seconds": recording.duration_seconds if recording.duration_seconds is not None else int(payload.get("duration_seconds", 0)),
+                "recording_started_at": recording.started_at,
+                "recording_finished_at": recording.finished_at,
+                "provider": final.provider.model_dump() if final.provider else {},
+                "segments": [item.model_dump() for item in final.segments],
+                "media_evidence": self._media_evidence_payload(complete=True),
+            }
+            if isinstance(prepared_decision, PreparedCandidateExit):
+                result = await self.interviews.submit_confirmed_exit(
+                    self.interview_id, submission, self.organization_id,
+                    evidence_fence=self.commit_fence, prepared_exit=prepared_decision,
+                )
+            else:
+                result = await self.interviews.submit_streaming_answer(
+                    self.interview_id, submission, self.organization_id,
+                    evidence_fence=self.commit_fence, prepared_decision=prepared_decision,
+                )
         except (ProviderError, StopIteration) as exc:
+            if isinstance(prepared_decision, PreparedCandidateExit):
+                # A repaired transcript cannot inherit an old exit permission.
+                raise
             if getattr(exc, "code", None) == "provider_final_transcript_missing":
                 # No valid transcript is not an answer. Do not manufacture
                 # semantics through a development/batch fallback on silence.
@@ -494,6 +521,9 @@ class StreamingInterviewSTT:
         self.evidence_media_writer = None
         self.last_result = result
         response = [item.model_dump() for item in events]
+        if result.get("exit_confirmed"):
+            await self._abort_dialogue()
+            return response
         if not result.get("accepted", True):
             response.append(self._non_answer_event(result))
             await self._abort_dialogue()
@@ -528,10 +558,13 @@ class StreamingInterviewSTT:
                         ),
                     )
                     followup_event["delivery"] = "s2s"
-                    followup_event["expression"] = self._materialize_dialogue_expression(
+                    followup_event["expression"] = await self._materialize_dialogue_expression(
                         dialogue_events
                     )
-                except (ApiError, ProviderError, ValueError) as exc:
+                except (ApiError, ProviderError, ValueError, asyncio.TimeoutError) as exc:
+                    if isinstance(exc, ApiError) and exc.code not in {
+                            "S2S_OUTPUT_AUDIO_INCOMPLETE", "S2S_OUTPUT_AUDIO_FORMAT_INVALID", "S2S_OUTPUT_AUDIO_INVALID"}:
+                        raise
                     response.append(
                         self._dialogue_error(
                             getattr(exc, "code", "dialogue_response_failed"),
@@ -888,15 +921,33 @@ class StreamingInterviewSTT:
         }
 
     def _dialogue_error(self, code: str, message: str) -> Dict[str, Any]:
+        # Only this optional-stream boundary can mint a degradation receipt.
+        # Queued events from a retired capture cannot affect a replacement.
+        if self._dialogue_degradation is None or self._dialogue_degradation[0] != self._capture_generation:
+            self._dialogue_degradation = (self._capture_generation, new_id("dialogue_degradation"),
+                                         self.turn_id, dialogue_degradation_reason(code))
+            self._dialogue_degradation_projected = False
         return {
             "stream_id": self.dialogue.stream_id if self.dialogue else "dialogue_unavailable",
             "sequence": 1,
             "type": "dialogue.error",
             "error_code": str(code),
             "message": message,
+            "turn_id": self.turn_id,
+            "_dialogue_degradation_id": self._dialogue_degradation[1],
         }
 
-    def _materialize_dialogue_expression(
+    def take_dialogue_degradation(self, raw: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        receipt = self._dialogue_degradation
+        if (self._dialogue_degradation_projected or receipt is None
+                or receipt[0] != self._capture_generation or receipt[2] != self.turn_id
+                or raw.get("turn_id") != self.turn_id or raw.get("_dialogue_degradation_id") != receipt[1]):
+            return None
+        self._assert_commit_allowed()
+        self._dialogue_degradation_projected = True
+        return {"capability": "speech.dialogue_realtime", "fallback": "cascade", "reason_code": receipt[3]}
+
+    async def _materialize_dialogue_expression(
         self, events: List[Any]
     ) -> Dict[str, Any]:
         audio_events = [item for item in events if item.type == "output.audio.delta"]
@@ -924,7 +975,7 @@ class StreamingInterviewSTT:
                 "Realtime speech output audio is invalid.",
                 status_code=502,
             ) from exc
-        stored = self.expression_audio.store_pcm(
+        stored = await self.expression_audio.store_pcm_async(
             organization_id=self.organization_id,
             interview_id=self.interview_id,
             turn_id=self.turn_id,

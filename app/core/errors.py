@@ -35,13 +35,17 @@ async def api_error_handler(_: Request, exc: ApiError) -> JSONResponse:
 
 async def provider_error_handler(_: Request, exc: ProviderError) -> JSONResponse:
     status_code = 502
+    message = exc.message
+    if exc.code == "provider_billing_required":
+        status_code = 503
+        message = "模型供应商账户计费或额度需要处理，请管理员处理后重试。"
     if exc.code == "provider_rate_limited":
         status_code = 429
     if exc.code in {"provider_auth_failed", "provider_bad_request", "provider_capability_missing"}:
         status_code = 400
     return error_response(
         exc.code,
-        exc.message,
+        message,
         status_code=status_code,
         details={"retryable": exc.retryable, **exc.details},
     )

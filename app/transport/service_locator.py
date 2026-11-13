@@ -25,9 +25,13 @@ from app.services.review import EnterpriseReviewService
 from app.services.roles import RoleRequirementService
 from app.services.session_monitor import SessionHeartbeatMonitor
 from app.services.talent import TalentService
+from app.services.interview_skills import InterviewSkillService
+from app.services.interview_customization import InterviewCustomizationService
 
 
 _SERVICE_FACTORIES: Dict[str, Type[Any]] = {
+    "interview_skills": InterviewSkillService,
+    "interview_customization": InterviewCustomizationService,
     "model_admin": ModelAdminService,
     "catalog": CatalogService,
     "knowledge_base_speech": KnowledgeBaseSpeechService,

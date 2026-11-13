@@ -1,10 +1,180 @@
 # 模型供应商插件化设计
 
+## 098：辅助输入诊断与内容定向纠错
+
+可选语音表达的输入队列继续以半秒PCM容量和有界发送期限隔离慢供应商。溢出/超时关闭该辅助流并保留正常cascade路径；诊断仅输出严格数值水位、块长度和耗时，不能记录音频或供应商响应正文。辅助失败不等于主识别失败。
+
+补充合同升级v11/v12，保留历史版本审计。v12只接受固定纠错原因invalid_json_object、reception_cannot_ask_question、reception_current_control_conflict；原因来自实际类型和字段路径匹配的失败，服务层绑定完整权威来源和上下文，不能自由注入异常文本。单次8秒/零Provider内部重试及097原总量不变。presence+unchanged且confidence≥0.75经过其余语义规则后，仅reception_cannot_ask_question反问文案可由中央批准话术替代并完整复验；模型响应仍不直接授权领域状态，model.correction_applied记录安全原因而不保存正文。
+
+## 097：补充分类的后置错误与有界恢复（实施中）
+
+补充分类沿原v9/v10 Prompt、严格Schema、模型路由与单次8秒/零内部重试。只调整编排层有界恢复：每份权威文本至多两次、连续失败期至多四次/40秒，当前分类成功不等于完成许可。网关成功仅代表Provider与统一Schema通过；后置语义合同、来源和证明校验的成功与失败另记安全阶段、固定原因和异常类型，不能把内部异常归为供应商故障。未知历史异常不回填；真实模型返回非对象仍严格拒绝，不通过解包、猜字段或无限重试掩盖。
+
+## 096：补充语义合同与剩余一次定向纠错
+
+`supplement_reply.v9` 增加必填答案影响枚举与有前次服务端证明约束的确认延续意图。格式失败后的剩余一次调用使用 `supplement_reply.v10`，仅接受白名单纠错原因，不把失败响应或候选敏感内容写入诊断。请求继续使用原路由/结构化输出方式与严格对象Schema；adapter不解包数组、强转字符串或补造字段。每次8秒、零provider内部重试/一次尝试，外层两次额度和10秒单次限制保持。
+
+真实事故两次输出是可解析但顶层非对象的JSON，未留存正文无法确定具体根类型；同一请求重复没有提供定向纠错。语义噪音本身不是协议错误，既要合理解释附言，也要保留供应商格式错误的独立失败分类。真实合成语义探针与仓库回归分开记录，不以少量成功承诺供应商长期可靠。
+
+## 095：业务纠错、安全解析诊断与真实批量转写
+
+仅 `semantic_first + optional_context + company_question_contract_invalid` 的纠错分支采用新集中指令：理解版本120/121/124/125分别映射130/131/132/133，组合决策151/152/155/156分别映射161/162/163/164；本轮早期合成验收使用的126–129/157–160继续兼容读取。纠错Schema要求显式返回company_question（合法原文引用对象或null），普通请求Schema、来源引用、置信度及调用额度保持；模糊音近词不得强制解释为公司问题或技术术语，也不得通过删除真实歧义来过校验。`contract_detail`仅记录12个固定规则枚举，无字段原值。固定恢复语音独立使用 `conversation_recovery_speech.v1`，原固定通知v4不变。
+
+解析失败追加 `json_decode_reason=non_object/extra_data/syntax_error`、严格整数 `json_error_offset`（相对strip后文本）和实际请求格式 `requested_response_format=json_schema/json_object/prompt`。这只诊断原拒绝分支，不改变JSON接受策略；请求格式不代表供应商遵守格式，错误位置也不暴露响应正文。
+
+`batch_stt_known_speech.v1` 以仓库内16kHz单声道PCM WAV合成语音及固定文本匹配验证批量模型。资源有界读取并校验SHA256，缺失、符号链接或内容变化拒绝。探针仅测primary、零重试、无fallback，避免mock或次级模型替主模型获得健康证明；实际业务路由的重试策略保持。结果只含探针模式/版本、字节数与匹配布尔值。真实streaming启用时，入场必须具备健康真实batch修复路由，纯mock开发兼容路径仍在。
+
+已有DashScope适配器支持 `qwen3-asr-flash`，使用私有音频Data URL。官方批量能力存在5分钟/10MB边界（编码体积需考虑），095不实现长音频分块，也不将短合成探针通过等同真实长答案验收。实际本机配置和外呼结果以[操作日志](change-log.md)为准。
+
+## 094：可观察的 JSON 解析错误
+
+OpenAI-compatible及继承适配器在原空内容和JSON解析失败分支，分别附加`json_failure_kind=empty_content/invalid_json_object`，保持`provider_schema_invalid`及原解析政策。网关只持久化这两个枚举和0–10000000的严格整数`content_length`，拒绝布尔值、容器、私密字符串和越界长度；不记录响应正文。合法JSON的中央Schema拒绝仍是原规则/路径诊断，无解析分类；截断、鉴权及HTTP错误语义保持。
+
+Supervisor仅对上述可重试分类增加共享一次后台重试，使用原治理合同、当前工具清单、原15秒期限及最多3次实际模型调用，每次Provider仍为单attempt/零内部重试。至少保留1秒及必要最终决策额度，否则独立使用批准目录回退。取消、Schema/领域拒绝、认证/计费错误不走此恢复。没有Prompt、Schema、模型路由或厂商请求协议修改；此次离线HTTP集成不等同真实模型稳定性验收。
+
+## 090：媒体封存恢复诊断
+
+没有新增模型Prompt或厂商协议。封存配置缺失/鉴权错误、身份或保护校验失败停止自动重试；暂时供应商故障与Egress未结束仍受Outbox有限退避约束。API/worker使用独立media-runtime配置摘要核验同媒体模式与存储路由，摘要不比较凭据值，不替代真实ListEgress/对象验证。开发入口统一设置本地开关，production拒绝使用。
+
+
+## 089：下一题规划的临时故障处理
+
+089基线中Provider只报告原始协议及结构化错误；Supervisor仅对`retryable=true`的`provider_timeout / provider_server_error / provider_rate_limited / provider_circuit_open`，以及当前有界模型await的本地超时，使用已批准候选目录继续选题。原15秒/最多3次模型调用及中央格式校验不变，不增加供应商重试或切换模型；认证、计费、中央Schema失败和取消不会被转换为正常答案；094另增加明确解析故障的独立恢复，不采用无效模型结果。选题回退不适用于回答理解、STT或评分失败。保留原模型调用失败审计，并将固定策略/原因写入规划收据，不记录敏感响应。
+
+## 087：临时转写与分析取消来源
+
+供应商协议、原始转写和模型调用上限保持。字幕partial/final投影仅作为撤销当前推进资格的通知，完整证据来源由原稳定preview/权威snapshot验证。分析取消诊断新增白名单`source=stable_evidence`，不记录候选原话；partial不再取消纯分析，也不刷新该分析的次数或时间。详见[087](provisional-transcript-preparation-087.md)。
+
+## 2026-11-02 · 接话合同v10（086）
+
+conversation_reception.v10新增silent kind=stop_interview，reply_text必须为空；模型只能识别当前请求，统一Schema和E来源校验通过后才允许提出独立确认。候选的新确认仍走candidate_exit_reply.v1的严格来源合同；实际结束由服务端事务决定，不再调用完整答案模型。接话继续使用一次4秒、零供应商重试；正常答案的原调用与限时策略不变。厂商协议、路由配置、ASR和原始转写未改。见[086](conversation-control-autonomy-086.md)。
+
+## 085：内容澄清结构化输出（仓库与本机已验证）
+
+理解118–125/组合149–156采用单条首位system指令；已送达澄清的target为resolved、same_focus_unresolved+C1、new_focus_unresolved+E/焦点的严格联合对象。统一Schema与解析器恢复既有canonical结构并继续执行语义校验；provider不承担业务纠错。来源不匹配提供专门中央纠错指令，正常首次成功不增加外呼。单次18秒、共享两次完整调用及20/40秒整体期限保持。见[085](followup-clarification-085.md)。
+
+## 084：补充交流合同
+
+supplement_reply.v6扩展轻量交流意图与有界接话文本，中央Schema及引用校验先于业务路由。一次provider尝试、原8秒provider限时和10秒外层等待保持；生成表达记录实际v6来源。完整语义指令更新为v21/v22；semantic理解v110–117、组合决策v141–148，非semantic106–109/137–140和全部历史读取兼容保持。按真实补充阶段说明授权，completion_basis校验保留。供应商、ASR和音色不变，见[084](supplement-dialogue-routing-084.md)。
+
+## 083：跨准备阶段接续已有纠错合同
+
+统一理解校验产生的固定错误原因可在精确来源/合同约束下，由预分析带到正式准备的剩余一次调用，使用`app/core/prompt/`中已有的版本化纠错指令。不缓存或直接采用未校验响应，不改变供应商适配器、模型路由、18秒请求限制或单attempt配置；仍共用两次完整调用预算。正常路径不增加请求，实际纠错是否采用通过安全诊断核验。详见[083](bounded-correction-continuation-083.md)。
+
+## 079：非流式调用开始与取消审计
+
+非流式`invoke`的attempt开始/结束输出安全结构化诊断，使用`invocation_id + attempt + fallback_index`及`diagnostic_scope_id/parent_scope_id`关联端点和理解阶段。记录配置请求期限、实际执行期限、交互剩余时间及耗时；`CancelledError`补`status=cancelled`终态审计后原样传播，不重试、不fallback、不增加断路器失败。正常供应商超时仍是`failed/provider_timeout`，不能把调用方撤销写成供应商失败。取消来源由实际取消方标注；未取得来源时保留`caller_cancelled`，由关联的外层timeout或输入撤销事件解释，不猜测网络子阶段。开始事件不增加数据库attempt行；诊断写入失败不吞掉取消。范围仅新增观测，不改模型、路由、Prompt和时间策略。验证见[操作日志079](change-log.md)。
+
+## 078：理解调用额度与语义版本（仓库与本机已验证）
+
+理解合同98–109、组合决策129–140增加普通交流澄清约束，保留历史版本读取。关键理解调用18秒、max_provider_retries=0、max_provider_attempts=1；同答案实际模型尝试由Endpoint共用额度，防止预计算/格式纠正/恢复各自加倍。固定提示继续用075原供应商/音色缓存。安全失败保留timeout/auth/billing/rate/circuit及调用额度耗尽原因，使用量不表示余额。详见[078](answer-recovery-and-reuse-078.md)。
+
+DashScope在显式`max_provider_attempts=1`时不得在adapter内部进行HTTP400后的`json_schema→json_object`第二次请求；该400沿原结构化错误返回。无显式单次attempt限制时保留原协议兼容路径，仅`max_provider_retries=0`不会改变兼容。统一结果Schema校验始终执行，不改现有模型、结构化配置或音色。每capture投机仅一次实际模型调用，同一证据的正式处理继承已消费额度；新证据不是无条件刷新不可重试的供应商错误。
+
+## 075：同音色提示缓存与连接复用（已实现，末次追加暂未加载）
+
+保留现有TTS路由和音色，不添加备用目标。版本化固定提示预热只使用当前primary，在独立有界期限内完成并验证PCM；精确配置身份匹配才可复用，正式动态表达仍走现有网关。预热不继承正式交互ContextVar期限，不阻塞控制会话，不生成播放/送达事实或失败暂停。
+
+单次预热作业最多首轮加一次延迟2秒补齐，只处理可重试缺失项；成功项、认证/欠费/配置等终止错误不补试。每轮仍受既有网关重试策略和单项8秒期限约束。补齐前再次核对配置，关闭取消旧作业；无定时循环，60秒冷却后需新的会话/实际miss触发。DashScope流与`ValidatedTTSStream.terminal_error`只读保留或透传既有标准终止错误，形成于清理等待前；缓存的内外层流发生已知终止错误时，即使清理随后耗尽期限，也不能改判为可重试超时。并发位直到原collector关闭才释放。
+
+开流尚未返回source时，已知标准错误通过当前调用Task传递，下一次调用清除本网关的旧注记。当前TTS调用的`tts_cleanup_completion`汇总未交付开流及迟到stream的实际abort完成；缓存直到成功清理才释放原key/slot，不能把网关有界等待返回等同底层结束。迟到abort异常或取消不能证明释放，只隔离当前缓存scope内的原占位；其它槽与正式合成保持原路径，关闭仍有界。
+
+DashScope HTTP连接池仅在显式API生命周期内启用，按PID/事件循环/组织/连接配置和端点隔离，认证与超时逐请求传入；取消单流仅关闭其响应。空闲连接与池容量有界，退出先停止业务媒体与预热，再关闭当前循环的池。worker等短生命周期asyncio.run调用未显式启用时保留逐流客户端，避免已关闭事件循环的资源复用。注入client_factory保留隔离测试路径。
+
+## 074：流式 TTS 错误与期限
+
+DashScope HTTP/SSE 错误体必须有界解析，明确区分欠费 `Arrearage`、免费额度停用 `AllocationQuota.FreeTierOnly`、认证失败、速率限制和服务错误；`Throttling.AllocationQuota` 是 TPS/TPM 限流，不能当作余额不足。仅保留白名单错误码、HTTP 状态、请求标识、网络阶段与耗时，不记录原始响应正文、message、输入或凭据。取消继续向上传播；开流重试只发生在音频尚未暴露时，不能在已开始播放后透明重放。详见[074说明](warmup-tts-resilience-074.md)。
+
+同一次调用因真实失败达到熔断阈值后，结束当前目标重试，保留最后真实错误决定是否转向备用目标；不能用随后产生的 `provider_circuit_open` 覆盖超时并绕过 `fallback_on=["timeout"]`。下一独立调用仍执行熔断预检。所有实际尝试共享首音总期限，不因重试或备用目标延长截止时间。
+
+072：当前理解 v86–97、组合决策 v117–128、服务端派生说明 semantic_controls.v3；为完成与歧义冲突、未核实收尾字段冲突增加固定纠正指令。首次矛盾仅可经来源校验后撤销提交权限并具体澄清，不能删除疑点强行完成。统一 seam、原 wire 字段与供应商路由保持；领域/网关/Mock 保留旧版本读取。详见[072说明](ambiguous-completion-recovery-072.md)。
+
+071：不调整TTS模型、供应商协议或路由配置。并行准备需区分TTS初始化与媒体发布阶段，保持12秒共享首音预算；明确的供应商/媒体错误不得被另一挂起任务遮蔽，总预算超时应留下非空结构化诊断。已有重试策略只使用剩余预算，第一次耗尽预算时不会开始第二次调用。现场记录与恢复限制见[071说明](followup-speech-timeout-071.md)。
+
+068：当前理解 v74–85、组合决策 v105–116、语义指令 v19/v20、控制意图规则 v2 支持 `off_topic`；快速接话 v9 将无关发言交回完整理解，固定接话台词 v4 增加一次回题提示。所有结构化与来源校验继续经过统一 seam；历史版本保留读取兼容。新增业务拒绝原因码与恢复播报异常诊断，不记录原话、响应正文或凭据。没有新增供应商或配置；详见[068说明](off-topic-and-reconnect-068.md)。
+
+067：理解 v62–73、组合决策 v93–104、接话 v7 升级送达说明与服务端动作投影；规划 v4、证据专家 v2 改为有界引用 Schema、工具分页与完整冻结池领域校验。为保持厂商 strict JSON Schema 兼容，wire 仍包含 `followup_allowed`/`suggested_action`，统一校验后由已验证语义派生，业务不接受模型的冗余权限声明。TTS 打开/重试/首 PCM、媒体连接/订阅共用最多 12 秒首音期限，并受当前整轮剩余预算限制；首音后单次读取最多 8 秒，播放仍有总期限且不切换到另一供应商重播。无新增供应商凭据或路由配置；详见[067说明](agent-chain-improvements-067.md)。
+
+066：当前语义指令v17/v18、理解v50–61、组合v81–92、固定接话v3；增加来源绑定的未核实内容收尾及具体安全诊断。DashScope/网关/ContinuousSTT新增进程内可信撤回事实：仅同流有身份的临时词全部明确撤回、音频排空且服务端完成才接纳empty；已暴露稳定词及旧失败流遗失保护保持。wire Schema不变。详见[066说明](interaction-recovery-066.md)。
+
+065：新增candidate_exit_reply.v1、candidate_exit_confirmation.v1；退出上下文专用理解v46–49/组合v77–80，旧模式版本保持。回复分类8秒/0供应商内部重试，经统一Schema、原文及否定/引用校验，规则只能拒绝而不能授予退出。复用原理解路由及提供方，不改凭据，详见[065说明](candidate-exit-confirmation-065.md)。
+
+064：当前Prompt升级为语义v15/v16、理解v40–45、组合v71–76及接话v6；当前发言范围与明确控制冲突通过集中校验，最多一次纠正，失败返回`semantic_current_speech_conflict`且无结束权限。LiveKit适配器安全回收被撤销的在途join，厂商协议及凭据保持。详见[064说明](conversation-intent-and-end-064.md)。
+
+062：`conversation_reception.v5`提供独立题目/解释锚点及角色历史，接话响应新增受限可选 `repeat_target`，保持统一schema/cross-field验证。OpenAI-compatible JSON/凭据检查/二进制请求均把HTTP402映射为不可自动重试的 `provider_billing_required`；审计仅记录安全原因与402，对外503。实际语音一次首连30秒超时后重试的证据及优化计划见[062说明](multiturn-context-062.md)。
+
+061未更换供应商或音频协议。LiveKit表达适配器增加可选撤轨前通知回调：停止新写入并清空原生队列后，有界等待精确取消通知，再释放track/source/room；正常drained关闭不调用。业务层仅为已发布且授权失效的旧输出发取消，有效授权下的真实供应商/传输失败继续原错误处理，详见[061说明](first-question-audio-061.md)。
+
+## 060 · 可选追问修复合同
+
+组合决策更新为`interview_turn_decision.v65–v70`，独立追问为`controlled_followup.v6`，新增`controlled_followup_repair.v1`；理解v36–v39、语义v13/v14与接话v4保留。传输Schema将待检提案上限改为600字符以保留已验证理解，业务批准仍不超过180字符且至多一个问号。修复Schema只包含selected/question_text，不准替换证据、目标、理解或安全标记。统一Schema校验与业务门禁均通过才生成act；修复一次、至多3秒、0供应商内部重试/1尝试，共享原决策15秒期限。失败原因保留为固定诊断，不记录敏感模型全文。
+
+总控`interviewer_supervisor.v3`说明按turn_id调用既有只读历史工具，三次总请求预算保持；实际规划审计使用集中版本常量，历史v1/v2仍可读。网关与mock版本矩阵同步，未调整真实路由、供应商凭据、STT或TTS协议。详见[060说明](agent-autonomy-improvements-060.md)。
+
+## 057 理解与追问合同
+
+本轮不增加供应商调用次数或扩大推理预算。语义规则使用`semantic_turn.v9/v10`，当前理解合同`interview_turn_understanding.v28–31`，组合决策`interview_turn_decision.v35–40`，独立追问`controlled_followup.v3`，静音接话文本`conversation_reception_speech.v2`。历史版本白名单和冻结表达继续兼容，不重写已批准act。所有Prompt及Schema仍集中于`app/core/prompt/`。
+
+内容抽取与关闭话题独立；明确技术内容必须保留，即使简短或未覆盖评分点。不可理解的残片先澄清，不能推断拒答。追问提案只聚焦一个缺口，选中与不选中的字段约束分开；仍经统一wire/canonical校验和独立业务门禁，未获批的提案不能播报。静音提示使用集中批准文本，不新开一次LLM推理。
+
+## 053：有界连续播放
+
+不改变TTS供应商路由或PCM/final合同。服务器每帧并行提交录制音轨与浏览器可靠PCM，共享一次有界授权监视；任一分支异常撤销另一分支，最多一帧在途。浏览器240ms缓冲吸收包抖动并统计欠载；持续慢供给需消除发送瓶颈，不能增加无限缓冲或伪造完成。完整消费者已失败时也回收异常，避免监视器同时撤销造成后台Task异常。详见[053说明](warmup-playback-053.md)。
+
+## 052：自然接话与连续识别、流式输出
+
+集中合同 `conversation_reception.v2` 返回且仅返回 `kind/confidence/evidence_id/reply_text`。11 类 kind 保留控制边界并加入 `interview_dialogue`；`reply_text` 最多 180 字符，非空口语、不含链接、代码块或控制字符。`other` 与 `repeat` 必须空回复：普通技术回答、公司反问和结束意图归后续专门路径；重读沿冻结原题。统一结构、跨字段及原文编号校验通过后才进入批准表达。现有理解路由、4 秒供应商预算和 0 次内部重试保持，输出上限为 320 tokens。
+
+接话上下文仅含当前题、当前及此前原话、最近最多 4 条候选人可见话语、安全的流程事实和可选 Skill；不传标准答案、评分依据、企业全文或任意会话对象。Skill 不能提升工具或结束权限；公司事实只能走已有资料引用问答，没有资料不能编造。预览理解在稳定短停顿时提前启动，与接话调用并行；最多一个受控任务，失败不提供完成许可，新增输入或关闭撤销。final 与预览的全部证据指纹匹配才可复用。
+
+STT 供应商 final 仍只结束识别片段；服务端取得 final 并投影字幕后立即重开识别，较慢理解期间继续接收 partial。完整答案最终仍需权威 final、录音与输入代次校验。没有修改供应商路由、模型密钥或评分模型合同。
+
+批准 TTS 默认 `INTERVIEWER_STREAMING_TTS_ENABLED=true`，继续通过 `ModelGateway.open_tts_stream` 严格验证 PCM 和唯一 final。LiveKit RTC 音轨保留录制，同源 PCM 经可靠数据通道送往有界 AudioWorklet；源样本消费与设备输出时钟共同确认排空，PCM 不经事件/Redis。供应商不支持流式传输时仅首 PCM 前可用原完整资产路径；首 PCM 后失败或取消不自动重播。已有完整题目音频仍优先，动态承接语与问题可能重新合成。052 本机 Chromium / LiveKit 断供实验通过，真实口音、长会话、其他浏览器和生产 p50/p95 仍需独立验收，见[052 改造说明](continuous-conversation-052.md)。
+
+## 2026-09-14：短问题生成预算（048）
+
+批次边界：每批只含一个原题的最多6个评分点；响应Schema的题目ID、知识点ID、能力与参考片段枚举只来自该题，unit数量等于该批实际点数。
+
+失败处理：统一格式或单元内容校验失败时，仅对失败小批次使用集中修正指令再尝试一次，已通过批次保留。修正仍占用3并发/180秒总预算；超时、鉴权或服务错误不在装配层重复调用，第二次无效仍失败关闭。校验日志只记录固定原因枚举与题目/考察点/批次数量，不记录原文。
+
+新调用使用集中合同 `interview_inquiry_units.v2`：输入原标准答案的连续编号片段，模型仅选择参考范围首尾编号，不重复输出整段答案。统一Schema及引用seam校验合法编号、同源顺序、逐点评分范围与非空内容，再从原文还原标准答案引用；冻结单元结构不变，历史v1计划不重写。每批最多6个知识点（原题可跨批）、并发3、输出3500tokens、每次60秒，整体180秒；不重试相同大批次，不通过mock或长题回退掩盖失败。审计保留v1并登记v2。
+
+## 047：计划准备使用真实语言模型
+
+`InterviewPlanAssembly.prepare` 复用 `llm.chat_json / question_generation`，执行版本化 `interview_inquiry_units.v2`；准备不是仅靠题目标签或模板拼接。部署时此用途必须绑定可用语言模型，不能把开发环境缺路由的 mock 回退当成真实模型验收。047本机排查发现这条路由缺失，先使用合成题库在内存复用已有语言模型验证，再通过模型管理接口补齐本机路由；具体结果记录在操作日志。供应商协议、统一结构校验与调用预算均沿用既有 ModelGateway，不在业务模块绑定特定厂商。
+
+
+## 2026-09-14 · 交流接话模型合同（046）
+
+新增`conversation_reception.v1`，通过既有`interview_turn_understanding`路由返回且仅返回`kind/confidence/evidence_id`；180输出token、4秒provider预算、0次内部重试，整体5秒可撤销等待。类型/枚举/边界/额外字段与服务端证据引用先统一校验，再进行高置信度控制分发；预览不得提交或直接播放。候选新话语和先前上下文作为数据，普通答案、公司问题和明确结束留给完整语义链。
+
+短表达集中为`conversation_reception_speech.v1`，等待/继续/确认在线/重说/题意澄清请求/转写投诉/收听问题/暂停/不明请求/理解失败均复用批准act与TTS。语义理解升级v16/v17（无可选上下文）和v18/v19（可选上下文），decision升级v15/v16、v17/v18；分别对应未确认/已确认结束。`semantic_turn.v3/v4`明确thinking与pause及completion_basis互斥，原严格校验不放宽；旧版本继续可读，版本进入领域与网关审计。
+
+046 当时没有变更模型路由、密钥或开启实时 PCM 播放；052 的自然接话和默认流式输出取代这部分旧行为。046 当时仍收齐完整 PCM 并发布受管音频；一条固定合成等待回应在真实路由首PCM466ms、完整收齐1048ms，独立于1–2秒的合成接话识别，均非用户端到端承诺。失败/取消保持当前回答，不把识别服务故障伪装为候选人没有补充。
+
+## 2026-09-10 · 公司问答模型合同（044）
+
+公司反问沿既有interview_turn_understanding路由，新增company_question_reply.v1只返回受限引用，无自由事实回答；抽取一次调用、8秒、供应商内部0次重试。带公司反问的理解v14/v15、decision v13/v14、supplement_reply.v4及带排除的answer_evaluation.v7均集中注册并进入统一校验/审计。Provider adapter不增加业务Prompt，TTS继续走原网关和私有音频链路。详细语义、失败回退和范围见[公司问答合同](company-question-runtime.md)。
+
+## 2026-09-10 · 可选上下文Prompt（039）
+
+interviewer_supervisor.v2明确Skill由用户自由编写、可选加载，企业资料独立可选。模型只在资料真实存在时调用受控读取工具；缺省直接按岗位面试，不猜测企业事实或把Skill资源当成企业身份。真实语义入口携带独立skill/company_context后，集中Prompt seam使用understanding.v12/v13与decision.v11/v12；旧无该上下文的审计Prompt保持原版本。新自由包使用interview_skill_compiler.v2；历史v1hash与编译结果保持可读，不把旧快照套入新Prompt。
+
+运行时仍统一模型网关、结构化输出校验、调用预算和取消；Skill文字包含代码或链接只是文字，不执行代码或自动访问网络。没有新增供应商或生产模型配置要求。
+
+## 2026-09-10 · 总控、语义与Skill统一模型合同（038）
+
+所有新Prompt、工具定义、条件Schema与语义引用验证集中在app/core/prompt，不新增厂商SDK或要求厂商原生tool calling。新合同包括interviewer_supervisor.v1、interviewer_evidence_expert.v1、interviewer_transition.v1、interview_inquiry_units.v1、首次语义理解v10/决策v9、真实补充确认后理解v11/决策v10与单元评分answer_evaluation.v6；版本加入网关审计白名单并有合同测试。企业正文通过受控编译seam加载，不能直接替换平台指令。
+
+总控沿用interview_turn_understanding路由，每次规划共享15秒与最多3次实际供应商尝试，specialists.consult至多一次并占用同一预算；InvocationExecutionBudget增加可选max_provider_attempts，实时规划每次调用设为1，同时max_provider_retries=0，避免fallback隐式突破预算。普通旧调用省略新字段保持原路由策略。超时/取消不记录完整Prompt或响应，只暴露安全错误码；候选人明确重试恢复规划。
+
+离线单元生成继续question_generation，评分继续既有answer_evaluation工作链；语义输入分离answer_content、turn_intent及真实CompletionBasis。语音生成和数字人继续通过既有批准act与供应商插件执行。未更换生产模型路由、密钥或声明实际供应商延迟达标；接口参数和运行限制见[总控合同](interviewer-supervisor-contract.md)及[自适应合同](adaptive-interview-contract.md)。
+
 ## 2026-09-10 · 补充分类与完整音频直取（034）
 
 supplement_reply.v3集中定义Prompt和严格Schema，只返回intent/confidence/evidence_id。长回答不要求模型复写最多300字的quote；服务端按编号恢复精确证据。调用预算8秒、350输出token、0次provider内重试；端点按原文最多三次失败。网关记录白名单schema_reason/schema_path用于区分枚举、类型、长度、字段等错误，保留历史版本。
 
-AgentExpressionAudioService通过既有open_tts_stream收齐完整PCM并私有存储，默认INTERVIEWER_BUFFERED_TTS_ENABLED=true；不支持此传输时使用原batch URL导入。已开始的流失败、超时、取消不自动重播，Mock拒绝；浏览器仍是完整文件播放，INTERVIEWER_STREAMING_TTS_ENABLED=false不变。20秒总准备预算，字节/音频时长与输出终态校验继续由既有网关承担。
+AgentExpressionAudioService通过既有open_tts_stream收齐完整PCM并私有存储，默认INTERVIEWER_BUFFERED_TTS_ENABLED=true；不支持此传输时使用原batch URL导入。已开始的流失败、超时、取消不自动重播，Mock拒绝；034 当时使用完整文件播放且 INTERVIEWER_STREAMING_TTS_ENABLED=false；052 已默认开启可计数 PCM 播放，完整文件保留作适用回退。20秒总准备预算，字节/音频时长与输出终态校验继续由既有网关承担。
 
 合成真实调用发现DashScope Qwen HTTP SSE三项旧适配遗漏：中间finish_reason为字符串“null”，首片带精确PCM16/24k/mono的44字节流式WAVE头，stop前还有一条空audio.data的usage通知。Adapter仅兼容已观察到的固定头（signed-limit占位对），未知头/格式拒绝；空usage通知只允许一次且必须已有PCM，不能视为final，之后仅允许有效stop和EOF。统一网关看到的始终是无容器PCM，不能把文件头当声音或时长。供应商状态/终片规范参照[官方Qwen-TTS接口](https://help.aliyun.com/en/model-studio/qwen-tts-api)；usage空通知和精确首片头依据本次新合成文本的只读字段/容器探针，不声称文档保证所有模型都相同。
 
@@ -71,7 +241,11 @@ DashScope正常finish在拿到有效final后复用独立共享清理任务，优
 
 邀请、企业显式 readiness refresh 和已通过前置准入的候选人 readiness/start 复用统一路由探测模块：健康且未过期复用；未测/过期按需探测；失败有 30 秒冷却。每批至多 3 条并行、每条探测至多 15 秒、自动刷新总预算 30 秒，同租户同路由通过持久化租约去重；配置变化或旧探针完成不得覆盖新配置证据。手动 route test 使用同一所有权和配置检查，不以模型 test 冒充路由健康。
 
-探针继续只使用 `app/core/prompt/` 的既有版本化合成输入；流式 STT/实时语音只验证 ready 握手并关闭，不拿静音要求 final，也不评价 WER。TTS 检测既有完整合成能力，不启用 012 的实验流式输出。错误仅持久化安全分类，不写原始异常/响应/凭据；取消或超时须回收已经打开的流连接。成功仍不等于正式业务质量/端到端验收。
+流式 STT/实时语音探针只验证 ready 握手并关闭，不拿静音要求 final，也不评价 WER。076修正动态表达路由探针：启用流式TTS时，`interview_agent_expression` 使用统一网关的PCM流式合成，读取固定连接测试短句的完整有效PCM和终片并确认回收；不能仅收到ready或首片就宣告健康。其他TTS用途或明确关闭流式表达时沿用批量合成。探测使用同一路由模型及其默认语音配置，不替代预约冻结音色的资产匹配或实际媒体播放验收，也不读取候选内容、使用固定提示缓存冒充联网成功。外层15秒/批次30秒及失败冷却保持；错误仅保留安全分类，不写原始异常/响应/凭据，取消或超时须回收已打开的流连接。成功仍不等于正式业务质量或端到端验收。
+
+076的TTS关闭观测仅提供`cleanup_confirmed/cleanup_error`，不改变既有abort取消、连接池或重试语义；探针不能把吞异常的abort返回当作已确认回收。健康写入前仍复核原租约和配置指纹。截止或取消期间已取得的标准供应商错误优先保留，调用取消本身仍传播。安全错误码增加既有标准类别`provider_audio_final_missing`与`provider_audio_format_unsupported`，让不完整/不支持的音频有明确诊断；不得持久化原始响应。
+
+沿用实际表达的协议兼容：仅开流阶段明确`provider_streaming_not_supported`、尚无PCM且清理确认后，可在原探针剩余时间内调用同一路由、同一请求的批量合成；不新增备用供应商或音色。超时、鉴权、计费、格式或语义错误不触发该兼容分支，清理过程中迟到的明确拒绝也不得被忽略。该批量兼容路径仍可能在外层取消时缺少单次invocation记录；路由健康会记录失败，此项未修改通用批量网关的审计语义。
 
 手动路由测试可显式重试冷却中的失败，但仍与自动刷新共享租约和配置检查。STT 探针独立回收预算2秒，仍受每条15秒总预算约束，不能确认回收时返回安全分类 `provider_probe_cleanup_failed`。DashScope abort 以共享独立任务保证重复调用能等到同一次清理，优雅关闭至多0.5秒，取消/超时先强制回收底层 transport 再取消等待；不能仅凭 closed 标志跳过未完成清理。正常正式 finish 与尾音 final 不变。批次网络等待预算30秒，取消任务另有最多0.1秒收尾等待；前端邀请/候选检查和开场40秒、手动路由测试35秒局部超时与此预算匹配。
 
@@ -85,8 +259,7 @@ DashScope正常finish在拿到有效final后复用独立共享清理任务，优
 
 ### 已批准文本的 TTS streaming transport
 
-默认关闭，开关 `INTERVIEWER_STREAMING_TTS_ENABLED=false`；网关/供应商 PCM 合同已验证，但 Chrome 接收端时钟尚不具备可靠内容样本映射，
-不得把已实现供应商 SSE 等同于正式链路已启用边生成边播放。自动轮次、合并理解和原完整私有 TTS 路径正常运行。
+052 已用可计数的客户端 PCM 播放器替代 012 的 MediaStream 墙钟适配器，默认 `INTERVIEWER_STREAMING_TTS_ENABLED=true`。本机 Chromium / LiveKit 停供实验验证源样本位置不随静音增长；供应商 SSE、发送结束和客户端实际排空仍是独立事实，不能把此实验等同于生产延迟达标。原完整私有 TTS 路径保持。
 
 `ModelGateway.open_tts_stream(TTSSynthesizeRequest, route=...)` 是已有 `tts.synthesize` 能力的可选传输，非新业务能力。
 统一 `ValidatedTTSStream` 严格校验 ready→顺序 PCM16 mono chunks→唯一 final，provider/model/请求身份、采样率和字节水位不可换代，
@@ -248,7 +421,7 @@ app/
 
 ## 实时语音的空转写与真实补偿边界
 
-`provider_final_transcript_missing` 不代表一个可提交的空答案：实时 Evidence 保留录音并返回 `STT_TRANSCRIPT_UNAVAILABLE`，继续当前题，不把空值交给理解或评分。其他流式故障仍可使用 `stt.batch/candidate_answer_repair` 补偿；网关在调用 mock adapter 前检查必须是开发环境且提供显式非空字符串 `development_transcript`，否则以 `provider_real_stt_required` 拒绝（包含 mock fallback）。Mock adapter 同时拒绝 None、非字符串与空白 fixture，禁止 `str(None)` 伪造转写。此约束适用于真实本地面试，而非仅生产环境；开发测试 fixture 通道保留，生产禁止 fixture。当前本机只有真实流式 STT，尚无真实批量识别路由，不能宣称已具备真实断流批量补偿。
+`provider_final_transcript_missing` 不代表一个可提交的空答案：实时 Evidence 保留录音并返回 `STT_TRANSCRIPT_UNAVAILABLE`，继续当前题，不把空值交给理解或评分。其他流式故障仍可使用 `stt.batch/candidate_answer_repair` 补偿；网关在调用 mock adapter 前检查必须是开发环境且提供显式非空字符串 `development_transcript`，否则以 `provider_real_stt_required` 拒绝（包含 mock fallback）。Mock adapter 同时拒绝 None、非字符串与空白 fixture，禁止 `str(None)` 伪造转写。此约束适用于真实本地面试，而非仅生产环境；开发测试 fixture 通道保留，生产禁止 fixture。091排查时本机仅有真实流式STT；095已通过正常管理API新增真实`qwen3-asr-flash`模型及`stt.batch/candidate_answer_repair`专用路由，模型和路由各一次固定合成语音测试通过。该验证证明短音频配置可用，真人断流和长音频仍需复验，详见[操作日志095](change-log.md)。
 
 ## 插件 Manifest
 
@@ -758,7 +931,7 @@ ModelConfiguration、连接和模型 `default_voice`，并冻结成带 `source=m
 | `model_configuration_id` | 使用的模型配置 |
 | `provider_id` | provider 类型 |
 | `model` | 模型名 |
-| `status` | `success`、`failed`、`fallback_success` |
+| `status` | `success`、`failed`、`fallback_success`；079为非流式调用增加`cancelled`，流式保留既有`stream_*`状态 |
 | `attempt` | 当前 target 尝试序号 |
 | `fallback_index` | primary 为 0，fallback 依次递增 |
 | `latency_ms` | 本 attempt 耗时 |
@@ -770,6 +943,12 @@ ModelConfiguration、连接和模型 `default_voice`，并冻结成带 `source=m
 | `estimated_cost_usd` | 预估费用 |
 | `error_code` | 统一错误码 |
 | `redacted_request_hash` | 统一请求的 SHA-256，用于关联重复调用 |
+| `interview_id/turn_id/capture_id` | 可选内部归属标识，禁止用转写或凭据填充 |
+| `diagnostic_scope_id/parent_scope_id/stage` | 当前处理阶段与父阶段的诊断关联；不产生业务权限 |
+| `requested_timeout_ms/effective_timeout_ms/interaction_remaining_ms` | 该层请求等待上限、实际传入等待器的上限、开始时外层交互剩余时间；没有外层期限时剩余字段缺省。网关自身不新增期限裁剪，端点保留原裁剪规则 |
+| `cancel_reason/outcome/provider_invoked` | 受控取消来源、阶段结果、是否已进入adapter调用；preflight/熔断拒绝为false，不代表厂商已收到网络请求 |
+
+079新增运行事件使用`model.scope_*`、`model.operation_*`、`model.attempt_*`及`model.understanding_failed/rejected`前缀，失败重试事件继续使用`turn_control.understanding_retry_budget`并补安全原因与关联字段。按会话和题目定位后，用scope父链与`invocation_id/attempt/fallback_index`串联开始、终态和外层取消。函数正常返回的operation success不代表答案被接受，应同时查看understanding_failed/rejected和原提交事件。没有用量回执的cancelled记录中token与估算费用为null，不能当作免费调用。诊断sink失败不改变处理结果；取消审计失败仍传播原取消并记录`model.audit_failed`，不会伪造持久成功。
 
 日志默认不保存完整 prompt、候选人音频或标准答案。需要调试时必须通过受控开关开启短期脱敏采样。
 
@@ -869,3 +1048,21 @@ token；ModelInvocationLog 在失败 attempt 也保存这些诊断，不记录�
 - 豆包端到端实时语音（Seeduplex）API：<https://docs.volcengine.com/docs/DoubaoVoice/endtoend-realtime-voice-full-duplex-version?lang=zh>
 
 外部文档只决定 adapter 的厂商协议转换；领域能力、route、日志、隐私和 readiness 仍以本仓库统一 schema 为准。
+
+## FOLLOWUP-CONTEXT-055：接话合同
+
+conversation_reception.v3明确将考察追问交给正式子题链路；接话只响应候选人的交流请求，不自行生成技术追问或发起补充确认。wait/continue/presence/interview_dialogue生成问句在统一合同校验处拒绝，端点回到正式理解路径，不播出未批准的新问题。最近实际问题/澄清和新发言进入上下文，完整评分证据不截断。语音供应商、分片、缓冲与媒体协议保持054实现。
+
+父子合并评分升级为answer_evaluation.v8：完整输入含经来源校验及公司反问/拒答过滤的evidence_chain；评分原文必须归属于对应考察点允许的回答。统一seam派生evidence_sources，拒绝引用题干、其他考察方向或不存在的原文。结构链不一致为不可重试evaluation_evidence_invalid；模型引用不合法同码可重试。单答案保持原有v5/v6/v7合同选择。
+
+### 056 回答结束语义合同
+
+语义提示升级 `semantic_turn.v5/v6`，对应理解 `interview_turn_understanding.v20–v23` 与组合决策 `interview_turn_decision.v19–v22`；非语义组合决策的细节追问提示升级v23/v24，独立 `controlled_followup.v2`。新枚举 `finish_answer` 仍由集中响应 Schema 与内容校验约束：真实专业回答、置信度门槛、逐字结束证据、允许追问；关闭话题的旧枚举仍禁止追问。补充确认表达升级 `supplement_confirmation.v2`，不再提前承诺“没有补充就进入下一题”。历史版本继续可读，当前调用与诊断使用新版本。
+
+## 2026-09-22 · 059 会话上下文与识别假设
+
+DashScope 的正常 task-finished 在上行音频已排空、从未观察到非空文字时，可以完成一个空识别段，包括空 sentence_begin 占位；一旦曾观察到文字，不能用空结果掩盖丢失。传输失败、缺少正常完成确认和非空假设丢失继续为可恢复错误。只有供应商和统一网关校验通过的结果才能进入后续证据链；空结果不表示答完。协议依据与故障证据见[059改进计划](agent-conversation-improvement-plan-059.md)。
+
+059的`stt.hypothesis_source`是无正文、按句子身份关联的诊断：首次非空假设，以及定稿替换/撤回/任务结束/abort时记录哈希、字符数、版本与区间；中间更新只合并摘要，活跃及近期结束句各最多64条。诊断不作为答案证据，不在PCM帧路径输出，不新增网络等待。缺少稳定句身份的供应商结果不能由日志伪造关联。
+
+最终集中合同为 `semantic_turn.v13/v14`、`interview_turn_understanding.v36–v39`、`interview_turn_decision.v59–v64`、`controlled_followup.v5`、`supplement_reply.v5` 和 `conversation_reception.v4`。输出 Schema 先生成含义再选动作；`semantic_control_contract_invalid` 是固定、无敏感正文的跨字段错误，在日志和既有一次纠正中保持原因，纠正说明仍集中在 Prompt 模块，不增加模型调用次数。历史版本继续可读，非法动作不因重试而绕过校验。

@@ -1,3 +1,4 @@
+import ast
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -73,6 +74,8 @@ def test_api_package_contains_only_router_declarations_and_assembly() -> None:
         "__init__",
         "admin",
         "catalog",
+        "interview_customization",
+        "interview_skills",
         "interviews",
         "plans",
         "realtime",
@@ -84,3 +87,14 @@ def test_api_package_contains_only_router_declarations_and_assembly() -> None:
     assert not (api_root / "dependencies.py").exists()
     assert not (api_root / "realtime.py").exists()
     assert not (api_root / "responses.py").exists()
+
+
+def test_skill_routes_delegate_delivery_and_recovery_policy_to_the_service() -> None:
+    path = Path(__file__).resolve().parents[1] / "app" / "api" / "routers" / "interview_skills.py"
+    module = ast.parse(path.read_text(encoding="utf-8"))
+    for function in (node for node in module.body if isinstance(node, ast.AsyncFunctionDef)):
+        assert function.decorator_list, "Async Skill operations belong in the service; only route handlers live here."
+        assert not any(isinstance(node, (ast.For, ast.AsyncFor, ast.While, ast.Try, ast.If))
+                       for node in ast.walk(function)), "Skill routes must not own lifecycle or delivery recovery policy."
+    assert not any(isinstance(node, ast.ImportFrom) and (node.module or "").startswith("app.persistence")
+                   for node in ast.walk(module))

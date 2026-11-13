@@ -2,7 +2,99 @@ import { describe, expect, it } from "vitest";
 
 import { OrderedAgentEventStream, validateAgentEvent } from "./agent-event-runtime.js";
 
+describe("auxiliary dialogue degradation contract 098", () => {
+  const reasons = [
+    "provider_dialogue_input_overflow", "provider_dialogue_input_timeout", "provider_dialogue_input_failed",
+    "provider_dialogue_event_overflow", "provider_dialogue_response_mismatch", "provider_timeout",
+    "provider_unavailable", "provider_route_missing", "provider_configuration_invalid", "provider_auth_failed",
+    "provider_billing_required", "provider_rate_limited", "provider_circuit_open", "provider_schema_invalid",
+    "provider_audio_unavailable", "provider_stream_closed",
+  ];
+  const payload = { capability: "speech.dialogue_realtime", fallback: "cascade", reason_code: reasons[0] };
+  const degraded = (sequence, value = payload) => ({
+    ...event(sequence, "capability.degraded", value), turn_id: "turn_1", replayability: "transient",
+  });
+
+  it.each(["candidate", "enterprise"])("accepts only the fixed auxiliary capability and bounded diagnostics for %s", audience => {
+    for (const reason_code of reasons) {
+      for (const capture_id of [undefined, null, "capture_current", "c".repeat(128)]) {
+        expect(validateAgentEvent(degraded(1, { ...payload, reason_code, capture_id }), { audience }).ok).toBe(true);
+      }
+    }
+    expect(validateAgentEvent({ ...degraded(1), turn_id: null }, { audience }).ok).toBe(true);
+  });
+
+  it.each(["candidate", "enterprise"])("rejects unsafe or incomplete auxiliary degradation payloads for %s", audience => {
+    for (const change of [
+      { capability: undefined }, { capability: "speech.transcription" }, { capability: true },
+      { fallback: undefined }, { fallback: "s2s" }, { fallback: true },
+      { reason_code: undefined }, { reason_code: null }, { reason_code: "private provider response" },
+      { reason_code: "" }, { reason_code: [] }, { capture_id: true }, { capture_id: 7 },
+      { capture_id: "" }, { capture_id: "c".repeat(129) }, { message: "private response" }, { provider_result: {} },
+      { text: "unapproved text" }, { audio_uri: "/private.wav" }, { approved: true },
+      { recoverable: true }, { action: "retry_answer_processing" }, { source_id: "private-source" },
+    ]) {
+      expect(validateAgentEvent(degraded(1, { ...payload, ...change }), { audience }).ok).toBe(false);
+    }
+    expect(validateAgentEvent({ ...degraded(1), replayability: "replayable" }, { audience }).ok).toBe(false);
+  });
+
+  it.each(["candidate", "enterprise"])("orders and deduplicates auxiliary degradation without masking a gap for %s", audience => {
+    const stream = new OrderedAgentEventStream({ audience });
+    const notice = degraded(1);
+    expect(stream.accept(notice).action).toBe("apply");
+    expect(stream.accept(notice)).toMatchObject({ action: "drop", reason: "duplicate_event_id" });
+    expect(stream.accept({ ...notice, event_id: "older_notice" })).toMatchObject({ action: "drop", reason: "stale_or_replayed_sequence" });
+    expect(stream.accept(degraded(3))).toMatchObject({ action: "resync", reason: "sequence_gap" });
+    expect(stream.cursor).toBe(1);
+  });
+});
+
 describe("ordered AgentEvent runtime", () => {
+  it("bounds formal question audio recovery to the current followup without capture or private fields", () => {
+    const snapshot = { ...candidateSnapshot(), floor: "none",
+      current_question: { ...candidateSnapshot().current_question, is_followup: true },
+      question_audio_recovery: { status: "retry_required", turn_id: "turn_1", selection_event_id: "event_1" } };
+    const validate = (value) => validateAgentEvent(event(1, "session.snapshot", value)).ok;
+    expect(validate(snapshot)).toBe(true);
+    expect(validate({ ...snapshot, floor: "agent", question_audio_recovery: { ...snapshot.question_audio_recovery, status: "retrying" } })).toBe(true);
+    for (const change of [{ status: "paused" }, { floor: "candidate" }, { calibration_status: "listening" },
+      { current_question: { ...snapshot.current_question, is_followup: false } },
+      { question_audio_recovery: { ...snapshot.question_audio_recovery, turn_id: "turn_stale" } },
+      { question_audio_recovery: { ...snapshot.question_audio_recovery, act_id: "private" } },
+      { question_audio_recovery: { ...snapshot.question_audio_recovery, status: "ready" } },
+      { question_audio_recovery: { ...snapshot.question_audio_recovery, selection_event_id: "" } }]) {
+      expect(validate({ ...snapshot, ...change })).toBe(false);
+    }
+    expect(validateAgentEvent(event(2, "problem", { code: "QUESTION_AUDIO_RETRY_REQUIRED", message: "synthetic", recoverable: true, action: "retry_question_audio" })).ok).toBe(true);
+    expect(validateAgentEvent(event(2, "problem", { code: "QUESTION_AUDIO_RETRY_REQUIRED", message: "synthetic", recoverable: true, action: "continue_speaking" })).ok).toBe(false);
+  });
+  it("accepts only a bounded completion receipt for the snapshot interview", () => {
+    const completion = { interview_id: "iv_1", status: "submitted_for_human_review", submitted_at: "2026-09-23T00:00:00Z", recording_retention_notice: "已停止采集。", human_review_required: true };
+    for (const receipt of [undefined, null, completion]) {
+      expect(validateAgentEvent(event(1, "session.snapshot", { ...candidateSnapshot(), completion: receipt }), { audience: "candidate" }).ok).toBe(true);
+    }
+    for (const change of [{ interview_id: "iv_other" }, { human_review_required: "true" }, { internal_notes: "private" }, { submitted_at: 1 }]) {
+      expect(validateAgentEvent(event(1, "session.snapshot", { ...candidateSnapshot(), completion: { ...completion, ...change } }), { audience: "candidate" }).ok).toBe(false);
+    }
+  });
+  it("bounds closing presentation to ended input without granting capture or human-floor authority", () => {
+    const completion = { interview_id: "iv_1", status: "submitted_for_human_review", submitted_at: "2026-09-23T00:00:00Z", recording_retention_notice: "已停止采集。", human_review_required: true };
+    const snapshot = { ...candidateSnapshot(), current_turn_id: null, current_question: null, floor: "agent", completion, completion_presentation: "closing" };
+    const validate = value => validateAgentEvent(event(1, "session.snapshot", value)).ok;
+    expect(validate(snapshot)).toBe(true);
+    for (const change of [{ completion: null }, { completion_presentation: true }, { completion_presentation: "pending" },
+      { status: "paused" }, { floor: "human" }, { current_turn_id: "turn_1" }, { current_question: candidateSnapshot().current_question }]) {
+      expect(validate({ ...snapshot, ...change })).toBe(false);
+    }
+  });
+  it("accepts only fixed runtime diagnostic codes in a paused snapshot", () => {
+    const snapshot = { ...candidateSnapshot(), status: "paused", runtime_problem_code: "AUDIO_TRACK_LOST" };
+    expect(validateAgentEvent(event(1, "session.snapshot", snapshot), { audience: "candidate" }).ok).toBe(true);
+    for (const bad of [{ ...snapshot, runtime_problem_code: "secret provider error" }, { ...snapshot, status: "in_progress" }]) {
+      expect(validateAgentEvent(event(1, "session.snapshot", bad), { audience: "candidate" }).ok).toBe(false);
+    }
+  });
   it("accepts unknown transcript confidence without converting it into certainty or a protocol failure", () => {
     const stream = new OrderedAgentEventStream({ audience: "candidate" });
     const received = event(1, "transcript.final", { text: "合成术语回答。", confidence: null, authoritative: true, persisted_audio: true });
@@ -157,7 +249,9 @@ describe("ordered AgentEvent runtime", () => {
   it("validates only safe fields in the current turn's supplement confirmation", () => {
     const snapshot = { ...candidateSnapshot(), current_turn_id: "turn_1" };
     const confirmation = { status: "awaiting_reply", turn_id: "turn_1", capture_id: "capture_1" };
-    expect(validateAgentEvent(event(1, "session.snapshot", { ...snapshot, supplement_confirmation: confirmation })).ok).toBe(true);
+    for (const status of ["listening", "awaiting_reply", "awaiting_exit_reply"]) {
+      expect(validateAgentEvent(event(1, "session.snapshot", { ...snapshot, supplement_confirmation: { ...confirmation, status } })).ok).toBe(true);
+    }
     for (const extra of [{ boundary: "private transcript" }, { turn_id: "turn_old" }, { status: "finished" }, { capture_id: "" }]) {
       expect(validateAgentEvent(event(1, "session.snapshot", { ...snapshot, supplement_confirmation: { ...confirmation, ...extra } })).ok).toBe(false);
     }
@@ -181,6 +275,24 @@ describe("ordered AgentEvent runtime", () => {
     }
   });
 
+  it("accepts clarification only on the candidate floor with current scope and safe recovery metadata", () => {
+    const snapshot = { ...candidateSnapshot(), floor: "candidate", current_turn_id: "turn_1" };
+    const preparation = { status: "clarifying", turn_id: "turn_1", capture_id: "capture_1",
+      stage: "answer_understanding", reason_code: "invalid_result", attempt: 2, max_attempts: 2, retryable: true };
+    expect(validateAgentEvent(event(1, "session.snapshot", { ...snapshot, answer_preparation: preparation })).ok).toBe(true);
+    for (const change of [{ status: "paused" }, { status: "completed" }, { floor: "agent" }, { floor: "none" },
+      { current_turn_id: "turn_old" }, { calibration_status: "listening" },
+      { capture_recovery: { status: "recovering", turn_id: "turn_1", capture_id: "capture_1", attempt: 1, max_attempts: 3 } }]) {
+      expect(validateAgentEvent(event(1, "session.snapshot", { ...snapshot, ...change, answer_preparation: preparation })).ok).toBe(false);
+    }
+    for (const change of [{ turn_id: "turn_old" }, { capture_id: "" }, { capture_id: "wrong scope" },
+      { provider_result: "PRIVATE_RESPONSE" }, { transcript: "PRIVATE_WORDS" }, { retryable: false }]) {
+      expect(validateAgentEvent(event(1, "session.snapshot", {
+        ...snapshot, answer_preparation: { ...preparation, ...change },
+      })).ok).toBe(false);
+    }
+  });
+
   it("requires capture and turn scope with the correct floor/action for recovery events", () => {
     const recoveryEvents = [
       ["floor.changed", { owner: "candidate", reason: "answer_recovering", capture_id: "capture_1" }],
@@ -195,6 +307,35 @@ describe("ordered AgentEvent runtime", () => {
       expect(validateAgentEvent({ ...item, payload: { ...payload, capture_id: undefined } }).ok).toBe(false);
       expect(validateAgentEvent({ ...item, payload: { ...payload, cause_type: "ProviderError" } }).ok).toBe(false);
       expect(validateAgentEvent({ ...item, payload: { ...payload, ...(type === "problem" ? { action: "pause_or_human_takeover" } : { owner: "human" }) } }).ok).toBe(false);
+    }
+  });
+
+  it("validates safe recovery stage, cause and finite attempt fields", () => {
+    const snapshot = { ...candidateSnapshot(), current_turn_id: "turn_1" };
+    const preparation = { status: "retrying", turn_id: "turn_1", capture_id: "capture_1",
+      stage: "answer_understanding", reason_code: "provider_timeout", attempt: 2, max_attempts: 2, retryable: true };
+    expect(validateAgentEvent(event(1, "session.snapshot", { ...snapshot, answer_preparation: preparation })).ok).toBe(true);
+    for (const change of [{ reason_code: "private exception" }, { stage: "private stage" }, { attempt: 3 },
+      { attempt: true }, { max_attempts: 20 }, { retryable: "true" }, { provider_result: "private" }]) {
+      expect(validateAgentEvent(event(1, "session.snapshot", { ...snapshot, answer_preparation: { ...preparation, ...change } })).ok).toBe(false);
+    }
+    expect(validateAgentEvent(event(1, "session.snapshot", { ...snapshot, answer_preparation: { ...preparation,
+      status: "blocked", reason_code: "provider_billing_required", retryable: false } })).ok).toBe(true);
+  });
+
+  it("accepts durable understanding recovery on any active floor without relaxing snapshot scope", () => {
+    const snapshot = { ...candidateSnapshot(), current_turn_id: "turn_1" };
+    for (const status of ["retrying", "retry_required"]) {
+      const answer_preparation = { status, turn_id: "turn_1", capture_id: "capture_1" };
+      for (const floor of ["candidate", "agent", "none"]) {
+        expect(validateAgentEvent(event(1, "session.snapshot", { ...snapshot, floor, answer_preparation })).ok).toBe(true);
+      }
+      for (const change of [{ status: "paused" }, { current_turn_id: "turn_old" }, { calibration_status: "listening" }]) {
+        expect(validateAgentEvent(event(1, "session.snapshot", { ...snapshot, ...change, answer_preparation })).ok).toBe(false);
+      }
+      expect(validateAgentEvent(event(1, "session.snapshot", {
+        ...snapshot, answer_preparation: { ...answer_preparation, provider_result: "private" },
+      })).ok).toBe(false);
     }
   });
 });

@@ -77,9 +77,25 @@ class SensitiveMediaLogFilter(logging.Filter):
         return True
 
 
+class SensitiveWebSocketLogFilter(logging.Filter):
+    """WebSocket handshakes use uvicorn.error, not HTTP's access logger."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if (isinstance(record.msg, str) and '"WebSocket %s"' in record.msg
+                and isinstance(record.args, tuple) and len(record.args) >= 2):
+            values = list(record.args)
+            try:
+                values[1] = redact_sensitive_query(str(values[1]))
+            except ValueError:
+                values[1] = "/{redacted-invalid-target}"
+            record.args = tuple(values)
+        return True
+
+
 def install_sensitive_access_log_filter() -> None:
     for name, filter_type in (
         ("uvicorn.access", SensitiveQueryAccessLogFilter),
+        ("uvicorn.error", SensitiveWebSocketLogFilter),
         ("livekit", SensitiveMediaLogFilter),
     ):
         logger = logging.getLogger(name)

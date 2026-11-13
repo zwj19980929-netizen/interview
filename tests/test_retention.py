@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 
@@ -156,7 +157,11 @@ def test_candidate_purge_deletes_all_evidence_revisions_and_livekit_object_once(
                     "phone": "13800138000",
                     "metadata": {"secret": "value"},
                 },
-                "plan_snapshot": {"candidate_profile_id": "candidate_retention"},
+                "plan_snapshot": {
+                    "candidate_profile_id": "candidate_retention",
+                    "company_context": "组织公开业务介绍，不属于候选人回答。",
+                    "enterprise_skill_snapshot": {"skill_id": "organization_skill", "revision": 2},
+                },
                 "answers": [
                     {
                         "id": "answer_retention",
@@ -164,6 +169,8 @@ def test_candidate_purge_deletes_all_evidence_revisions_and_livekit_object_once(
                         "raw_transcript": "sensitive raw transcript",
                         "final_transcript": "sensitive final transcript",
                         "transcript_revisions": [{"text": "sensitive"}],
+                        "scoring_transcript": "必须清理的评分派生正文。",
+                        "non_scoring_spans": [{"start": 4, "end": 16, "quote": "必须清理的公司反问。"}],
                     }
                 ],
                 "turns": [
@@ -172,6 +179,11 @@ def test_candidate_purge_deletes_all_evidence_revisions_and_livekit_object_once(
                         "utterances": [{"text": "sensitive utterance"}],
                         "current_understanding": {"summary": "sensitive"},
                         "conversation_acts": [{"text": "sensitive echo"}],
+                        "company_question_exchanges": [{
+                            "transcript_prefix": "必须清理的完整技术回答前缀，然后提出公司问题。",
+                            "question_span": {"start": 0, "end": 12, "quote": "必须清理的公司反问。"},
+                            "reply": {"text": "本次给候选人的公司答复。"},
+                        }],
                     }
                 ],
                 "evaluation_revisions": [{"evidence": "sensitive"}],
@@ -310,6 +322,14 @@ def test_candidate_purge_deletes_all_evidence_revisions_and_livekit_object_once(
             assert file_object["checksum"] is None
         interview = transaction.interview_sessions.get("interview_retention")
         assert interview["turns"][0]["utterances"] == []
+        assert "company_question_exchanges" not in interview["turns"][0]
+        assert "scoring_transcript" not in interview["answers"][0]
+        assert "non_scoring_spans" not in interview["answers"][0]
+        serialized = json.dumps(interview, ensure_ascii=False)
+        for removed in ("必须清理的评分派生正文", "必须清理的公司反问", "必须清理的完整技术回答前缀"):
+            assert removed not in serialized
+        assert interview["plan_snapshot"]["company_context"] == "组织公开业务介绍，不属于候选人回答。"
+        assert interview["plan_snapshot"]["enterprise_skill_snapshot"] == {"skill_id": "organization_skill", "revision": 2}
         assert interview["agent_events"] == []
         events = [
             item

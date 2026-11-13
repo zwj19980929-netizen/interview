@@ -2,7 +2,7 @@ from typing import Any, Dict, Tuple
 
 import pytest
 
-from app.persistence.errors import ConcurrencyConflict
+from app.persistence.errors import ConcurrencyConflict, ReadOnlyViolation
 from app.persistence.interface import Persistence, new_work_item
 from app.persistence.provider import persistence_for
 from app.repositories.memory import InMemoryStore
@@ -47,6 +47,55 @@ def work(question_id: str = "q_contract", organization_id: str = "org_a") -> Dic
         idempotency_key="question.index:%s:1" % question_id,
         payload={"question_id": question_id},
     )
+
+
+def test_read_only_transaction_keeps_tenant_isolation_and_returns_detached_data(persistence_bundle):
+    store, persistence = persistence_bundle
+    with persistence.transaction("org_a") as transaction:
+        saved = transaction.questions.add(question())
+        queued = transaction.outbox.enqueue(work())
+    cached_question = store.questions[saved["id"]]
+    with persistence.transaction("org_a", read_only=True) as transaction:
+        current = transaction.questions.get(saved["id"])
+        assert current == saved
+        current["title"] = "local-only edit"
+        assert transaction.outbox.claimable()[0]["id"] == queued["id"]
+        assert transaction.database_now().tzinfo is not None
+    # A read must not rewrite or replace the compatibility cache.
+    assert store.questions[saved["id"]] is cached_question
+    with persistence.transaction("org_b", read_only=True) as transaction:
+        assert transaction.questions.get(saved["id"]) is None
+        assert transaction.outbox.get(queued["id"]) is None
+        assert transaction.outbox.claimable() == []
+    with persistence.transaction("org_a", read_only=True) as transaction:
+        assert transaction.questions.get(saved["id"])["title"] == saved["title"]
+
+
+@pytest.mark.parametrize("operation", ["insert", "update", "delete", "claim", "enqueue", "secret", "invocation"])
+def test_read_only_transactions_reject_mutation_without_poisoning_later_writes(persistence_bundle, operation):
+    _, persistence = persistence_bundle
+    with persistence.transaction("org_a") as transaction:
+        saved = transaction.questions.add(question())
+        queued = transaction.outbox.enqueue(work())
+    with persistence.transaction("org_a", read_only=True) as transaction:
+        writes = {
+            "insert": lambda: transaction.questions.add(question("q_new")),
+            "update": lambda: transaction.questions.update({**saved, "title": "changed"}, expected_version=1),
+            "delete": lambda: transaction.questions.delete(saved["id"], expected_version=1),
+            "claim": lambda: transaction.outbox.start(queued["id"]),
+            "enqueue": lambda: transaction.outbox.enqueue(work("q_new")),
+            "secret": lambda: transaction.provider_secrets.replace("synthetic_provider", {"api_key": "synthetic"}),
+            "invocation": lambda: transaction.model_invocations.append({"id": "inv_readonly", "organization_id": "org_a"}),
+        }
+        with pytest.raises(ReadOnlyViolation):
+            writes[operation]()
+        assert transaction.questions.get(saved["id"]) == saved
+        assert transaction.outbox.get(queued["id"])["attempt_count"] == 0
+    # SQLite query_only applies to the closed read connection, never the next
+    # write transaction. The original version and outbox attempt remain valid.
+    with persistence.transaction("org_a") as transaction:
+        assert transaction.questions.update({**saved, "title": "allowed"}, expected_version=1)["version"] == 2
+        assert transaction.outbox.start(queued["id"])["attempt_count"] == 1
 
 
 def test_transaction_is_atomic_and_tenant_scoped(persistence_bundle) -> None:

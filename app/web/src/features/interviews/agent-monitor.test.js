@@ -84,6 +84,57 @@ describe("enterprise takeover media contracts", () => {
     };
   });
 
+  it("keeps auxiliary dialogue degradation separate from monitor problems and conversation acts", async () => {
+    const socket = new FakeSocket();
+    const monitor = createEnterpriseInterviewMonitor({ socketFactory: () => socket,
+      request: async () => ({ agent_ticket: "synthetic", agent_ws_url: "/agent",
+        media: { status: "ready", url: "wss://livekit.test", participant_token: "synthetic-observer" } }) });
+    const run = await monitor.open({ interviewId: "iv_1", actorId: "admin", canTakeover: false });
+    try {
+      const emit = (value) => socket.emit("message", { data: JSON.stringify(value) });
+      emit(agentEvent(1, "session.snapshot", enterpriseSnapshot()));
+      emit(agentEvent(2, "problem", { code: "UNDERSTANDING_RETRY_EXHAUSTED", message: "synthetic", recoverable: true }));
+      const before = run.getSnapshot();
+      const sent = [...socket.sent];
+      const notice = { ...agentEvent(3, "capability.degraded", { capability: "speech.dialogue_realtime", fallback: "cascade",
+        reason_code: "provider_dialogue_input_overflow", capture_id: "capture_current" }),
+        turn_id: "turn_1", replayability: "transient" };
+      emit(notice);
+      emit(notice);
+      emit({ ...notice, event_id: "old_scope_notice", session_sequence: 4, turn_id: "turn_old",
+        payload: { ...notice.payload, capture_id: "capture_old" } });
+      expect(run.getSnapshot()).toEqual(before);
+      expect(socket.sent).toEqual(sent);
+      expect(rooms).toHaveLength(1);
+      expect(rooms[0].disconnect).not.toHaveBeenCalled();
+      emit({ ...agentEvent(5, "transcript.partial", { text: "合成新增片段", confidence: 0.9 }), turn_id: "turn_1" });
+      expect(run.getSnapshot().captions).toEqual([{ text: "合成新增片段", final: false, turnId: "turn_1" }]);
+      expect(run.getSnapshot().problem).toEqual(before.problem);
+    } finally { await run.close(); }
+  });
+
+  it("updates the current question immediately on a followup act and retains it through repeat", async () => {
+    const socket = new FakeSocket();
+    const monitor = createEnterpriseInterviewMonitor({ socketFactory: () => socket,
+      request: async () => ({ agent_ticket: "synthetic", agent_ws_url: "/agent",
+        media: { status: "ready", url: "wss://livekit.test", participant_token: "synthetic-observer" } }) });
+    const run = await monitor.open({ interviewId: "iv_1", actorId: "admin", canTakeover: false });
+    let state;
+    const unsubscribe = run.subscribe(value => { state = value; });
+    try {
+      socket.emit("message", { data: JSON.stringify(agentEvent(1, "session.snapshot", enterpriseSnapshot())) });
+      socket.emit("message", { data: JSON.stringify({ ...agentEvent(2, "conversation.act.selected",
+        { act_id: "follow", act_type: "followup", text: "追问当前方案的回滚边界", approved: true }), turn_id: "child" }) });
+      expect(state.session).toMatchObject({ current_turn_id: "child", current_question: { turn_id: "child", is_followup: true, question_text: "追问当前方案的回滚边界" } });
+      socket.emit("message", { data: JSON.stringify({ ...agentEvent(3, "conversation.act.selected",
+        { act_id: "repeat", act_type: "repeat", text: "追问当前方案的回滚边界", approved: true }), turn_id: "child" }) });
+      expect(state.session.current_question.is_followup).toBe(true);
+      socket.emit("message", { data: JSON.stringify({ ...agentEvent(4, "conversation.act.selected",
+        { act_id: "ack", act_type: "conversation_acknowledgement", text: "我在听", approved: true }), turn_id: "child" }) });
+      expect(state.session.current_question.question_text).toBe("追问当前方案的回滚边界");
+    } finally { unsubscribe(); await run.close(); }
+  });
+
   it("keeps the base room subscribe-only and exchanges an active lease for microphone media", async () => {
     const socket = new FakeSocket();
     const audioTrack = { stop: vi.fn() };

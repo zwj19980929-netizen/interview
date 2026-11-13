@@ -12,3 +12,7 @@ class RecordNotFound(PersistenceError):
 
 class ConcurrencyConflict(PersistenceError):
     pass
+
+
+class ReadOnlyViolation(PersistenceError):
+    """A read-only transaction attempted a state-changing operation."""

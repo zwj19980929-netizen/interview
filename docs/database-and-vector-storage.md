@@ -1,5 +1,84 @@
 # 数据库与向量存储设计
 
+## 098：辅助降级事件与当前纠错状态
+
+capability.degraded沿现有Agent事件瞬时投影批准能力、替代路径、固定原因和capture标识；它为TRANSIENT，不保存到agent_events历史、不新增快照字段，仅沿既有事件流程更新序号/时间。候选投影不包含供应商正文。纠错原因与来源绑定仍仅进程内，不增加持久授权或表/DDL；语义合同审计新增v11/v12，原版本继续读取。辅助输入数值诊断只进入既有安全日志，不保存PCM、Prompt或失败响应。历史面试、答案、录制和评分不改写。
+
+## 096：语义完成证明仅限当前进程
+
+新增语义完成证明及组合收据不写入数据库，不作为可序列化提交许可；重启、capture或控制权变化后必须重新通过当前证据与状态门禁。完整原录音、转写、正式答案和评分保存方式保持，不截掉候选附言或修改历史资料。模型调用审计允许补充分类v9/v10版本；不保存完整失败响应，不新增表、迁移或向量字段。
+
+## 095：澄清恢复与诊断兼容
+
+既有 `agent_runtime.answer_preparation` JSON 增加 `clarifying` 状态，只保存当前turn/capture及安全恢复事实；仍由快照权限过滤，不迁移或补写历史Answer、Understanding和评分。新准备覆盖旧澄清，普通发言权归还保持当前恢复提示。模型调用日志可选增加请求格式、JSON解析枚举/位置，公司合同子原因仅在安全诊断白名单记录，不落响应正文。新增Prompt版本加入历史读取白名单；没有DDL、表、索引或向量检索变更。模型配置/路由如需新增，须通过正常管理API、合成语音测试和健康指纹流程，不能直接修改数据库绕过审计。
+
+## 094：模型调用的安全解析分类
+
+既有`model_invocations.data`新增可空`json_failure_kind`和`content_length`，前者严格限制为`empty_content/invalid_json_object`，后者为0–10000000的严格整数。沿现有组织隔离和JSON文档写入，无新表、索引或DDL。历史缺失诊断保留为空，不能倒推原响应；不保存原始模型正文，也不回填或改写历史面试、答案、评分及音频。
+
+## 090：兼容的文档字段
+
+新计划的v2冻结合同含assessment_scope；会话可选candidate_input_completion_detail记录真实预算触发，媒体capture可选finalization_error记录安全分类。全部沿现有组织隔离的document存储与版本事务，无表/索引迁移，旧文档不回填。指定录像恢复仅沿Outbox原幂等身份重放封存，不能直接改completed或重写回答/评分/报告。
+
+
+089：既有InterviewSession JSON新增可选`execution_question_budget`，以及预算应用生命周期事件、v2未考察原因；选题收据保留`selection_strategy`和`fallback_reason`安全诊断。均走组织事务及原版本比较，没有新表、索引或DDL；历史终态和冻结合同不批量迁移。连接级`completion_presentation=closing`只在实时投影出现，不持久化，也不授权新连接恢复作答。
+
+079：非流式ModelInvocation终态审计补`cancelled`及可选安全关联/时间/取消字段，沿用现有JSON持久化与组织事务，无新表、索引或DDL。开始事件只写结构化运行日志，避免将一次attempt重复统计为两次调用；取消不表示成功计费或供应商故障。历史调用审计不回填猜测原因，不修改候选音频、回答或评分。验证证据见[操作日志079](change-log.md)。
+
+078（仓库与本机已验证）：既有InterviewSession JSON中的answer_preparation增加blocked和白名单失败诊断；新evidence.retry_processing沿原命令幂等、租约及当前capture/control校验。准备组合证明仅在进程内，提交仍以原事务验证权威final和上下文，不新增表或迁移。详见[078](answer-recovery-and-reuse-078.md)。
+
+077（仓库已验证）：试音确认逐帧守卫禁止读事务内嵌套开启独立写事务的控制权检查。SQLite默认回滚日志模式下，内层BEGIN IMMEDIATE可成功，但commit仍会等待外层读锁；增加超时不能修复自等待。独立controller检查移出会话事务，事务内原owner/control/校准版本核验保留，不修改journal_mode、锁等待配置、DDL或业务记录。真实临时SQLite已验证Evidence试音生命周期、缓存命中/未命中、实际PCM播放与显式确认，原始现场库只读。用户授权后，运行后端已于2026-10-20T01:09Z加载077；所有原面试业务摘要保持一致。
+
+075（已实现）：既有InterviewSession JSON聚合新增可空`agent_runtime.question_audio_recovery`，引用原批准行为和选择收据，使用原事务/CAS，不增加表或索引。固定提示只缓存白名单完整PCM于有界进程内存，不写会话转写、不产生共享私有文件访问许可，无数据库迁移。缓存配置更新、过期、损坏或进程重启均视为miss，不修改真实会话或评分数据。
+
+074：实时媒体只读投影增加已有 `agent_runtime.calibration_status` 和 `calibration_updated_at`，供试音确认输出核对新确认/重试边界；SQLite/PostgreSQL 在查询中投影字段，不能因守卫新增整份历史解码。内存与 SQLite 通过更新后即时读取及大历史体积限制回归，PostgreSQL 查询形状经合同验证；无 DDL 或数据迁移。见[074说明](warmup-tts-resilience-074.md)。
+
+## 067：耐久交流收据
+
+InterviewSession 聚合内每个已审批 ConversationAct 增加内部 `selection_receipts`，最多保留该 act 最近 8 次选择；每条存 event/turn/act/sequence/时间/文字 SHA256 及绑定 performance 的送达状态。与选中事件同一事务写入，独立于 1000 条客户端重放窗口。向 ApprovedConversationAct 表达合同投影时去掉内部收据，其余额外字段仍严格拒绝；旧聚合可从原 selected event 读取，不能伪造已送达。没有新表或迁移，组织隔离、CAS 与媒体逐帧权限守卫保留。详见[067说明](agent-chain-improvements-067.md)。
+
+## 056：实时媒体守卫最小投影
+
+`InterviewSessionRepository.realtime_state(interview_id)` 每次读取当前持久化记录，只返回组织/版本/状态/当前题目、输入完成标记、播放守卫需要的 runtime 字段、完整 Skill 身份快照，以及数组中最后一个 `conversation.act.selected` 的事件 ID、act ID 和原始 approved 布尔值。它不是完整会话，不得用于保存或生命周期变更。SQLite/PostgreSQL 在数据库内投影后才交给 Python 解码，Memory 保持相同字段与隔离语义；不读取答案、简历、题库、对话正文或整个历史对象。没有新增持久化字段、授权缓存或迁移。
+
+每帧的 owner lease、组织、状态、turn、floor、performance 和最新 selected act 检查次数保持不变；Skill 仍在同一只读事务中独立读取当前授权，不能仅相信冻结快照。新事务可以立即看到其他实例已提交的暂停、换题、接管、表达替换或 Skill 撤销。最后事件按持久数组顺序选择，即便其 approved=false 也不得退回先前批准事件；JSON true 与数字 1 不可互换。仅由此投影做终态轮询与播放校验，写事务仍使用完整聚合和原 CAS/租约合同。
+
+## 053：Evidence 命令按会话查询
+
+`EvidenceCommandRepository.list_unsettled(interview_id)` 是实时命令轮询的读取接口：backend 必须按当前组织、精确 interview ID、`pending/running` 状态筛选后再反序列化，不能通过 `list_documents` 读取全部历史命令。Repository 对返回的少量候选再次校验组织、会话和状态，保留防御性租户边界。Memory/SQLite/PostgreSQL 保持同一筛选语义；只读 transaction 允许此查询。`has_unsettled` 使用相同定向查询，历史 completed/rejected/failed/expired 命令仍保留用于审计和幂等查询。
+
+SQLite 初始化增加 `idx_evidence_commands_unsettled` 部分索引，键为 JSON 中的 organization/interview；PostgreSQL 新增 `migrations/006_evidence_command_poll.sql`，索引 organization 列与 JSON interview，继续保留 documents 的 RLS。两者部分条件均为 evidence_commands 集合的 pending/running 行。SQLite 在正常 schema 初始化时幂等创建；PostgreSQL 由迁移角色按既有流程执行，不由业务连接执行 DDL，启动 schema 验证要求该索引存在。
+
+查询结果只是待核验候选，不授予执行权。`claim_next` 仍在同一写事务中先校验/锁定 owner lease，再锁选中命令并核验当前状态、deadline、control generation、available/claim expiry、版本与 claim ID。排序仍由 journal 执行。时间和租约判断保留在领域层，避免 SQL 比较改变旧缺失/异常时间按 due 处理或过时代次必须拒绝的既有语义；不提高轮询间隔，不清理历史记录。Memory 的事务快照仍遵循原回滚合同，本改动只减少 SQL 热路径的历史扫描与解析。
+
+本地组合验收：仅将 3353 条既有命令及必要记录复制到进程内 SQLite，源库全程只读，合成 6 秒 PCM 经随机 LiveKit 房间发送，同时每 20ms 执行一次空命令轮询与完整 owner/session/Skill 读取守卫。全量历史读取使 6 秒音频耗时 12.409 秒；定向索引查询为 6.016 秒，两组均收齐 144000 个样本，未放松每帧和真正启动输出前的守卫。轮询 p50 从 74.085ms 降至 1.557ms，事件循环延迟 p95 从 98.317ms 降至 7.625ms。测试不领取真实命令，不产生候选答案或评分，临时房间和内存副本已清理。Memory/SQLite 回归及 PostgreSQL SQL/迁移合同已通过；真实 PostgreSQL/RLS 部署联调仍需环境验收，不能以本地 SQL 合同测试替代。
+
+## 051：只读任务扫描与写事务分离
+
+`Persistence.transaction(organization_id, read_only=True)` 用于读取已提交的持久状态，不获得可写工作区；默认仍为原写事务。SQLite 以 `BEGIN` 和连接级 `query_only` 读取，避免周期 dispatcher 只查待执行工作却抢占 `BEGIN IMMEDIATE` 写锁。PostgreSQL 只读事务不为查询附加 `FOR UPDATE`；Memory 保持同一禁止写入合同。组织隔离仍由 transaction/repository 边界执行。
+
+Dispatcher 只发现可执行任务并发送其 ID，读到的结果不是领取授权；真正执行时仍通过原写事务的 claim/version/lease 规则保证并发与幂等。只读模式不能写文档、凭据、模型调用或 Outbox，退出后不影响后续写事务。未改变 SQLite 的默认锁等待时间，不以扩大超时替代减少无意义写锁。
+
+## 2026-09-10 · 组织级面试定制（044）
+
+新增通用文档集合interview_customizations，组织内唯一记录，id等于organization_id。字段含version、default_skill_id、sealed_company_profile、content_hash、has_company_profile、创建/更新操作者及时间。公司四字段经组织绑定JSON封装后加密，读取校验租户与内容hash；has_company_profile仅表示是否填写，使无资料的新面试不必解密空内容。GET编辑仍校验正文；审计只含模块名、版本、Skill标识等元数据。Skill revision与配置expected_version更新在同一事务，失败一起回滚。
+
+Memory/SQLite和PostgreSQL repository均注册该集合；`migrations/005_interview_customization.sql`在现有documents RLS下增加组织唯一索引和结构约束。部署PostgreSQL需按序应用003、004、005并验证真实数据库；本机SQLite不执行这些DDL，不把迁移静态检查当成生产通过。计划JSON增加customization_version及既有Skill/公司快照，历史数据不迁写。新增问答前缀、问题范围、评分派生转写按候选人原有保留期同步清理，组织级公司事实与Skill历史引用不因此删除。
+
+## 2026-09-10 · 自由Skill与可选公司文本（039）
+
+新Skill包保存为active版本，继续复用加密Skill文档集合、不可变内容revision、CAS和组织隔离；`migrations/004_optional_interview_skills.sql`扩展状态约束，003迁移历史不改写。旧approved/retired版本与已冻结快照仍可读取，compiler按实际schema/版本校验，不能因039升级而误撤销旧版本。
+
+计划与会话聚合JSON增加可选company_context文本；空白不存储，非空仅供本场权限范围读取并参与上下文指纹，候选人白名单投影不返回全文。Skill输入skill_id映射现有快照身份，不双写两套可漂移的内容真相。不迁改历史面试、评分或候选媒体，也不因可选项缺省引入新的外部基础设施前置要求。
+
+## 2026-09-10 · Skill与自适应会话持久化（038）
+
+新增interview_skills与interview_skill_revisions受保护文档集合；Memory/SQLite/PostgreSQL适配器登记允许集合，revision内容不可变，正文和资源为字段密文。PostgreSQL新增migrations/003_interview_skills.sql，配置索引与租户保护；部署先运行迁移。草稿生成即冻结精确批准Skill，后续批准复核同revision而不选择最新版本。列表/审计及计划快照只含身份、hash、编译版本、授权epoch等必要元数据，不包含正文。
+
+v3 assessment_contract及企业Skill精确快照继续存于计划/会话聚合JSON，实际选择才追加question_snapshot/QuestionSelection/turn，保存presented_unit_ids与assessed_rubric_point_ids。决策revision、输入结束原因、覆盖及安全回执与生命周期/Outbox同事务保存。记忆从权威证据派生，不建立另一套框架checkpointer或跨候选个人向量库；现有向量检索不成为实时规划的强依赖。
+
+Skill撤销按稳定会话锁序再锁Skill/revision，原子推进epoch、阻止旧授权并暂停绑定活动会话；并发绑定冲突失败关闭并返回409，通知/媒体清理在事务之后执行，失败可重试而不撤销已经提交的授权变更。规划最终提交复核同一事务内授权、owner和控制代次。具体字段与并发合同见[Skill API](interview-skills-api.md)和[自适应合同](adaptive-interview-contract.md)。本轮不改写历史候选回答、评分或媒体；真实PostgreSQL/RLS外部验收与本地适配器测试分开记录。
+
 ## 2026-09-10 · 诊断与完整语音来源（034）
 
 既有ModelInvocation JSON增加可选schema_reason/schema_path元数据，只记录校验规则代码和schema路径，不持久化被拒绝值/完整Prompt/响应。既有FileObject JSON的source_type增加tts_complete_pcm，沿用agent_expression_audio、组织/面试/题目归属、私有存储checksum与加密门禁。仅在验证完整final+EOF后写ready；取消或格式失败不写入资产。无DDL迁移，不修改历史回答、评分或冻结题库语音。
@@ -519,6 +598,13 @@ finish/token 诊断；活动进度、后续 merge 和停止/恢复只处理替�
 
 ## 迁移与验收要求
 
+054 实时巡检使用存储端按组织筛选的 `InterviewSessionRepository.watchdog_candidates(kind)`：
+`takeover` 只读取保留接管 lease 且未从列表移除的会话；`deadline` 只读取未完成候选人输入的 scheduled/waiting/in_progress/paused 会话。
+SQLite 与 PostgreSQL 增加部分索引，历史完成面试不再在音频事件循环内整批反序列化。
+候选查询与无任务检查采用只读事务；查询结果不构成状态变更许可，实际 lease 消费、截止关闭与命令领取仍在写事务内重新读取、校验数据库时钟/版本/所有权。
+截止巡检按会话事务提交，单场失败由后续周期重试；不把已完成输入或重新延长预约的会话按过期候选结果关闭。
+该优化不删除历史记录、不缓存播放授权，也不改变候选人 API。
+
 切换 PostgreSQL/对象存储时必须保持：
 
 - API 资源和状态语义不变，service 不直接依赖数据库或对象存储 SDK。
@@ -546,3 +632,7 @@ finish/token 诊断；活动进度、后续 merge 和停止/恢复只处理替�
 明确无 final 的采集使用现有 `transcription.started/failed` 生命周期事实与同事务 stream CAS；归档元数据增加 `reason=transcript_unavailable`、`untranscribed_audio_uri`，录音继续受既有留存/访问控制约束，不增加虚构 utterance。Evidence command payload 允许经长度/字符校验的 `capture_id` 和（仅自动 seal）`endpoint_id`，作为迟到计时命令的作用域证据；它们不能代替数据库 owner fence 或媒体 checkpoint。无需 DDL 迁移。
 
 Memory、SQLite 与 PostgreSQL 通用 documents/RLS adapter 已实现上述 collection 合同。数据库时钟 ownership lease、单调 epoch、control generation、CandidateAnswer 事务 commit fence 与持久 command submit/claim/result journal 已由连接无关 owner executor 执行：数据库 polling 是正确性路径，Redis 只作 wake hint，remote controller 只等待 terminal receipt。LiveKit subscriber、StreamingSTTSession 与端点 timer 是当前 owner 的进程态，但新 owner 可从已 seal 的私有 segment/checkpoint 重建并执行 batch repair；未 seal 的内存后缀不冒充已持久化证据，必要时只接受服务端授权 sequence gap 内的浏览器私有 backfill。目标 PostgreSQL/RLS 并发、Redis/LiveKit 故障注入和真实 Egress 对象一致性仍必须由绑定当前 release 的外部验收报告证明，因此实时 Agent 状态继续为 `in_progress`。
+
+## FOLLOWUP-CONTEXT-055：持久对话引用与评分版本
+
+现有InterviewSession文档增加可选turn.dialogue_focus（已选中可播放澄清act_id）及answer.pending/current_evidence_fingerprint；不增加表/索引，不迁移旧会话。Outbox的evidence_fingerprint为入队快照，评分执行从当前持久答案计算input_fingerprint并在提交前重验；变化时保留旧评分、可观察有界重试。report版本冻结独立父子Q/A与来源引用。原始音频、服务端转写以及更正历史仍分开保留。

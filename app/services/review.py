@@ -7,9 +7,10 @@ from typing import Any, Dict, Optional
 from app.core.errors import ApiError
 from app.core.ids import new_id
 from app.core.time import utc_now
-from app.domain.scoring_quality import evaluation_answers, project_evaluation, project_report
+from app.domain.scoring_quality import is_unresolved_evaluation, evaluation_answers, project_evaluation, project_report
 from app.domain.speech_quality import transcript_is_verified
 from app.domain.interview_lifecycle import LifecycleCommand, LifecycleCommandType
+from app.domain.interview_completion import completion_projection, presented_question_counts
 from app.file_storage.signing import FileAccessSigner
 from app.file_storage.provider import private_file_storage
 from app.file_storage.interface import PrivateFileStorage
@@ -48,7 +49,7 @@ class EnterpriseReviewService:
                             if item.get("interview_id") == interview_id), None)
             works = [item for item in transaction.outbox.list()
                      if item.get("payload", {}).get("interview_id") == interview_id]
-        recording = self._recording_projection(capture)
+        recording = self._recording_projection(capture, works)
         turns = []
         for turn in sorted(interview.get("turns", []), key=lambda item: item["order"]):
             answer = answers.get(turn["id"])
@@ -64,6 +65,13 @@ class EnterpriseReviewService:
             turns.append(
                 {
                     "turn_id": turn["id"],
+                    "parent_turn_id": turn.get("parent_turn_id"),
+                    "root_turn_id": turn.get("root_turn_id") or turn["id"],
+                    "followup_depth": int(turn.get("followup_depth", 0)),
+                    "question_text": (turn.get("question_spoken_text") or turn["question_snapshot"].get("spoken_text")
+                                      or turn["question_snapshot"].get("question_text", "")),
+                    "question_spoken_text": (turn.get("question_spoken_text") or turn["question_snapshot"].get("spoken_text")
+                                             or turn["question_snapshot"].get("question_text", "")),
                     "phase": turn.get("phase", "position_bank"),
                     "status": turn["status"],
                     "skip_reason": turn.get("skip_reason"),
@@ -71,6 +79,10 @@ class EnterpriseReviewService:
                     "answer": answer_projection,
                     "evaluation": deepcopy(evaluation),
                     "is_followup": bool(turn.get("is_followup")),
+                    "competency_ids": deepcopy(turn.get("competency_ids", [])),
+                    "assessed_rubric_point_ids": deepcopy(turn.get("assessed_rubric_point_ids", [])),
+                    "presented_unit_ids": deepcopy(turn.get("presented_unit_ids", [])),
+                    "inquiry_unit_id": turn.get("inquiry_unit_id"),
                     "order": turn.get("order"),
                     "playback": self._turn_playback(turn, answer, capture),
                 }
@@ -87,6 +99,19 @@ class EnterpriseReviewService:
             "candidate": deepcopy(interview["candidate"]),
             "position_id": interview.get("plan_snapshot", {}).get("job_position_id"),
             "status": interview["status"],
+            "execution_schema_version": interview.get("execution_schema_version") or interview.get("plan_snapshot", {}).get("execution_schema_version", 2),
+            "candidate_input_completion_reason": interview.get("candidate_input_completion_reason"),
+            "completion": completion_projection(interview),
+            "question_counts": presented_question_counts(interview),
+            "planning": {
+                "last_decision": {key: deepcopy(value) for key, value in
+                    (interview.get("agent_runtime", {}).get("last_planning") or {}).items()
+                    if key in {"decision_id", "reason_code", "tools_used", "model_calls", "prompt_version", "context_hash"}},
+                "decisions": [{key: deepcopy(value) for key, value in item.items()
+                    if key in {"decision_id", "kind", "revision", "committed_at", "question_id", "inquiry_unit_id",
+                               "reason", "reason_code", "tools_used", "model_calls", "prompt_version", "context_hash", "request_hash"}}
+                    for item in interview.get("adaptive_decision_receipts", [])[-100:]],
+            },
             "turns": turns,
             "report": deepcopy(report),
             "review_completion": deepcopy(interview.get("review_completion")),
@@ -124,14 +149,44 @@ class EnterpriseReviewService:
                 "report_status": status, "can_retry": bool(failed or interview.get("status") == "report_failed")}
 
     @staticmethod
-    def _recording_projection(capture):
+    def _recording_projection(capture, works=()):
         if not capture:
-            return {"status": "unavailable", "available": False, "consented_scopes": []}
-        return {"status": capture["status"], "available": bool(capture.get("status") == "completed"
-                and capture.get("content_hash") and capture.get("byte_count") and capture.get("storage_protection")),
+            return {"status": "unavailable", "available": False, "consented_scopes": [],
+                    "processing_status": "unavailable", "failure_reason": None, "can_retry": False}
+        available = bool(capture.get("status") == "completed" and capture.get("content_hash")
+                         and capture.get("byte_count") and capture.get("storage_protection"))
+        work = next((item for item in works if item.get("kind") == "interview.media.finalize"
+                     and item.get("payload", {}).get("capture_id") == capture["id"]), None)
+        error = capture.get("finalization_error") or {}
+        active = bool(work and (work.get("status") in {"pending", "running"}
+                      or work.get("status") == "failed" and work.get("error_retryable") is not False))
+        dead_letter = bool(work and work.get("status") == "dead_letter")
+        exhausted = bool(dead_letter and work.get("error_retryable") is not False
+                         and int(work.get("attempt_count", 0)) >= int(work.get("max_attempts", 8)))
+        failure = bool(capture["status"] == "failed" or (not active and (error or dead_letter
+                       or work and work.get("status") == "failed")))
+        code = error.get("code") or capture.get("failure_code") or (work or {}).get("last_error_code")
+        codes = {"recording_configuration_invalid", "recording_binding_invalid", "recording_protection_unverified",
+                 "recording_provider_unauthorized", "recording_provider_unavailable", "recording_finalization_failed",
+                 "recording_finalization_pending", "recording_capture_failed", "egress_provider_failed"}
+        code = code if code in codes else ("recording_finalization_failed" if failure else None)
+        category = error.get("category")
+        reason = category if category in {"configuration", "integrity", "provider", "unknown"} else None
+        if reason not in {"configuration", "integrity"} and exhausted:
+            reason = "retry_exhausted"
+        if failure and not reason:
+            reason = "provider" if code == "egress_provider_failed" else "unknown"
+        if capture["status"] == "completed" and not available:
+            reason = "integrity"
+        state = "completed" if available else "failed" if failure or capture["status"] == "completed" else (
+            "unavailable" if capture["status"] in {"cancelled", "retention_purged"} else "processing")
+        return {"status": capture["status"], "available": available,
                 "consented_scopes": capture.get("consented_scopes", []),
                 "hash_verified": bool(capture.get("status") == "completed" and capture.get("content_hash")),
-                "storage_protection": capture.get("storage_protection"), "failure_code": capture.get("failure_code")}
+                "storage_protection": capture.get("storage_protection"), "failure_code": code,
+                "processing_status": state, "failure_reason": reason if state == "failed" else None,
+                "can_retry": bool(state == "failed" and capture["status"] in {"recording", "stopping", "hash_pending"}
+                                  and reason not in {"configuration", "integrity"})}
 
     @staticmethod
     def _turn_playback(turn, answer, capture):
@@ -218,7 +273,8 @@ class EnterpriseReviewService:
                    if (item.get("root_turn_id") or item["turn_id"]) == root):
                 raise ApiError("TRANSCRIPTION_REVIEW_BUSY", "本题正在评分，请等待后刷新。", status_code=409)
             revisions = answer.setdefault("transcript_revisions", [])
-            revision = max([int(item["revision"]) for item in revisions], default=0) + 1
+            revision = max(int(answer.get("current_transcript_revision", 1)),
+                           max([int(item["revision"]) for item in revisions], default=0)) + 1
             now = utc_now()
             revisions.append(
                 {
@@ -361,6 +417,9 @@ class EnterpriseReviewService:
             if interview is None:
                 raise ApiError("INTERVIEW_NOT_FOUND", "Interview does not exist.", status_code=404)
             evaluations = {item["id"]: item for item in interview.get("evaluation_revisions", [])}
+            if any(is_unresolved_evaluation(evaluations.get(answer.get("current_evaluation_id")) or {})
+                   for answer in interview.get("answers", [])):
+                raise ApiError("REVIEW_EVIDENCE_UNRESOLVED", "部分回答的转写仍待核实，请先回听录音、核验转写并完成重评，再完成复核。", status_code=409)
             if any(answer.get("evaluation_status") != "completed"
                 or (evaluation := evaluations.get(answer.get("current_evaluation_id"))) is None
                 or project_evaluation(evaluation, evaluation_answers(interview, evaluation))["score"] is None

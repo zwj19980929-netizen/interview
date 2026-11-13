@@ -147,24 +147,47 @@ def test_multiple_thinking_pauses_reuse_one_stt_and_commit_all_pcm_exactly_once(
     asyncio.run(scenario())
 
 
-def test_final_tail_revision_is_reunderstood_without_reopening_an_empty_stt(tmp_path, monkeypatch):
+def test_final_tail_revision_keeps_asr_open_during_reasoning_and_seals_once(tmp_path, monkeypatch):
     async def scenario():
         state = _ControlledTranscript()
         state.final_extra = _SUFFIX
         inputs = []
+        entered, release = asyncio.Event(), asyncio.Event()
         original_prepare = InterviewEvidenceChain.prepare_decision
 
         async def inspect_prepare(chain, transcript):
             inputs.append((type(transcript).__name__, transcript.text))
-            return await original_prepare(chain, transcript)
+            decision = await original_prepare(chain, transcript)
+            if isinstance(transcript, StreamingSTTEvent):
+                entered.set()
+                await release.wait()
+            return decision
 
         monkeypatch.setattr(InterviewEvidenceChain, "prepare_decision", inspect_prepare)
         async with _controlled_session(tmp_path, monkeypatch, state) as (store, runtime, channel, managed):
+            capture_id = managed._capture_id
             await _feed(managed._ingress, _VOICE, 10)
-            await _settled_answer(store, runtime, managed._ingress)
+            await _feed(managed._ingress, _SILENCE, 1)
+            await _wait_until(entered.is_set)
+            _no_domain_answer(store, runtime)
+            assert state.finishes == 1 and len(state.raw_streams) == 2
+            assert state.raw_streams[0].closed and not state.raw_streams[1].closed
+            assert state.raw_streams[1].byte_count == 0
+            assert managed._capture_id == capture_id and managed.chain.is_open
+            # No new speech arrived during this slow inference. The reopened
+            # stream is ready to receive it, but must not fabricate another
+            # provider final or seal the earlier prefix before revalidation.
+            await asyncio.sleep(0.05)
+            _no_domain_answer(store, runtime)
+            assert not state.raw_streams[1].closed
+            release.set()
+            await _wait_until(lambda: len(_current(runtime)["answers"]) == 1)
+            await _wait_until(lambda: all(command["status"] == "completed"
+                                         for command in store.evidence_commands.values()))
             assert inputs == [("StableTranscriptPreview", _PREFIX), ("StreamingSTTEvent", _PREFIX + _SUFFIX)]
             assert state.understood == [_PREFIX, _PREFIX + _SUFFIX]
-            assert state.finishes == 1 and len(state.raw_streams) == 1
+            assert state.finishes == 1 and len(state.raw_streams) == 2
+            assert state.raw_streams[1].closed
             _assert_one_automatic_answer(store, runtime, _PREFIX + _SUFFIX, voice_frames=10)
 
     asyncio.run(scenario())
@@ -193,10 +216,10 @@ def test_late_stable_sentence_reconsiders_same_quiet_audio_revision_without_a_cu
     asyncio.run(scenario())
 
 
-def test_new_voice_revokes_preview_preparation_without_cutting_or_losing_tail(tmp_path, monkeypatch):
+def test_new_voice_revokes_preview_progress_but_retains_bounded_analysis_without_losing_tail(tmp_path, monkeypatch):
     async def scenario():
         state = _ControlledTranscript()
-        entered, cancelled = asyncio.Event(), asyncio.Event()
+        entered, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
         original_prepare = InterviewEvidenceChain.prepare_decision
         calls = 0
 
@@ -207,7 +230,7 @@ def test_new_voice_revokes_preview_preparation_without_cutting_or_losing_tail(tm
             if calls == 1:
                 entered.set()
                 try:
-                    await asyncio.Event().wait()
+                    await release.wait()
                 except asyncio.CancelledError:
                     cancelled.set()  # late successful upstream return must be fenced
             return decision
@@ -218,9 +241,22 @@ def test_new_voice_revokes_preview_preparation_without_cutting_or_losing_tail(tm
             await _silence_until(managed._ingress, entered.is_set)
             _no_domain_answer(store, runtime)
             assert state.finishes == 0
+            endpoint = managed._answer_endpoint
+            preparation = endpoint._confirmed_preparation
+            deadline = endpoint._confirmed_preparation_deadline
+            revision = endpoint.revision
             state.tail = True
             await _feed(managed._ingress, _CONTINUATION, 10)
-            await _wait_until(cancelled.is_set)
+            assert endpoint.revision > revision
+            assert endpoint._proposal_revision != endpoint.revision
+            assert endpoint._confirmed_preparation is preparation and not preparation.done()
+            assert endpoint._confirmed_preparation_deadline == deadline
+            assert not cancelled.is_set()
+            release.set()
+            await asyncio.wait_for(asyncio.shield(preparation), 1)
+            # Even an upstream success arriving after acoustic revocation
+            # cannot seal the stale prefix while newer audio has an ASR tail.
+            assert not cancelled.is_set()
             _no_domain_answer(store, runtime)
             assert state.finishes == 0 and len(state.raw_streams) == 1
             state.append(_SUFFIX)

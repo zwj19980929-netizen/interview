@@ -1,0 +1,369 @@
+"""Real owner/STT/act/TTS/playback path with only synthetic provider inputs."""
+import asyncio
+import json
+
+import pytest
+
+from app.core.prompt.conversation_reception import RECEPTION_SPEECH
+from app.domain.interview_agent import ClientSignal
+from app.model_gateway.schemas import ChatJSONResponse, ProviderMeta, Usage
+from app.persistence.provider import persistence_for
+from app.providers.mock.provider import MockProvider
+from test_answer_endpoint import _Clock
+from test_automatic_turn_integration import _automatic_session, _current, _feed, _VOICE, _CONTINUATION
+from test_evidence_owner_recovery_integration import ORGANIZATION_ID, TURN_ID, _wait_until
+from test_spoken_supplement_integration import _synthetic_tts, _finish_playback
+
+
+def reception_provider(monkeypatch, kind, *, release=None, reply_text=None, full_thinking=False):
+    original = MockProvider.invoke
+    calls = []
+
+    async def invoke(provider, capability, request, context):
+        if request.metadata.get("prompt_version") != "conversation_reception.v10":
+            response = await original(provider, capability, request, context)
+            version = str(request.metadata.get("prompt_version") or "")
+            if full_thinking and version.startswith(("interview_turn_understanding.", "interview_turn_decision.")):
+                response = response.model_copy(deep=True)
+                data = response.data.get("understanding", response.data)
+                data.update(intent="not_finished", answer_content="none", turn_intent="thinking",
+                            claims=[], covered_point_ids=[], completion_basis=None,
+                            followup_allowed=False, suggested_action="continue_listening")
+                if "followup" in response.data:
+                    response.data["followup"]["selected"] = False
+            return response
+        value = json.loads(request.messages[-1].content)
+        calls.append(value)
+        if release:
+            await release.wait()
+        return ChatJSONResponse(data={"kind": kind, "confidence": .98,
+            "evidence_id": next(iter(value["evidence"])),
+            "reply_text": (reply_text if reply_text is not None else
+                           ("" if kind in {"other", "repeat"} else RECEPTION_SPEECH[kind]))}, usage=Usage(), provider=ProviderMeta(
+                provider_id="mock", model="synthetic_reception", request_id="reception_test", latency_ms=0))
+    monkeypatch.setattr(MockProvider, "invoke", invoke)
+    return calls
+
+
+def acts(runtime):
+    return [event["payload"] for event in _current(runtime)["agent_events"]
+            if event["type"] == "conversation.act.selected"]
+
+
+def test_initial_idle_check_waits_for_main_question_floor_and_never_submits(tmp_path, monkeypatch):
+    from app.domain.interview_agent import FloorOwner
+
+    async def scenario():
+        async with _automatic_session(tmp_path, monkeypatch, [],
+                stable_previews=True, spoken_confirmation=True) as (store, runtime, channel, managed):
+            spoken = _synthetic_tts(runtime)
+            endpoint = managed._answer_endpoint
+            clock = _Clock()
+            endpoint.clock = clock
+            endpoint.candidate_floor_returned()
+            await channel._set_floor(FloorOwner.AGENT, "synthetic_long_question", None)
+            capture_id = managed._capture_id
+            clock.value = 20
+            await asyncio.sleep(.2)
+            assert not acts(runtime) and not spoken
+            await channel._set_floor(FloorOwner.CANDIDATE, "agent_finished", None)
+            clock.value += 14.9
+            await asyncio.sleep(.15)
+            assert not spoken
+            clock.value += .1
+            await _wait_until(lambda: spoken)
+            assert spoken == [RECEPTION_SPEECH["idle_check"]]
+            await _finish_playback(channel, runtime, managed)
+            clock.value += 300
+            await asyncio.sleep(.2)
+            assert len(spoken) == 1 and managed._capture_id == capture_id
+            assert not _current(runtime)["answers"] and managed.chain.is_open
+            assert not [item for item in store.evidence_commands.values() if item["command_type"] == "evidence.seal"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("kind,text", [
+    ("wait", "稍等。没有。嗯。"), ("presence", "你能听到我说话吗？"),
+    ("transcript_correction", "这里的字幕不是我说的。"), ("repeat", "请再说一遍题目。"),
+])
+def test_request_is_audible_before_answer_review_and_continues_same_capture(tmp_path, monkeypatch, kind, text):
+    calls = reception_provider(monkeypatch, kind, full_thinking=kind == "wait")
+
+    async def scenario():
+        async with _automatic_session(tmp_path, monkeypatch, [text, "我继续说。", ""],
+                stable_previews=True, spoken_confirmation=True) as (store, runtime, channel, managed):
+            spoken = _synthetic_tts(runtime)
+            clock = _Clock()
+            endpoint = managed._answer_endpoint
+            endpoint.clock = clock
+            capture_id = managed._capture_id
+            before = _current(runtime)
+            await _feed(managed._ingress, _VOICE, 5)
+            clock.value = 1.1
+            await _wait_until(lambda: bool(spoken), timeout=5)
+            current = _current(runtime)
+            assert len(acts(runtime)) == 1
+            assert acts(runtime)[0]["act_type"] == "conversation_acknowledgement"
+            assert spoken == [acts(runtime)[0]["text"]]
+            if kind == "repeat":
+                assert before["turns"][0]["question_snapshot"]["question_text"] in spoken[0]
+            else:
+                assert spoken == [RECEPTION_SPEECH[kind]]
+            assert current["current_turn_id"] == TURN_ID and current["turn_ids"] == before["turn_ids"]
+            assert not current["answers"] and not current["agent_runtime"].get("answer_preparation")
+            assert managed._capture_id == capture_id
+            assert not [c for c in store.evidence_commands.values() if c["command_type"] == "evidence.seal"]
+            # Speculative evidence work may run alongside this fast reply;
+            # it must neither delay reception nor commit/switch the question.
+            versions = [v["prompt_version"] for v in store.model_invocations
+                        if v["purpose"] == "interview_turn_understanding"]
+            assert versions.count("conversation_reception.v10") == 1
+            await _finish_playback(channel, runtime, managed)
+            assert endpoint.confirmation.phase == "listening" and managed.chain.is_open
+            clock.value += 30
+            if kind == "wait":
+                await asyncio.sleep(.2)
+                assert len(spoken) == 1
+                assert endpoint.confirmation._reception_review is None
+                assert not endpoint.confirmation._idle_check_allowed
+                assert not endpoint._prepare_failures
+            else:
+                await _wait_until(lambda: len(spoken) == 2, timeout=5)
+                assert spoken[-1] == RECEPTION_SPEECH["idle_check"]
+                await _finish_playback(channel, runtime, managed)
+            assert len(calls) == 1 and not _current(runtime)["answers"]
+            prior_spoken = len(spoken)
+            await _feed(managed._ingress, _CONTINUATION, 5)
+            clock.value += 1.1
+            try:
+                await _wait_until(lambda: len(spoken) == prior_spoken + 1, timeout=5)
+            except AssertionError:
+                raise AssertionError(str({"calls": calls, "phase": endpoint.confirmation.phase,
+                    "revision": endpoint.revision, "blocked": endpoint._blocked_revision,
+                    "retry": endpoint._retry_at, "last_voice": endpoint._last_voice,
+                    "clock": clock.value, "preview": await managed.chain.transcript_preview(),
+                    "events": acts(runtime)})) from None
+            assert calls[-1]["new_speech"] == "我继续说。"
+            assert calls[-1]["preceding_text"] == text
+            assert managed._capture_id == capture_id and not _current(runtime)["answers"]
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_pause_acknowledgement_waits_for_playback_and_barge_in_revokes_pause(tmp_path, monkeypatch, interrupt):
+    reception_provider(monkeypatch, "pause")
+
+    async def scenario():
+        async with _automatic_session(tmp_path, monkeypatch, ["我们先暂停面试。", "不用暂停了。", ""],
+                stable_previews=True, spoken_confirmation=True) as (_, runtime, channel, managed):
+            spoken = _synthetic_tts(runtime)
+            endpoint = managed._answer_endpoint
+            clock = _Clock()
+            endpoint.clock = clock
+            await _feed(managed._ingress, _VOICE, 5)
+            clock.value = 1.1
+            await _wait_until(lambda: bool(_current(runtime)["agent_runtime"].get("active_performance_id")), timeout=5)
+            assert spoken == [RECEPTION_SPEECH["pause"]]
+            assert _current(runtime)["status"] == "in_progress" and managed.chain.is_open
+            if interrupt:
+                await _feed(managed._ingress, _CONTINUATION, 5)
+                await channel.send(ClientSignal(type="speech.started", turn_id=TURN_ID,
+                    idempotency_key="revoke_pause", payload={"capture_id": managed._capture_id}))
+                await asyncio.sleep(.15)
+                assert endpoint.confirmation.phase == "listening"
+                assert _current(runtime)["status"] == "in_progress" and managed.chain.is_open
+            else:
+                await _finish_playback(channel, runtime, managed)
+                await _wait_until(lambda: _current(runtime)["status"] == "paused")
+            assert not _current(runtime)["answers"]
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("change", ["voice", "owner"])
+def test_late_request_cannot_speak_over_new_input_or_new_owner(tmp_path, monkeypatch, change):
+    async def scenario():
+        release = asyncio.Event()
+        calls = reception_provider(monkeypatch, "wait", release=release)
+        async with _automatic_session(tmp_path, monkeypatch, ["稍等。", ""],
+                stable_previews=True, spoken_confirmation=True) as (store, runtime, _, managed):
+            spoken = _synthetic_tts(runtime)
+            endpoint = managed._answer_endpoint
+            clock = _Clock()
+            endpoint.clock = clock
+            await _feed(managed._ingress, _VOICE, 5)
+            clock.value = 1.1
+            await _wait_until(lambda: bool(calls))
+            if change == "voice":
+                await _feed(managed._ingress, _CONTINUATION, 5)
+            else:
+                with persistence_for(store).transaction(ORGANIZATION_ID) as tx:
+                    owner = tx.evidence_ownerships.list()[0]
+                    owner["ownership_epoch"] += 1
+                    owner["owner_instance_id"] = "successor"
+                    tx.evidence_ownerships.update(owner, expected_version=owner["version"])
+            release.set()
+            await asyncio.sleep(.2)
+            assert not spoken and not acts(runtime) and not _current(runtime)["answers"]
+            assert not _current(runtime)["agent_runtime"].get("answer_preparation")
+    asyncio.run(scenario())
+
+
+def test_barge_in_while_tts_is_preparing_prevents_late_playback(tmp_path, monkeypatch):
+    reception_provider(monkeypatch, "wait")
+    async def scenario():
+        async with _automatic_session(tmp_path, monkeypatch, ["稍等。", "不用等了，我继续。", ""],
+                stable_previews=True, spoken_confirmation=True) as (_, runtime, channel, managed):
+            _synthetic_tts(runtime)
+            original = runtime.gateway.invoke
+            entered, release = asyncio.Event(), asyncio.Event()
+            async def delayed(capability, request, **kwargs):
+                if capability == "tts.synthesize":
+                    entered.set()
+                    await release.wait()
+                return await original(capability, request, **kwargs)
+            runtime.gateway.invoke = delayed
+            endpoint = managed._answer_endpoint
+            clock = _Clock()
+            endpoint.clock = clock
+            await _feed(managed._ingress, _VOICE, 5)
+            clock.value = 1.1
+            await asyncio.wait_for(entered.wait(), 5)
+            await _feed(managed._ingress, _CONTINUATION, 5)
+            await channel.send(ClientSignal(type="speech.started", turn_id=TURN_ID,
+                idempotency_key="reception_tts_barge", payload={"capture_id": managed._capture_id}))
+            release.set()
+            await asyncio.sleep(.2)
+            assert endpoint.confirmation.phase == "listening" and managed.chain.is_open
+            assert not _current(runtime)["agent_runtime"].get("active_performance_id")
+            assert not _current(runtime)["answers"]
+    asyncio.run(scenario())
+
+
+def test_pause_commit_rechecks_owner_inside_the_lifecycle_transaction(tmp_path, monkeypatch):
+    from app.core.errors import ApiError
+    async def scenario():
+        async with _automatic_session(tmp_path, monkeypatch, [],
+                stable_previews=True, spoken_confirmation=True) as (store, runtime, _, managed):
+            fence = managed.ownership.commit_fence()
+            with persistence_for(store).transaction(ORGANIZATION_ID) as tx:
+                owner = tx.evidence_ownerships.list()[0]
+                owner["ownership_epoch"] += 1
+                owner["owner_instance_id"] = "successor"
+                tx.evidence_ownerships.update(owner, expected_version=owner["version"])
+            with pytest.raises(ApiError) as rejected:
+                runtime.interviews.pause_interview(_current(runtime)["id"],
+                    organization_id=ORGANIZATION_ID, evidence_fence=fence)
+            assert rejected.value.code == "EVIDENCE_OWNER_FENCED"
+            assert _current(runtime)["status"] == "in_progress"
+            await managed.chain.abort()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("quiet,analysis_started", [(1.1, False), (3.1, True)])
+def test_unpreset_interview_request_speaks_generated_reply_without_waiting_for_analysis(
+        tmp_path, monkeypatch, quiet, analysis_started):
+    reply = "可以，先讲你自己的组织方式，我会跟着你的思路听。"
+    reception_provider(monkeypatch, "interview_dialogue", reply_text=reply)
+
+    async def scenario():
+        analysis_entered, analysis_release = asyncio.Event(), asyncio.Event()
+        async with _automatic_session(tmp_path, monkeypatch,
+                ["我想先从遇到的一次小故障说起，再展开整个设计，可以这样讲吗？", ""],
+                stable_previews=True, spoken_confirmation=True) as (store, runtime, channel, managed):
+            spoken = _synthetic_tts(runtime)
+            original = MockProvider.invoke
+            async def hold_deep_analysis(provider, capability, request, context):
+                if request.purpose == "interview_turn_understanding" and request.metadata.get("prompt_version") != "conversation_reception.v10":
+                    analysis_entered.set()
+                    await analysis_release.wait()
+                return await original(provider, capability, request, context)
+            monkeypatch.setattr(MockProvider, "invoke", hold_deep_analysis)
+            endpoint = managed._answer_endpoint
+            clock = _Clock()
+            endpoint.clock = clock
+            capture = managed._capture_id
+            before = _current(runtime)
+            try:
+                await _feed(managed._ingress, _VOICE, 5)
+                clock.value = quiet
+                await _wait_until(lambda: bool(spoken), timeout=5)
+                # Fast dialogue stays available at 1s without buying a full
+                # understanding call; an already-started 3s analysis also
+                # cannot hold up the same natural acknowledgement.
+                assert analysis_entered.is_set() == analysis_started
+                assert not analysis_release.is_set()
+                assert spoken == [reply]
+                act = acts(runtime)[0]
+                assert act["act_type"] == "conversation_acknowledgement"
+                current = _current(runtime)
+                stored_act = next(item for item in current["turns"][0]["conversation_acts"]
+                                  if item["act_id"] == act["act_id"])
+                assert stored_act["prompt_version"] == "conversation_reception.v10"
+                assert stored_act["evaluative"] is False
+                assert current["current_turn_id"] == before["current_turn_id"]
+                assert current["turn_ids"] == before["turn_ids"] and not current["answers"]
+                assert managed._capture_id == capture and managed.chain.is_open
+                assert not [item for item in store.evidence_commands.values() if item["command_type"] == "evidence.seal"]
+                assert not [item for item in store.model_invocations if item["purpose"] == "answer_evaluation"]
+                await _finish_playback(channel, runtime, managed)
+                assert endpoint.confirmation.phase == "listening" and managed.chain.is_open
+            finally:
+                analysis_release.set()
+    asyncio.run(scenario())
+
+
+def test_server_audio_keeps_reaching_stt_during_tts_preparation_and_revokes_old_playback(tmp_path, monkeypatch):
+    reception_provider(monkeypatch, "wait")
+
+    async def scenario():
+        async with _automatic_session(tmp_path, monkeypatch,
+                ["稍等。", "不用等了，我继续回答。", ""],
+                stable_previews=True, spoken_confirmation=True) as (_, runtime, _, managed):
+            _synthetic_tts(runtime)
+            original = runtime.gateway.invoke
+            entered, release, cancelled = asyncio.Event(), asyncio.Event(), asyncio.Event()
+            async def held_tts(capability, request, **kwargs):
+                if capability == "tts.synthesize":
+                    entered.set()
+                    try:
+                        await release.wait()
+                    except asyncio.CancelledError:
+                        cancelled.set()
+                        raise
+                return await original(capability, request, **kwargs)
+            monkeypatch.setattr(runtime.gateway, "invoke", held_tts)
+            endpoint = managed._answer_endpoint
+            clock = _Clock()
+            endpoint.clock = clock
+            capture = managed._capture_id
+            try:
+                await _feed(managed._ingress, _VOICE, 5)
+                clock.value = 1.1
+                await asyncio.wait_for(entered.wait(), 5)
+                assert endpoint.confirmation.phase == "preparing_speech"
+                assert not endpoint.confirmation.speaking
+                stream = managed.chain._stt.stream
+                received = stream._received_bytes
+                revision = endpoint.revision
+                # No browser speech hint: authoritative PCM/ASR alone must
+                # stay live and revoke the phrase waiting on synthesis.
+                await _feed(managed._ingress, _CONTINUATION, 5)
+                assert stream._received_bytes == received + len(_CONTINUATION) * 5
+                assert endpoint.revision > revision
+                preview = await managed.chain.transcript_preview()
+                assert "不用等了，我继续回答。" in preview.text
+                assert not _current(runtime)["agent_runtime"].get("active_performance_id")
+                await asyncio.wait_for(cancelled.wait(), 1)
+                await _wait_until(lambda: endpoint.confirmation.phase == "listening")
+                assert not release.is_set(), "Do not wait for stale TTS before receiving the next request"
+                release.set()
+                await asyncio.sleep(.05)
+                current = _current(runtime)
+                assert managed._capture_id == capture and managed.chain.is_open
+                assert not current["answers"]
+                assert not [event for event in current["agent_events"] if event["type"] == "avatar.performance.started"]
+                assert not current["agent_runtime"].get("active_performance_id")
+            finally:
+                release.set()
+    asyncio.run(scenario())

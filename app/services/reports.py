@@ -6,7 +6,9 @@ from typing import Any, Dict, List, Optional
 
 from app.core.errors import ApiError
 from app.core.ids import new_id
-from app.domain.scoring_quality import DISPUTE_FLAGS, evaluation_answers, project_evaluation, project_report
+from app.domain.primary_question_budget import has_budget_skipped_questions
+from app.domain.scoring_quality import DISPUTE_FLAGS, evaluation_answers, project_evaluation, project_report, is_unresolved_evaluation
+from app.domain.adaptive_interview import adaptive_score_summary, interrupted_fixed_plan_summary, is_adaptive
 from app.core.time import utc_now
 from app.persistence.interface import Persistence
 from app.persistence.provider import persistence_for
@@ -59,7 +61,7 @@ class ReportService:
             evaluation = project_evaluation(original, evaluation_answers(interview, original)) if original else None
             if evaluation is None:
                 continue
-            if evaluation["score"] is None:
+            if evaluation["score"] is None and not is_unresolved_evaluation(evaluation):
                 raise ApiError("REPORT_EVALUATION_UNAVAILABLE", "本题尚无有效评分，请重试后台评分。", status_code=409)
             plan_item = item_by_snapshot.get(
                 evaluation["question_snapshot_id"],
@@ -84,6 +86,7 @@ class ReportService:
                     "covered_key_points": deepcopy(evaluation["covered_key_points"]),
                     "missing_key_points": deepcopy(evaluation["missing_key_points"]),
                     "evidence": [item["evidence"] for item in evaluation["covered_key_points"]],
+                    "evidence_sources": deepcopy(evaluation.get("evidence_sources", [])),
                     "evidence_answer_ids": deepcopy(
                         evaluation.get("evidence_answer_ids") or [answer["id"]]
                     ),
@@ -91,6 +94,9 @@ class ReportService:
                         evaluation.get("evidence_utterance_ids") or []
                     ),
                     "summary": evaluation["feedback"],
+                    **(self._question_chain(interview, turns_by_id[answer["turn_id"]],
+                                           evaluation.get("evidence_answer_ids") or [answer["id"]])
+                       if answer.get("turn_id") in turns_by_id else {}),
                 }
             )
 
@@ -112,7 +118,7 @@ class ReportService:
             }
             for dimension, value in sorted(dimension_totals.items())
         ]
-        return project_report({
+        document = {
             "id": new_id("report"),
             "organization_id": interview["organization_id"],
             "interview_id": interview["id"],
@@ -136,7 +142,132 @@ class ReportService:
             "decision_notice": "本报告只提供岗位匹配证据，不自动作出录用或淘汰决定。",
             "generated_by": "system",
             "generated_at": utc_now(),
-        }, interview)
+        }
+        if is_adaptive(interview):
+            document.update(adaptive_score_summary(interview, question_evaluations))
+            document["execution_schema_version"] = 3
+            document["candidate_input_completion_reason"] = interview.get("candidate_input_completion_reason")
+            document["skipped_questions"] = [
+                {"turn_id": turn["id"], "question_id": turn.get("question_id"),
+                 "reason": turn.get("skip_reason", "not_assessed"), "counts_toward_score": False}
+                for turn in interview.get("turns", []) if turn.get("status") == "skipped"
+            ]
+            for entry in question_evaluations:
+                setting = item_by_snapshot.get(entry["question_snapshot_id"], {})
+                entry["competency_ids"] = deepcopy(setting.get("competency_ids", []))
+                entry["assessed_rubric_point_ids"] = deepcopy(setting.get("assessed_rubric_point_ids", []))
+                entry["presented_unit_ids"] = deepcopy(setting.get("presented_unit_ids", []))
+                entry["inquiry_unit_id"] = setting.get("inquiry_unit_id")
+                entry["not_assessed_rubric_point_ids"] = deepcopy(setting.get("not_assessed_rubric_point_ids", []))
+            if any(scope["scope_status"] != "complete" for scope in document.get("source_question_scopes", [])):
+                document["scope_notice"] = "本报告只评价实际呈现的考察单元；原题未问到的关键点标记为未考察，不作为扣分项。"
+            if document["coverage_status"] != "sufficient":
+                document.update(job_fit_level="insufficient_evidence", recommendation="insufficient_evidence", strengths=[],
+                                risks=["考察覆盖或证据不足；未考察能力不计零分，需结合已取得证据人工复核。"],
+                                followup_suggestions=["针对报告标示的未覆盖能力补充人工访谈。"])
+            else:
+                score = document["overall_score"]
+                fit = self._job_fit_level(score, requires_manual_review=requires_manual_review, has_evidence=bool(question_evaluations))
+                document.update(job_fit_level=fit, recommendation=fit,
+                                strengths=["关键点覆盖较好"] if score >= 75 else [],
+                                risks=["存在未覆盖关键点，建议人工复核"] if score < 75 else [],
+                                followup_suggestions=["针对缺失关键点安排人工追问"] if score < 75 else [])
+        elif interview.get("candidate_input_completion_reason") == "candidate_requested" or has_budget_skipped_questions(interview):
+            document.update(interrupted_fixed_plan_summary(interview, question_evaluations))
+            budget_limited = has_budget_skipped_questions(interview)
+            document["candidate_input_completion_reason"] = "budget_exhausted" if budget_limited else "candidate_requested"
+            document["skipped_questions"] = [
+                {"turn_id": turn["id"], "question_id": turn.get("question_id"),
+                 "reason": turn.get("skip_reason", "not_assessed"), "counts_toward_score": False}
+                for turn in interview.get("turns", []) if turn.get("status") == "skipped"
+            ]
+            if document["coverage_status"] != "sufficient":
+                notice = ("达到整场主问题上限，计划中部分题目未考察；不计零分，保留原权重与已取得的评分证据。"
+                          if budget_limited else "候选人主动结束，计划中部分题目未考察；保留已取得的评分证据。")
+                document.update(strengths=[], risks=[notice],
+                                followup_suggestions=["结合未考察范围与已有证据人工复核。"])
+        retained = self._retained_exit_evidence(interview)
+        if retained:
+            document["unassessed_retained_evidence"] = retained
+            document["manual_review_required"] = True
+            notice = "退出时的原始发言和录音已保留，尚未评估；请人工复核，不将其视作未作答或计零分。"
+            document["scope_notice"] = " ".join(value for value in (document.get("scope_notice"), notice) if value)
+            document["risks"].append(notice)
+        return project_report(document, interview)
+
+    @staticmethod
+    def _retained_exit_evidence(interview):
+        """Expose retained speech as unassessed material, never a scored answer."""
+        from app.services.candidate_exit_confirmation import text_hash
+
+        retained = []
+        for turn in interview.get("turns", []):
+            evidence = turn.get("exit_evidence") or {}
+            receipt = turn.get("candidate_exit_confirmation") or {}
+            text = evidence.get("final_transcript")
+            utterance = next((item for item in turn.get("utterances", [])
+                              if item.get("utterance_id") == evidence.get("utterance_id")), {})
+            if (evidence.get("version") != "candidate_exit_evidence.v1"
+                    or evidence.get("assessment_status") != "not_evaluated"
+                    or not isinstance(text, str) or not text.strip()
+                    or receipt.get("state") != "confirmed" or not receipt.get("confirmed_at")
+                    or receipt.get("transcript_sha256") != text_hash(text.strip())
+                    or utterance.get("authoritative") is not True or utterance.get("is_final") is not True
+                    or utterance.get("text") != text.strip() or utterance.get("audio_uri") != evidence.get("audio_uri")):
+                continue
+            retained.append({"turn_id": turn["id"], "question_id": turn.get("question_id"),
+                "root_turn_id": turn.get("root_turn_id") or turn["id"],
+                "question_text": turn.get("question_spoken_text", ""),
+                "utterance_id": evidence["utterance_id"], "final_transcript": text,
+                "assessment_status": "not_evaluated", "counts_toward_score": False,
+                "human_review_required": True, "retained_at": evidence.get("retained_at")})
+        return retained
+
+    @staticmethod
+    def _question_chain(interview, root, evidence_answer_ids):
+        """Freeze presented Q/A pairs; only the root carries a report weight."""
+        answers = {item["turn_id"]: item for item in interview.get("answers", [])}
+        evidence_ids = set(evidence_answer_ids)
+        root_id = root.get("id")
+
+        def project(turn):
+            answer = answers.get(turn.get("id"))
+            snapshot = turn.get("question_snapshot") or {}
+            return {
+                "turn_id": turn.get("id"), "parent_turn_id": turn.get("parent_turn_id"),
+                "root_turn_id": turn.get("root_turn_id") or turn.get("id"),
+                "followup_depth": int(turn.get("followup_depth", 0)),
+                "question_text": turn.get("question_spoken_text") or snapshot.get("spoken_text") or snapshot.get("question_text", ""),
+                "status": turn.get("status"),
+                "answer": ({"id": answer["id"], "turn_id": answer["turn_id"],
+                            "root_turn_id": answer.get("root_turn_id") or answer["turn_id"],
+                            "utterance_id": answer.get("utterance_id"),
+                            "final_transcript": answer.get("final_transcript", ""),
+                            "transcript_revision": int(answer.get("current_transcript_revision", 1)),
+                            "transcript_source": answer.get("transcript_source"),
+                            "evaluation_id": answer.get("current_evaluation_id"),
+                            "evaluation_status": answer.get("evaluation_status")} if answer else None),
+                "included_in_root_evidence": bool(answer and answer["id"] in evidence_ids),
+                "scope": {"inquiry_unit_id": turn.get("inquiry_unit_id") or snapshot.get("inquiry_unit_id"),
+                          "assessed_rubric_point_ids": deepcopy(turn.get("assessed_rubric_point_ids") or
+                                                               snapshot.get("assessed_rubric_point_ids") or
+                                                               [p["id"] if isinstance(p, dict) else str(p) for p in snapshot.get("key_points", [])]),
+                          "target_key_points": deepcopy(turn.get("target_key_points", [])),
+                          "competency_ids": deepcopy(turn.get("competency_ids", [])),
+                          "counts_toward_score": not bool(turn.get("is_followup")),
+                          "weight": 0.0 if turn.get("is_followup") else float(turn.get("weight", 0.0))},
+            }
+
+        result = project(root)
+        linked = {root_id}
+        children = []
+        for turn in sorted(interview.get("turns", []), key=lambda item: int(item.get("order", 0))):
+            if (turn.get("is_followup") and turn.get("root_turn_id") == root_id
+                    and turn.get("parent_turn_id") in linked):
+                children.append(project(turn))
+                linked.add(turn["id"])
+        result["followups"] = children
+        return result
 
     def get_report(self, interview_id: str, organization_id: str = "org_default") -> Dict[str, Any]:
         interview = self._get_interview(interview_id, organization_id)
@@ -176,6 +307,8 @@ class ReportService:
             fields = [
                 "interview_id",
                 "overall_score",
+                "score_scope",
+                "assessment_scope",
                 "score_status",
                 "recognition_notice",
                 "recognition_warning_answer_ids",
@@ -185,6 +318,8 @@ class ReportService:
                 "strengths",
                 "risks",
                 "followup_suggestions",
+                "question_evaluations",
+                "unassessed_retained_evidence",
                 "generated_at",
             ]
             writer = csv.DictWriter(output, fieldnames=fields)
@@ -193,6 +328,8 @@ class ReportService:
                 {
                     "interview_id": interview_id,
                     "overall_score": report["overall_score"],
+                    "score_scope": report.get("score_scope"),
+                    "assessment_scope": json.dumps(report["assessment_scope"], ensure_ascii=False) if report.get("assessment_scope") else "",
                     "score_status": report["score_status"],
                     "recognition_notice": report.get("recognition_notice"),
                     "recognition_warning_answer_ids": json.dumps(report.get("recognition_warning_answer_ids", [])),
@@ -202,6 +339,8 @@ class ReportService:
                     "strengths": json.dumps(report.get("strengths", []), ensure_ascii=False),
                     "risks": json.dumps(report.get("risks", []), ensure_ascii=False),
                     "followup_suggestions": json.dumps(report.get("followup_suggestions", []), ensure_ascii=False),
+                    "question_evaluations": json.dumps(report.get("question_evaluations", []), ensure_ascii=False),
+                    "unassessed_retained_evidence": json.dumps(report.get("unassessed_retained_evidence", []), ensure_ascii=False),
                     "generated_at": report["generated_at"],
                 }
             )

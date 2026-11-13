@@ -1,5 +1,104 @@
 # Interviewer Domain
 
+## 090：本场范围与综合分
+
+“批准题池”是可选材料全集；“本场考察范围”是在面试前按总主题预算冻结的具体单元与核心能力，不等于整份岗位能力清单。“本场考察综合分”只在该冻结范围的必要证据已取得并评分后形成；旧合同不足不能事后改权重凑分。主题与追问分别计数，录制已结束与录像已完成哈希/保护封存是不同事实。
+
+
+## 089：整场主题预算与告别呈现
+
+主题指非追问的正式根轮次，两类来源合计正常8–10题，追问独立计数；原题拆分单元属于可选范围，不是全部必须问完。历史批准合同与当前执行题数限制是两种事实，未问能力只代表证据不足。`completion_presentation=closing`只表示原有效连接还在播放告别，不表示候选输入重新开放或完成回执失效。选题模型临时故障恢复仍是批准范围内的提案，不是回答理解或评分结果。
+
+## 2026-11-02 · 交流控制与未评估证据（086）
+
+退出请求只代表需要询问是否结束；独立退出确认是已实际送达的问题和之后新回复形成的服务端证据，不是技术完成依据。PreparedCandidateExit不含技术理解或claims。确认后本题的原始发言和录音记为exit_evidence/not_evaluated，报告以unassessed_retained_evidence供人工复核，不计作拒答、零分或已完成答案；已完成题维持原评分。见[086](docs/conversation-control-autonomy-086.md)。
+
+## 085：澄清与理解失败
+
+“内容待澄清”只表示发言存在实际含义疑点，不等于答案缺知识点或候选不会。已送达澄清的来源由服务端固定，模型理解新解释；“结果校验失败”与“供应商不可用”是不同恢复类别。实施状态见[085](docs/followup-clarification-085.md)。
+
+## 084：补充交流
+
+“补充交流决策”只判断当前新发言希望如何继续：提问、澄清、跑题、等待和结束各有正常路径。“无法确认结束”保持对话开放，不等同回答分析失败。“补充阶段”来自实际送达及服务端确认，不能从历史肯定词推断。详见[084](docs/supplement-dialogue-routing-084.md)。
+
+## 083：有界纠错接续
+
+**Pending correction**：仅进程内、绑定完整证据/语境/模式/合同的固定校验原因，用于剩余调用的纠错，不是已验证理解、完成许可或新模型额度。预分析的一次局部额度不能丢弃正式准备仍可使用的匹配原因；新输入或来源变化不能借用旧原因。见[083](docs/bounded-correction-continuation-083.md)。
+
+## 081：保留分析与推进资格
+
+**Retained preparation**：证据不变时可继续完成的唯一有界纯分析，不因短暂音频撤销而重复调用；读取结果仍核对当前完整来源与语境。**Recovery review**：正常恢复通知ACK之后的一次性重新取final机会，不是完成确认或提交授权。详见[081](docs/answer-preparation-cancellation-081.md)。
+
+## 079：模型处理诊断
+
+**ModelCallScope**：进程内一次等待/处理阶段的诊断关联上下文，包含父作用域与受控取消来源；不是授权、模型调用次数或持久会话状态。**Cancelled ModelInvocation**：调用方撤销后的终态审计，不等于供应商超时、失败计费或自动重试许可。见[操作日志079](docs/change-log.md)。
+
+## 078：处理恢复与补充确认（仓库与本机已验证）
+
+**PreparedCompletionReceipt**：已验证答案理解与实际送达补充询问后的新结束回复之间的服务端证明；不能代替当前来源与提交校验。**AnswerProcessingRetry**：恢复已有回答的失败处理，保留仍有效的确认；与表示新发言的继续补充不同。详见[078说明](docs/answer-recovery-and-reuse-078.md)。
+
+## 075：固定提示与追问音频恢复（已实现）
+
+固定提示音（Fixed Speech）是 `app/core/prompt/fixed_speech.py` 的版本化精确文案白名单，不含候选内容。固定音频缓存只复用当前组织、路由、模型、voice、语言及合成参数匹配的完整 PCM。追问音频恢复（Question Audio Recovery）只重试当前未播出原题，不重新规划、重交答案或视为已送达；`retry_required` 等候候选显式重试，`retrying` 直到真实播放排空。部分播放或无法证明清理完成维持暂停恢复流程。用户未配置备用，本轮保留当前 TTS 音色。详见[075说明](docs/same-voice-tts-stability-075.md)。
+
+074：试音 `awaiting_confirmation` 表示有待候选人核对的权威试音字幕，不要求提示音成功才能保留确认按钮；零音频恢复必须绑定当前 owner、capture 与选择，不能自动开始正式面试。供应商 token 用量、账户余额、速率配额及首音期限分别诊断。见[074说明](docs/warmup-tts-resilience-074.md)。
+
+073领域补充：**SupplementQuestionDelivered** 是当前采集内补充询问已实际播完并取得权威回复边界的事实；选中或播放开始不等同送达。正常语音回答先询问补充，再用之后的新答复确认；**CompletionBasis** 的有效原文引用不能代替此流程。继续补充保留同一回答，整场退出使用独立二次确认。详见[073说明](docs/supplement-confirmation-stability-073.md)。
+
+066领域补充：**ContentClarification** 是具体疑点的实际送达与后续新语音事实；**UnresolvedAnswer** 是已结束但技术转写仍待核实的回答，保留证据且不计零分；**UnderstandingRecovery** 是当前 capture 的有限恢复状态，不是候选人没回答，也不授予退出许可。详见[066说明](docs/interaction-recovery-066.md)。
+
+065领域补充：**CandidateExitConfirmation**是独立问题实际送达后、当前权威新语音明确确认整场退出的事实，与补充确认或本题完成不同。**CandidateWithdrawal**客观记录候选人主动退出，报告交由人工复核，不自动作出淘汰决定。详见[065说明](docs/candidate-exit-confirmation-065.md)。
+
+064领域补充：**CurrentSpeech**是最后已回应交流之后可追溯的新发言范围，只约束当前意图；**AccumulatedAnswerEvidence**是完整服务端转写中的实际技术陈述，交流范围变化不能删除它。**CandidateInputCompleted**是候选人输入结束，评分与录制封存可以继续；媒体错误不能撤销此事实。详见[064说明](docs/conversation-intent-and-end-064.md)。
+
+## 当前补充：面试定制（044）
+
+**InterviewCustomization**：组织保存的可选面试偏好与公司介绍，含相互独立的Skill正文和CompanyProfile。保存后新生成的计划默认使用已填写部分；空项略过，不要求用户再次选用，也不要求两项同时存在。
+
+**CompanyProfile**：管理员提供、可以向候选人介绍的公司名称、业务、产品服务与补充信息。它是公司问答的事实来源，不是评分材料；Skill中的行为说明或个人资源不等同公司事实。未提供的信息不能由模型自行补全。
+
+默认解析结果在准备开始时冻结，配置更新与已审阅计划是不同事实；清空默认绑定不会删除历史Skill或会话证据。
+
+## 当前领域语言：面试官自主决策与可选上下文（039）
+
+**InterviewerSupervisor**:
+面试中根据考察目标、候选人话语和已有证据选择下一步交流动作的面试官总控；专家向它提供建议，对外表达保持一个面试官身份。
+_Avoid_: FixedQuestionRunner、AgentChain、IndependentSpeakers
+
+**InterviewAssessmentContract**:
+企业在面试前批准的能力目标、评价标准、证据要求、允许问题范围和考察预算；它约束面试官自主选择问题和结束考察。
+_Avoid_: FixedQuestionList、PromptOnlyPlan、UnlimitedInterview
+
+**InterviewAgenda**:
+一场面试当前的考察议程，包含正在了解的目标、待补证据、已考察和明确不再继续的话题；它可随真实对话修订。
+_Avoid_: PendingQuestionQueue、StaticExamPaper
+
+**CompetencyEvidenceLedger**:
+从本场已提交轮次、答案与理解派生的能力证据及覆盖缺口；当前实现为有界投影，不是独立知识库或最终能力得分。
+_Avoid_: LiveScore、CandidateRanking、ModelBelief
+
+**CompletionBasis**:
+将候选人话题结束判断与其真实发言、补充答复或明确操作相联系的依据；它区分停止继续交流的意愿与回答内容是否充分。
+_Avoid_: SilenceEqualsFinish、NoKnowledgeEqualsNoSpeech
+
+**InterviewSkill**:
+用户自由编写、可选加载的面试方法或行为说明；没有Skill也可以正常面试，不代表企业身份，不要求企业审批，也不等同于模型权重微调。
+_Avoid_: ModelFineTuning、UnrestrictedScript、CandidateInstruction
+
+**AgentDecisionReceipt**:
+已提交面试决策的安全元数据与真实效果记录；被拒绝提案只留下受控错误信息，不能当作已经执行。
+_Avoid_: PrivateThoughts、RawModelResponse、ProposedActionAsFact
+
+**InquiryUnit**:
+企业批准的单点提问单元，绑定一个原关键点、原标准答案引用及自身能力子集。实际单元是v3根题与评分范围，原题其他标签和未问点不能自动计入。
+_Avoid_: FullQuestionAsOneTurn、UnaskedPointPenalty
+
+**AwaitingNextDecision**:
+已保存本题、当前无下一题但候选输入仍未结束的对话状态；可重试规划。只有明确的END_CANDIDATE_INPUT结束候选输入，评分完成或空队列不代替它。
+_Avoid_: EmptyQueueMeansCompleted
+
+当前实现与版本边界见[面试官架构](docs/interviewer-agent-architecture.md)。下列带日期章节保留历史词义，038语义优先与v3合同优先适用。
+
 ## 2026-09-10 · 补充确认与候选人提示（034）
 
 “补充确认”使用当前服务端回复的意图分类；v3通过证据编号恢复原文，同一原文的失败预算不由声学活动刷新。“完整音频直取”只优化服务端收集与私有存储，浏览器仍播放完整文件，不等同实验性的实时PCM播放。候选人提示描述当前状态和可采取动作，内部错误代码、供应商故障和技术指标只用于诊断；必须如实区分正在暂停、已确认暂停与连接中断。
@@ -64,7 +163,7 @@ _Avoid_: EmptyStreamReconfirmation、EnergyEqualsSpeech、VadEqualsTranscript
 
 ## SpokenSupplementConfirmation
 
-**SpokenSupplementConfirmation**：候选人回答后静音5秒触发的补充确认。肯定或实质补充继续同题收听，明确否定才授权准备完整答案，未知/无答复不会自动跳题。它是当前owner/turn/capture内的会话控制状态，不是评分或答案事实。
+**SpokenSupplementConfirmation**：普通语音作答完成前的补充确认；073要求正常答案即使被模型标为finish_answer，也先实际询问补充。首次静音边界仍先理解服务端发言。肯定或实质补充继续同题收听，问题实际播完后的新明确否定才授权准备完整答案，未知/无答复不会自动跳题。它是当前owner/turn/capture内的会话控制状态，不是评分或答案事实；明确按钮和独立话题/整场控制按各自门禁处理。
 _Avoid_: SilenceEqualsAnswer、ButtonRequired、BrowserTranscript
 
 本领域描述从岗位题库与候选人简历形成计划和预约，执行语音面试并形成可复核岗位评价的核心概念。
@@ -227,6 +326,9 @@ _Avoid_: PersonalKnowledgeBase、CandidateKnowledgeBase、CopiedQuestionBank
 绑定 CandidateProfile，由符合资格后的独立生成工作或面试官基于该候选人简历证据创建，经批准后用于核验过往经历的问题；批准表示可入计划，不提前产生全局读题语音。没有证据快照或题干未点名证据标签的题不得展示或组卷。
 _Avoid_: FollowUp、ResumeGuess、AutoApprovedQuestion、PersonalQuestion
 
+**QuestionBankPreparation**:
+基于岗位、候选人与已关联题库直接准备可预约面试计划的过程；实际考察内容和评分依据来自题库，自动确定问题预算，可选上下文有则使用，不要求另填岗位要求或重复批准。
+
 **InterviewPlanAssembly**:
 依据岗位要求、岗位题库候选池和 ResumeReview 形成候选人专属 InterviewPlan 草稿的结果，包含抽题槽位、冻结候选池、经历问题、覆盖、权重、时长与告警。
 _Avoid_: TopNQuestions、SearchResult、GeneratedList
@@ -362,3 +464,14 @@ _Avoid_: BackgroundTask、FireAndForgetJob、QueueMessage
 **AuditEvent**:
 对鉴权、敏感访问、导出、人工修正、供应商和运维动作形成的元数据级不可变审计事实；不得包含 URL token、联系方式或正文载荷。
 _Avoid_: DebugLog、RequestBodyLog、MutableHistory
+# 067 新增领域术语
+
+068补充：**OffTopicAnswer**（清楚跑题）表示发言可理解但与当前题意无关；它不是转写歧义、明确不会或整场退出。内容相关性与当前控制意图分开验证；相关技术事实不能被旁支话题抹掉。结束本题仍依赖当前权威来源，结束整场仍须独立确认。详见[068说明](docs/off-topic-and-reconnect-068.md)。
+
+**ConversationSelectionReceipt**:
+一次经过审批的面试官回应被选中表达的事实，关联所属题目、回应及选择次序；它不表示候选人已听到回应。
+_Avoid_: PlaybackCompleted、CandidateAnswer
+
+**ConversationDelivery**:
+某次面试官回应播放的进展与结局，区分准备播放、开始播放、完整播完、被打断和失败；完整送达须有当前播放的有效完成回执。
+_Avoid_: ModelResponse、SpeechGenerated

@@ -27,6 +27,7 @@ class InvocationExecutionBudget(BaseModel):
     model_config = ConfigDict(extra="forbid")
     timeout_s: float = Field(gt=0, le=300)
     max_provider_retries: int = Field(default=0, ge=0, le=3)
+    max_provider_attempts: Optional[int] = Field(default=None, ge=1, le=16)
 
 
 class ChatJSONRequest(BaseModel):

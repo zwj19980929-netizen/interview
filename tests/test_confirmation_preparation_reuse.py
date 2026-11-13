@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 from app.core.errors import ApiError
+from app.domain.interview_agent import UnderstandingProblem
 from test_answer_endpoint import _final, _until
 from test_spoken_supplement import ask, setup
 
@@ -150,11 +151,14 @@ def test_close_cancels_retained_work_after_its_waiter_was_revoked():
     asyncio.run(scenario())
 
 
-def test_uncertain_results_are_not_reused():
+def test_retryable_uncertain_results_are_not_reused():
     async def scenario():
         endpoint, _, _, _, _ = setup()
         endpoint.confirmation.confirmed = True
-        endpoint.capture.problem = {"code": "UNDERSTANDING_RESULT_REJECTED"}
+        endpoint.capture.problem = UnderstandingProblem(
+            code="UNDERSTANDING_PROVIDER_UNAVAILABLE", source="provider",
+            recoverable=True, action="clarify", retryable=True,
+        )
         final = _final()
         await endpoint._prepare_transcript(final)
         assert endpoint._confirmed_preparation is None

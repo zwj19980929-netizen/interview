@@ -8,6 +8,7 @@ single bounded frame sink owned by the InterviewAgent Evidence chain.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sys
 from array import array
 from dataclasses import dataclass, field
@@ -17,11 +18,13 @@ from typing import Any, Awaitable, Callable, Optional
 from livekit import rtc
 
 from app.adapters.livekit_media import LiveKitMediaPlane
+from app.adapters.livekit_connection import connect_room
 from app.core.errors import ApiError
 
 
 AudioFrameSink = Callable[["LiveKitIngressAudioFrame"], Awaitable[None]]
 IngressStateSink = Callable[[str], Awaitable[None]]
+_LOG = logging.getLogger(__name__)
 
 
 _SAFE_TRACK_FAILURE_CODES = frozenset(
@@ -140,6 +143,8 @@ class _SinkPumpState:
     delivered_sequence: int = 0
     failure: Optional[BaseException] = None
     task: Optional[asyncio.Task[None]] = None
+    congested_at: Optional[float] = None
+    congested_through: int = 0
 
 
 class LiveKitCandidateAudioIngress:
@@ -213,6 +218,11 @@ class LiveKitCandidateAudioIngress:
     def last_track_failure(self) -> Optional[LiveKitAudioIngressFailure]:
         return self._last_track_failure
 
+    @property
+    def accepted_audio_sequence(self) -> int:
+        """Server receive watermark, including frames still queued for the sink."""
+        return self._sequence
+
     async def drain(self, *, timeout_seconds: Optional[float] = None) -> int:
         """Wait until every frame accepted before this call crossed the sink.
 
@@ -239,6 +249,9 @@ class LiveKitCandidateAudioIngress:
                 while state.delivered_sequence < target:
                     if state.failure is not None:
                         raise state.failure
+                    if state.task is not None and state.task.done():
+                        await state.task
+                        raise RuntimeError("LiveKit evidence sink stopped before its watermark")
                     await state.condition.wait()
 
         try:
@@ -280,11 +293,17 @@ class LiveKitCandidateAudioIngress:
             ttl_seconds=3600,
         )
         try:
-            await room.connect(
+            await connect_room(room,
                 self.media_plane.url,
                 token,
                 rtc.RoomOptions(auto_subscribe=False),
             )
+            if self._closing or self._room is not room:
+                # close() can run before the native join completes. Its early
+                # disconnect then has no connected room to release; reclaim
+                # this late connection before subscribing to any microphone.
+                await room.disconnect()
+                raise ApiError("LIVEKIT_INGRESS_CLOSED", "LiveKit evidence ingress was closed during connection.", status_code=409)
             # Publications that existed before this receive-only participant
             # joined are not guaranteed to emit track_published again.
             for participant in getattr(room, "remote_participants", {}).values():
@@ -536,6 +555,9 @@ class LiveKitCandidateAudioIngress:
                     await self.on_audio_frame(item)
                     async with state.condition:
                         state.delivered_sequence = item.sequence
+                        if state.congested_at is not None and state.delivered_sequence >= state.congested_through:
+                            self._log_sink_backpressure(state, "recovered")
+                            state.congested_at = None
                         state.condition.notify_all()
             except asyncio.CancelledError:
                 raise
@@ -575,15 +597,7 @@ class LiveKitCandidateAudioIngress:
                         ),
                         pcm_s16le=pcm,
                     )
-                if sink_task.done():
-                    await sink_task
-                try:
-                    state.queue.put_nowait(value)
-                    state.accepted_sequence = value.sequence
-                except asyncio.QueueFull as exc:
-                    raise LiveKitAudioIngressBackpressureError(
-                        "LiveKit evidence sink exceeded its configured backpressure budget"
-                    ) from exc
+                await self._enqueue_frame(state, value)
                 # LiveKit 的本地缓冲可能让 __anext__ 连续立即返回。显式让出
                 # 调度权，避免接收任务在 pump_sink 获得首次运行机会前就把
                 # 有界队列一次性填满；真实慢消费仍会按配置预算失败关闭。
@@ -615,6 +629,57 @@ class LiveKitCandidateAudioIngress:
                 await stream.aclose()
             except Exception:
                 pass
+
+    async def _enqueue_frame(self, state: _SinkPumpState, frame: LiveKitIngressAudioFrame) -> None:
+        """Let a cooperative sink drain a native burst without enlarging its queue.
+
+        A full queue is a scheduling observation, not elapsed congestion. Bind
+        one deadline to the accepted watermark at saturation; a perpetually
+        slow sink cannot renew that budget by releasing one slot per frame.
+        """
+        loop = asyncio.get_running_loop()
+        async with state.condition:
+            while True:
+                if state.failure is not None:
+                    raise state.failure
+                if state.task is not None and state.task.done():
+                    await state.task
+                    raise RuntimeError("LiveKit evidence sink stopped before ingress completed")
+                if state.congested_at is not None and state.delivered_sequence >= state.congested_through:
+                    self._log_sink_backpressure(state, "recovered")
+                    state.congested_at = None
+                if not state.queue.full():
+                    state.queue.put_nowait(frame)
+                    state.accepted_sequence = frame.sequence
+                    return
+                if state.congested_at is None:
+                    state.congested_at = loop.time()
+                    state.congested_through = state.accepted_sequence
+                    self._log_sink_backpressure(state, "waiting")
+                remaining = self._sink_backpressure_seconds - (loop.time() - state.congested_at)
+                if remaining <= 0:
+                    self._log_sink_backpressure(state, "timed_out")
+                    raise LiveKitAudioIngressBackpressureError(
+                        "LiveKit evidence sink exceeded its configured backpressure budget"
+                    )
+                try:
+                    # Delivery, failure and pump cancellation all notify this
+                    # condition. No orphaned queue.put task may accept a frame
+                    # after cancellation or mutate the accepted watermark.
+                    await asyncio.wait_for(state.condition.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    # Recheck sink failure and the watermark before classifying
+                    # a deadline that raced the last delivery as backpressure.
+                    continue
+
+    @staticmethod
+    def _log_sink_backpressure(state: _SinkPumpState, outcome: str) -> None:
+        elapsed = max(0.0, asyncio.get_running_loop().time() - state.congested_at) if state.congested_at is not None else 0.0
+        _LOG.log(logging.WARNING if outcome == "timed_out" else logging.INFO,
+                 "livekit_sink_backpressure outcome=%s queue_depth=%d queue_capacity=%d "
+                 "accepted_sequence=%d delivered_sequence=%d congested_through=%d wait_ms=%.3f",
+                 outcome, state.queue.qsize(), state.queue.maxsize, state.accepted_sequence,
+                 state.delivered_sequence, state.congested_through, elapsed * 1000)
 
     def _schedule_state(self, state: str) -> None:
         if self.on_state is None:
