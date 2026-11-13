@@ -20,6 +20,57 @@ import {
   verifyLicensedVrmAsset,
 } from "./vrm-avatar.js";
 
+describe("auxiliary dialogue degradation 098", () => {
+  const degraded = { capability: "speech.dialogue_realtime", fallback: "cascade",
+    reason_code: "provider_dialogue_input_overflow", capture_id: "capture_endpoint" };
+
+  it("preserves the independent understanding failure and pending retry without sending commands", async () => {
+    const { run, emit, socket, request, audioFactory } = await openFormalEndpointHarness();
+    try {
+      emit("problem", { code: "UNDERSTANDING_RETRY_EXHAUSTED", message: "synthetic", recoverable: true,
+        action: "retry_answer_processing", capture_id: "capture_endpoint" });
+      await run.act({ type: "retry_answer_processing" });
+      expect(run.getSnapshot().understandingRetryPending).toBe(true);
+      const before = run.getSnapshot();
+      const sent = [...socket.sent];
+      for (const [turn, capture_id] of [["turn_1", "capture_endpoint"], ["turn_old", "capture_old"], ["turn_1", "capture_old"]]) {
+        emit("capability.degraded", { ...degraded, capture_id }, turn);
+        expect(run.getSnapshot()).toEqual(before);
+      }
+      expect(socket.sent).toEqual(sent);
+      expect(audioFactory).not.toHaveBeenCalled();
+      expect(runtimeProblemCalls(request)).toHaveLength(0);
+      emit("transcript.partial", { text: "合成新增片段", confidence: 0.9, server_received: true });
+      expect(run.getSnapshot().captions.recent.map(row => row.text)).toEqual(["合成新增片段"]);
+      expect(run.getSnapshot().captions.full).toEqual([]);
+      expect(run.getSnapshot().problem).toEqual(before.problem);
+      expect(run.getSnapshot().understandingRetryPending).toBe(true);
+    } finally { await run.close(); }
+  });
+
+  it("does not finish or replace approved playback when the auxiliary channel degrades", async () => {
+    const audio = new CandidateFakeAudio();
+    const { run, socket, audioFactory, request } = await openPlaybackHarness({ audios: [audio] });
+    try {
+      socket.emit("message", { data: JSON.stringify(candidateEvent(1, "session.snapshot", candidateSnapshot())) });
+      socket.emit("message", { data: JSON.stringify(candidateEvent(2, "avatar.performance.started", candidatePerformance())) });
+      await flushPlaybackEvents();
+      expect(run.getSnapshot().avatar).toMatchObject({ status: "speaking", performanceId: "performance_1" });
+      const before = run.getSnapshot();
+      const sent = [...socket.sent];
+      const notice = { ...candidateEvent(3, "capability.degraded", degraded), turn_id: "turn_1" };
+      socket.emit("message", { data: JSON.stringify(notice) });
+      socket.emit("message", { data: JSON.stringify(notice) });
+      await flushPlaybackEvents();
+      expect(run.getSnapshot()).toEqual(before);
+      expect(socket.sent).toEqual(sent);
+      expect(audioFactory).toHaveBeenCalledOnce();
+      expect(audio.pause).not.toHaveBeenCalled();
+      expect(runtimeProblemCalls(request)).toHaveLength(0);
+    } finally { await run.close(); }
+  });
+});
+
 describe("candidate startup cancellation", () => {
   it("does not claim the next page's prepared devices when an old avatar request completes late", async () => {
     let resolveAvatar;
@@ -2961,7 +3012,7 @@ function candidateEvent(sequence, type, payload) {
     turn_id: type === "avatar.performance.started" ? "turn_1" : null,
     causation_id: null,
     occurred_at: "2026-09-01T12:00:00Z",
-    replayability: type === "session.snapshot" ? "transient" : "replayable",
+    replayability: ["session.snapshot", "capability.degraded"].includes(type) ? "transient" : "replayable",
     payload,
   };
 }

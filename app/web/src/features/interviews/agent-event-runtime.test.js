@@ -2,6 +2,54 @@ import { describe, expect, it } from "vitest";
 
 import { OrderedAgentEventStream, validateAgentEvent } from "./agent-event-runtime.js";
 
+describe("auxiliary dialogue degradation contract 098", () => {
+  const reasons = [
+    "provider_dialogue_input_overflow", "provider_dialogue_input_timeout", "provider_dialogue_input_failed",
+    "provider_dialogue_event_overflow", "provider_dialogue_response_mismatch", "provider_timeout",
+    "provider_unavailable", "provider_route_missing", "provider_configuration_invalid", "provider_auth_failed",
+    "provider_billing_required", "provider_rate_limited", "provider_circuit_open", "provider_schema_invalid",
+    "provider_audio_unavailable", "provider_stream_closed",
+  ];
+  const payload = { capability: "speech.dialogue_realtime", fallback: "cascade", reason_code: reasons[0] };
+  const degraded = (sequence, value = payload) => ({
+    ...event(sequence, "capability.degraded", value), turn_id: "turn_1", replayability: "transient",
+  });
+
+  it.each(["candidate", "enterprise"])("accepts only the fixed auxiliary capability and bounded diagnostics for %s", audience => {
+    for (const reason_code of reasons) {
+      for (const capture_id of [undefined, null, "capture_current", "c".repeat(128)]) {
+        expect(validateAgentEvent(degraded(1, { ...payload, reason_code, capture_id }), { audience }).ok).toBe(true);
+      }
+    }
+    expect(validateAgentEvent({ ...degraded(1), turn_id: null }, { audience }).ok).toBe(true);
+  });
+
+  it.each(["candidate", "enterprise"])("rejects unsafe or incomplete auxiliary degradation payloads for %s", audience => {
+    for (const change of [
+      { capability: undefined }, { capability: "speech.transcription" }, { capability: true },
+      { fallback: undefined }, { fallback: "s2s" }, { fallback: true },
+      { reason_code: undefined }, { reason_code: null }, { reason_code: "private provider response" },
+      { reason_code: "" }, { reason_code: [] }, { capture_id: true }, { capture_id: 7 },
+      { capture_id: "" }, { capture_id: "c".repeat(129) }, { message: "private response" }, { provider_result: {} },
+      { text: "unapproved text" }, { audio_uri: "/private.wav" }, { approved: true },
+      { recoverable: true }, { action: "retry_answer_processing" }, { source_id: "private-source" },
+    ]) {
+      expect(validateAgentEvent(degraded(1, { ...payload, ...change }), { audience }).ok).toBe(false);
+    }
+    expect(validateAgentEvent({ ...degraded(1), replayability: "replayable" }, { audience }).ok).toBe(false);
+  });
+
+  it.each(["candidate", "enterprise"])("orders and deduplicates auxiliary degradation without masking a gap for %s", audience => {
+    const stream = new OrderedAgentEventStream({ audience });
+    const notice = degraded(1);
+    expect(stream.accept(notice).action).toBe("apply");
+    expect(stream.accept(notice)).toMatchObject({ action: "drop", reason: "duplicate_event_id" });
+    expect(stream.accept({ ...notice, event_id: "older_notice" })).toMatchObject({ action: "drop", reason: "stale_or_replayed_sequence" });
+    expect(stream.accept(degraded(3))).toMatchObject({ action: "resync", reason: "sequence_gap" });
+    expect(stream.cursor).toBe(1);
+  });
+});
+
 describe("ordered AgentEvent runtime", () => {
   it("bounds formal question audio recovery to the current followup without capture or private fields", () => {
     const snapshot = { ...candidateSnapshot(), floor: "none",

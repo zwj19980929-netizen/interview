@@ -2,6 +2,31 @@
 
 本文件记录所有会修改仓库内容的工作项。只读检查不单独登记；同一目标下的代码、测试、迁移和文档修改合并为一个工作项。状态使用 `in_progress`、`verified`、`failed` 或 `cancelled`，历史条目只追加或补充结果，不删除。
 
+## 2026-11-13 · DIALOGUE-CONTINUITY-098
+
+- 状态：`in_progress`。
+- 授权与基线：用户批准辅助语音降级、接话文案与语义校验分离、有界定向纠错及诊断方案并要求开始修复。修改前工作区干净，a8b1ef2（实现6d5b534）已提交作为回退点，独立分支codex/dialogue-continuity-098。按入口顺序复核11份设计文档与097证据；活动面试期间不重启，不自动重放、补交、结束真实面试，不使用真实候选录音或原文做模型探针。
+- 已确认事故：iv_1379a399cfba4d77的可选S2S输入分别在09:18:47Z/09:20:45Z/09:22:50Z溢出，权威STT与录音继续，但dialogue.error和stream.error共用problem出口。09:23:47Z/52Z补充分类网关成功后被reception_cannot_ask_question拒绝，09:24:54Z又被reception_current_control_conflict拒绝；当前纠错只覆盖顶层非对象JSON，后置内容违规仍重复原请求。未保存模型正文，不能推断具体生成话语；现有日志不足以区分音频突发与辅助供应商消费慢。
+- 实施边界：只对已确认辅助故障降级，真实STT/录音/控制权失败保持恢复；可验证的presence纯交流才允许独立审核固定话术，来源、完整语义和控制冲突仍严格校验。新增中央版本化纠错原因只消费097原同文本2次/失败期4次/40秒额度，不增加内部重试；新音频、过期来源、取消和失权不产生提交许可。保留原题、完整录音转写、题数和评分。增加有界队列数值诊断，不记录PCM、原始Prompt、响应或凭据。
+- 验证计划：先复现辅助故障投影及文案/控制冲突，再覆盖实际服务/端点联动、固定接话交付、过期来源/预算/取消反例、前后端完整回归与构建。完成后提交实现，重新检查空闲再加载API/worker并验证实际源码和前端；所有修改文件、命令、失败与未完成事项在本项补齐。
+
+- 首轮红例：新增tests/test_supplement_content_runtime_098.py针对内容纠错与来源绑定，pytest结果4失败/13通过，失败精确复现第二次请求没有纠错原因、Evidence未保留实际内容失败、真实adapter两次请求相同；未调用真实模型或修改业务状态。
+
+- 内容恢复联动：原红例修复后，6文件169项通过（/private/tmp/interviewer-098-content-runtime-second.log）；覆盖真实adapter两次内容纠错、当前来源/实际原因匹配、同文本额度、固定presence交付/中断/无音频/新输入/owner失效。上一轮7失败/162通过保留于interviewer-098-content-runtime.log：4项新测试夹具重复act_id及未期待正确抛出的失权异常，3项097仍patch旧validator入口，已窄调夹具和resolver seam，业务门禁未放宽。中央合同/服务相关分别240、210、76通过；新增固定文案再次校验与日志故障隔离，无真实模型外呼。
+
+- 辅助链验证：后端5文件166通过、前端相关192通过；新增22项覆盖实际ContinuousSTT最终转写及双录制优先、16000字节原限额、突发/慢消费、日志故障/数值边界、current source/generation/turn/owner/controller及主错误保留。新事件为TRANSIENT，不入历史或新增快照，仅推进现有序号；托管capture_id可用时才提供，未知原因归固定provider_unavailable。独立语义审查无新增阻断，辅助审查初步无阻断；源码准备冻结完整回归，尚未发布或重启。
+
+- 冻结与审查：辅助链独立66项通过，语义与辅助两轮只读交叉审查无阻断；前端可选capture_id空串与后端长度约束差异已统一，相关27项通过。098验收/发布临时工具19+25项隔离通过，精确限定12生产文件及11关键后端/3前端测试；新增全量collection与passed+skipped计数一致性校验。冻结619文件、237后端文件，源码SHA58ddd862b1c928cb1fcb8b2cb2942e9d85eaf89f48eafd1d675ba0405b0abdf7，开始完整回归，正式结果待补。
+
+- 首轮完整回归失败：5220项实际收集；后端4 failed/5208 passed/8 skipped，276.48秒。4失败均为098新日志测试：全量先前的日志配置关闭interviewer.speech_evidence向根logger传播，预期安全事件已在stderr实际输出但caplog未捕获。辅助与中央测试分别补日志捕获隔离，生产及业务断言不改；原冻结快照、collection与失败日志保留为/private/tmp/interviewer-098-first-{tested-source.json,backend-collection.log,backend-full.log}，未生成发布证明、未发布或重启。修正后重新冻结完整验证。
+- 日志测试隔离验证：在预先启用生产日志配置、propagate=False的环境下，辅助22项、中央44项通过；各测试退出后handlers、propagate、level恢复原值。辅助fixture临时允许传播，中央测试直接挂载caplog.handler并保持不传播，均只作用于测试。重新冻结619份源码/测试，后端237文件SHA仍为58ddd862b1c928cb1fcb8b2cb2942e9d85eaf89f48eafd1d675ba0405b0abdf7，第二轮完整验证已开始。
+
+- 实际修改文件（41份）：`app/core/prompt/conversation_reception.py`、`app/core/prompt/supplement_reply.py`、`app/domain/interview_agent.py`、`app/model_gateway/dialogue.py`、`app/model_gateway/gateway.py`、`app/providers/mock/provider.py`、`app/services/conversation_understanding.py`、`app/services/interview_agent.py`、`app/services/interview_evidence.py`、`app/services/spoken_supplement.py`、`app/services/streaming_stt.py`、`app/web/src/features/candidate/agent-experience.test.js`、`app/web/src/features/interviews/agent-event-runtime.js`、`app/web/src/features/interviews/agent-event-runtime.test.js`、`app/web/src/features/interviews/agent-monitor.test.js`、`docs/api-design.md`、`docs/architecture.md`、`docs/change-log.md`、`docs/database-and-vector-storage.md`、`docs/development-progress.md`、`docs/domain-model.md`、`docs/implementation-roadmap.md`、`docs/known-issues-and-remediation.md`、`docs/model-provider-plugins.md`、`docs/retrieval-and-evaluation.md`、`tests/test_company_question_integration.py`、`tests/test_conversation_handoff_059.py`、`tests/test_declined_answer_integration.py`、`tests/test_dialogue_degradation_098.py`、`tests/test_off_topic_integration_068.py`、`tests/test_supplement_completion_proof_096.py`、`tests/test_supplement_confirmation_073.py`、`tests/test_supplement_content_recovery_098.py`、`tests/test_supplement_content_runtime_098.py`、`tests/test_supplement_contracts.py`、`tests/test_supplement_diagnostics_097.py`、`tests/test_supplement_dialogue_084.py`、`tests/test_supplement_evidence_diagnostics_097.py`、`tests/test_supplement_format_correction_096.py`、`tests/test_supplement_reply_contract_084.py`、`tests/test_supplement_reply_sqlite_082.py`。生产范围为12文件；16份后端测试、3份前端测试及10份文档。没有DDL、模型路由或历史业务数据迁移。
+
+
+- 第二轮完整验证：`PYTHONDONTWRITEBYTECODE=1 .venv/bin/python /private/tmp/interviewer-098-test-and-attest.py`退出0。完整collection为5220；`pytest -p no:cacheprovider -q`为5212 passed /8 skipped /278.59秒，与收集计数一致；`npm test -- --reporter=dot`为26文件589项通过；`npm run build -- --outDir /private/tmp/interviewer-098-web-dist`成功，既有大chunk非阻断提示保留。619份冻结源码/测试在收集、后端、前端和构建后逐次核对无漂移；12生产路径及11后端/3前端关键测试全部纳入。日志`/private/tmp/interviewer-098-{backend-collection,backend-full,frontend-full,web-build}.log`，候选证明`interviewer-098-verified-unpublished.json`。文档交叉审查补清presence阈值0.75/唯一反问错误和纠错仍需正常完成证明；没有再改生产或测试。
+- 加载安排：先提交实现，再原子发布已测静态入口、保留旧assets并生成正式证明；即时检查空闲后使用PTY正常重启并核验新PID和实际资源。预检的`/readyz`会短暂连接并断开专用LiveKit探测房间，不使用候选业务数据或真实模型。此刻服务尚未重启，最终运行结果待补。
+
 ## 2026-11-12 · SUPPLEMENT-RECOVERY-CONFLICT-097
 
 - 状态：`verified（仓库全量与本机加载；真人连续语音待验）`。

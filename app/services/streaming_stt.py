@@ -6,6 +6,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from app.adapters.private_media import media_recording_storage
 from app.core.errors import ApiError
+from app.core.ids import new_id
 from app.domain.evidence_coordination import EvidenceCommitFence
 from app.core.prompt.realtime_dialogue import (
     approved_spoken_response_instruction,
@@ -13,7 +14,7 @@ from app.core.prompt.realtime_dialogue import (
 )
 from app.model_gateway.errors import ProviderError
 from app.model_gateway.gateway import ModelGateway
-from app.model_gateway.dialogue import OptionalSpeechDialogueInput
+from app.model_gateway.dialogue import OptionalSpeechDialogueInput, dialogue_degradation_reason
 from app.model_gateway.schemas import (
     RealtimeSpeechDialogueRequest,
     RealtimeSpeechResponseCommand,
@@ -87,6 +88,8 @@ class StreamingInterviewSTT:
         self.last_media_checkpoint: Optional[Dict[str, Any]] = None
         self.continuous = False
         self._capture_generation = 0
+        self._dialogue_degradation: Optional[tuple] = None
+        self._dialogue_degradation_projected = False
 
     def validate_candidate_token(self, token: Optional[str]) -> None:
         self.interviews.validate_candidate_token(
@@ -98,6 +101,8 @@ class StreamingInterviewSTT:
             raise ApiError("STT_STREAM_ALREADY_OPEN", "An STT stream is already open.", status_code=409)
         self._capture_generation += 1
         generation = self._capture_generation
+        self._dialogue_degradation = None
+        self._dialogue_degradation_projected = False
         self.continuous = bool(payload.get("_continuous_capture"))
         try:
             return await self._open_capture(payload, generation)
@@ -228,6 +233,7 @@ class StreamingInterviewSTT:
                         raise
                 self.dialogue = OptionalSpeechDialogueInput(
                     dialogue, max_pending_bytes=max(1, sample_rate_hz * channels),
+                    diagnostic_context={"interview_id": self.interview_id, "turn_id": self.turn_id},
                 )
                 ready.extend(item.model_dump() for item in self.dialogue.ready_events)
             except ProviderError as exc:
@@ -287,6 +293,9 @@ class StreamingInterviewSTT:
             if self.dialogue is not None:
                 try:
                     dialogue_result = await self.dialogue.send_audio(chunk)
+                except ApiError:
+                    # Ownership/recording guards are not optional Provider faults.
+                    raise
                 except Exception as exc:
                     dialogue_events = [
                         self._dialogue_error(
@@ -553,6 +562,9 @@ class StreamingInterviewSTT:
                         dialogue_events
                     )
                 except (ApiError, ProviderError, ValueError, asyncio.TimeoutError) as exc:
+                    if isinstance(exc, ApiError) and exc.code not in {
+                            "S2S_OUTPUT_AUDIO_INCOMPLETE", "S2S_OUTPUT_AUDIO_FORMAT_INVALID", "S2S_OUTPUT_AUDIO_INVALID"}:
+                        raise
                     response.append(
                         self._dialogue_error(
                             getattr(exc, "code", "dialogue_response_failed"),
@@ -909,13 +921,31 @@ class StreamingInterviewSTT:
         }
 
     def _dialogue_error(self, code: str, message: str) -> Dict[str, Any]:
+        # Only this optional-stream boundary can mint a degradation receipt.
+        # Queued events from a retired capture cannot affect a replacement.
+        if self._dialogue_degradation is None or self._dialogue_degradation[0] != self._capture_generation:
+            self._dialogue_degradation = (self._capture_generation, new_id("dialogue_degradation"),
+                                         self.turn_id, dialogue_degradation_reason(code))
+            self._dialogue_degradation_projected = False
         return {
             "stream_id": self.dialogue.stream_id if self.dialogue else "dialogue_unavailable",
             "sequence": 1,
             "type": "dialogue.error",
             "error_code": str(code),
             "message": message,
+            "turn_id": self.turn_id,
+            "_dialogue_degradation_id": self._dialogue_degradation[1],
         }
+
+    def take_dialogue_degradation(self, raw: Dict[str, Any]) -> Optional[Dict[str, str]]:
+        receipt = self._dialogue_degradation
+        if (self._dialogue_degradation_projected or receipt is None
+                or receipt[0] != self._capture_generation or receipt[2] != self.turn_id
+                or raw.get("turn_id") != self.turn_id or raw.get("_dialogue_degradation_id") != receipt[1]):
+            return None
+        self._assert_commit_allowed()
+        self._dialogue_degradation_projected = True
+        return {"capability": "speech.dialogue_realtime", "fallback": "cascade", "reason_code": receipt[3]}
 
     async def _materialize_dialogue_expression(
         self, events: List[Any]

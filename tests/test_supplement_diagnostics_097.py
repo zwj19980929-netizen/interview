@@ -29,8 +29,8 @@ def post_gateway_events(events):
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("correction,version", [(None, "supplement_reply.v9"),
-    ("invalid_json_object", "supplement_reply.v10")])
+@pytest.mark.parametrize("correction,version", [(None, "supplement_reply.v11"),
+    ("invalid_json_object", "supplement_reply.v12")])
 @pytest.mark.parametrize("change,reason,path", [
     ({"reply_text": "PRIVATE_MODEL_REPLY"}, "supplement_silent_intent_has_reply", "$.reply_text"),
     ({"intent": "supplement"}, "supplement_answer_effect_conflict", "$.answer_effect"),
@@ -75,7 +75,7 @@ async def test_internal_post_gateway_error_is_not_mislabeled_schema_or_swallowed
     def reject(*_args, **_kwargs):
         raise failure
 
-    monkeypatch.setattr(supplement_reply, "validate_supplement_reply", reject)
+    monkeypatch.setattr(supplement_reply, "resolve_supplement_reply", reject)
     with pytest.raises(error_type) as caught:
         await service.classify_supplement_reply(REPLY, "org_default", conversation_context=CONTEXT)
     assert caught.value is failure and len(calls) == 1

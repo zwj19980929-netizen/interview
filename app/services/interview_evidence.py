@@ -467,8 +467,13 @@ class InterviewEvidenceChain:
                 pass
         failure_identity = (stream, generation, recognizer, frozen_evidence, context_fingerprint,
                             prior_confirmation_proof if verified_prior else None)
-        correction = ("invalid_json_object" if correction_reason == "invalid_json_object"
-                      and getattr(self, "_supplement_reply_failure", None) == failure_identity else None)
+        from app.core.prompt.supplement_reply import (
+            SUPPLEMENT_CORRECTION_REASONS, supplement_correction_reason,
+        )
+        correction = (correction_reason if isinstance(correction_reason, str)
+                      and correction_reason in SUPPLEMENT_CORRECTION_REASONS
+                      and getattr(self, "_supplement_reply_failure", None) == (failure_identity, correction_reason)
+                      else None)
         self._supplement_reply_failure = None
         try:
             result = await stream.interviews.conversation.classify_supplement_reply(
@@ -477,16 +482,14 @@ class InterviewEvidenceChain:
                 conversation_context=context, correction_reason=correction,
             )
         except Exception as exc:
-            from app.model_gateway.errors import ProviderError
-            if (isinstance(exc, ProviderError) and exc.code == "provider_schema_invalid" and exc.retryable
-                    and exc.details.get("json_failure_kind") == "invalid_json_object"
-                    and exc.details.get("json_decode_reason") == "non_object"
+            failure_reason = supplement_correction_reason(exc)
+            if (failure_reason is not None
                     and stream is self._stt and not self._input_revoked
                     and stream.turn_id == turn_id and stream._capture_generation == generation
                     and stream.stream is recognizer and evidence_identity() == frozen_evidence):
                 stream._assert_commit_allowed()
                 if self._supplement_dialogue_context(stream)[2] == context_fingerprint:
-                    self._supplement_reply_failure = failure_identity
+                    self._supplement_reply_failure = (failure_identity, failure_reason)
             raise
         from app.core.prompt.supplement_reply import SUPPLEMENT_REPLY_VERSION, SUPPLEMENT_REPLY_CORRECTION_VERSION
         prompt_version = SUPPLEMENT_REPLY_CORRECTION_VERSION if correction is not None else SUPPLEMENT_REPLY_VERSION

@@ -72,7 +72,7 @@ def test_correction_changes_version_and_instruction_not_evidence_or_schema():
     context = {"reply": REPLY, "conversation_context": CONTEXT}
     normal = prompt_contract("supplement_reply", context)
     corrected = prompt_contract("supplement_reply", {**context, "correction_reason": "invalid_json_object"})
-    assert normal.version == "supplement_reply.v9" and corrected.version == "supplement_reply.v10"
+    assert normal.version == "supplement_reply.v11" and corrected.version == "supplement_reply.v12"
     assert normal.response_schema == corrected.response_schema
     assert corrected.response_schema["type"] == "object"
     assert "answer_effect" in corrected.response_schema["required"]
@@ -105,7 +105,7 @@ async def test_second_external_attempt_is_changed_single_http_request_without_un
     assert first["messages"] != second["messages"]
     assert [m for m in first["messages"] if m["role"] == "user"] == [m for m in second["messages"] if m["role"] == "user"]
     assert "PRIVATE_REJECTED_RESPONSE" not in json.dumps(second)
-    assert [item["prompt_version"] for item in store.model_invocations] == ["supplement_reply.v9", "supplement_reply.v10"]
+    assert [item["prompt_version"] for item in store.model_invocations] == ["supplement_reply.v11", "supplement_reply.v12"]
     assert all(item["attempt"] == 1 and item["fallback_index"] == 0 for item in store.model_invocations)
 
 

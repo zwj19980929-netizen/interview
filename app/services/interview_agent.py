@@ -1844,6 +1844,9 @@ class AgentChannel:
         self, raw: Dict[str, Any], causation_id: Optional[str]
     ) -> None:
         raw_type = str(raw.get("type") or "")
+        if raw_type == "dialogue.error":
+            await self._project_dialogue_degradation(raw, causation_id)
+            return
         turn_id = (
             self._stt.turn_id
             if self._stt
@@ -1982,7 +1985,7 @@ class AgentChannel:
                     gesture="listen",
                 )
             return
-        if raw_type in {"stream.error", "dialogue.error"}:
+        if raw_type == "stream.error":
             await self._emit(
                 "problem",
                 {
@@ -1994,6 +1997,32 @@ class AgentChannel:
                 causation_id=causation_id,
                 replayability=Replayability.REPLAYABLE,
             )
+
+    async def _project_dialogue_degradation(self, raw: Dict[str, Any], causation_id: Optional[str]) -> None:
+        """A current auxiliary failure is neither an answer failure nor delivery."""
+        if self._closed or self._terminating:
+            return
+        managed = self._evidence_session
+        if managed is not None:
+            if managed._stopped:
+                return
+            managed.assert_controller(self)
+            source = getattr(getattr(managed, "chain", None), "_stt", None)
+        else:
+            source = self._stt
+        if source is None or source.stream is None or source.recording is None:
+            return
+        session = self.runtime.interviews.get_interview(self.interview_id, self.organization_id)
+        if (session.get("status") != "in_progress" or session.get("current_turn_id") != source.turn_id
+                or raw.get("turn_id") != source.turn_id):
+            return
+        payload = source.take_dialogue_degradation(raw)
+        if payload is None:
+            return
+        if managed is not None and managed._capture_id:
+            payload["capture_id"] = managed._capture_id
+        await self._emit("capability.degraded", payload, turn_id=source.turn_id,
+                         causation_id=causation_id, replayability=Replayability.TRANSIENT)
 
     def _planning_fence(self):
         if self._evidence_session is None:
@@ -3696,6 +3725,7 @@ class InterviewAgentRuntime:
             },
             "problem": {"code", "message", "recoverable", "action", "calibration", "capture_id",
                         "stage", "reason_code", "attempt", "max_attempts", "retryable"},
+            "capability.degraded": {"capability", "fallback", "reason_code", "capture_id"},
             "completed": {
                 "interview_id",
                 "status",

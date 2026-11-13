@@ -80,7 +80,7 @@ def compose(harness, final, decision, *, boundary=None, reply=""):
 
 def test_current_contract_explicitly_separates_answer_effect_from_completion():
     contract = prompt_contract("supplement_reply", {"reply": "我已经说完了。太好笑了。"})
-    assert contract.version == "supplement_reply.v9"
+    assert contract.version == "supplement_reply.v11"
     assert "answer_effect" in contract.response_schema["required"]
     result = validate_supplement_reply(_wire(), contract.response_schema,
                                       reply="我已经说完了。太好笑了。")
@@ -90,7 +90,7 @@ def test_current_contract_explicitly_separates_answer_effect_from_completion():
 
 def test_prior_confirmation_aside_rule_has_priority_without_overriding_real_requests():
     contract = prompt_contract("supplement_reply", {"reply": "窗外好像下雨了。", "prior_confirmation": True})
-    assert contract.version == "supplement_reply.v9"
+    assert contract.version == "supplement_reply.v11"
     instructions = contract.messages[0].content
     assert "必须使用confirmation_unchanged" in instructions
     assert "主动请求另聊无关话题仍用off_topic" in instructions
@@ -335,10 +335,10 @@ async def test_mixed_finish_commits_once_with_full_transcript_and_no_second_unde
 
 
 @pytest.mark.anyio
-@pytest.mark.parametrize("change,expected", [(None, "supplement_reply.v10"),
-    ("context", "supplement_reply.v9"), ("source", "supplement_reply.v9"),
-    ("syntax", "supplement_reply.v9"), ("terminal", "supplement_reply.v9"),
-    ("no_failure", "supplement_reply.v9")])
+@pytest.mark.parametrize("change,expected", [(None, "supplement_reply.v12"),
+    ("context", "supplement_reply.v11"), ("source", "supplement_reply.v11"),
+    ("syntax", "supplement_reply.v11"), ("terminal", "supplement_reply.v11"),
+    ("no_failure", "supplement_reply.v11")])
 async def test_format_correction_binds_the_actual_failure_source_and_context(tmp_path, monkeypatch, change, expected):
     from app.model_gateway.errors import ProviderError
     harness = await prepared_harness(tmp_path, monkeypatch)

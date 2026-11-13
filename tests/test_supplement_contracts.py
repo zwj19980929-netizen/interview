@@ -45,7 +45,7 @@ def test_new_supplement_approval_uses_central_version_and_keeps_frozen_history(k
 ])
 def test_confirmation_reply_has_strict_nonempty_bounded_contract(change):
     contract = prompt_contract("supplement_reply", {"reply": "没有补充"})
-    assert contract.version == "supplement_reply.v9"
+    assert contract.version == "supplement_reply.v11"
     with pytest.raises(StructuredResponseValidationError):
         validate_structured_response({"intent": "finish", "confidence": 0.9, "evidence_id": "E1", "reply_text": "", "answer_effect": "unchanged", **change}, contract.response_schema)
 
@@ -70,7 +70,7 @@ def test_reply_evidence_cannot_be_invented_even_after_valid_json():
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("version", ["supplement_reply.v1", "supplement_reply.v2", "supplement_reply.v3", "supplement_reply.v4", "supplement_reply.v5", "supplement_reply.v6", "supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10"])
+@pytest.mark.parametrize("version", ["supplement_reply.v1", "supplement_reply.v2", "supplement_reply.v3", "supplement_reply.v4", "supplement_reply.v5", "supplement_reply.v6", "supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10", "supplement_reply.v11", "supplement_reply.v12"])
 def test_supplement_versions_remain_readable_in_mock_and_invocation_audit(version):
     from app.providers.mock.provider import MockProvider
 
@@ -78,11 +78,11 @@ def test_supplement_versions_remain_readable_in_mock_and_invocation_audit(versio
         contract = prompt_contract("supplement_reply", {"reply": "我说的内容和字幕不一样。"})
         schema = deepcopy(supplement_reply_canonical_schema() if version in {
             "supplement_reply.v1", "supplement_reply.v2"} else contract.response_schema)
-        if version not in {"supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10"}:
+        if version not in {"supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10", "supplement_reply.v11", "supplement_reply.v12"}:
             schema["required"].remove("answer_effect")
             schema["properties"].pop("answer_effect")
             schema["properties"]["intent"]["enum"].remove("confirmation_unchanged")
-        if version not in {"supplement_reply.v6", "supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10"}:
+        if version not in {"supplement_reply.v6", "supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10", "supplement_reply.v11", "supplement_reply.v12"}:
             # Historical contracts never required generated conversation text.
             schema["required"].remove("reply_text")
             for key in ("reply_text", "repeat_target"):
@@ -120,7 +120,7 @@ def test_transcription_dispute_uses_versioned_contract_without_relaxing_evidence
 
     result = asyncio.run(ConversationUnderstandingService(InMemoryStore(), gateway=Gateway()).classify_supplement_reply(reply, "org_default"))
     assert result["intent"] == "unclear" and result["evidence_quote"] in reply
-    assert seen[0].metadata["prompt_version"] == "supplement_reply.v9"
+    assert seen[0].metadata["prompt_version"] == "supplement_reply.v11"
     assert set(seen[0].json_schema["required"]) == {"intent", "answer_effect", "confidence", "evidence_id", "reply_text"}
     assert seen[0].json_schema["additionalProperties"] is False
     system = "".join(message.content for message in seen[0].messages if message.role == "system")

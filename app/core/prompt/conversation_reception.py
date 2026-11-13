@@ -205,6 +205,12 @@ def reception_contract(context):
 
 def validate_reception_response(data, schema, *, current_speech=None):
     """Cross-field response contract, before a generated phrase reaches runtime."""
+    validate_reception_semantics(data, schema, current_speech=current_speech)
+    validate_reception_expression(data)
+
+
+def validate_reception_semantics(data, schema, *, current_speech=None):
+    """Validate source, current control and routing before checking expression."""
     import math
     from app.core.prompt.validation import StructuredResponseValidationError, validate_structured_response
     validate_structured_response(data, schema)
@@ -222,9 +228,19 @@ def validate_reception_response(data, schema, *, current_speech=None):
         from app.core.prompt.semantic_turn import _explicit_control_conflict
         if _explicit_control_conflict(current_speech, "thinking", "none"):
             reject("reception_current_control_conflict", "$.kind")
-    reply = data["reply_text"]
     if data["kind"] != "repeat" and data.get("repeat_target") is not None:
         reject("reception_repeat_target_without_repeat", "$.repeat_target")
+
+
+def validate_reception_expression(data):
+    """Only for already schema/semantics-validated reception fields."""
+    from app.core.prompt.validation import StructuredResponseValidationError
+
+    def reject(reason):
+        raise StructuredResponseValidationError("Reception response violates the conversation contract.",
+                                                reason_code=reason, schema_path="$.reply_text")
+
+    reply = data["reply_text"]
     if data["kind"] in {"other", "repeat", "stop_interview"}:
         if reply != "":
             reject("reception_silent_kind_has_reply")

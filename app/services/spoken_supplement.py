@@ -1612,8 +1612,9 @@ class SpokenSupplementConfirmation:
         correction_identity = (endpoint.capture, endpoint.revision, budget_epoch,
             endpoint._identity(final), endpoint._identity(self._boundary_final),
             self._reply_question, self._confirmation_proof)
-        if self._supplement_correction == correction_identity:
-            reply_context["correction_reason"] = "invalid_json_object"
+        pending_correction = self._supplement_correction
+        if pending_correction is not None and pending_correction[0] == correction_identity:
+            reply_context["correction_reason"] = pending_correction[1]
         # A continuation is consumed before I/O and can never become an inner
         # retry loop. The endpoint retains the original two-call allowance.
         self._supplement_correction = None
@@ -1643,10 +1644,10 @@ class SpokenSupplementConfirmation:
                 return
             from app.core.model_diagnostics import safe_model_failure_fields
             endpoint.trace("supplement_classification_failed", **safe_model_failure_fields(exc))
-            if (isinstance(exc, ProviderError) and exc.retryable and exc.code == "provider_schema_invalid"
-                    and exc.details.get("json_failure_kind") == "invalid_json_object"
-                    and exc.details.get("json_decode_reason") == "non_object"):
-                self._supplement_correction = correction_identity
+            from app.core.prompt.supplement_reply import supplement_correction_reason
+            correction_reason = supplement_correction_reason(exc)
+            if correction_reason is not None:
+                self._supplement_correction = (correction_identity, correction_reason)
             endpoint._record_preparation_failure(attempt, problem=exc)
             await endpoint._understanding_failed(record_failure=False)
             return

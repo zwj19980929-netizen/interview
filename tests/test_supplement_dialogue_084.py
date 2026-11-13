@@ -213,7 +213,7 @@ async def test_new_noncompletion_reply_uses_one_small_decision_and_no_full_analy
                                       else "你是想确认题目里这个词的含义吗？") if generated else ""
         await _reply(harness, reply)
         assert harness.gateway.kinds == ["small"]
-        assert harness.gateway.requests[0].metadata["prompt_version"] == "supplement_reply.v9"
+        assert harness.gateway.requests[0].metadata["prompt_version"] == "supplement_reply.v11"
         assert harness.spoken == ["check", speech]
         assert not harness.committed and not harness.confirmation.confirmed
         assert harness.capture.is_open and len(harness.capture.prepares) == 1

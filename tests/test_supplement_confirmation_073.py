@@ -278,10 +278,10 @@ async def test_supplement_exit_request_routes_real_audio_to_separate_exit_confir
             return response
         version = request.metadata.get("prompt_version", "")
         data = deepcopy(response.data)
-        if version in {"supplement_reply.v5", "supplement_reply.v6", "supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10"}:
+        if version in {"supplement_reply.v5", "supplement_reply.v6", "supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v11", "supplement_reply.v12"}:
             requests.append("supplement")
             data.update(intent="stop_interview", confidence=.95, reply_text="")
-            if version in {"supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10"}:
+            if version in {"supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v11", "supplement_reply.v12"}:
                 data["answer_effect"] = "unchanged"
         elif version.startswith(("interview_turn_understanding.", "interview_turn_decision.")):
             requests.append("understanding")

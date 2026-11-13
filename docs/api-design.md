@@ -1,5 +1,15 @@
 # 接口设计
 
+## 098：辅助语音降级与接话内容恢复
+
+仅可选语音表达通道的故障投影为能力降级，主识别、录音与正常TTS路径仍持续工作时不要求候选人重试回答；权威stream.error及录音/所有权故障保持原恢复语义。降级通知不能清除其他回答处理失败、宣称播报已送达或产生回答完成许可。
+
+新增Agent事件`capability.degraded`，payload为`capability=speech.dialogue_realtime`、`fallback=cascade`、固定白名单`reason_code`及可选`capture_id`（托管采集提供，直接STT路径可省略）。该事件为TRANSIENT，不写入事件历史或新增快照状态，只描述辅助表达降级，不占用或清除`problem`和`answer_preparation`；服务端按当前实例/generation/turn/capture/owner验证并只投影一次，客户端校验固定载荷后推进事件游标，不改变候选失败或播放状态。原因白名单为provider_dialogue_input_overflow、provider_dialogue_input_timeout、provider_dialogue_input_failed、provider_dialogue_event_overflow、provider_dialogue_response_mismatch、provider_timeout、provider_unavailable、provider_route_missing、provider_configuration_invalid、provider_auth_failed、provider_billing_required、provider_rate_limited、provider_circuit_open、provider_schema_invalid、provider_audio_unavailable、provider_stream_closed；未知原因归provider_unavailable。供应商正文不透传候选端。输入队列的后台安全诊断只记录有界字节数和耗时，日志失败不得影响主录音/STT。
+
+补充交流统一校验将当前意图、答案影响、证据和控制冲突与生成接话文案分开处理。仅presence、answer_effect=unchanged、confidence≥0.75且其余全部合同通过，唯一表达失败为reception_cannot_ask_question时，可用集中审核的固定回应替代反问文案，再执行完整校验；固定回应不提交、不换题、不结束。控制冲突必须对完整当前权威回复重新分类，不能当作润色修复。
+
+明确的JSON非对象、接话反问和当前控制冲突可在同来源剩余额度内触发一次版本化定向纠错；纠错原因须来自实际失败并绑定capture、完整final、回复边界、已送达问题与上下文，不能由客户端或模型授予。沿用同文本2次、连续失败期4次/40秒、单次8秒/零Provider内部重试。耗尽仍保留证据与有界中性恢复，真实暂停/退出/完成继续经过既有门禁。最终具体版本和验证记录见098操作日志。
+
 ## 097：补充回复独立恢复与后置诊断
 
 补充问题实际送达后，服务端对完整权威新回复分类。分类恢复与完整技术答案理解的失败预算分离：每个capture/显式操作epoch内，同一完整文本最多两次实际调用；一次连续失败期最多四次调用，固定40秒从该期首个调用前起算，新字句、VAD或metadata不延期。所有调用在I/O前扣额，取消不退；新回复不能重置永久供应商阻断。只有分类及当前来源复验成功才结束连续失败期，逐文本账本仍保留；成功分类本身不是完成许可。显式处理重试可更新epoch且保留有效确认，显式继续更新epoch同时撤销旧完成事实。完整技术分析的两次额度不增加。

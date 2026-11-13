@@ -24,6 +24,7 @@ export const STABLE_AGENT_EVENT_TYPES = Object.freeze([
   "avatar.performance.interrupted",
   "avatar.performance.stopped",
   "takeover.changed",
+  "capability.degraded",
   "problem",
   "completed",
 ]);
@@ -42,6 +43,13 @@ const GESTURES = new Set([
 ]);
 const ALIGNMENT_SOURCES = new Set(["provider_timestamp", "g2p_estimate"]);
 const EXPRESSION_DELIVERIES = new Set(["pre_generated", "cascade", "s2s", "streaming_tts"]);
+const DIALOGUE_DEGRADATION_REASONS = new Set([
+  "provider_dialogue_input_overflow", "provider_dialogue_input_timeout", "provider_dialogue_input_failed",
+  "provider_dialogue_event_overflow", "provider_dialogue_response_mismatch", "provider_timeout",
+  "provider_unavailable", "provider_route_missing", "provider_configuration_invalid", "provider_auth_failed",
+  "provider_billing_required", "provider_rate_limited", "provider_circuit_open", "provider_schema_invalid",
+  "provider_audio_unavailable", "provider_stream_closed",
+]);
 
 const BASE_PAYLOAD_KEYS = Object.freeze({
   "avatar.performance.playback": ["performance_id", "status"],
@@ -69,6 +77,7 @@ const BASE_PAYLOAD_KEYS = Object.freeze({
   "avatar.performance.interrupted": ["performance_id", "reason", "deadline_ms"],
   "avatar.performance.stopped": ["performance_id", "output_id", "reason"],
   "takeover.changed": ["status", "expires_at", "version", "ai_resumed"],
+  "capability.degraded": ["capability", "fallback", "reason_code", "capture_id"],
   problem: ["code", "message", "recoverable", "action", "calibration", "capture_id", "stage", "reason_code", "attempt", "max_attempts", "retryable"],
   completed: [
     "interview_id", "status", "submitted_at", "recording_retention_notice", "human_review_required",
@@ -138,6 +147,9 @@ export function validateAgentEvent(value, { audience = "candidate" } = {}) {
   }
   if (!REPLAYABILITY.has(value.replayability)) {
     return invalid("AGENT_EVENT_REPLAYABILITY_INVALID", "replayability is invalid");
+  }
+  if (value.type === "capability.degraded" && value.replayability !== "transient") {
+    return invalid("AGENT_EVENT_REPLAYABILITY_INVALID", "auxiliary degradation cannot be replayed");
   }
   if (!isPlainObject(value.payload)) return invalid("AGENT_EVENT_PAYLOAD_INVALID", "payload must be a plain object");
   if (audience !== "candidate" && audience !== "enterprise") {
@@ -317,6 +329,12 @@ function validatePayload(type, payload, audience) {
         && optionalString(payload.media_participant_identity, 160)
         && optionalString(payload.media_permit_issued_at, 64)
         && optionalString(payload.media_permit_expires_at, 64)
+        ? valid() : invalidPayload(type);
+    case "capability.degraded":
+      return payload.capability === "speech.dialogue_realtime"
+        && payload.fallback === "cascade"
+        && DIALOGUE_DEGRADATION_REASONS.has(payload.reason_code)
+        && (payload.capture_id == null || boundedString(payload.capture_id, 1, 128))
         ? valid() : invalidPayload(type);
     case "problem":
       return boundedString(payload.code, 1, 128)

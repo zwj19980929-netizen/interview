@@ -28,7 +28,7 @@ def test_contract_has_one_route_and_only_fresh_utterance_evidence():
             "history": [{"role": "interviewer", "text": "已播出的解释。", "delivery_status": "delivered"},
                         {"role": "interviewer", "text": "未播出的私有说明。", "delivery_status": "selected"}],
             "rubric": "private-rubric-sentinel", "standard_answer": "private-answer-sentinel"}})
-    assert contract.version == "supplement_reply.v9"
+    assert contract.version == "supplement_reply.v11"
     context = json.loads(contract.messages[-1].content)
     assert context["evidence"] == {"E1": "这个术语是什么？"}
     assert context["stage"] == "awaiting_reply"

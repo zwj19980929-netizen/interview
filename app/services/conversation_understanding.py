@@ -479,10 +479,15 @@ class ConversationUnderstandingService:
             execution_budget=InvocationExecutionBudget(timeout_s=8, max_provider_retries=0, max_provider_attempts=1),
             metadata={"prompt_version": contract.version},
         ))
-        from app.core.prompt.supplement_reply import validate_supplement_reply
+        from app.core.prompt.supplement_reply import resolve_supplement_reply
         try:
-            return validate_supplement_reply(response.data, contract.response_schema, reply=reply,
-                                            prior_confirmation=prior_confirmation)
+            resolved = resolve_supplement_reply(response.data, contract.response_schema, reply=reply,
+                                               prior_confirmation=prior_confirmation)
+            if resolved.repair_reason:
+                record_model_diagnostic("correction_applied", **{**safe_model_call_context(),
+                    "validation_stage": "supplement_content", "reason_code": resolved.repair_reason,
+                    "prompt_version": contract.version, "outcome": "fallback_success"})
+            return resolved.decision
         except Exception as exc:
             record_model_diagnostic(
                 "understanding_rejected" if isinstance(exc, StructuredResponseValidationError) else "understanding_failed",

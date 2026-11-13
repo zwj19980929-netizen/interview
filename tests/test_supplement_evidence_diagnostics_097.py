@@ -54,7 +54,7 @@ async def test_post_classification_failure_preserves_exception_without_private_d
         return
     event, = [row for row in rows if row["event"] == "model.understanding_failed"]
     assert event["validation_stage"] == stage
-    assert event["prompt_version"] == "supplement_reply.v9"
+    assert event["prompt_version"] == "supplement_reply.v11"
     assert event["diagnostic_scope_id"] == scope.scope_id
     assert event["error_type"] == expected_type.__name__
     assert event["failure_source"] == ("control" if stage == "supplement_source" else "internal")
@@ -130,7 +130,7 @@ async def test_real_adapter_four_calls_recover_new_reply_after_old_schema_and_lo
         assert len(calls) == 4 and len(accepted) == 1
         assert not commits and endpoint.capture.is_open and endpoint._prepare_failures == 0
         assert [row["prompt_version"] for row in store.model_invocations] == [
-            "supplement_reply.v9", "supplement_reply.v10", "supplement_reply.v9", "supplement_reply.v10"]
+            "supplement_reply.v11", "supplement_reply.v12", "supplement_reply.v11", "supplement_reply.v12"]
         assert [row["status"] for row in store.model_invocations] == ["failed", "success", "failed", "success"]
         assert all(row["attempt"] == 1 and row["fallback_index"] == 0 for row in store.model_invocations)
         for call in calls:

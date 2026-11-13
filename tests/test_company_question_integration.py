@@ -28,13 +28,13 @@ def provider(monkeypatch, *, blocked_reply=None):
             if blocked_reply is not None:
                 await blocked_reply.wait()
             data = {"status": "supported", "citations": [{"reference_id": "company:context", "quote": FACT}]}
-        elif version in {"supplement_reply.v5", "supplement_reply.v6", "supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10"}:
+        elif version in {"supplement_reply.v5", "supplement_reply.v6", "supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v11", "supplement_reply.v12"}:
             value = json.loads(request.messages[-1].content)
             calls.append(("supplement", value))
             data = {"intent": "company_question" if QUESTION in value["reply"] else "finish", "confidence": .99, "evidence_id": "E1"}
-            if version in {"supplement_reply.v6", "supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10"}:
+            if version in {"supplement_reply.v6", "supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v11", "supplement_reply.v12"}:
                 data["reply_text"] = ""
-            if version in {"supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v9", "supplement_reply.v10"}:
+            if version in {"supplement_reply.v7", "supplement_reply.v8", "supplement_reply.v11", "supplement_reply.v12"}:
                 data["answer_effect"] = "unchanged"
         elif capability == "llm.chat_json" and request.purpose == "interview_turn_understanding":
             text, points = request.metadata["transcript"], request.metadata["capability_points"]

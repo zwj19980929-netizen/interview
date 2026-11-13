@@ -90,6 +90,23 @@ class ClientSignal(BaseModel):
         return self
 
 
+class SpeechDialogueDegradation(BaseModel):
+    """An optional expression loss, without any evidence/recovery authority."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    capability: Literal["speech.dialogue_realtime"]
+    fallback: Literal["cascade"]
+    reason_code: Literal[
+        "provider_dialogue_input_overflow", "provider_dialogue_input_timeout", "provider_dialogue_input_failed",
+        "provider_dialogue_event_overflow", "provider_dialogue_response_mismatch", "provider_timeout",
+        "provider_unavailable", "provider_route_missing", "provider_configuration_invalid", "provider_auth_failed",
+        "provider_billing_required", "provider_rate_limited", "provider_circuit_open", "provider_schema_invalid",
+        "provider_audio_unavailable", "provider_stream_closed",
+    ]
+    capture_id: Optional[str] = Field(default=None, min_length=1, max_length=128)
+
+
 class AgentEvent(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -110,6 +127,7 @@ class AgentEvent(BaseModel):
         "avatar.performance.interrupted",
         "avatar.performance.stopped",
         "takeover.changed",
+        "capability.degraded",
         "problem",
         "completed",
     ]
@@ -118,6 +136,14 @@ class AgentEvent(BaseModel):
     occurred_at: str = Field(min_length=1, max_length=64)
     replayability: Replayability
     payload: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def bound_optional_degradation(self) -> "AgentEvent":
+        if self.type == "capability.degraded":
+            SpeechDialogueDegradation.model_validate(self.payload)
+            if self.replayability != Replayability.TRANSIENT:
+                raise ValueError("Auxiliary degradation is a current transient notice")
+        return self
 
 
 class VisemeCue(BaseModel):

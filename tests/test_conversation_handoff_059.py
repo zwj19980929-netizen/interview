@@ -56,7 +56,7 @@ async def test_supplement_classifier_uses_bounded_server_context_but_only_fresh_
     assert context["prior_confirmation"] is True
     assert len(context["preceding_text"]) <= 1000 and len(context["question"]) <= 600
     assert context["evidence"] == {"E1": "我已经说完了。"}
-    assert request.metadata["prompt_version"] == "supplement_reply.v9"
+    assert request.metadata["prompt_version"] == "supplement_reply.v11"
     assert result["evidence_quote"] == "我已经说完了。"
 
 
