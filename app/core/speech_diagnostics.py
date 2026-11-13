@@ -5,7 +5,7 @@ import logging
 from collections import OrderedDict
 
 from app.core.time import utc_now
-from app.core.model_diagnostics import safe_model_diagnostic_fields
+from app.core.model_diagnostics import SUPPLEMENT_DIAGNOSTIC_SCHEMA_PATHS, safe_model_diagnostic_fields
 
 _LOG = logging.getLogger("interviewer.speech_evidence")
 
@@ -128,7 +128,26 @@ def record_turn_control(event: str, *, interview_id: str, turn_id: str,
     """Explicit safe fields; arbitrary exception/response bodies never escape."""
     if event not in {"input_invalidated", "supplement_decided", "proposal_rejected", "audio_playback",
                      "understanding_retry_budget", "reception_selected", "reception_unavailable", "recovery_speech_unavailable",
-                     "idle_check", "followup_decided", "handled_final_suppressed", "prepared_answer_reused"}:
+                     "idle_check", "followup_decided", "handled_final_suppressed", "prepared_answer_reused",
+                     "supplement_classification_failed"}:
+        return
+    if event == "supplement_classification_failed":
+        # This previously discarded event carries only typed failure facts.
+        # Do not reuse the broader speech trace's text/cause-code passthrough.
+        safe = safe_model_diagnostic_fields({key: details.get(key) for key in (
+            "revision", "diagnostic_scope_id", "parent_scope_id", "interaction_remaining_ms",
+            "failure_reason", "failure_source", "schema_reason", "error_type", "validation_stage",
+            "prompt_version", "retryable",
+        )}, strict_failure_reasons=True)
+        path = details.get("schema_path")
+        if isinstance(path, str) and path in SUPPLEMENT_DIAGNOSTIC_SCHEMA_PATHS:
+            safe["schema_path"] = path
+        try:
+            _LOG.info(json.dumps({"event": "turn_control." + event, "at": utc_now(),
+                "interview_id": interview_id, "turn_id": turn_id, "capture_id": capture_id,
+                **safe}, ensure_ascii=True))
+        except Exception:
+            pass
         return
     safe = {key: details[key] for key in (
         "revision", "phase", "source", "stage", "cause_code", "intent", "confidence",

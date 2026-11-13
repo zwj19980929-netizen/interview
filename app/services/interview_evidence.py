@@ -488,43 +488,61 @@ class InterviewEvidenceChain:
                 if self._supplement_dialogue_context(stream)[2] == context_fingerprint:
                     self._supplement_reply_failure = failure_identity
             raise
-        if (stream is not self._stt or self._input_revoked or stream.turn_id != turn_id
-                or stream._capture_generation != generation or stream.stream is not recognizer
-                or evidence_identity() != frozen_evidence):
-            raise ApiError("TURN_DECISION_STALE", "Capture changed.", status_code=409)
-        stream._assert_commit_allowed()
-        if self._supplement_dialogue_context(stream)[2] != context_fingerprint:
-            raise ApiError("TURN_DECISION_STALE", "Conversation changed.", status_code=409)
         from app.core.prompt.supplement_reply import SUPPLEMENT_REPLY_VERSION, SUPPLEMENT_REPLY_CORRECTION_VERSION
-        result = {**result, "reply_prompt_version": (SUPPLEMENT_REPLY_CORRECTION_VERSION
-                  if correction is not None else SUPPLEMENT_REPLY_VERSION)}
-        if final is not None and boundary_final is not None and all(question_identity):
-            import weakref
-            chain_reference, stream_reference = weakref.ref(self), weakref.ref(stream)
+        prompt_version = SUPPLEMENT_REPLY_CORRECTION_VERSION if correction is not None else SUPPLEMENT_REPLY_VERSION
+        validation_stage = "supplement_source"
+        try:
+            if (stream is not self._stt or self._input_revoked or stream.turn_id != turn_id
+                    or stream._capture_generation != generation or stream.stream is not recognizer
+                    or evidence_identity() != frozen_evidence):
+                raise ApiError("TURN_DECISION_STALE", "Capture changed.", status_code=409)
+            stream._assert_commit_allowed()
+            if self._supplement_dialogue_context(stream)[2] != context_fingerprint:
+                raise ApiError("TURN_DECISION_STALE", "Conversation changed.", status_code=409)
+            result = {**result, "reply_prompt_version": prompt_version}
+            validation_stage = "supplement_proof"
+            if final is not None and boundary_final is not None and all(question_identity):
+                import weakref
+                chain_reference, stream_reference = weakref.ref(self), weakref.ref(stream)
+                try:
+                    recognizer_reference = weakref.ref(recognizer)
+                except TypeError:
+                    # Tiny synthetic recognizers may lack weakref support. Real
+                    # continuous recognizers use the weak reference above.
+                    recognizer_reference = lambda: recognizer
+                def proof_current():
+                    # Durable ownership is checked by the normal chain/preflight
+                    # and commit transaction. This local check also works while
+                    # the same stream is detached for its final atomic commit.
+                    chain, live = chain_reference(), stream_reference()
+                    attached = chain is not None and live is not None and live is chain._stt
+                    finishing = chain is not None and chain._finishing and chain._stt is None
+                    if (chain is None or live is None or chain._input_revoked or not (attached or finishing)
+                            or live.turn_id != turn_id or live._capture_generation != generation
+                            or live.stream is not recognizer_reference()):
+                        raise ValueError("Supplement capture changed")
+                proof = issue_completion_proof(result, final=final, boundary_final=boundary_final,
+                    reply=reply, capture_binding=stream, question_identity=question_identity,
+                    context_fingerprint=context_fingerprint, assert_current=proof_current,
+                    prior_proof=prior_confirmation_proof if verified_prior else None)
+                if proof is not None:
+                    result = {**result, "completion_proof": proof}
+            return result
+        except Exception as exc:
+            # Wire success does not establish source ownership or completion
+            # proof. Preserve the original failure and record safe metadata only.
+            from app.core.model_diagnostics import (
+                record_model_diagnostic, safe_model_call_context, safe_model_failure_fields,
+            )
             try:
-                recognizer_reference = weakref.ref(recognizer)
-            except TypeError:
-                # Tiny synthetic recognizers may lack weakref support. Real
-                # continuous recognizers use the weak reference above.
-                recognizer_reference = lambda: recognizer
-            def proof_current():
-                # Durable ownership is checked by the normal chain/preflight
-                # and commit transaction. This local check also works while
-                # the same stream is detached for its final atomic commit.
-                chain, live = chain_reference(), stream_reference()
-                attached = chain is not None and live is not None and live is chain._stt
-                finishing = chain is not None and chain._finishing and chain._stt is None
-                if (chain is None or live is None or chain._input_revoked or not (attached or finishing)
-                        or live.turn_id != turn_id or live._capture_generation != generation
-                        or live.stream is not recognizer_reference()):
-                    raise ValueError("Supplement capture changed")
-            proof = issue_completion_proof(result, final=final, boundary_final=boundary_final,
-                reply=reply, capture_binding=stream, question_identity=question_identity,
-                context_fingerprint=context_fingerprint, assert_current=proof_current,
-                prior_proof=prior_confirmation_proof if verified_prior else None)
-            if proof is not None:
-                result = {**result, "completion_proof": proof}
-        return result
+                record_model_diagnostic("understanding_failed", **{
+                    **safe_model_call_context(),
+                    **safe_model_failure_fields(exc, validation_stage=validation_stage,
+                                                prompt_version=prompt_version),
+                })
+            except Exception:
+                pass
+            raise
 
     async def classify_exit_reply(self, reply: str) -> Any:
         stream = self._stt

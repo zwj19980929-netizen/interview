@@ -17,7 +17,9 @@ from app.core.answer_processing_budget import (
     consume_answer_model_call, new_correction_attempt, remember_answer_correction,
     deferred_answer_correction, answer_model_call_budget_exhausted,
 )
-from app.core.model_diagnostics import diagnosed_wait_for, record_model_diagnostic, safe_model_call_context
+from app.core.model_diagnostics import (
+    diagnosed_wait_for, record_model_diagnostic, safe_model_call_context, safe_model_failure_fields,
+)
 from app.core.prompt.contracts import prompt_contract, understanding_canonical_schema, supplement_reply_canonical_schema
 from app.core.prompt.semantic_turn import (
     with_semantic_turn_schema, validate_semantic_turn, validate_current_speech, validate_unresolved_completion, SemanticContractError,
@@ -478,8 +480,16 @@ class ConversationUnderstandingService:
             metadata={"prompt_version": contract.version},
         ))
         from app.core.prompt.supplement_reply import validate_supplement_reply
-        return validate_supplement_reply(response.data, contract.response_schema, reply=reply,
-                                        prior_confirmation=prior_confirmation)
+        try:
+            return validate_supplement_reply(response.data, contract.response_schema, reply=reply,
+                                            prior_confirmation=prior_confirmation)
+        except Exception as exc:
+            record_model_diagnostic(
+                "understanding_rejected" if isinstance(exc, StructuredResponseValidationError) else "understanding_failed",
+                **{**safe_model_call_context(), **safe_model_failure_fields(exc,
+                    validation_stage="supplement_content", prompt_version=contract.version)},
+            )
+            raise
 
     async def classify_exit_reply(self, reply: str, organization_id: str) -> Dict[str, Any]:
         """Classify fresh authoritative speech after a delivered exit question.

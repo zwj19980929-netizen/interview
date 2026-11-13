@@ -2,6 +2,27 @@
 
 本文件记录所有会修改仓库内容的工作项。只读检查不单独登记；同一目标下的代码、测试、迁移和文档修改合并为一个工作项。状态使用 `in_progress`、`verified`、`failed` 或 `cancelled`，历史条目只追加或补充结果，不删除。
 
+## 2026-11-12 · SUPPLEMENT-RECOVERY-CONFLICT-097
+
+- 状态：`in_progress`。
+- 授权与基线：用户明确要求修复补充确认重试冲突，沿用Git回退、测试及空闲加载授权。首次修改前工作区干净，022c9fd（实现7f32fc5）已提交保留；独立分支codex/supplement-recovery-097。按入口顺序复核11份设计文档及096证据，不自动重放/补交/结束真实面试，不在活动面试期间重启。
+- 已确认事故：iv_2dabd257499140fd在2026-11-10T23:38:23Z技术理解成功，补充问题23:38:30Z实际送达；截图中的Well.与23:38:32Z五字符STT哈希精确一致。该回复23:38:36Z v9返回顶层非对象JSON，23:38:40Z v10通过网关但本地后置处理失败。23:38:55Z九字符STT与截图“没有需要补充的了。”精确匹配，23:38:59Z v9再次non_object；前面连续失败已使episode耗尽，新回复只获一次请求而无剩余纠错。两个non_object均finish=stop、55/40 tokens，非超时/截断。未留存第二次本地异常子原因，不能断言具体语义规则或内部代码异常。
+- 诊断缺口：supplement_classification_failed被日志事件白名单过滤；后置校验无专门安全事件，外层仅读code而校验异常用reason_code/schema_path，预算错误被笼统归为unavailable。本项补固定白名单原因/阶段/异常类型/版本诊断，不记录原始候选文本、Prompt、响应或凭据，不回填未知历史原因。
+- 修复边界与验证计划：区分补充分类与完整技术理解的有界恢复预算；当前已送达补充问题之后的真正新权威回复可获得有限纠错，同文字/VAD/metadata不得重购额度，取消不退款，整体时间/次数有界，永久供应商失败、失权、旧来源仍拒绝。保留明确完成、实际送达、完整原文、语义证明与最终事务门禁，显式继续和处理重试保持不同。先复现短回复失败后新完成回复无法纠错及诊断丢失，再验证真实adapter隔离路径、负例和全量；不以增加无界重试或强制完成消除提示。实际范围与结果随后补充。
+
+
+- 阶段复现：补充预算红例5失败/1通过；诊断红例23失败/3通过；Evidence后置诊断红例2失败/3通过，原异常保持与成功路径原本正常，但source/proof缺事件。诊断实现后相关6文件103通过；Evidence前5例通过。追加真实DashScope adapter+MockTransport四次调用联动，模拟旧v9非对象、旧v10通过网关后本地合同拒绝、新v9非对象、新v10成功；当前随预算实现推进，不能提前宣称通过。过程日志均保留/private/tmp/interviewer-097-*，不触达真实模型/面试。
+- 发布准备：097临时验收/原子静态发布/空闲重启/独立运行验证工具已准备，精确限定6生产路径及3份097回归；发布隔离22组与验收发布隔离12组通过。移除096指定capture豁免，所有requested/starting/recording/stopping均阻断。当前API52071/worker52072仍旧a121dfadf6b1860f158a3d41b5d052c0c7d4ba94cb6375b4a5dd101364b077cb；尚未执行全量、静态发布或重启。
+
+
+- 联动与兼容修正：真实adapter四次调用联动及Evidence安全边界6例通过；中间失败是合成fixture引用不存在E2（英文句号未拆出第二引用），仅改回真实引用表的E1，原证明/完整回答/4次wire断言保留。扩大runtime回归83通过/3失败，发现新增失权分支缺ApiError导入并补齐；另两例旧测试仍等技术失败计数，且旧三轮噪音+10秒越过新40秒期限，窄改为独立补充计数和每轮+1秒，097新增单独截止/取消负例。新增47项runtime/Evidence/096回归通过，含最后0.01秒超时取消、过期结果拒绝、永久故障、新source/epoch拒绝、技术两次失败不能被补充成功清除。一次不存在033测试路径导致pytest exit4，无代码/业务副作用，改为实际078文件后继续。
+- 诊断兼容审查：撤回无关通用diagnosed_wait_for修改；helper固定集合覆盖项目60种正式供应商错误码，防止旧network/output_truncated等误归unknown。新增事件自身也严格过滤任意provider_字符串和非合同字段路径。相关7文件115通过/1暂排除后已由联动通过，日志interviewer-097-diagnostics-compat.log。
+- 早期只读预检：API52071/worker52072仍096原版本，LiveKit房间/参与者/Egress、owner、commands、后台work、活动录制均0；83场核心摘要b158a9ddd57e50218a3d78d3c76b06992dcb700c9a518b7629d2e65bc6d38b06，全部capture原始行摘要37724c2353f57667afb801208d4ba07836980a3084e50dcde2ce8ed86524140f。尚未重启；加载前仍需重新核验而非沿用本次空闲结果。
+
+- 冻结前完成：最终runtime整合5文件87通过/10.82秒，078/084/079/067相关6文件123通过/2.49秒，诊断115通过，真实adapter联动6通过。独立只读复核预算隔离/取消扣费/期限/来源/永久失败/技术次数保持无新增阻断；333处本地文档链接有效、git diff --check通过。冻结616份源码/测试与237后端文件，SHA6a2dc44fafb808ea80f67299ffa8431d0c21847b4935d5900622580891753646，开始本轮完整pytest、前端Vitest及临时构建，尚未生成发布通过证明。
+
+- 最终完整验证：`.venv/bin/python /private/tmp/interviewer-097-test-and-attest.py`执行本轮`pytest -p no:cacheprovider -q`为5122 passed/8 skipped/279.11秒；`npm test -- --reporter=dot`为580 passed/26文件；`npm run build -- --outDir /private/tmp/interviewer-097-web-dist`成功（原非阻断大chunk提示保持）。616份冻结源码/测试前后完全一致、6条生产路径精确匹配；原Prompt/Schema/路由、评分、题数和音频处理均未修改。随后同工具`--publish`通过，保留66份历史静态资产并原子切换入口，7份当前构建与日志SHA绑定v5证明。日志/private/tmp/interviewer-097-{backend-full,frontend-full,web-build}.log；证明interviewer-097-test-attestation.json。此时仅准备保存实现提交并即时空闲加载，尚不宣称服务已更新。
+
 ## 2026-11-10 · SEMANTIC-TAIL-CONTINUITY-096
 
 - 状态：`verified（仓库全量、本机加载；真实语义探针有限通过，真人连续面试与独立STT积压待验）`。

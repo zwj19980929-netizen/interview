@@ -29,6 +29,45 @@ _CANCEL_REASONS = frozenset({
 _EVENTS = frozenset({"attempt_started", "attempt_finished", "operation_started", "operation_finished",
                      "scope_started", "scope_finished", "scope_cancel_requested", "audit_failed",
                      "understanding_rejected", "understanding_failed", "correction_applied"})
+_SUPPLEMENT_CONTRACT_REASONS = frozenset({
+    "supplement_confirmation_proof_required", "supplement_answer_effect_conflict",
+    "supplement_silent_intent_has_reply", "supplement_repeat_target_without_repeat",
+    "reception_confidence_invalid", "reception_current_control_conflict",
+    "reception_repeat_target_without_repeat", "reception_silent_kind_has_reply",
+    "reception_reply_missing", "reception_reply_not_plain_speech", "reception_cannot_ask_question",
+})
+_CONTROL_FAILURE_REASONS = frozenset({
+    "TURN_DECISION_STALE", "AGENT_EVIDENCE_NOT_OPEN", "AGENT_EVIDENCE_FINISHING",
+    "AGENT_EVIDENCE_ALREADY_OPEN", "EVIDENCE_MEDIA_INCOMPLETE",
+})
+_PROVIDER_FAILURE_REASONS = frozenset({
+    "provider_timeout", "provider_cancelled", "provider_auth_failed", "provider_authentication_failed",
+    "provider_billing_required", "provider_rate_limited", "provider_circuit_open", "provider_unavailable",
+    "provider_bad_request", "provider_forbidden", "provider_configuration_invalid", "provider_capability_missing",
+    "provider_connection_disabled", "provider_cost_limit_exceeded", "provider_real_stt_required",
+    "provider_route_invalid", "provider_route_missing", "provider_schema_invalid", "provider_server_error",
+    "provider_streaming_not_supported", "provider_unexpected_error",
+    "provider_audio_chunk_too_large", "provider_audio_final_missing", "provider_audio_format_unsupported",
+    "provider_audio_recovery_buffer_exceeded", "provider_audio_stream_too_large", "provider_audio_unavailable",
+    "provider_backpressure_exceeded", "provider_dialogue_event_overflow", "provider_dialogue_input_failed",
+    "provider_dialogue_input_overflow", "provider_dialogue_input_timeout", "provider_dialogue_response_mismatch",
+    "provider_entrypoint_invalid", "provider_final_transcript_missing", "provider_health_failed",
+    "provider_media_url_invalid", "provider_model_type_missing", "provider_model_unavailable",
+    "provider_network_error", "provider_not_implemented", "provider_not_installed", "provider_output_audio_too_large",
+    "provider_output_truncated", "provider_probe_cancelled", "provider_probe_cleanup_failed", "provider_probe_failed",
+    "provider_route_changed", "provider_snapshot_stale", "provider_stream_cleanup_failed", "provider_stream_close_failed",
+    "provider_stream_closed", "provider_stream_failed", "provider_stream_interrupted", "provider_stream_open_failed",
+    "provider_transport_unavailable", "model_configuration_missing", "model_configuration_not_ready",
+    "evaluation_evidence_invalid", "evaluation_timeout", "resume_evidence_budget_exceeded",
+    "resume_evidence_item_too_large", "resume_question_evidence_missing", "resume_question_generation_invalid",
+    "resume_question_not_grounded", "resume_text_empty",
+})
+# Only declared supplement/reception fields, never a rejected extra key or an
+# arbitrary exception attribute. Other contracts retain their own diagnostics.
+SUPPLEMENT_DIAGNOSTIC_SCHEMA_PATHS = frozenset({
+    "$", "$.intent", "$.kind", "$.answer_effect", "$.confidence", "$.evidence_id",
+    "$.evidence_quote", "$.reply_text", "$.repeat_target",
+})
 _FAILURE_REASONS = frozenset({
     "unknown", "timeout", "unavailable", "invalid_result", "retry_exhausted", "non_retryable",
     "call_budget_exhausted", "wire_schema_invalid", "reference_resolution_invalid",
@@ -46,7 +85,7 @@ _FAILURE_REASONS = frozenset({
     "point_not_frozen", "point_partition_invalid", "question_shape_invalid", "safety_gate_rejected",
     "semantic_completion_evidence_invalid", "technical_content_claims_missing", "unresolved_answer_contract_invalid",
     "unresolved_clarification_required", "unresolved_clarification_source_invalid",
-})
+}) | _SUPPLEMENT_CONTRACT_REASONS | _CONTROL_FAILURE_REASONS | _PROVIDER_FAILURE_REASONS
 _COMPANY_CONTRACT_DETAILS = frozenset({
     "missing_question", "completion_basis_present", "followup_allowed", "action_mismatch",
     "low_confidence", "unresolved_ambiguity", "intent_content_mismatch", "quote_mismatch",
@@ -66,7 +105,7 @@ def _identifier(value: Any) -> Optional[str]:
     return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,159}", value) else None
 
 
-def safe_model_diagnostic_fields(fields: dict) -> dict:
+def safe_model_diagnostic_fields(fields: dict, *, strict_failure_reasons: bool = False) -> dict:
     safe = {}
     for key, value in fields.items():
         if key in _IDENTIFIERS:
@@ -83,30 +122,68 @@ def safe_model_diagnostic_fields(fields: dict) -> dict:
             safe[key] = value
         elif key in {"error_code", "failure_reason", "reason_code"} and isinstance(value, str):
             safe[key] = value if (value in _CANCEL_REASONS or value in _FAILURE_REASONS
-                                  or re.fullmatch(r"provider_[a-z_]{1,64}", value)) else "unknown"
+                                  or not strict_failure_reasons and re.fullmatch(r"provider_[a-z_]{1,64}", value)) else "unknown"
         elif key == "operation" and isinstance(value, str) and value in {"infer", "prepare_decision", "confirmed_prepare", "speculative_prepare", "speculative_wait", "confirmed_wait"}:
             safe[key] = value
         elif key == "source" and isinstance(value, str) and value in {"audio", "client", "transcript", "stable_evidence"}:
             safe[key] = value
-        elif key == "failure_source" and isinstance(value, str) and value in {"provider", "schema_or_content", "semantic", "control"}:
+        elif key == "failure_source" and isinstance(value, str) and value in {"provider", "schema_or_content", "semantic", "control", "internal"}:
             safe[key] = value
         elif key == "error_type" and isinstance(value, str) and value in {"TimeoutError", "CancelledError", "ProviderError", "ApiError", "ValueError",
-                                                "KeyError", "TypeError", "RuntimeError", "StructuredResponseValidationError"}:
+                                                "KeyError", "TypeError", "RuntimeError", "StructuredResponseValidationError", "OtherError"}:
             safe[key] = value
         elif key == "validation_stage" and isinstance(value, str):
             safe[key] = value if value in {"provider", "wire_schema", "understanding_content", "understanding_semantic",
                                           "understanding_materialize", "understanding_canonical", "understanding_references",
                                           "understanding_domain", "followup", "followup_references", "followup_gate", "followup_act",
-                                          "followup_repair", "reception_content"} else "unknown"
+                                          "followup_repair", "reception_content", "supplement_content",
+                                          "supplement_source", "supplement_proof"} else "unknown"
         elif key == "contract_detail" and isinstance(value, str) and value in _COMPANY_CONTRACT_DETAILS:
             safe[key] = value
         elif key == "schema_path" and isinstance(value, str) and re.fullmatch(r"\$[A-Za-z0-9_.\[\]]{0,160}", value):
             safe[key] = re.sub(r"\[\d+\]", "[]", value)
+        elif key == "schema_reason" and isinstance(value, str):
+            safe[key] = value if value in _FAILURE_REASONS else "unknown"
         elif key == "prompt_version" and isinstance(value, str) and re.fullmatch(r"[a-z_]{1,64}\.v[0-9]{1,6}", value):
             safe[key] = value
         elif key in {"retryable", "provider_invoked"} and type(value) is bool:
             safe[key] = value
     return safe
+
+
+def safe_model_failure_fields(exc: BaseException, *, validation_stage=None, prompt_version=None) -> dict:
+    """Project typed failure metadata without reading messages or granting retry.
+
+    This observes the original exception; it does not wrap it, modify it or
+    infer a provider failure from an internal ValueError/TypeError. Unknown
+    schema paths are omitted rather than exposing a rejected field name.
+    """
+    try:
+        from app.core.errors import ApiError
+        from app.core.prompt.validation import StructuredResponseValidationError
+        from app.model_gateway.errors import ProviderError
+
+        fields = {"failure_reason": "unknown", "failure_source": "internal",
+                  "error_type": type(exc).__name__, "validation_stage": validation_stage,
+                  "prompt_version": prompt_version}
+        if isinstance(exc, StructuredResponseValidationError):
+            reason = exc.reason_code if isinstance(exc.reason_code, str) and exc.reason_code in _FAILURE_REASONS else "unknown"
+            fields.update(failure_source="schema_or_content", failure_reason=reason, schema_reason=reason)
+            if isinstance(exc.schema_path, str) and exc.schema_path in SUPPLEMENT_DIAGNOSTIC_SCHEMA_PATHS:
+                fields["schema_path"] = exc.schema_path
+        elif isinstance(exc, ProviderError):
+            fields.update(failure_source="provider", failure_reason=(
+                exc.code if isinstance(exc.code, str) and exc.code in _PROVIDER_FAILURE_REASONS else "unknown"))
+        elif isinstance(exc, ApiError):
+            fields.update(failure_source="control", failure_reason=(
+                exc.code if isinstance(exc.code, str) and exc.code in _CONTROL_FAILURE_REASONS else "unknown"))
+        safe = safe_model_diagnostic_fields(fields, strict_failure_reasons=True)
+        safe.setdefault("error_type", "OtherError")
+        return safe
+    except Exception:
+        # Even a malformed optional diagnostic attribute cannot mask the
+        # original failure or alter its cancellation/retry policy.
+        return {"failure_reason": "unknown", "failure_source": "internal", "error_type": "OtherError"}
 
 
 @dataclass

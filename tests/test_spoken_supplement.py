@@ -283,13 +283,15 @@ def test_classification_failures_are_bounded_by_words_not_acoustic_revisions(rec
         for attempt in range(2):
             endpoint.speech_started()
             clock.value += 5
-            await _until(lambda: endpoint._prepare_failures == attempt + 1)
+            await _until(lambda: endpoint._supplement_failures == attempt + 1)
         assert len(endpoint.capture.replies) == 2
         assert "understanding_retry_exhausted" in notices
         for _ in range(3):
             endpoint.speech_started()
-            clock.value += 10
+            clock.value += 1
             await asyncio.sleep(.06)
+        clock.value += 5  # Let the bounded recovery invitation reach its silence gate.
+        await _until(lambda: len(spoken) == 2)
         assert len(endpoint.capture.replies) == 2
         assert not commits and endpoint.capture.is_open
         assert spoken == ["check", "reception_recovery_clarification"]

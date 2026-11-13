@@ -61,7 +61,7 @@ async def test_same_supplement_evidence_gets_one_targeted_retry_then_one_recover
             await confirmation._reply(endpoint, final)
             await confirmation.control_step(endpoint, quiet=20)
         assert len(calls) == 2 and len(spoken) == 1 and not commits
-        assert endpoint.capture.is_open and endpoint._prepare_failures == 2
+        assert endpoint.capture.is_open and endpoint._supplement_failures == 2
     finally:
         await endpoint.close()
 
@@ -98,7 +98,7 @@ async def test_correction_never_crosses_changed_source_or_retry_epoch(change):
         await confirmation._reply(endpoint, final)
         assert len(calls) == 2
         assert all(context.get("correction_reason") is None for context in calls)
-        assert endpoint._prepare_failures == (1 if change == "epoch" else 2)
+        assert endpoint._supplement_failures == (1 if change == "epoch" else 2)
         assert not commits
     finally:
         await endpoint.close()
@@ -224,9 +224,9 @@ async def test_live_endpoint_after_exhaustion_invites_once_then_routes_fresh_sup
     endpoint.start()
     try:
         clock.value += 5
-        await _until(lambda: endpoint._prepare_failures == 1)
+        await _until(lambda: endpoint._supplement_failures == 1)
         clock.value += 2
-        await _until(lambda: endpoint._prepare_failures == 2)
+        await _until(lambda: endpoint._supplement_failures == 2)
         clock.value += 3
         await _until(lambda: spoken == ["reception_recovery_clarification"])
         await confirmation.complete_playback(endpoint, reason="agent_finished")
@@ -235,7 +235,7 @@ async def test_live_endpoint_after_exhaustion_invites_once_then_routes_fresh_sup
         clock.value += 5
         await _until(lambda: spoken[-1] == "continue")
         assert len(calls) == 3 and calls[-1].endswith("我会补充超时处理。")
-        assert endpoint._prepare_failures == 2 and not commits and endpoint.capture.is_open
+        assert endpoint._supplement_failures == 0 and not commits and endpoint.capture.is_open
         assert confirmation._confirmation_proof is None
     finally:
         await endpoint.close()

@@ -16,9 +16,11 @@ from typing import Any, Awaitable, Callable, Optional
 from types import SimpleNamespace
 
 from app.core.errors import ApiError
+from app.core.prompt.validation import StructuredResponseValidationError
 from app.core.interaction_budget import interaction_deadline, remaining_interaction_seconds
 from app.core.model_diagnostics import (
     current_model_call_scope, diagnosed_wait_for, model_call_scope, record_model_diagnostic, safe_model_call_context,
+    safe_model_failure_fields,
 )
 from app.core.answer_processing_budget import (
     AnswerProcessingBudget, AnswerCorrectionContinuation, answer_processing_budget, require_answer_correction,
@@ -33,6 +35,8 @@ _CONFIRMED_PREPARATION_TIMEOUT = 45.0
 _INTERACTION_PREPARATION_TIMEOUT = 20.0
 _INTERACTION_RECOVERY_TIMEOUT = 40.0
 _MAX_PREPARATION_FAILURES = 2
+_MAX_SUPPLEMENT_EPISODE_CALLS = 4
+_SUPPLEMENT_EPISODE_TIMEOUT = 40.0
 _SPECULATIVE_PREPARATION_TIMEOUT = 20.0
 _SPECULATIVE_SILENCE_SECONDS = 3.0
 
@@ -48,6 +52,8 @@ class _PreparationAttempt:
     failure_recorded: bool = False
     diagnostic_scope: Any = field(default_factory=current_model_call_scope, repr=False)
     discarded: bool = False
+    supplement: bool = False
+    capture: Any = field(default=None, repr=False)
 
 
 class _SpeculativeModelAllowance(AnswerProcessingBudget):
@@ -135,6 +141,12 @@ class AnswerEndpoint:
         self._preparation_budget_key = ""
         self._preparation_failures_by_evidence: dict[str, int] = {}
         self._supplement_calls: dict[tuple, int] = {}
+        self._supplement_budget_epoch = 0
+        self._supplement_episode_calls = 0
+        self._supplement_episode_deadline: Optional[float] = None
+        self._supplement_failures = 0
+        self._supplement_terminal_keys: set[tuple] = set()
+        self._supplement_recovery_active = False
         self._preparation_failure_notice_pending = False
         self._last_server_transcript = ""
         self._interaction_text = ""
@@ -216,7 +228,7 @@ class AnswerEndpoint:
         self._probability = None
         self._explicit_revision = None
         self._prediction_retry_at = 0
-        if not self._prepare_failures:
+        if not self._prepare_failures and not self._supplement_failures:
             self._retry_at = 0
         if self._inference_task is not None:
             self._mark_task_cancellation(self._inference_task, self._inference_scope,
@@ -273,6 +285,7 @@ class AnswerEndpoint:
         self._blocked_revision = None
         self._blocked_preview = None
         self._reset_preparation_budget()
+        self._reset_supplement_budget()
         self._invalidate_answer_corrections()
         self._model_budgets.clear()
         if self._last_voice is None:
@@ -280,11 +293,12 @@ class AnswerEndpoint:
 
     def continue_speaking(self) -> None:
         """An explicit user action renews retries; microphone noise does not."""
-        retrying = self._prepare_failures > 0
+        retrying = self._prepare_failures > 0 or self._supplement_failures > 0
         self._interaction_deadline = None
         self._manual_retry_notice_pending = self._understanding_recovery_active
         self._reset_missing_final_budget()
         self._reset_preparation_budget()
+        self._reset_supplement_budget()
         self._invalidate_answer_corrections()
         self._model_budgets.clear()
         self.speech_started()
@@ -314,6 +328,7 @@ class AnswerEndpoint:
         self._invalidate_answer_corrections()
         self._model_budgets.clear()
         self._reset_preparation_budget()
+        self._reset_supplement_budget()
         self._manual_retry_notice_pending = True
         retry_prompt = getattr(self.confirmation, "retry_pending_prompt", None)
         if callable(retry_prompt):
@@ -327,7 +342,8 @@ class AnswerEndpoint:
         if not self._understanding_recovery_active:
             return {}
         attempts = (getattr(self.confirmation, "_prompt_attempts", 0) if self._recovery_stage == "supplement_prompt"
-                    else self._prepare_failures)
+                    else self._supplement_calls.get(self._supplement_evidence_key(), 0)
+                    if self._supplement_recovery_active else self._prepare_failures)
         return {"stage": self._recovery_stage, "reason_code": self._recovery_reason,
                 "attempt": min(_MAX_PREPARATION_FAILURES, attempts),
                 "max_attempts": _MAX_PREPARATION_FAILURES, "retryable": self._recovery_retryable}
@@ -1149,7 +1165,7 @@ class AnswerEndpoint:
             self._inference_task.add_done_callback(
                 lambda done: self._observe_preparation_result(done, preparation_attempt)
             )
-        outcome, failure_reason = "success", None
+        outcome, failure_reason, failure_fields = "success", None, {}
         try:
             # Child revocation differs from whole-worker cancellation.
             done, _ = await asyncio.wait({self._inference_task}, timeout=timeout)
@@ -1189,7 +1205,8 @@ class AnswerEndpoint:
         except Exception as exc:
             outcome = "cancelled" if (getattr(exc, "code", None) == "TURN_DECISION_STALE"
                                        and self._inference_task is not None and self._inference_task.cancelled()) else "failed"
-            failure_reason = getattr(exc, "code", None)
+            failure_fields = safe_model_failure_fields(exc)
+            failure_reason = failure_fields.pop("failure_reason", None)
             raise
         finally:
             if self._inference_task is not None:
@@ -1204,7 +1221,7 @@ class AnswerEndpoint:
             self._inference_task = None
             self._inference_scope = None
             record_model_diagnostic("scope_finished", **fields, outcome=outcome,
-                                    elapsed_ms=(time.monotonic() - started) * 1000,
+                                    elapsed_ms=(time.monotonic() - started) * 1000, **failure_fields,
                                     cancel_reason=scope.cancel_reason if outcome in {"cancelled", "timeout"} else None,
                                     failure_reason=failure_reason)
 
@@ -1315,12 +1332,12 @@ class AnswerEndpoint:
     def preparation_blocked(self) -> bool:
         tried = self._preparation_failures_by_evidence.get(self._preparation_budget_key, 0)
         return bool(self._terminal_provider_failure
+                    or self._supplement_preparation_blocked
                     or tried and (self._preparation_terminal or self._prepare_failures >= _MAX_PREPARATION_FAILURES))
 
     def _reset_preparation_budget(self) -> None:
         self._preparation_budget_epoch += 1
         self._preparation_failures_by_evidence.clear()
-        self._supplement_calls.clear()
         self._prepare_failures = 0
         self._preparation_terminal = self._terminal_provider_failure
         self._recovery_retryable = not self._terminal_provider_failure
@@ -1330,19 +1347,124 @@ class AnswerEndpoint:
         self._blocked_revision = None
         self._blocked_preview = None
 
+    def _supplement_evidence_key(self) -> tuple:
+        return (id(self.capture), self._preparation_budget_key)
+
+    @property
+    def _supplement_preparation_blocked(self) -> bool:
+        if not self._supplement_recovery_active:
+            return False
+        key = self._supplement_evidence_key()
+        return bool(key in self._supplement_terminal_keys
+            or self._supplement_calls.get(key, 0) >= _MAX_PREPARATION_FAILURES
+            or self._supplement_episode_calls >= _MAX_SUPPLEMENT_EPISODE_CALLS
+            or self._supplement_episode_deadline is not None
+               and self.clock() >= self._supplement_episode_deadline)
+
+    def _reset_supplement_episode(self) -> None:
+        self._supplement_episode_calls = 0
+        self._supplement_episode_deadline = None
+        self._supplement_failures = 0
+        self._supplement_recovery_active = False
+
+    def _reset_supplement_budget(self) -> None:
+        # Only explicit controls buy new calls for old words. A successful
+        # classification ends a failure episode but retains this ledger.
+        self._supplement_budget_epoch += 1
+        self._supplement_calls.clear()
+        self._supplement_terminal_keys.clear()
+        self._reset_supplement_episode()
+
     def _start_supplement_attempt(self) -> Optional[_PreparationAttempt]:
-        """Debit a same-capture/words call before I/O; cancellation never refunds it."""
-        key = (id(self.capture), self._preparation_budget_key)
+        """Bound each reply and its failed exchange separately from full analysis."""
+        key = self._supplement_evidence_key()
         used = self._supplement_calls.get(key, 0)
-        if used >= _MAX_PREPARATION_FAILURES:
-            self._record_preparation_failure(problem=SimpleNamespace(
-                source="schema_or_content", reason_code="call_budget_exhausted", retryable=False))
+        expired = (self._supplement_episode_deadline is not None
+                   and self.clock() >= self._supplement_episode_deadline)
+        if (used >= _MAX_PREPARATION_FAILURES or key in self._supplement_terminal_keys
+                or self._supplement_episode_calls >= _MAX_SUPPLEMENT_EPISODE_CALLS or expired):
+            # No provider call happened, so do not manufacture a failed call.
+            self._supplement_recovery_active = self._understanding_recovery_active = True
+            self._recovery_stage = "answer_understanding"
+            self._recovery_reason = "timeout" if expired else "call_budget_exhausted"
+            self._recovery_retryable = not self._terminal_provider_failure
+            self._preparation_failure_notice_pending = True
+            self._blocked_revision = self.revision
             return None
+        if self._supplement_episode_deadline is None:
+            self._supplement_episode_deadline = self.clock() + _SUPPLEMENT_EPISODE_TIMEOUT
+        # Both allowances are spent before I/O, including VAD cancellation.
         self._supplement_calls[key] = used + 1
-        return _PreparationAttempt(self._preparation_budget_epoch, self._preparation_budget_key)
+        self._supplement_episode_calls += 1
+        return _PreparationAttempt(self._supplement_budget_epoch, self._preparation_budget_key,
+                                   supplement=True, capture=self.capture)
+
+    def _supplement_attempt_current(self, attempt: _PreparationAttempt) -> bool:
+        return (attempt.budget_epoch == self._supplement_budget_epoch
+                and attempt.capture is self.capture and not attempt.discarded)
+
+    def _supplement_attempt_succeeded(self, attempt: _PreparationAttempt) -> bool:
+        if (not self._supplement_attempt_current(attempt)
+                or attempt.evidence_key != self._preparation_budget_key):
+            raise ApiError("TURN_DECISION_STALE", "Supplement reply changed.", status_code=409)
+        if (self._supplement_episode_deadline is None
+                or self.clock() >= self._supplement_episode_deadline):
+            raise asyncio.TimeoutError()
+        recovering = self._supplement_recovery_active
+        self._reset_supplement_episode()
+        if recovering and not self._prepare_failures:
+            self._understanding_recovery_active = False
+            self._preparation_failure_notice_pending = False
+            self._blocked_revision = self._blocked_preview = None
+            self._retry_at = 0
+        return recovering
+
+    def _record_supplement_failure(self, attempt: _PreparationAttempt, *, problem: Any = None,
+                                   interaction_expired: bool = False) -> None:
+        if attempt.failure_recorded or not self._supplement_attempt_current(attempt):
+            return
+        attempt.failure_recorded = True
+        self._supplement_failures += 1
+        self._supplement_recovery_active = self._understanding_recovery_active = True
+        self._recovery_stage = "answer_understanding"
+        reason = str(getattr(problem, "reason_code", "") or getattr(problem, "code", "")).lower()
+        allowed = {"provider_timeout", "provider_auth_failed", "provider_billing_required",
+                   "provider_rate_limited", "provider_circuit_open", "provider_unavailable"}
+        self._recovery_reason = (
+            "invalid_result" if (isinstance(problem, StructuredResponseValidationError)
+                or getattr(problem, "source", None) == "schema_or_content"
+                or isinstance(problem, ProviderError) and problem.code == "provider_schema_invalid") else
+            reason if reason in allowed else
+            "timeout" if interaction_expired or isinstance(problem, asyncio.TimeoutError) else "unavailable"
+        )
+        permanent = reason in {"provider_auth_failed", "provider_authentication_failed", "provider_billing_required",
+                              "provider_forbidden", "provider_configuration_invalid", "provider_route_missing"}
+        if problem is not None and not getattr(problem, "retryable", not permanent):
+            self._supplement_terminal_keys.add((id(attempt.capture), attempt.evidence_key))
+            if isinstance(problem, ProviderError) or getattr(problem, "source", None) == "provider" or permanent:
+                self._terminal_provider_failure = True
+            self._recovery_retryable = getattr(problem, "source", None) == "schema_or_content"
+            if not self._recovery_retryable and reason not in allowed:
+                self._recovery_reason = "non_retryable"
+        if attempt.evidence_key != self._preparation_budget_key:
+            return
+        self._retry_at = self.clock() + min(4, self._supplement_failures)
+        self._preparation_failure_notice_pending = True
+        if self.preparation_blocked:
+            self._blocked_revision = self.revision
+        diagnostic = safe_model_call_context(scope=attempt.diagnostic_scope)
+        self.trace("understanding_retry_budget", failures=self._supplement_failures,
+            exhausted=self.preparation_blocked, revision=self.revision,
+            stage=self._recovery_stage, reason_code=self._recovery_reason,
+            retryable=self._recovery_retryable, diagnostic_scope_id=diagnostic.get("diagnostic_scope_id"),
+            parent_scope_id=diagnostic.get("parent_scope_id"),
+            interaction_remaining_ms=max(0, (self._supplement_episode_deadline or self.clock()) - self.clock()) * 1000)
 
     def _record_preparation_failure(self, attempt: Optional[_PreparationAttempt] = None, *, problem: Any = None,
                                     interaction_expired: bool = False) -> None:
+        if attempt is not None and attempt.supplement:
+            self._record_supplement_failure(attempt, problem=problem, interaction_expired=interaction_expired)
+            return
         evidence_key = self._preparation_budget_key
         if attempt is not None:
             if attempt.discarded:
@@ -1366,7 +1488,8 @@ class AnswerEndpoint:
         allowed = {"call_budget_exhausted", "provider_timeout", "provider_auth_failed", "provider_billing_required",
                    "provider_rate_limited", "provider_circuit_open", "provider_unavailable"}
         self._recovery_reason = (
-            "invalid_result" if (getattr(problem, "source", None) == "schema_or_content"
+            "invalid_result" if (isinstance(problem, StructuredResponseValidationError)
+                                 or getattr(problem, "source", None) == "schema_or_content"
                                  or isinstance(problem, ProviderError) and problem.code == "provider_schema_invalid") else
             reason if reason in allowed else
             "timeout" if interaction_expired or isinstance(problem, asyncio.TimeoutError) else "unavailable"
@@ -1417,6 +1540,7 @@ class AnswerEndpoint:
         recovering = self._understanding_recovery_active
         self._understanding_recovery_active = False
         self._reset_preparation_budget()
+        self._reset_supplement_episode()
         if self.confirmation is not None:
             self.confirmation._failure_spoken_identity = None
         if recovering:
@@ -1428,6 +1552,10 @@ class AnswerEndpoint:
             await self._notify("understanding_retrying")
         if self._preparation_failure_notice_pending:
             self._preparation_failure_notice_pending = False
+            if self._supplement_recovery_active:
+                await self._notify("understanding_retry_exhausted" if self._supplement_preparation_blocked
+                                   or self._terminal_provider_failure else "understanding_unavailable")
+                return
             await self._notify("understanding_retry_exhausted" if self._interaction_budget_exhausted else
                                "understanding_result_rejected" if self._preparation_terminal else
                                "understanding_retry_exhausted" if self._prepare_failures >= _MAX_PREPARATION_FAILURES

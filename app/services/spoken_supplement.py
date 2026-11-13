@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from app.domain.speech_quality import minimum_reported_confidence
+from app.core.errors import ApiError
 from app.core.prompt.validation import StructuredResponseValidationError
 from app.model_gateway.errors import ProviderError
 from app.services.conversation_understanding import ConversationUnderstandingService
@@ -1587,7 +1588,7 @@ class SpokenSupplementConfirmation:
             await endpoint._understanding_failed(record_failure=False)
             return
         budget_key = endpoint._preparation_budget_key
-        budget_epoch = endpoint._preparation_budget_epoch
+        budget_epoch = endpoint._supplement_budget_epoch
         capture = endpoint.capture
         attempt = endpoint._start_supplement_attempt()
         if attempt is None:
@@ -1619,9 +1620,14 @@ class SpokenSupplementConfirmation:
         try:
             decision = await endpoint._infer(
                 endpoint.capture.classify_supplement_reply(reply, final=final,
-                    boundary_final=self._boundary_final, **reply_context), timeout=10,
+                    boundary_final=self._boundary_final, **reply_context),
+                timeout=min(10, max(0, endpoint._supplement_episode_deadline - endpoint.clock())),
+                use_interaction_budget=False,
             )
             endpoint.assert_current()
+            if endpoint.capture is not capture:
+                raise ApiError("TURN_DECISION_STALE", "Supplement capture changed.", status_code=409)
+            recovered = endpoint._supplement_attempt_succeeded(attempt)
         except Exception as exc:
             self.phase = "awaiting_reply"
             if getattr(exc, "code", None) == "TURN_DECISION_STALE":
@@ -1633,10 +1639,10 @@ class SpokenSupplementConfirmation:
                 raise
             endpoint.assert_current()
             if (endpoint._preparation_budget_key != budget_key
-                    or endpoint._preparation_budget_epoch != budget_epoch):
+                    or endpoint._supplement_budget_epoch != budget_epoch):
                 return
-            endpoint.trace("supplement_classification_failed", error_type=type(exc).__name__,
-                           cause_code=getattr(exc, "code", "supplement_classification_invalid"))
+            from app.core.model_diagnostics import safe_model_failure_fields
+            endpoint.trace("supplement_classification_failed", **safe_model_failure_fields(exc))
             if (isinstance(exc, ProviderError) and exc.retryable and exc.code == "provider_schema_invalid"
                     and exc.details.get("json_failure_kind") == "invalid_json_object"
                     and exc.details.get("json_decode_reason") == "non_object"):
@@ -1649,7 +1655,7 @@ class SpokenSupplementConfirmation:
             if endpoint.capture is capture and not endpoint._closed:
                 endpoint._record_preparation_failure(attempt)
             raise
-        if endpoint._prepare_failures:
+        if recovered or endpoint._prepare_failures:
             await endpoint._notify("supplement_awaiting_reply")
             endpoint.assert_current()
         action = decision["intent"]
