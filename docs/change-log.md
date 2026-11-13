@@ -4,7 +4,7 @@
 
 ## 2026-11-12 · SUPPLEMENT-RECOVERY-CONFLICT-097
 
-- 状态：`in_progress`。
+- 状态：`verified（仓库全量与本机加载；真人连续语音待验）`。
 - 授权与基线：用户明确要求修复补充确认重试冲突，沿用Git回退、测试及空闲加载授权。首次修改前工作区干净，022c9fd（实现7f32fc5）已提交保留；独立分支codex/supplement-recovery-097。按入口顺序复核11份设计文档及096证据，不自动重放/补交/结束真实面试，不在活动面试期间重启。
 - 已确认事故：iv_2dabd257499140fd在2026-11-10T23:38:23Z技术理解成功，补充问题23:38:30Z实际送达；截图中的Well.与23:38:32Z五字符STT哈希精确一致。该回复23:38:36Z v9返回顶层非对象JSON，23:38:40Z v10通过网关但本地后置处理失败。23:38:55Z九字符STT与截图“没有需要补充的了。”精确匹配，23:38:59Z v9再次non_object；前面连续失败已使episode耗尽，新回复只获一次请求而无剩余纠错。两个non_object均finish=stop、55/40 tokens，非超时/截断。未留存第二次本地异常子原因，不能断言具体语义规则或内部代码异常。
 - 诊断缺口：supplement_classification_failed被日志事件白名单过滤；后置校验无专门安全事件，外层仅读code而校验异常用reason_code/schema_path，预算错误被笼统归为unavailable。本项补固定白名单原因/阶段/异常类型/版本诊断，不记录原始候选文本、Prompt、响应或凭据，不回填未知历史原因。
@@ -22,6 +22,10 @@
 - 冻结前完成：最终runtime整合5文件87通过/10.82秒，078/084/079/067相关6文件123通过/2.49秒，诊断115通过，真实adapter联动6通过。独立只读复核预算隔离/取消扣费/期限/来源/永久失败/技术次数保持无新增阻断；333处本地文档链接有效、git diff --check通过。冻结616份源码/测试与237后端文件，SHA6a2dc44fafb808ea80f67299ffa8431d0c21847b4935d5900622580891753646，开始本轮完整pytest、前端Vitest及临时构建，尚未生成发布通过证明。
 
 - 最终完整验证：`.venv/bin/python /private/tmp/interviewer-097-test-and-attest.py`执行本轮`pytest -p no:cacheprovider -q`为5122 passed/8 skipped/279.11秒；`npm test -- --reporter=dot`为580 passed/26文件；`npm run build -- --outDir /private/tmp/interviewer-097-web-dist`成功（原非阻断大chunk提示保持）。616份冻结源码/测试前后完全一致、6条生产路径精确匹配；原Prompt/Schema/路由、评分、题数和音频处理均未修改。随后同工具`--publish`通过，保留66份历史静态资产并原子切换入口，7份当前构建与日志SHA绑定v5证明。日志/private/tmp/interviewer-097-{backend-full,frontend-full,web-build}.log；证明interviewer-097-test-attestation.json。此时仅准备保存实现提交并即时空闲加载，尚不宣称服务已更新。
+
+- 实际提交与加载：实现提交6d5b534，分支codex/supplement-recovery-097，原022c9fd保留、未push。即时及执行前双重空闲检查均通过后，正常TERM旧API52071/worker52072，2026-11-13T02:44:05Z（本地11月12日）启动API62473/worker62474；两端237源码文件SHA均6a2dc44fafb808ea80f67299ffa8431d0c21847b4935d5900622580891753646。runner退出0，无强杀或恢复分支，健康/就绪与媒体配置dcbaf54ac496b9217094dae97dfcd6b2ffec665d23f934bfaae2895c5ecefb0f均通过；重启前后83场核心及全部capture原始行摘要分别保持b158a9ddd57e50218a3d78d3c76b06992dcb700c9a518b7629d2e65bc6d38b06和37724c2353f57667afb801208d4ba07836980a3084e50dcde2ce8ed86524140f。没有重放回答、补交、跳题、结束历史场次或改写评分。
+- 独立运行核验：`interviewer-097-runtime-verify.py 62473 62474`退出0，API/worker实际源码、媒体配置、8000健康与readyz、5174健康/API代理、静态入口和bundle均匹配证明，4个实际Vite模块还原既有导入变换后与冻结源码一致。Vite未重启，前端源码未改；当前构建实际HTTP已核验。结果/private/tmp/interviewer-097-runtime-verification.log。
+- 实际范围与剩余边界：6生产文件为core/{model_diagnostics,speech_diagnostics}、services/{answer_endpoint,conversation_understanding,interview_evidence,spoken_supplement}；新增3份097测试、窄调2份旧测试，同步8份设计/状态文档。无Prompt/Schema/路由、DB结构、评分/选题或音频采集逻辑变更。补充回复与技术分析重试冲突已有代码、负例、真实adapter隔离联动及本机运行证据；没有新增真实外部模型探针，不能承诺供应商不再持续返回无效结果，真人连续语音与独立STT积压仍待验，不标closed。最后仅补实际验收文档，无需重复完整源码测试。
 
 ## 2026-11-10 · SEMANTIC-TAIL-CONTINUITY-096
 
