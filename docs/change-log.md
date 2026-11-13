@@ -4,11 +4,14 @@
 
 ## 2026-11-13 · GIT-DELIVERY-099
 
-- 状态：`in_progress`。
+- 状态：`verified（远程合并与本地主分支同步）`。
 - 授权与目标：用户明确要求“推送到远程，并且把代码合并到主分支”。目标为既有origin `git@github.com:zwj19980929-netizen/interview.git`，GitHub确认默认主分支为main。保留原提交与修复分支，不强制推送或重写历史。
 - 首次检查：工作区干净，当前codex/dialogue-continuity-098为8491179；`git fetch origin`成功后，远程同名分支也为8491179，远程main仍为9619fd7且为当前HEAD祖先，差异0/29。合并范围是累计29个已存在提交及521个差异文件，包含此前多轮修复，不仅098；没有分叉冲突。独立只读范围检查未见新增真实环境文件、数据库、凭据、录音或运行日志路径。仓库无.github工作流。
 - 计划与边界：先提交本登记并推送修复分支，再通过GitHub合并请求保留历史合并到main，绑定预期head SHA；随后同步本地主分支并核验远程引用、祖先关系、已测源码/构建及干净工作区。本项仅修改本日志；使用098已通过的完整后端5212/8环境跳过、前端589及构建证据，不改变生产代码、测试、构建内容或运行服务，不执行迁移或模型调用。实际PR、提交、命令结果和未完成事项在本项补齐。
 - 检查附注：首次get_repo调用参数名称有误被connector拒绝，改用正式repository_full_name后成功，无远程写入；只读rg发现.github目录不存在，未产生修改。跨29提交的diff检查发现既有tests/test_dialogue_degradation_098.py末尾多一空行，属于已测试提交的非功能格式项，本次发布不改动测试快照。
+- 实际交付：登记提交587e013通过`git push origin codex/dialogue-continuity-098`成功推送；创建[PR #1](https://github.com/zwj19980929-netizen/interview/pull/1)，base=main/9619fd7、head=587e013。GitHub复核mergeable=true，当前head无commit status或Actions运行；仓库没有远程CI，未将其表述为CI通过。使用merge方式并绑定完整expected_head_sha，于2026-11-13T18:01:12Z合并成功，合并提交b97e7be7a2e191b58b0690812f9e6600f49d6964；PR随后确认closed/merged。
+- 本地同步与验收：`git fetch origin`、`git switch main`及`git merge --ff-only origin/main`成功，main从9619fd7快进到b97e7be，无冲突。本地HEAD与origin/main一致，`git diff --exit-code 587e013 HEAD`为空；8491179和旧主分支9619fd7均为合并结果祖先，保留修复与旧主线历史。619份源码/测试及69份已发布构建文件逐一匹配098证明，后端SHA仍为58ddd862b1c928cb1fcb8b2cb2942e9d85eaf89f48eafd1d675ba0405b0abdf7，因此不重复全量测试。
+- 实际修改与收尾：本工作项仅新增/补充`docs/change-log.md`，代码合并已完成，收尾只提交并推送本条验收记录。修复远程分支保留，不删除分支，不强制推送，不运行服务重启、数据库迁移或候选业务动作。真人连续语音及外部长期可靠性边界沿098保留，未因Git合并改写为已验收。
 
 ## 2026-11-13 · DIALOGUE-CONTINUITY-098
 
